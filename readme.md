@@ -40,4 +40,7 @@ User: liangzou (这是您的 Mac 用户名)
 Password: (留空即可)
 Database: stock_db
 
+## git testing difference
+testing 
+
 

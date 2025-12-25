@@ -226,6 +226,25 @@ def get_market_snapshot():
             st.info("💡 建议：请检查网络连接，或稍后再次执行扫描。")
             return pd.DataFrame()
 
+@st.cache_data(ttl=60)
+def get_index_data():
+    """获取主要指数实时行情 (通过历史接口补全全市场)"""
+    indices = {"上证指数": "000001", "创业板指": "399006", "沪深300": "000300"}
+    res = {}
+    for name, code in indices.items():
+        try:
+            # 获取最近 5 天日线以计算最新涨跌幅
+            df = ak.index_zh_a_hist(symbol=code, period="daily", 
+                                   start_date=(datetime.now() - timedelta(days=10)).strftime("%Y%m%d"))
+            if not df.empty:
+                curr = df.iloc[-1]
+                prev = df.iloc[-2] if len(df) > 1 else curr
+                pct = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
+                res[name] = {'price': curr['收盘'], 'pct': pct}
+        except:
+            continue
+    return res
+
 def apply_snapshot_filter(df, min_mkt_cap=30e8, max_mkt_cap=800e8):
     """第一层漏斗：快照初步筛选 (v2.1 市值范围 30亿~800亿)"""
     if df.empty: return df, 0, 0
@@ -297,12 +316,15 @@ def check_strategy(df, threshold=0.08, vol_multiplier=2.0):
     vol_ratio = curr['成交量'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 0
     is_volume = vol_ratio >= vol_multiplier
 
+    is_above_ema20 = curr['收盘'] > curr['EMA20']
+
     debug_info = {
         "squeeze": round(squeeze, 4),
         "vol_ratio": round(vol_ratio, 2),
         "is_breakout": is_breakout,
         "is_trending": is_trending,
         "is_volume": is_volume,
+        "is_above_ema20": is_above_ema20,
         "curr_price": curr['收盘'],
         "max_ma": round(max_ma, 2)
     }
@@ -409,32 +431,32 @@ def single_stock_task(code, name, current_price, current_vol, current_open, thre
         match, stats = check_strategy(df, threshold, vol_multiplier)
         
         if match:
-            return {
+            match_res = {
                 '代码': code, '名称': name, '现价': stats['price'], 
                 '涨幅%': stats['pct_change'], '粘合度': stats['squeeze'], 
                 '量比': stats['vol_ratio'], 'ema20': stats['ema20'],
                 '综合得分': stats['score']
             }
+            return True, match_res, stats.get('is_above_ema20', False)
         else:
             # 返回失败原因以便诊断
             stats['name'] = name
             stats['code'] = code
-            return False, stats
+            return False, stats, stats.get('is_above_ema20', False)
     except Exception as e:
-        return False, {"error": str(e), "code": code, "name": name}
+        return False, {"error": str(e), "code": code, "name": name}, False
     return None
 
 def concurrent_scan(candidates, threshold, vol_multiplier, max_workers=10, target_date=None):
     """第二层漏斗：并发历史回测 (Level 2 Funnel)"""
     results = []
     debug_samples = [] # 存储前几个候选股的失败原因
+    above_ema20_count = 0
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(candidates)
     
     start_time = time.time()
-    
-    # 提前获取 engine 以便传给子线程
     engine = get_db_engine()
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -445,11 +467,17 @@ def concurrent_scan(candidates, threshold, vol_multiplier, max_workers=10, targe
         
         for i, future in enumerate(as_completed(futures)):
             res = future.result()
-            if isinstance(res, dict) and '代码' in res:
-                results.append(res)
-            elif isinstance(res, tuple) and res[0] is False and len(debug_samples) < 3:
-                # 记录失败详情供调试
-                debug_samples.append(res[1])
+            if res is None: continue
+            
+            # res 结构现在是 (match_success, info_dict, is_above_ema20)
+            success, info, above_ema20 = res
+            if above_ema20:
+                above_ema20_count += 1
+                
+            if success:
+                results.append(info)
+            elif len(debug_samples) < 3:
+                debug_samples.append(info)
             
             # 更新进度
             if i % 10 == 0 or i == total - 1:
@@ -461,7 +489,8 @@ def concurrent_scan(candidates, threshold, vol_multiplier, max_workers=10, targe
     status_text.empty()
     
     duration = time.time() - start_time
-    return pd.DataFrame(results), duration, debug_samples
+    breadth_ratio = (above_ema20_count / total * 100) if total > 0 else 0
+    return pd.DataFrame(results), duration, debug_samples, breadth_ratio
 
 def send_bark_notification(bark_key, name, pct_change):
     if not bark_key: return
@@ -609,18 +638,21 @@ def main():
                 st.sidebar.caption(f"存储状态: {total_records} 条记录")
         except: pass
     
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("上涨家数", f"📈 {up}", delta=f"{up-down}" if up > down else f"-{down-up}", delta_color="normal")
-    with col2:
-        st.metric("下跌家数", f"📉 {down}")
-    with col3:
-        if up < 1500:
-            st.error("🥶 市场冰点，慎重出手")
-        elif up > 3000:
-            st.success("🔥 市场火热，积极寻找机会")
-        else:
-            st.info("⚖️ 市场震荡中")
+    # --- Market Indices & Breadth ---
+    idx_data = get_index_data()
+    cols = st.columns(4)
+    indices = [("上证指数", "📉" if idx_data.get('上证指数', {}).get('pct', 0) < 0 else "📈"), 
+               ("创业板指", "📉" if idx_data.get('创业板指', {}).get('pct', 0) < 0 else "📈"), 
+               ("沪深300", "📉" if idx_data.get('沪深300', {}).get('pct', 0) < 0 else "📈")]
+    
+    for i, (name, icon) in enumerate(indices):
+        data = idx_data.get(name, {'price': 0, 'pct': 0})
+        cols[i].metric(f"{icon} {name}", f"{data['price']:.2f}", f"{data['pct']:.2f}%")
+        
+    with cols[3]:
+        # 市场宽度 (处于EMA20之上的比例)
+        breadth = st.session_state.get('breadth_v2', 0)
+        st.metric("📊 市场宽度 (>EMA20)", f"{breadth:.1f}%", help="初筛入围个股中，股价站上20日均线的比例 (数值越高，趋势越好)")
 
     # Workflow Execution
     if st.sidebar.button("🚀 执行扫描") or auto_mode:
@@ -646,7 +678,8 @@ def main():
                     funnel_1_count = len(candidates)
         
         # Level 2
-        results_df, duration, debug_samples = concurrent_scan(candidates, threshold, vol_multiplier, max_workers, target_date=analysis_date if is_historical else None)
+        results_df, duration, debug_samples, breadth_ratio = concurrent_scan(candidates, threshold, vol_multiplier, max_workers, target_date=analysis_date if is_historical else None)
+        st.session_state['breadth_v2'] = breadth_ratio
         
         # --- 诊断汇报 (v2.6.3) ---
         col_st1, col_st2, col_st3 = st.columns(3)
@@ -708,13 +741,27 @@ def main():
         
         st.subheader(f"📊 选股池 (Top 30)")
         
+        # 增加信心评分标签 (v2.6.7)
+        def get_confidence(score):
+            if score > 80: return "💎 极高"
+            if score > 60: return "🔥 高"
+            return "🔍 观察"
+        
         def color_row(row):
-            if row['涨幅%'] > 3.0 and row['现价'] > row['ema20']:
+            # 由于列顺序变了，我们需要安全获取
+            pct = row.get('涨幅%', 0)
+            if isinstance(pct, str): pct = float(pct.strip('%'))
+            if pct > 3.0:
                 return ['background-color: #dcfce7; color: #166534; font-weight: bold'] * len(row)
             return [''] * len(row)
 
+        df_res['信心等级'] = df_res['综合得分'].apply(get_confidence)
+        # 调整列顺序 (确保包含 ema20 虽然不显示但可能用于逻辑)
+        cols_order = ['代码', '名称', '现价', '涨幅%', '信心等级', '综合得分', '粘合度', '量比']
+        df_display = df_res[cols_order].copy()
+
         st.dataframe(
-            df_res.style.apply(color_row, axis=1).format({
+            df_display.style.apply(color_row, axis=1).format({
                 '现价': '{:.2f}',
                 '涨幅%': '{:+.2f}%',
                 '粘合度': '{:.4f}',
@@ -722,22 +769,38 @@ def main():
                 '综合得分': '{:.2f}'
             }), 
             use_container_width=True,
-            height=600
+            height=500
         )
         
-        # TradingView Export
-        tv_df = df_res.head(tv_limit).copy()
-        tv_codes = []
-        for code in tv_df['代码']:
-            prefix = "SSE" if code.startswith('6') else "SZSE"
-            tv_codes.append(f"{prefix}:{code}")
+        # --- Export Panel (v2.6.7) ---
+        st.divider()
+        st.subheader("📥 结果导出面板")
+        ex_col1, ex_col2 = st.columns(2)
         
-        st.download_button(
-            label="📥 下载 TradingView 列表",
-            data=",".join(tv_codes),
-            file_name=f"TV_Squeeze_v2_{datetime.now().strftime('%Y%m%d')}.txt",
-            mime="text/plain"
-        )
+        with ex_col1:
+            st.write("**1. 结构化导出**")
+            csv_full = df_res.to_csv(index=False).encode('utf-8')
+            st.download_button("💾 下载完整结果 (CSV)", csv_full, f"Squeeze_Results_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
+            
+            # TradingView Export
+            tv_df = df_res.head(tv_limit).copy()
+            tv_codes = []
+            for code in tv_df['代码']:
+                prefix = "SSE" if code.startswith('6') else "SZSE"
+                tv_codes.append(f"{prefix}:{code}")
+            
+            st.download_button(
+                label="📥 下载 TradingView 列表 (TXT)",
+                data=",".join(tv_codes),
+                file_name=f"TV_List_{datetime.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain"
+            )
+
+        with ex_col2:
+            st.write("**2. 快速拷贝自选股**")
+            code_list = ",".join(df_res['代码'].tolist())
+            st.text_area("通达信/同花顺代码列表 (直接复制)", code_list, height=100)
+            st.caption("提示：直接复制上方代码并粘贴到交易软件的『批量入库』或『自选股导入』中即可。")
         
         # Detail & Chart
         sel = st.selectbox("选择股票查看 K 线图详情", df_res['名称'].tolist())
