@@ -258,13 +258,14 @@ def sync_stock(code, name, engine=None):
 
 # --- Logic & Data Functions ---
 
-@st.cache_data(ttl=3)
+@st.cache_data(ttl=60)
 def get_market_snapshot():
-    """获取全市场实时快照 (Level 1 Funnel) - 增加重试逻辑以应对网络超时"""
+    """获取全市场实时快照 (v5.1 - 强化防封与缓存)"""
     max_retries = 3
-    retry_delay = 2
     for attempt in range(max_retries):
         try:
+            # 增加微小随机延迟以打散并发请求
+            time.sleep(random.uniform(0.1, 0.5))
             df = ak.stock_zh_a_spot_em()
             # 重命名常用列以便处理
             df = df.rename(columns={
@@ -281,10 +282,12 @@ def get_market_snapshot():
             return df
         except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(retry_delay)
+                # 指数退避：第一次重试等 2s，第二次等 4s
+                wait_time = (attempt + 1) * 2
+                time.sleep(wait_time)
                 continue
             st.error(f"⚠️ 无法连接数据服务器 (Attempt {attempt+1}/{max_retries}): {e}")
-            st.info("💡 建议：请检查网络连接，或稍后再次执行扫描。")
+            st.info("💡 建议：该错误通常由 API 频率限制引起。系统已自动增加缓存时间，请等待 1 分钟后再试，或检查网络代理设置。")
             return pd.DataFrame()
 
 @st.cache_data(ttl=3600*12)
@@ -618,12 +621,19 @@ def single_stock_task(code, name, current_price, current_vol, current_open, thre
         end_date_str = target_date.strftime("%Y-%m-%d")
         start_date = (target_date - timedelta(days=250)).strftime("%Y%m%d")
         
-        df = load_from_db(code, engine)
-        if df.empty or df.iloc[-1]['日期'] < (target_date - timedelta(days=3)).strftime("%Y-%m-%d"):
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
-            if not df.empty: save_to_db(code, df, engine)
+        df = load_from_db(code, (target_date - timedelta(days=360)).strftime("%Y-%m-%d"), engine)
+        
+        # 增加类型检查，防止某些情况下返回非 DataFrame 类型
+        if not isinstance(df, pd.DataFrame): 
+            df = pd.DataFrame()
 
-        if df.empty: return None
+        if df.empty or df.iloc[-1]['日期'] < (target_date - timedelta(days=3)).strftime("%Y-%m-%d"):
+            df_new = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
+            if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                df = df_new
+                save_to_db(df, code, engine)
+
+        if not isinstance(df, pd.DataFrame) or df.empty: return None
         
         df = df[df['日期'] <= end_date_str].copy()
         if len(df) < 120: return None
@@ -1082,10 +1092,11 @@ def main():
                 return ['background-color: #dcfce7; color: #166534; font-weight: bold'] * len(row)
             return [''] * len(row)
 
-        df_res['信心等级'] = df_res['综合得分'].apply(get_confidence)
-        # 调整列顺序 (v2.7)
-        cols_order = ['代码', '名称', '行业', '现价', '涨幅%', '信心等级', '综合得分', '粘合度', '量比']
-        df_display = df_res[cols_order].copy()
+        df_res['信心等级'] = df_res['Score'].apply(get_confidence)
+        # 调整列顺序 (v5.0 增加 RSI, 历史胜率, 北向)
+        cols_order = ['代码', '名称', '行业', '现价', '涨幅%', '信心等级', 'Score', 'RSI', '历史胜率', '北向']
+        cols_exist = [c for c in cols_order if c in df_res.columns]
+        df_display = df_res[cols_exist].copy()
 
         st.dataframe(
             df_display.style.apply(color_row, axis=1).format({
@@ -1093,8 +1104,9 @@ def main():
                 '涨幅%': '{:+.2f}%',
                 '粘合度': '{:.4f}',
                 '量比': '{:.2f}',
-                '综合得分': '{:.2f}'
-            }), 
+                'Score': '{:.2f}',
+                'RSI': '{:.1f}'
+            }, na_rep='-'), 
             use_container_width=True,
             height=500
         )
