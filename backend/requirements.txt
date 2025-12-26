@@ -1,0 +1,10 @@
+fastapi==0.111.0
+uvicorn==0.30.1
+akshare==1.14.96
+pandas==2.2.2
+numpy==1.26.4
+sqlalchemy==2.0.30
+psycopg2-binary==2.9.9
+requests==2.32.3
+plotly==5.22.0
+python-multipart==0.0.9
