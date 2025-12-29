@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import random
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from .db import save_to_db, get_db_engine
 
