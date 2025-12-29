@@ -186,14 +186,23 @@ def scan_market(
         
         # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
         total_snapshot = len(snapshot_df)
+        
+        # SOP: 剔除 ST、北交所 (8, 4, 920开头)、退市整理
+        snapshot_df['code_str'] = snapshot_df['code'].astype(str)
+        snapshot_df['name_str'] = snapshot_df['name'].astype(str)
+        
+        is_not_st = ~snapshot_df['name_str'].str.contains('ST|退', case=False)
+        is_not_bj = ~snapshot_df['code_str'].str.startswith(('8', '4', '920'))
+        
         candidates = snapshot_df[
             (snapshot_df['pct_chg'] > 0) & 
+            is_not_st & is_not_bj &
             (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000) & # UI 传过来的是“亿”为单位
             (snapshot_df['turnover'] >= turnover_min)
         ].copy()
         
         print(f"📊 Snapshot: {total_snapshot} stocks")
-        print(f"🔍 After initial filter (+%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
+        print(f"🔍 After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
         
         # 1. 处理科创板过滤
         if "包含科创板" not in market_range:
@@ -308,6 +317,19 @@ def scan_market(
         
         for res in results:
             res['行业'] = industry_results.get(res['代码'], "未知")
+            
+        # --- SOP: 板块共振 (Sector Resonance) 计算 ---
+        industry_counts = {}
+        for res in results:
+            ind = res.get('行业', '未知')
+            industry_counts[ind] = industry_counts.get(ind, 0) + 1
+            
+        for res in results:
+            ind = res.get('行业', '未知')
+            if industry_counts.get(ind, 0) > 1 and ind != '未知':
+                res['共振'] = "🔥 核心热点"
+            else:
+                res['共振'] = "独苗"
             
         # --- 持久化保存 ---
         save_scan_results(results, engine)

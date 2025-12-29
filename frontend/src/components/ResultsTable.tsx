@@ -28,6 +28,7 @@ interface Result {
     历史胜率: string;
     信号次数: number;
     北向?: string;
+    共振?: string;
 }
 
 export default function ResultsTable({ results }: { results: Result[] }) {
@@ -103,7 +104,9 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                         包含：<br />
                                         涨幅：当日价格变动<br />
                                         RSI：14日相对强弱指标<br />
-                                        DIF：MACD 核心差值
+                                        DIF：MACD 核心差值<br />
+                                        价格行为：实体 &gt; 上影线<br />
+                                        板块共振：同行业多股同发
                                     </div>
                                 </div>
                             </th>
@@ -167,9 +170,16 @@ export default function ResultsTable({ results }: { results: Result[] }) {
 
                                     <td className="px-6 py-5">
                                         <div className="flex flex-col items-center gap-2">
-                                            <div className="flex items-center gap-1.5 px-3 py-1 bg-slate-100 rounded-full">
-                                                <Map size={10} className="text-slate-400" />
-                                                <span className="text-[10px] font-bold text-slate-600">{res.行业}</span>
+                                            <div className="flex flex-wrap items-center justify-center gap-2">
+                                                <div className="flex items-center gap-1.5 px-3 py-1 bg-slate-100 rounded-full">
+                                                    <Map size={10} className="text-slate-400" />
+                                                    <span className="text-[10px] font-bold text-slate-600">{res.行业}</span>
+                                                </div>
+                                                {res.共振 === "🔥 核心热点" && (
+                                                    <div className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600 text-white rounded-lg shadow-lg shadow-indigo-100 animate-pulse">
+                                                        <span className="text-[9px] font-black uppercase tracking-tighter">🔥 板块共振</span>
+                                                    </div>
+                                                )}
                                             </div>
                                             <div className="flex items-center gap-1">
                                                 <span className="text-[10px] font-bold text-slate-300">北向</span>
