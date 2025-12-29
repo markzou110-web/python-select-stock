@@ -36,6 +36,9 @@ export default function Dashboard() {
         local_only: false
     });
 
+    const [historyDates, setHistoryDates] = useState<string[]>([]);
+    const [selectedDate, setSelectedDate] = useState<string>("");
+
     const [syncProgress, setSyncProgress] = useState<any>(null);
 
     const fetchMarketData = useCallback(async () => {
@@ -53,7 +56,6 @@ export default function Dashboard() {
 
     const fetchSyncStatus = useCallback(async () => {
         try {
-            // Using direct marketApi if it has a generic get, otherwise use marketApi.syncStatus if you added it
             const res = await api.get('/api/sync/status');
             setSyncProgress(res.data);
         } catch (e) {
@@ -61,11 +63,29 @@ export default function Dashboard() {
         }
     }, []);
 
+    const fetchHistory = useCallback(async () => {
+        try {
+            const dateRes = await api.get('/api/scan/dates');
+            const dates = dateRes.data;
+            setHistoryDates(dates);
+
+            // 如果有历史记录且当前没有选中，则默认加载最近一天的
+            if (dates.length > 0 && !results.length) {
+                const latestDate = dates[0];
+                setSelectedDate(latestDate);
+                const res = await api.get(`/api/scan/history?date=${latestDate}`);
+                setResults(res.data);
+            }
+        } catch (e) {
+            console.error("Failed to fetch history", e);
+        }
+    }, [results.length]);
+
     useEffect(() => {
         const init = async () => {
             setLoading(true);
             setLastUpdated(new Date().toLocaleTimeString());
-            await Promise.all([fetchMarketData(), fetchSyncStatus()]);
+            await Promise.all([fetchMarketData(), fetchSyncStatus(), fetchHistory()]);
             setLoading(false);
         };
         init();
@@ -89,10 +109,25 @@ export default function Dashboard() {
         try {
             const res = await marketApi.scanMarket(params);
             setResults(res.data);
+            setSelectedDate(new Date().toISOString().split('T')[0]);
+            fetchHistory(); // 刷新日期列表
         } catch (e: any) {
             console.error("Scan Error Detail:", e);
             const errorMsg = e.response?.data?.detail || e.message;
             alert(`扫描失败: ${errorMsg}\n\n请检查后端终端输出或网络连接。`);
+        } finally {
+            setIsScanning(false);
+        }
+    };
+    const handleDateChange = async (date: string) => {
+        setSelectedDate(date);
+        if (!date) return;
+        setIsScanning(true);
+        try {
+            const res = await api.get(`/api/scan/history?date=${date}`);
+            setResults(res.data);
+        } catch (e) {
+            console.error("Failed to load history", e);
         } finally {
             setIsScanning(false);
         }
@@ -160,6 +195,27 @@ export default function Dashboard() {
                                 <Filter size={18} />
                                 策略参数配置
                             </button>
+
+                            {/* History Selector */}
+                            {historyDates.length > 0 && (
+                                <div className="flex items-center gap-3 pl-6 border-l border-slate-200 ml-2">
+                                    <span className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                                        🕒 历史记录
+                                    </span>
+                                    <select
+                                        value={selectedDate}
+                                        onChange={(e) => handleDateChange(e.target.value)}
+                                        className="bg-white border border-slate-200 text-slate-600 text-sm font-bold rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500/20 transition-all cursor-pointer shadow-sm hover:border-slate-300"
+                                    >
+                                        <option value="">-- 选择记录日期 --</option>
+                                        {historyDates.map(date => (
+                                            <option key={date} value={date}>
+                                                📅 {date} {date === new Date().toISOString().split('T')[0] ? "(今日扫描)" : ""}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+                            )}
                         </div>
 
                         <div className="flex items-center gap-2 bg-white p-1.5 rounded-2xl border border-slate-200">
