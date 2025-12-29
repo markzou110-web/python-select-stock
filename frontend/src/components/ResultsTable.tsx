@@ -1,6 +1,6 @@
 "use client";
 
-import React from 'react';
+import React, { useState } from 'react';
 import {
     TrendingUp,
     Target,
@@ -10,7 +10,9 @@ import {
     History,
     ExternalLink,
     LayoutGrid,
-    HelpCircle
+    HelpCircle,
+    ChevronDown,
+    ChevronUp
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -31,7 +33,18 @@ interface Result {
 }
 
 export default function ResultsTable({ results }: { results: Result[] }) {
+    const [expandedRow, setExpandedRow] = useState<string | null>(null);
+
     if (results.length === 0) return null;
+
+    const toggleRow = (code: string) => {
+        setExpandedRow(expandedRow === code ? null : code);
+    };
+
+    const getH5ChartUrl = (code: string) => {
+        const market = code.startsWith('6') || code.startsWith('688') ? '1' : '2';
+        return `https://quote.eastmoney.com/h5chart/main.html?code=${code}&market=${market}&type=kline`;
+    };
 
     const openChart = (code: string) => {
         const fullCode = code.startsWith('6') || code.startsWith('688') ? `SH${code}` : `SZ${code}`;
@@ -108,91 +121,151 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                     </thead>
                     <tbody className="divide-y divide-slate-50">
                         {results.map((res, i) => (
-                            <tr key={res.代码} className="group hover:bg-indigo-50/30 transition-all">
-                                <td className="px-8 py-5">
-                                    <div className="flex items-center gap-3">
-                                        <div className="flex flex-col">
-                                            <span className="font-extrabold text-slate-700">{res.名称}</span>
-                                            <span className="text-[10px] font-mono font-bold text-slate-400 tracking-tighter">{res.代码}</span>
-                                        </div>
-                                    </div>
-                                </td>
-
-                                <td className="px-6 py-5">
-                                    <div className="flex flex-col items-center">
-                                        <div className="flex items-baseline gap-1">
-                                            <span className="text-lg font-black text-slate-800">{res.Score.toFixed(1)}</span>
-                                            <span className="text-[10px] font-bold text-indigo-500">PT</span>
-                                        </div>
-                                        <ConfidenceBadge score={res.Score} />
-                                    </div>
-                                </td>
-
-                                <td className="px-6 py-5">
-                                    <div className="flex flex-col items-center gap-2">
-                                        <div className={cn(
-                                            "text-sm font-bold px-2 py-0.5 rounded-lg",
-                                            res["涨幅%"] >= 0 ? "text-emerald-600 bg-emerald-50" : "text-rose-600 bg-rose-50"
-                                        )}>
-                                            {res["涨幅%"] >= 0 ? '+' : ''}{res["涨幅%"].toFixed(2)}%
-                                        </div>
-                                        <div className="flex gap-3">
-                                            <div className="flex items-center gap-1">
-                                                <span className="text-[10px] font-bold text-slate-300">RSI</span>
-                                                <span className="text-[10px] font-extrabold text-slate-500">{res.RSI}</span>
+                            <React.Fragment key={res.代码}>
+                                <tr
+                                    onClick={() => toggleRow(res.代码)}
+                                    className={cn(
+                                        "group transition-all cursor-pointer border-b border-slate-50",
+                                        expandedRow === res.代码 ? "bg-indigo-50/50" : "hover:bg-indigo-50/20"
+                                    )}
+                                >
+                                    <td className="px-8 py-5">
+                                        <div className="flex items-center gap-3">
+                                            <div className="text-slate-300 group-hover:text-indigo-400 transition-colors">
+                                                {expandedRow === res.代码 ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                                             </div>
-                                            <div className="flex items-center gap-1">
-                                                <span className="text-[10px] font-bold text-slate-300">DIF</span>
-                                                <span className="text-[10px] font-extrabold text-slate-500">{res.DIF}</span>
+                                            <div className="flex flex-col">
+                                                <span className="font-extrabold text-slate-700">{res.名称}</span>
+                                                <span className="text-[10px] font-mono font-bold text-slate-400 tracking-tighter">{res.代码}</span>
                                             </div>
                                         </div>
-                                    </div>
-                                </td>
+                                    </td>
 
-                                <td className="px-6 py-5">
-                                    <div className="flex flex-col items-center gap-2">
-                                        <div className="flex items-center gap-1.5 px-3 py-1 bg-slate-100 rounded-full">
-                                            <Map size={10} className="text-slate-400" />
-                                            <span className="text-[10px] font-bold text-slate-600">{res.行业}</span>
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center">
+                                            <div className="flex items-baseline gap-1">
+                                                <span className="text-lg font-black text-slate-800">{res.Score.toFixed(1)}</span>
+                                                <span className="text-[10px] font-bold text-indigo-500">PT</span>
+                                            </div>
+                                            <ConfidenceBadge score={res.Score} />
                                         </div>
-                                        <div className="flex items-center gap-1">
-                                            <span className="text-[10px] font-bold text-slate-300">北向</span>
-                                            <span className={cn(
-                                                "text-[10px] font-extrabold",
-                                                res.北向?.includes("流入") ? "text-rose-500" :
-                                                    res.北向?.includes("流出") ? "text-emerald-500" : "text-slate-400"
+                                    </td>
+
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center gap-2">
+                                            <div className={cn(
+                                                "text-sm font-bold px-2 py-0.5 rounded-lg",
+                                                res["涨幅%"] >= 0 ? "text-emerald-600 bg-emerald-50" : "text-rose-600 bg-rose-50"
                                             )}>
-                                                {res.北向 || "---"}
-                                            </span>
+                                                {res["涨幅%"] >= 0 ? '+' : ''}{res["涨幅%"].toFixed(2)}%
+                                            </div>
+                                            <div className="flex gap-3">
+                                                <div className="flex items-center gap-1">
+                                                    <span className="text-[10px] font-bold text-slate-300">RSI</span>
+                                                    <span className="text-[10px] font-extrabold text-slate-500">{res.RSI}</span>
+                                                </div>
+                                                <div className="flex items-center gap-1">
+                                                    <span className="text-[10px] font-bold text-slate-300">DIF</span>
+                                                    <span className="text-[10px] font-extrabold text-slate-500">{res.DIF}</span>
+                                                </div>
+                                            </div>
                                         </div>
-                                    </div>
-                                </td>
+                                    </td>
 
-                                <td className="px-6 py-5">
-                                    <div className="flex flex-col items-center gap-1">
-                                        <div className="flex items-center gap-1 text-indigo-600">
-                                            <History size={14} strokeWidth={2.5} />
-                                            <span className="text-sm font-black italic">{res.历史胜率}</span>
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center gap-2">
+                                            <div className="flex items-center gap-1.5 px-3 py-1 bg-slate-100 rounded-full">
+                                                <Map size={10} className="text-slate-400" />
+                                                <span className="text-[10px] font-bold text-slate-600">{res.行业}</span>
+                                            </div>
+                                            <div className="flex items-center gap-1">
+                                                <span className="text-[10px] font-bold text-slate-300">北向</span>
+                                                <span className={cn(
+                                                    "text-[10px] font-extrabold",
+                                                    res.北向?.includes("流入") ? "text-rose-500" :
+                                                        res.北向?.includes("流出") ? "text-emerald-500" : "text-slate-400"
+                                                )}>
+                                                    {res.北向 || "---"}
+                                                </span>
+                                            </div>
                                         </div>
-                                        <span className="text-[9px] font-bold text-slate-400 tracking-tighter">基于 {res.信号次数} 次历史共振信号</span>
-                                    </div>
-                                </td>
+                                    </td>
 
-                                <td className="px-8 py-5 text-right">
-                                    <button
-                                        onClick={() => openChart(res.代码)}
-                                        className="p-2 text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
-                                    >
-                                        <LayoutGrid size={20} />
-                                    </button>
-                                    <button
-                                        onClick={() => openChart(res.代码)}
-                                        className="p-2 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition-all ml-1"
-                                    >
-                                        <BarChart3 size={20} />
-                                    </button>
-                                </td>
-                            </tr>
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center gap-1">
+                                            <div className="flex items-center gap-1 text-indigo-600">
+                                                <History size={14} strokeWidth={2.5} />
+                                                <span className="text-sm font-black italic">{res.历史胜率}</span>
+                                            </div>
+                                            <span className="text-[9px] font-bold text-slate-400 tracking-tighter">基于 {res.信号次数} 次历史共振信号</span>
+                                        </div>
+                                    </td>
+
+                                    <td className="px-8 py-5 text-right">
+                                        <div className="flex justify-end gap-1">
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); openChart(res.代码); }}
+                                                className="p-2 text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
+                                                title="查看详情"
+                                            >
+                                                <ExternalLink size={18} />
+                                            </button>
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); toggleRow(res.代码); }}
+                                                className={cn(
+                                                    "p-2 rounded-xl transition-all",
+                                                    expandedRow === res.代码 ? "text-indigo-600 bg-indigo-50" : "text-slate-300 hover:text-rose-600 hover:bg-rose-50"
+                                                )}
+                                                title="查看K线"
+                                            >
+                                                <BarChart3 size={18} />
+                                            </button>
+                                        </div>
+                                    </td>
+                                </tr>
+                                {expandedRow === res.代码 && (
+                                    <tr className="bg-slate-50/30 animate-in fade-in slide-in-from-top-2 duration-300">
+                                        <td colSpan={6} className="px-8 py-6">
+                                            <div className="flex flex-col gap-4">
+                                                <div className="flex items-center justify-between">
+                                                    <div className="flex items-center gap-3">
+                                                        <div className="px-3 py-1 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-600 shadow-sm">
+                                                            📈 动态 K 线集成
+                                                        </div>
+                                                        <span className="text-xs text-slate-400 font-bold font-mono tracking-widest">{res.名称} {res.代码}</span>
+                                                    </div>
+                                                    <div className="flex gap-4">
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); openChart(res.代码); }}
+                                                            className="flex items-center gap-1.5 text-xs font-bold text-indigo-600 hover:text-indigo-700 transition-colors"
+                                                        >
+                                                            <ExternalLink size={12} />
+                                                            东财详情
+                                                        </button>
+                                                        <button
+                                                            onClick={(e) => { e.stopPropagation(); toggleRow(res.代码); }}
+                                                            className="text-xs font-bold text-slate-400 hover:text-slate-600 transition-colors"
+                                                        >
+                                                            收起图表
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div className="w-full h-[450px] bg-white rounded-2xl border border-slate-100 shadow-xl overflow-hidden relative group/chart">
+                                                    <iframe
+                                                        src={getH5ChartUrl(res.代码)}
+                                                        className="w-full h-full border-none"
+                                                        title={`${res.名称} K线`}
+                                                    />
+                                                    <div className="absolute inset-x-0 bottom-0 py-2 px-4 bg-white/90 backdrop-blur-sm border-t border-slate-50 flex justify-between items-center opacity-0 group-hover/chart:opacity-100 transition-opacity">
+                                                        <span className="text-[10px] font-bold text-slate-400">数据源: 东方财富 H5 高级图表 (集成版)</span>
+                                                        <span className="text-[10px] font-bold text-indigo-400 italic">Alpha Vision 共振信号确认区</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                            </React.Fragment>
                         ))}
                     </tbody>
                 </table>

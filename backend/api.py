@@ -367,6 +367,59 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     
     return {"reason": "未知错误"}
 
+@app.get("/api/stock/{code}/kline")
+async def get_stock_kline(code: str, local_only: bool = False):
+    """获取个股 K 线数据供前端绘图"""
+    from core.db import load_from_db
+    import akshare as ak
+    from datetime import datetime, timedelta
+    
+    engine = get_db_engine()
+    target_date = datetime.now()
+    # 获取近 300 天的数据，确保有足够的交易日来画出 100-200 根 K 线
+    start_date_str = (target_date - timedelta(days=300)).strftime("%Y-%m-%d")
+    
+    df = load_from_db(code, start_date_str, engine)
+    
+    if df.empty and not local_only:
+        try:
+            print(f"📉 API: Fetching K-line for {code}...")
+            start_fetch = (target_date - timedelta(days=300)).strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_fetch, adjust="qfq")
+            if not df.empty:
+                from core.db import save_to_db
+                save_to_db(df, code, engine)
+        except Exception as e:
+            print(f"❌ K-line fetch error for {code}: {e}")
+            
+    if df.empty:
+        return {"code": code, "data": []}
+        
+    # 格式化输出: 日期, 开, 高, 低, 收, 量
+    # 统一列名映射
+    mapping = {
+        '日期': 'time', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'value'
+    }
+    ak_mapping = {
+        '日期': 'time', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'volume'
+    }
+    
+    col_map = mapping if '收盘' in df.columns else ak_mapping
+    plot_df = df.rename(columns=col_map)
+    
+    # 将 time 转为字符串格式 (YYYY-MM-DD)，Lightweight Charts 支持这种格式
+    plot_df['time'] = plot_df['time'].astype(str)
+    
+    # 只保留绘图需要的列并取最近 200 条
+    cols = ['time', 'open', 'high', 'low', 'close', 'value' if 'value' in plot_df.columns else 'volume']
+    records = plot_df[cols].tail(200).to_dict('records')
+    
+    return {
+        "code": code,
+        "name": df.iloc[0]['name'] if 'name' in df.columns else "未知",
+        "data": records
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
