@@ -9,7 +9,8 @@ import {
     Zap,
     History,
     ExternalLink,
-    LayoutGrid
+    LayoutGrid,
+    HelpCircle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -32,6 +33,25 @@ interface Result {
 export default function ResultsTable({ results }: { results: Result[] }) {
     if (results.length === 0) return null;
 
+    const openChart = (code: string) => {
+        const fullCode = code.startsWith('6') || code.startsWith('688') ? `SH${code}` : `SZ${code}`;
+        window.open(`https://quote.eastmoney.com/${fullCode}.html`, '_blank');
+    };
+
+    const handleExport = () => {
+        const headers = ["代码", "名称", "行业", "现价", "涨幅%", "综合强度", "RSI", "DIF", "BB", "粘合度", "历史胜率"];
+        const rows = results.map(r => [
+            r.代码, r.名称, r.行业, r.现价, r["涨幅%"], r.Score, r.RSI, r.DIF, r.BB, r.粘合度, r.历史胜率
+        ]);
+        const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
+        const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.setAttribute("href", url);
+        link.setAttribute("download", `AlphaVision_Scan_${new Date().toLocaleDateString()}.csv`);
+        link.click();
+    };
+
     return (
         <div className="glass-card overflow-hidden border-none shadow-2xl shadow-slate-200/50 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white">
@@ -44,7 +64,10 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                         <p className="text-xs text-slate-400 font-bold uppercase tracking-widest">Resonance Selection (Top {results.length})</p>
                     </div>
                 </div>
-                <button className="flex items-center gap-2 px-4 py-2 bg-slate-50 text-slate-500 rounded-xl text-sm font-bold hover:bg-slate-100 transition-all">
+                <button
+                    onClick={handleExport}
+                    className="flex items-center gap-2 px-4 py-2 bg-slate-50 text-slate-500 rounded-xl text-sm font-bold hover:bg-slate-100 transition-all"
+                >
                     <ExternalLink size={16} />
                     导出选股单
                 </button>
@@ -55,8 +78,29 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                     <thead>
                         <tr className="bg-slate-50/50">
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">股票信息</th>
-                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">综合强度</th>
-                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">技术指标</th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">
+                                <div className="flex items-center justify-center gap-1 group/tooltip cursor-help relative">
+                                    综合强度
+                                    <HelpCircle size={10} />
+                                    <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 p-2 bg-slate-800 text-white text-[9px] rounded-lg opacity-0 group-hover/tooltip:opacity-100 transition-opacity pointer-events-none z-50 normal-case font-medium leading-relaxed">
+                                        计算公式：<br />
+                                        (量比 × 20) + (粘合度贡献 × 4000) + (RSI × 0.5)<br />
+                                        分数越高代表量价配合越完美。
+                                    </div>
+                                </div>
+                            </th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">
+                                <div className="flex items-center justify-center gap-1 group/tooltip cursor-help relative">
+                                    技术指标
+                                    <HelpCircle size={10} />
+                                    <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 p-2 bg-slate-800 text-white text-[9px] rounded-lg opacity-0 group-hover/tooltip:opacity-100 transition-opacity pointer-events-none z-50 normal-case font-medium leading-relaxed">
+                                        包含：<br />
+                                        涨幅：当日价格变动<br />
+                                        RSI：14日相对强弱指标<br />
+                                        DIF：MACD 核心差值
+                                    </div>
+                                </div>
+                            </th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">资金/行业</th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">历史表现</th>
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-right">操作</th>
@@ -115,9 +159,10 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                             <span className="text-[10px] font-bold text-slate-300">北向</span>
                                             <span className={cn(
                                                 "text-[10px] font-extrabold",
-                                                res.北向 === "🔴流入" ? "text-rose-500" : "text-emerald-500"
+                                                res.北向?.includes("流入") ? "text-rose-500" :
+                                                    res.北向?.includes("流出") ? "text-emerald-500" : "text-slate-400"
                                             )}>
-                                                {res.北向 || "🟢流出"}
+                                                {res.北向 || "---"}
                                             </span>
                                         </div>
                                     </div>
@@ -134,10 +179,16 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                 </td>
 
                                 <td className="px-8 py-5 text-right">
-                                    <button className="p-2 text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all">
+                                    <button
+                                        onClick={() => openChart(res.代码)}
+                                        className="p-2 text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
+                                    >
                                         <LayoutGrid size={20} />
                                     </button>
-                                    <button className="p-2 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition-all ml-1">
+                                    <button
+                                        onClick={() => openChart(res.代码)}
+                                        className="p-2 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-xl transition-all ml-1"
+                                    >
                                         <BarChart3 size={20} />
                                     </button>
                                 </td>

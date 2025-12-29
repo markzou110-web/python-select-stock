@@ -59,9 +59,9 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                 onClick={() => setParams({ ...params, use_weekly: !params.use_weekly })}
                             />
                             <ToggleItem
-                                label="MACD 零轴之上"
-                                active={params.use_macd_zero}
-                                onClick={() => setParams({ ...params, use_macd_zero: !params.use_macd_zero })}
+                                label="🔥 MACD 必须处于金叉 (红柱)"
+                                active={params.use_macd_filter}
+                                onClick={() => setParams({ ...params, use_macd_filter: !params.use_macd_filter })}
                             />
                             <FilterItem label="最小换手率 (%)">
                                 <input
@@ -70,6 +70,21 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                                 />
                             </FilterItem>
+                            <FilterItem label="最小市值 (亿)">
+                                <input
+                                    type="number" step="10" value={params.mkt_cap_min}
+                                    onChange={e => setParams({ ...params, mkt_cap_min: parseFloat(e.target.value) })}
+                                    className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
+                                />
+                            </FilterItem>
+                            <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-slate-100 cursor-pointer transition-all hover:bg-slate-50">
+                                <span className="flex-1 font-semibold text-slate-600">相对强度过滤 (RS)</span>
+                                <input
+                                    type="checkbox" checked={params.use_rs_filter}
+                                    onChange={e => setParams({ ...params, use_rs_filter: e.target.checked })}
+                                    className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                />
+                            </label>
                         </div>
                     </div>
 
@@ -111,6 +126,21 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                 <option value="中证1000">中证1000</option>
                             </select>
                         </FilterItem>
+
+                        <div className="pt-4 border-t border-slate-100">
+                            <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-indigo-100 bg-indigo-50/20 cursor-pointer transition-all hover:bg-indigo-50/40">
+                                <div className="flex-1">
+                                    <span className="block font-bold text-indigo-700">🚀 本地极速扫描模式</span>
+                                    <span className="text-[10px] text-indigo-400 font-medium">仅使用本地数据库，无需网络，秒级出结果</span>
+                                </div>
+                                <input
+                                    type="checkbox"
+                                    checked={params.local_only}
+                                    onChange={e => setParams({ ...params, local_only: e.target.checked })}
+                                    className="w-5 h-5 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
+                                />
+                            </label>
+                        </div>
                     </div>
                 </div>
 
