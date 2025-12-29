@@ -157,22 +157,23 @@ def get_sector_map():
         all_boards = df_board['板块名称'].tolist()
         
         # 2. 并发抓取所有板块的成分股 (全量覆盖 80+)
-        def fetch_sector_with_retry(sector_name, retries=2):
+        def fetch_sector_with_retry(sector_name, retries=3):
             for i in range(retries):
                 try:
-                    # 微小随机延迟，避免瞬间高并发
-                    time.sleep(random.uniform(0.1, 0.3))
+                    # 适度随机延迟，保护接口不被封禁
+                    time.sleep(random.uniform(0.2, 0.6))
                     df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
                     if not df_curr.empty:
                         return sector_name, df_curr['代码'].tolist()
                 except Exception as e:
                     if i == retries - 1:
-                        print(f"❌ Failed to fetch members for {sector_name} after {retries} retries")
+                        print(f"❌ Failed to fetch members for {sector_name} after {retries} retries: {e}")
             return None, None
 
         print(f"🏗️ Building full sector map for {len(all_boards)} industries...")
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # 给全量抓取设置 30 秒超时
+        # 降低一点并发，确保持久稳定
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            # 给全量抓取设置 60 秒总超时
             future_to_sector = {executor.submit(fetch_sector_with_retry, name): name for name in all_boards}
             
             for future in as_completed(future_to_sector):
