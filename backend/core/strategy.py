@@ -18,30 +18,35 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     # 粘合判断 (最近 N 天内出现过粘合)
     was_squeeze_recent = sqz_ratios.iloc[-sqz_lookback:].min() < threshold
     
-    # --- 2. 突破动作 (Close > All MAs AND Close > EMA5 AND Close > Open) ---
+    # --- 2. 突破动作 (Close > All MAs AND Close > Open) ---
     curr_ma_max = ma_max_all.iloc[-1]
-    is_breakout = (curr['收盘'] > curr_ma_max) and (curr['收盘'] > curr['EMA5']) and (curr['收盘'] > curr['开盘'])
+    is_breakout = (curr['收盘'] >= curr_ma_max) and (curr['收盘'] > curr['开盘'])
     
-    # --- 3. 趋势与量能 ---
-    # 趋势隐式包含在 breakout 中，此处保留 EMA60 辅助判断
+    # --- 3. 价格行为 (SOP: 实体 > 上影线) ---
+    # 增加 Al Brooks 价格行为过滤：避免“避雷针”
+    body = abs(curr['收盘'] - curr['开盘'])
+    upper_shadow = curr['最高'] - max(curr['收盘'], curr['开盘'])
+    # 允许轻微上影线，但不能超过实体 (SOP 严格要求)
+    is_strong_body = upper_shadow <= body if body > 0 else True
+    
+    # --- 4. 趋势与量能 ---
     is_trending = curr['收盘'] > curr['EMA60']
     vol_ratio = curr['成交量'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 0
-    # 量能要求：放量且为阳线
-    is_volume = (vol_ratio >= vol_multiplier) and (curr['收盘'] > curr['开盘'])
+    # SOP: 量比 > 1.5
+    is_volume = (vol_ratio >= vol_multiplier)
     
-    # --- 4. RSI 强度 ---
-    is_rsi_ok = curr['RSI'] > rsi_min
+    # --- 5. RSI 强度 ---
+    is_rsi_ok = curr['RSI'] >= rsi_min
     
-    # --- 5. MACD 优化 (金叉状态 vs 水上) ---
-    # Pine Script: macdLine > signalLine (即红柱 HIST > 0)
+    # --- 6. MACD 优化 (SOP: 快线 > 慢线，红柱) ---
     is_macd_ok = curr['MACD_DIF'] > curr['MACD_DEA'] if use_macd_filter else True
     
-    # --- 6. 相对强度 (RS) vs 指数 ---
+    # --- 7. 相对强度 (RS) vs 指数 ---
     is_rs_ok = True
     if use_rs_filter and 'RS' in df.columns and 'RS_MA50' in df.columns:
         is_rs_ok = curr['RS'] > curr['RS_MA50']
     
-    # --- 7. 波动率收缩 (BB) ---
+    # --- 8. 波动率收缩 (BB) ---
     is_bb_ok = True
     if use_bb_sqz:
         bb_quantile_20 = df['BB_Width'].iloc[-120:].quantile(0.2)
@@ -52,6 +57,7 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         "vol_ratio": round(vol_ratio, 2),
         "rsi": round(curr['RSI'], 1),
         "is_breakout": is_breakout,
+        "is_strong_body": is_strong_body,
         "is_volume": is_volume,
         "is_rsi_ok": is_rsi_ok,
         "is_macd_ok": is_macd_ok,
@@ -61,14 +67,14 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     }
 
     if not was_squeeze_recent:
-        debug_info["reason"] = "近期未现粘合"
+        debug_info["reason"] = "近期未现均线粘合"
         return False, debug_info
 
-    # 综合判断
-    if is_breakout and is_volume and is_rsi_ok and is_macd_ok and is_bb_ok and is_rs_ok:
+    # 综合判断 (增加 is_strong_body 过滤)
+    if is_breakout and is_strong_body and is_volume and is_rsi_ok and is_macd_ok and is_bb_ok and is_rs_ok:
         pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
-        # 计算评分 (量比权重 + 粘合权重 + RSI权重)
-        score = (vol_ratio * 20) + ((threshold - sqz_ratios.iloc[-1]) * 100 * 40) + (curr['RSI'] * 0.5)
+        # SOP 评分权重调整：量能(40%) + 粘合(40%) + RSI(20%)
+        score = (vol_ratio * 25) + ((threshold - sqz_ratios.iloc[-1]) * 100 * 50) + (curr['RSI'] * 0.4)
         return True, {
             "Score": round(score, 2),
             "涨幅%": round(pct_change, 2),
@@ -81,16 +87,17 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
             "BB": round(curr['BB_Width'], 4)
         }
     
-    # 详细失败原因
+    # 详细失败原因 (SOP 术语)
     reasons = []
-    if not is_breakout: reasons.append("突破不足")
-    if not is_volume: reasons.append("量能不足")
-    if not is_rsi_ok: reasons.append("RSI过低")
+    if not is_breakout: reasons.append("未突破均线簇")
+    if not is_strong_body: reasons.append("避雷针/长上影线")
+    if not is_volume: reasons.append("量能未爆发")
+    if not is_rsi_ok: reasons.append("强度不足(RSI)")
     if not is_macd_ok: reasons.append("MACD未金叉")
-    if not is_bb_ok: reasons.append("BB收缩不足")
-    if not is_rs_ok: reasons.append("相对弱势")
+    if not is_bb_ok: reasons.append("布林带未收缩")
+    if not is_rs_ok: reasons.append("弱于大盘(RS)")
     
-    debug_info["reason"] = ",".join(reasons) if reasons else "因子未共振"
+    debug_info["reason"] = ",".join(reasons) if reasons else "多因子未共振"
     return False, debug_info
 
 def calculate_historical_win_rate(df):

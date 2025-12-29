@@ -75,6 +75,7 @@ def init_db(engine=None):
                     win_rate VARCHAR(20),
                     signal_count INTEGER,
                     north_money VARCHAR(100),
+                    resonance VARCHAR(50),
                     PRIMARY KEY (code, date)
                 );
             '''))
@@ -132,9 +133,9 @@ def save_scan_results(results, engine=None):
             for r in results:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money
+                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance
                     ) VALUES (
-                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money
+                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -146,7 +147,8 @@ def save_scan_results(results, engine=None):
                         industry = EXCLUDED.industry,
                         win_rate = EXCLUDED.win_rate,
                         signal_count = EXCLUDED.signal_count,
-                        north_money = EXCLUDED.north_money
+                        north_money = EXCLUDED.north_money,
+                        resonance = EXCLUDED.resonance
                 '''), {
                     "code": r.get('代码'),
                     "name": r.get('名称'),
@@ -161,7 +163,8 @@ def save_scan_results(results, engine=None):
                     "industry": r.get('行业', '未知'),
                     "win_rate": r.get('历史胜率', '0%'),
                     "signal_count": int(r.get('信号次数', 0)),
-                    "north_money": r.get('北向', '---')
+                    "north_money": r.get('北向', '---'),
+                    "resonance": r.get('共振', '独苗')
                 })
             conn.commit()
     except Exception as e:
@@ -192,7 +195,8 @@ def get_scan_history_by_date(date_str, engine=None):
                 "粘合度": row['glue'],
                 "历史胜率": row['win_rate'],
                 "信号次数": row['signal_count'],
-                "北向": row['north_money']
+                "北向": row['north_money'],
+                "共振": row['resonance']
             })
         return results
     except Exception as e:

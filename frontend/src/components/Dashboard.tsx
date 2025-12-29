@@ -22,8 +22,8 @@ export default function Dashboard() {
     const [lastUpdated, setLastUpdated] = useState("");
 
     const [params, setParams] = useState({
-        threshold: 0.12,
-        vol_multiplier: 1.5,
+        threshold: 0.10,
+        vol_multiplier: 1.8,
         rsi_min: 55,
         use_macd_filter: true,
         use_bb_sqz: true,
