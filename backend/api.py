@@ -276,29 +276,38 @@ def scan_market(
         results = sorted(results, key=lambda x: x['Score'], reverse=True)[:30]
         
         # 补充增强数据 (行业, 胜率)
-        # 核心优化：此处不再触发全量行业扫描逻辑，仅获取已有缓存，未知的由下方 Lazy Loader 实时抓取
         from core.data import get_cached_data
         sector_map = get_cached_data('sector_map', 86400) or {}
         
-        for res in results:
-            code = res['代码']
+        def fetch_single_industry(res_item):
+            code = res_item['代码']
             industry = sector_map.get(code, "未知")
-            
-            # --- 核心优化：针对选中的个股，如果行业未知，进行实时点对点查询 ---
             if industry == "未知":
                 try:
                     import akshare as ak
-                    print(f"🏷️ Fetching real-time industry for {res['名称']} ({code})...")
                     info_df = ak.stock_individual_info_em(symbol=code)
                     if not info_df.empty:
-                        # 获取“行业分类”对应的值
                         industry_val = info_df[info_df['item'] == '行业分类']['value'].values
                         if len(industry_val) > 0:
-                            industry = industry_val[0]
+                            return code, industry_val[0]
                 except:
                     pass
-            
-            res['行业'] = industry
+            return code, industry
+
+        # 并发补充结果详情，避免 30 个股票串行查询导致的超时
+        print(f"🏷️ Supplementing industry info for {len(results)} results in parallel...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_industry = {executor.submit(fetch_single_industry, res): res for res in results}
+            industry_results = {}
+            for future in as_completed(future_to_industry):
+                try:
+                    code, ind = future.result(timeout=10)
+                    industry_results[code] = ind
+                except:
+                    continue
+        
+        for res in results:
+            res['行业'] = industry_results.get(res['代码'], "未知")
             
         return results
     except HTTPException as he:
