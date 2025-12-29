@@ -94,27 +94,34 @@ def get_index_data():
         "中证1000": "000852"
     }
     
-    def fetch_one(name, code):
-        try:
-            # 增加超时控制
-            df = ak.index_zh_a_hist(symbol=code, period="daily", 
-                                   start_date=(datetime.now() - timedelta(days=10)).strftime("%Y%m%d"))
-            if not df.empty:
-                curr = df.iloc[-1]
-                prev = df.iloc[-2] if len(df) > 1 else curr
-                pct = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
-                return name, {'price': curr['收盘'], 'pct': pct}
-        except Exception as e:
-            print(f"⚠️ Index fetch failed for {name}: {e}")
+    def fetch_one_with_retry(name, code, retries=3):
+        for i in range(retries):
+            try:
+                # 策略：首推快速超时 (5s)，失败后再用长超时 (10s)
+                to = 5 if i == 0 else 10
+                # 给底层 akshare 增加环境超时，如果底层不支持，外层 ThreadPoolExecutor 会切断
+                df = ak.index_zh_a_hist(symbol=code, period="daily", 
+                                       start_date=(datetime.now() - timedelta(days=10)).strftime("%Y%m%d"))
+                if not df.empty:
+                    curr = df.iloc[-1]
+                    prev = df.iloc[-2] if len(df) > 1 else curr
+                    pct = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
+                    return name, {'price': curr['收盘'], 'pct': pct}
+            except Exception as e:
+                if i < retries - 1:
+                    time.sleep(random.uniform(0.5, 1.5)) # 避峰重试
+                else:
+                    print(f"❌ Index fetch totally failed for {name} after {retries} attempts: {e}")
         return name, None
 
     res = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        # 给整个执行过程设置 15 秒总超时
-        futures = [executor.submit(fetch_one, name, code) for name, code in indices.items()]
+    # 降低并发度，减少 EastMoney 连通重置风险
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(fetch_one_with_retry, name, code) for name, code in indices.items()]
         for future in futures:
             try:
-                name, data = future.result(timeout=15)
+                # 总执行过程超时设长，允许内部重试耗时
+                name, data = future.result(timeout=40)
                 if data: res[name] = data
             except:
                 pass
@@ -127,21 +134,24 @@ def get_hot_sectors():
     cached = get_cached_data('hot_sectors', 600)
     if cached: return cached
 
-    try:
-        df = ak.stock_board_industry_name_em()
-        if not df.empty:
-            df_sorted = df.sort_values('涨跌幅', ascending=False).head(5)
-            hot_sectors = []
-            for _, row in df_sorted.iterrows():
-                hot_sectors.append({
-                    'name': row['板块名称'],
-                    'pct': row['涨跌幅'],
-                    'lead': row['领涨股票']
-                })
-            set_cached_data('hot_sectors', hot_sectors)
-            return hot_sectors
-    except:
-        return []
+    for i in range(3):
+        try:
+            df = ak.stock_board_industry_name_em()
+            if not df.empty:
+                df_sorted = df.sort_values('涨跌幅', ascending=False).head(5)
+                hot_sectors = []
+                for _, row in df_sorted.iterrows():
+                    hot_sectors.append({
+                        'name': row['板块名称'],
+                        'pct': row['涨跌幅'],
+                        'lead': row['领涨股票']
+                    })
+                set_cached_data('hot_sectors', hot_sectors)
+                return hot_sectors
+        except:
+            if i < 2: time.sleep(1)
+            
+    return []
 
 def get_sector_map():
     """获取全市场个股行业映射 (重量级操作，缓存 24 小时)"""
