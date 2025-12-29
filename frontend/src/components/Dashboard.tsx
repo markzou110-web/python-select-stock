@@ -92,7 +92,7 @@ export default function Dashboard() {
 
         const intervalId = setInterval(fetchSyncStatus, 5000);
         return () => clearInterval(intervalId);
-    }, [fetchMarketData, fetchSyncStatus]);
+    }, [fetchMarketData, fetchSyncStatus, fetchHistory]);
 
     const startSync = async () => {
         try {
