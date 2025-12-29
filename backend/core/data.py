@@ -96,6 +96,7 @@ def get_index_data():
     
     def fetch_one(name, code):
         try:
+            # 增加超时控制
             df = ak.index_zh_a_hist(symbol=code, period="daily", 
                                    start_date=(datetime.now() - timedelta(days=10)).strftime("%Y%m%d"))
             if not df.empty:
@@ -103,15 +104,20 @@ def get_index_data():
                 prev = df.iloc[-2] if len(df) > 1 else curr
                 pct = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
                 return name, {'price': curr['收盘'], 'pct': pct}
-        except: pass
+        except Exception as e:
+            print(f"⚠️ Index fetch failed for {name}: {e}")
         return name, None
 
     res = {}
     with ThreadPoolExecutor(max_workers=5) as executor:
+        # 给整个执行过程设置 15 秒总超时
         futures = [executor.submit(fetch_one, name, code) for name, code in indices.items()]
         for future in futures:
-            name, data = future.result()
-            if data: res[name] = data
+            try:
+                name, data = future.result(timeout=15)
+                if data: res[name] = data
+            except:
+                pass
     
     if res: set_cached_data('index_data', res)
     return res
@@ -143,27 +149,46 @@ def get_sector_map():
     if cached: return cached
 
     try:
+        # 1. 获取所有行业板块名称
         df_board = ak.stock_board_industry_name_em()
-        sector_map = {}
-        # 优化：降低并发压力，只拉取前 30 个核心板块，防止被封
-        def fetch_sector(sector_name):
-            try:
-                # 增加随机延迟，模拟人类行为
-                time.sleep(random.uniform(0.2, 0.5))
-                df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
-                return sector_name, df_curr['代码'].tolist()
-            except: return None, None
-
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(fetch_sector, name) for name in df_board['板块名称'].head(30)]
-            for future in futures:
-                s_name, codes = future.result()
-                if codes:
-                    for c in codes: sector_map[c] = s_name
+        if df_board.empty: return {}
         
-        if sector_map: set_cached_data('sector_map', sector_map)
+        sector_map = {}
+        all_boards = df_board['板块名称'].tolist()
+        
+        # 2. 并发抓取所有板块的成分股 (全量覆盖 80+)
+        def fetch_sector_with_retry(sector_name, retries=2):
+            for i in range(retries):
+                try:
+                    # 微小随机延迟，避免瞬间高并发
+                    time.sleep(random.uniform(0.1, 0.3))
+                    df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
+                    if not df_curr.empty:
+                        return sector_name, df_curr['代码'].tolist()
+                except Exception as e:
+                    if i == retries - 1:
+                        print(f"❌ Failed to fetch members for {sector_name} after {retries} retries")
+            return None, None
+
+        print(f"🏗️ Building full sector map for {len(all_boards)} industries...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # 给全量抓取设置 30 秒超时
+            future_to_sector = {executor.submit(fetch_sector_with_retry, name): name for name in all_boards}
+            
+            for future in as_completed(future_to_sector):
+                try:
+                    s_name, codes = future.result(timeout=10)
+                    if codes:
+                        for c in codes: sector_map[c] = s_name
+                except:
+                    continue
+        
+        if sector_map: 
+            set_cached_data('sector_map', sector_map)
+            print(f"✅ Full sector map built: {len(sector_map)} stocks mapped.")
         return sector_map
-    except:
+    except Exception as e:
+        print(f"❌ Critical error in get_sector_map: {e}")
         return {}
 
 def get_index_hist(code):
