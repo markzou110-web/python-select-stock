@@ -4,7 +4,9 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
 
-CONFIG_FILE = "db_config.json"
+# 获取项目根目录下的配置文件路径
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_FILE = os.path.join(BASE_DIR, "db_config.json")
 
 def load_db_config():
     """从本地文件加载数据库配置"""

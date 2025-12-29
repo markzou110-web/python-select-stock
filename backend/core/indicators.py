@@ -54,15 +54,28 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
 
     return df
 
-def get_weekly_indicators(code):
-    """获取周线趋势指标 (v5.0)"""
+def get_weekly_indicators(code, df=None, local_only=False):
+    """获取周线趋势指标 (v5.1 - 支持本地重采样)"""
     try:
-        df_w = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
-        if len(df_w) < 30: return False
+        if local_only and df is not None and not df.empty:
+            # --- 核心优化：从本地日线重采样为周线 ---
+            temp_df = df.copy()
+            temp_df['日期'] = pd.to_datetime(temp_df['日期'])
+            temp_df.set_index('日期', inplace=True)
+            
+            # 重采样逻辑 (周五作为收盘参考)
+            df_w = temp_df['收盘'].resample('W').last().dropna().to_frame()
+            if len(df_w) < 30: return False
+        else:
+            # 只有在非本地模式下才去拉取
+            df_w = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
+            if len(df_w) < 30: return False
+            
         df_w['EMA10w'] = df_w['收盘'].ewm(span=10, adjust=False).mean()
         df_w['EMA30w'] = df_w['收盘'].ewm(span=30, adjust=False).mean()
         
         curr = df_w.iloc[-1]
         return curr['EMA10w'] > curr['EMA30w']
-    except:
+    except Exception as e:
+        print(f"⚠️ Weekly indicator failed for {code}: {e}")
         return False
