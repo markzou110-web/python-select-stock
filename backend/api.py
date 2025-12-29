@@ -277,9 +277,24 @@ def scan_market(
         # 补充增强数据 (行业, 胜率)
         sector_map = get_sector_map()
         for res in results:
-            res['行业'] = sector_map.get(res['代码'], "未知")
-            # 这里的 res 现在包含 df 吗？我们需要修改 single_stock_task 以返回数据或重新加载
-            # 暂且返回基础结果
+            code = res['代码']
+            industry = sector_map.get(code, "未知")
+            
+            # --- 核心优化：针对选中的个股，如果行业未知，进行实时点对点查询 ---
+            if industry == "未知":
+                try:
+                    import akshare as ak
+                    print(f"🏷️ Fetching real-time industry for {res['名称']} ({code})...")
+                    info_df = ak.stock_individual_info_em(symbol=code)
+                    if not info_df.empty:
+                        # 获取“行业分类”对应的值
+                        industry_val = info_df[info_df['item'] == '行业分类']['value'].values
+                        if len(industry_val) > 0:
+                            industry = industry_val[0]
+                except:
+                    pass
+            
+            res['行业'] = industry
             
         return results
     except HTTPException as he:

@@ -154,31 +154,28 @@ def get_sector_map():
         if df_board.empty: return {}
         
         sector_map = {}
-        all_boards = df_board['板块名称'].tolist()
+        # 优化：只拉取前 50 个核心板块作为背景缓存，其余依赖扫描后的“点对点”查询
+        all_boards = df_board['板块名称'].head(50).tolist()
         
-        # 2. 并发抓取所有板块的成分股 (全量覆盖 80+)
+        # 2. 并发抓取成分股 (全量扫描可能触发封锁，此处采取稳健策略)
         def fetch_sector_with_retry(sector_name, retries=3):
             for i in range(retries):
                 try:
-                    # 适度随机延迟，保护接口不被封禁
-                    time.sleep(random.uniform(0.2, 0.6))
+                    time.sleep(random.uniform(0.5, 1.0)) # 更加温和
                     df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
                     if not df_curr.empty:
                         return sector_name, df_curr['代码'].tolist()
-                except Exception as e:
-                    if i == retries - 1:
-                        print(f"❌ Failed to fetch members for {sector_name} after {retries} retries: {e}")
+                except:
+                    pass
             return None, None
 
-        print(f"🏗️ Building full sector map for {len(all_boards)} industries...")
-        # 降低一点并发，确保持久稳定
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            # 给全量抓取设置 60 秒总超时
+        print(f"🏗️ Building partial sector map for {len(all_boards)} core industries...")
+        with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_sector = {executor.submit(fetch_sector_with_retry, name): name for name in all_boards}
             
             for future in as_completed(future_to_sector):
                 try:
-                    s_name, codes = future.result(timeout=10)
+                    s_name, codes = future.result(timeout=15)
                     if codes:
                         for c in codes: sector_map[c] = s_name
                 except:
