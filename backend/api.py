@@ -242,8 +242,9 @@ def scan_market(
         print(f"🚀 Starting scan for {len(candidates)} candidates...")
         start_time = time.time()
         
-        # 并发扫描逻辑 (降低并发数以减少 AkShare 连通错误)
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # 并发扫描逻辑
+        workers = 15 if local_only else 8
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_stock = {
                 executor.submit(
                     single_stock_task, 
@@ -256,14 +257,14 @@ def scan_market(
             fail_reasons = {}
             for future in as_completed(future_to_stock):
                 try:
-                    res = future.result()
+                    # 单个股票分析超时设为 30s，防止某一个接口挂起卡死全场
+                    res = future.result(timeout=30)
                     if isinstance(res, dict) and 'Score' in res:
                         results.append(res)
                     elif isinstance(res, dict):
                         reason = res.get('reason', '未知原因')
                         fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                 except Exception as e:
-                    print(f"⚠️ Task failed: {e}")
                     continue
             
             if fail_reasons:
@@ -275,7 +276,10 @@ def scan_market(
         results = sorted(results, key=lambda x: x['Score'], reverse=True)[:30]
         
         # 补充增强数据 (行业, 胜率)
-        sector_map = get_sector_map()
+        # 核心优化：此处不再触发全量行业扫描逻辑，仅获取已有缓存，未知的由下方 Lazy Loader 实时抓取
+        from core.data import get_cached_data
+        sector_map = get_cached_data('sector_map', 86400) or {}
+        
         for res in results:
             code = res['代码']
             industry = sector_map.get(code, "未知")
