@@ -80,28 +80,61 @@ def background_sync_task():
     
     try:
         snapshot = get_market_snapshot()
-        candidates = snapshot[snapshot['mkt_cap'] > 2000000000] # 同步门槛稍低，包含更多票
+        # 初始门槛：全A股包含市值 > 20亿的票
+        candidates = snapshot[snapshot['mkt_cap'] > 2000000000]
         sync_progress["total"] = len(candidates)
         engine = get_db_engine()
         init_db(engine)
         
-        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
-        max_workers = 10
+        # --- 核心优化：批量查询本地已同步日期 ---
+        print("🔍 Checking existing data in batch...")
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            query = text("SELECT code, MAX(date) as last_date FROM daily_k GROUP BY code")
+            df_existing = pd.read_sql(query, engine)
+            # 建立映射: code -> last_date
+            existing_map = pd.Series(df_existing.last_date.values, index=df_existing.code).to_dict()
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(sync_single_stock, row['code'], row['name'], start_date, engine): row['code'] 
-                for _, row in candidates.iterrows()
-            }
-            
-            for i, future in enumerate(as_completed(futures)):
-                is_ok, _ = future.result()
-                if is_ok:
-                    sync_progress["success"] += 1
-                else:
-                    sync_progress["fail"] += 1
-                sync_progress["current"] = i + 1
-                if i % max_workers == 0: time.sleep(0.3)
+        # 计算同步基准日期 (今日或最近一个交易日)
+        today = datetime.now()
+        target_sync_date = today
+        if today.weekday() == 5: target_sync_date = today - timedelta(days=1)
+        elif today.weekday() == 6: target_sync_date = today - timedelta(days=2)
+        target_sync_date = target_sync_date.date()
+        
+        # 预过滤：将不需要下载的票直接标记为成功
+        actual_tasks = []
+        for _, row in candidates.iterrows():
+            code = row['code']
+            last_date = existing_map.get(code)
+            if last_date and last_date >= target_sync_date:
+                sync_progress["success"] += 1
+                sync_progress["current"] += 1
+            else:
+                actual_tasks.append(row)
+        
+        print(f"⚡ {len(candidates) - len(actual_tasks)} stocks skipped (up-to-date). {len(actual_tasks)} to sync.")
+        
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        max_workers = 15 # 稍微提升并发
+        
+        if actual_tasks:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(sync_single_stock, row['code'], row['name'], start_date, engine): row['code'] 
+                    for row in actual_tasks
+                }
+                
+                for future in as_completed(futures):
+                    is_ok, status = future.result()
+                    if is_ok:
+                        sync_progress["success"] += 1
+                    else:
+                        sync_progress["fail"] += 1
+                    sync_progress["current"] += 1
+                    # 动态延迟：如果是真正下载了且任务还很多，稍作休息；如果是跳过或报错，不停留
+                    if status == "downloaded" and sync_progress["current"] % 5 == 0:
+                        time.sleep(0.5)
                 
     except Exception as e:
         print(f"❌ Background sync error: {e}")
