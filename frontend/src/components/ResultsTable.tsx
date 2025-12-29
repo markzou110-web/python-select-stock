@@ -2,19 +2,17 @@
 
 import React, { useState } from 'react';
 import {
-    TrendingUp,
     Target,
     Map,
     BarChart3,
-    Zap,
     History,
     ExternalLink,
-    LayoutGrid,
     HelpCircle,
     ChevronDown,
     ChevronUp
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import KLineChart from './KLineChart';
 
 interface Result {
     代码: string;
@@ -39,11 +37,6 @@ export default function ResultsTable({ results }: { results: Result[] }) {
 
     const toggleRow = (code: string) => {
         setExpandedRow(expandedRow === code ? null : code);
-    };
-
-    const getH5ChartUrl = (code: string) => {
-        const market = code.startsWith('6') || code.startsWith('688') ? '1' : '2';
-        return `https://quote.eastmoney.com/h5chart/main.html?code=${code}&market=${market}&type=kline`;
     };
 
     const openChart = (code: string) => {
@@ -251,13 +244,9 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                                     </div>
                                                 </div>
                                                 <div className="w-full h-[450px] bg-white rounded-2xl border border-slate-100 shadow-xl overflow-hidden relative group/chart">
-                                                    <iframe
-                                                        src={getH5ChartUrl(res.代码)}
-                                                        className="w-full h-full border-none"
-                                                        title={`${res.名称} K线`}
-                                                    />
+                                                    <KLineChart code={res.代码} name={res.名称} />
                                                     <div className="absolute inset-x-0 bottom-0 py-2 px-4 bg-white/90 backdrop-blur-sm border-t border-slate-50 flex justify-between items-center opacity-0 group-hover/chart:opacity-100 transition-opacity">
-                                                        <span className="text-[10px] font-bold text-slate-400">数据源: 东方财富 H5 高级图表 (集成版)</span>
+                                                        <span className="text-[10px] font-bold text-slate-400">数据源: 本地数据库 (极速渲染)</span>
                                                         <span className="text-[10px] font-bold text-indigo-400 italic">Alpha Vision 共振信号确认区</span>
                                                     </div>
                                                 </div>

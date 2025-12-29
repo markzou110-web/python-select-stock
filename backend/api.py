@@ -408,7 +408,11 @@ async def get_stock_kline(code: str, local_only: bool = False):
     if df.empty:
         return {"code": code, "data": []}
         
-    # 格式化输出: 日期, 开, 高, 低, 收, 量
+    # 计算绘图所需的指标
+    from core.indicators import calculate_indicators
+    # 扩展 periods 包含 120 和 250
+    df = calculate_indicators(df, periods=[20, 120, 250])
+    
     # 统一列名映射
     mapping = {
         '日期': 'time', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'value'
@@ -419,12 +423,10 @@ async def get_stock_kline(code: str, local_only: bool = False):
     
     col_map = mapping if '收盘' in df.columns else ak_mapping
     plot_df = df.rename(columns=col_map)
-    
-    # 将 time 转为字符串格式 (YYYY-MM-DD)，Lightweight Charts 支持这种格式
     plot_df['time'] = plot_df['time'].astype(str)
     
-    # 只保留绘图需要的列并取最近 200 条
-    cols = ['time', 'open', 'high', 'low', 'close', 'value' if 'value' in plot_df.columns else 'volume']
+    # 只保留绘图需要的列并取最近 220 条 (多留一点为了指标计算的完整性)
+    cols = ['time', 'open', 'high', 'low', 'close', 'value' if 'value' in plot_df.columns else 'volume', 'EMA20', 'EMA120', 'EMA250']
     records = plot_df[cols].tail(200).to_dict('records')
     
     return {
