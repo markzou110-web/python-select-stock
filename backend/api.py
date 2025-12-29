@@ -10,7 +10,7 @@ import socket
 
 socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 
-from core.db import get_db_engine, init_db, load_db_config
+from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates
 from core.data import get_market_snapshot, get_index_data, get_hot_sectors, get_sector_map
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
@@ -309,6 +309,9 @@ def scan_market(
         for res in results:
             res['行业'] = industry_results.get(res['代码'], "未知")
             
+        # --- 持久化保存 ---
+        save_scan_results(results, engine)
+        
         return results
     except HTTPException as he:
         # 允许 HTTPException 直接通过，不再包装成 500
@@ -434,6 +437,16 @@ async def get_stock_kline(code: str, local_only: bool = False):
         "name": df.iloc[0]['name'] if 'name' in df.columns else "未知",
         "data": records
     }
+
+@app.get("/api/scan/dates")
+async def get_history_dates():
+    """获取历史扫描日期列表"""
+    return get_scan_dates()
+
+@app.get("/api/scan/history")
+async def get_history_results(date: str):
+    """获取指定日期的历史选股结果"""
+    return get_scan_history_by_date(date)
 
 if __name__ == "__main__":
     import uvicorn
