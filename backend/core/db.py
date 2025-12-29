@@ -60,6 +60,7 @@ def init_db(engine=None):
                     vol FLOAT,
                     PRIMARY KEY (code, date)
                 );
+            conn.execute(text('''
                 CREATE TABLE IF NOT EXISTS scan_history (
                     code VARCHAR(20),
                     name VARCHAR(50),
@@ -79,6 +80,11 @@ def init_db(engine=None):
                     PRIMARY KEY (code, date)
                 );
             '''))
+            # 兼容性迁移：确保 resonance 列存在
+            try:
+                conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
+            except:
+                pass
             conn.commit()
     except Exception as e:
         print(f"Database init failed: {e}")
@@ -167,8 +173,9 @@ def save_scan_results(results, engine=None):
                     "resonance": r.get('共振', '独苗')
                 })
             conn.commit()
+            print(f"💾 数据库：已成功保存 {len(results)} 条选股记录 ({current_date})")
     except Exception as e:
-        print(f"Failed to save scan results: {e}")
+        print(f"❌ 数据库：保存选股结果失败: {e}")
 
 def get_scan_history_by_date(date_str, engine=None):
     """按日期获取历史选股结果"""
