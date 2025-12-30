@@ -16,10 +16,8 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
-      <body className={`${inter.className} antialiased`}>
-        <div className="flex h-screen overflow-hidden">
-          {children}
-        </div>
+      <body className={`${inter.className} antialiased text-slate-900 bg-slate-50`}>
+        {children}
       </body>
     </html>
   );

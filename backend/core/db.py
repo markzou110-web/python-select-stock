@@ -60,6 +60,7 @@ def init_db(engine=None):
                     vol FLOAT,
                     PRIMARY KEY (code, date)
                 );
+            '''))
             conn.execute(text('''
                 CREATE TABLE IF NOT EXISTS scan_history (
                     code VARCHAR(20),
@@ -77,12 +78,26 @@ def init_db(engine=None):
                     signal_count INTEGER,
                     north_money VARCHAR(100),
                     resonance VARCHAR(50),
+                    shadow_ratio FLOAT,
                     PRIMARY KEY (code, date)
                 );
             '''))
-            # 兼容性迁移：确保 resonance 列存在
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS paper_trading (
+                    id SERIAL PRIMARY KEY,
+                    code VARCHAR(20),
+                    name VARCHAR(50),
+                    entry_price FLOAT,
+                    entry_date DATE,
+                    current_price FLOAT,
+                    status VARCHAR(20) DEFAULT 'OPEN',
+                    UNIQUE(code, entry_date)
+                );
+            '''))
+            # 兼容性迁移：确保 resonance 和 shadow_ratio 列存在
             try:
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
+                conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS shadow_ratio FLOAT;"))
             except:
                 pass
             conn.commit()
@@ -139,9 +154,9 @@ def save_scan_results(results, engine=None):
             for r in results:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance
+                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio
                     ) VALUES (
-                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance
+                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -154,7 +169,8 @@ def save_scan_results(results, engine=None):
                         win_rate = EXCLUDED.win_rate,
                         signal_count = EXCLUDED.signal_count,
                         north_money = EXCLUDED.north_money,
-                        resonance = EXCLUDED.resonance
+                        resonance = EXCLUDED.resonance,
+                        shadow_ratio = EXCLUDED.shadow_ratio
                 '''), {
                     "code": r.get('代码'),
                     "name": r.get('名称'),
@@ -170,7 +186,8 @@ def save_scan_results(results, engine=None):
                     "win_rate": r.get('历史胜率', '0%'),
                     "signal_count": int(r.get('信号次数', 0)),
                     "north_money": r.get('北向', '---'),
-                    "resonance": r.get('共振', '独苗')
+                    "resonance": r.get('共振', '独苗'),
+                    "shadow_ratio": float(r.get('影线比', 0))
                 })
             conn.commit()
             print(f"💾 数据库：已成功保存 {len(results)} 条选股记录 ({current_date})")
@@ -203,7 +220,8 @@ def get_scan_history_by_date(date_str, engine=None):
                 "历史胜率": row['win_rate'],
                 "信号次数": row['signal_count'],
                 "北向": row['north_money'],
-                "共振": row['resonance']
+                "共振": row['resonance'],
+                "影线比": row['shadow_ratio']
             })
         return results
     except Exception as e:
