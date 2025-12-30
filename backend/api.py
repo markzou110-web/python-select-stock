@@ -7,11 +7,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import random
 import socket
+import threading
+import asyncio
+import akshare as ak
+import requests
+
+BARK_KEY = "zVQJgaLZ4qApBq2d84NRTU" # 已自动提取您的 Key
 
 socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 
+import api as api_module # Assuming this is intended to be 'import api as api_module'
+from pydantic import BaseModel
+
 from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates
-from core.data import get_market_snapshot, get_index_data, get_hot_sectors, get_sector_map
+from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
 
@@ -38,10 +47,96 @@ app.add_middleware(
 
 import asyncio
 
+# --- Constants & Types ---
+class PaperTradeCreate(BaseModel):
+    code: str
+    name: str
+    price: float
+
+def fetch_mine_sweeper_data():
+    """Gathers risk data: earnings, unlocks, and reductions."""
+    today = datetime.now().strftime("%Y%m%d")
+    data = {"earnings": [], "unlocks": [], "reductions": []}
+    
+    try:
+        import akshare as ak
+        # 1. Earnings (Next 7 days)
+        df_earnings = ak.stock_report_disclosure_around_cn(symbol="利好利空")
+        if df_earnings is not None and not df_earnings.empty:
+            data["earnings"] = df_earnings[df_earnings['公告日期'] >= today]['股票代码'].tolist()
+            
+        # 2. Unlocks (Next 30 days)
+        df_unlocks = ak.stock_restricted_release_queue_em()
+        if df_unlocks is not None and not df_unlocks.empty:
+            data["unlocks"] = df_unlocks['代码'].tolist()
+            
+        # 3. Reductions (Major shareholders)
+        df_reduce = ak.stock_dzjy_mrtj_em()
+        if df_reduce is not None and not df_reduce.empty:
+            data["reductions"] = df_reduce['证券代码'].tolist()
+            
+    except Exception as e:
+        print(f"Mine Sweeper Error: {e}")
+        
+    return data
+
+def send_intraday_notification(stock_list):
+    """Sends a push notification via Bark for the 14:30 Sentinel."""
+    if not stock_list: return
+    
+    names = [s.get('名称', s.get('name')) for s in stock_list]
+    codes = [s.get('代码', s.get('code')) for s in stock_list]
+    
+    title = "Alpha Vision 哨兵提醒"
+    body = f"【14:30 尾盘确认】\n发现 {len(names)} 只标的走势稳健：\n" + "、".join([f"{n}({c})" for n, c in zip(names, codes)])
+    
+    print(f"\n🔔 NOTIFICATION: {body}\n")
+
+    if BARK_KEY and "YOUR_BARK_KEY" not in BARK_KEY:
+        try:
+            # Bark API: https://api.day.app/{key}/{title}/{body}
+            url = f"https://api.day.app/{BARK_KEY}/{title}/{body}?icon=https://i.imgur.com/8p4jA4w.png"
+            requests.get(url, timeout=5)
+            print("✅ Bark push sent successfully.")
+        except Exception as e:
+            print(f"❌ Bark push failed: {e}")
+    else:
+        print("⚠️ Bark Key not configured. Skipping push.")
+        
+    return body
+
+class IntradaySentinel:
+    def __init__(self):
+        self.last_top_5 = []
+        self.thread = None
+        self._stop = False
+
+    def start(self):
+        self._stop = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self._stop:
+            now = datetime.now()
+            # 14:30 trigger
+            if now.hour == 14 and now.minute == 30:
+                print("Sentinel Triggered: 14:30 check...")
+                if self.last_top_5:
+                    send_intraday_notification(self.last_top_5)
+                time.sleep(65) # Skip this minute
+            time.sleep(30)
+
+sentinel = IntradaySentinel()
+
 @app.on_event("startup")
 async def startup_event():
     print("🏗️ Initializing database...")
     init_db()
+    
+    print("🚀 Starting Intraday Sentinel...")
+    sentinel.start() # Start the sentinel thread
+
     # 异步预热核心缓存
     from core.data import get_index_data, get_hot_sectors
     loop = asyncio.get_event_loop()
@@ -331,6 +426,19 @@ def scan_market(
             else:
                 res['共振'] = "独苗"
             
+        # --- SOP: 地雷监测 (Mine Sweeper) ---
+        mine_data = fetch_mine_sweeper_data()
+        for res in results:
+            code = res['代码']
+            warnings = []
+            if code in mine_data["earnings"]: warnings.append("📅 财报")
+            if code in mine_data["unlocks"]: warnings.append("🔒 解禁")
+            if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
+            res['warnings'] = warnings
+
+        # Update Sentinel memory
+        sentinel.last_top_5 = results[:5]
+
         # --- 持久化保存 ---
         save_scan_results(results, engine)
         
@@ -381,7 +489,16 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     
     try:
         df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price)
-        match, stats = check_strategy(df, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_rs_filter=use_rs_filter)
+        match, stats = check_strategy(
+            df, 
+            threshold=threshold, 
+            vol_multiplier=vol_multiplier, 
+            rsi_min=rsi_min, 
+            use_macd_filter=use_macd_filter, 
+            use_bb_sqz=use_bb_sqz, 
+            sqz_lookback=sqz_lookback, 
+            use_rs_filter=use_rs_filter
+        )
         
         if match:
             print(f"✨ [{code}] Resonance Match!")
@@ -460,6 +577,90 @@ async def get_stock_kline(code: str, local_only: bool = False):
         "data": records
     }
 
+def fetch_stock_data_with_indicators(code: str):
+    from core.db import load_from_db, save_to_db, get_db_engine
+    from core.indicators import calculate_indicators
+    import akshare as ak
+    
+    engine = get_db_engine()
+    target_date = datetime.now()
+    # Load last 1 year
+    start_db = (target_date - timedelta(days=365)).strftime("%Y-%m-%d")
+    df = load_from_db(code, start_db, engine)
+    
+    # Check if stale (older than 2 days)
+    is_stale = True
+    if not df.empty and '日期' in df.columns:
+        last_date_str = str(df.iloc[-1]['日期'])
+        try:
+             last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
+             if (target_date - last_date).days <= 2: 
+                 is_stale = False
+        except: pass
+            
+    if is_stale or df.empty:
+        try:
+             start_date = (target_date - timedelta(days=365)).strftime("%Y%m%d")
+             df_new = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
+             if not df_new.empty:
+                 df = df_new
+                 save_to_db(df, code, engine)
+        except Exception as e:
+            print(f"Fetch error for {code}: {e}")
+            
+    if df.empty: return df
+    
+    # Calculate indicators
+    df = calculate_indicators(df, periods=[5, 10, 20, 60])
+    return df
+
+@app.get("/api/stock/detail")
+def get_stock_detail(code: str):
+    """获取单只股票详情 (k线指标 + 资金面) 用于 AI Deep Dive"""
+    try:
+        # 1. 获取 K 线数据并计算指标
+        df = fetch_stock_data_with_indicators(code)
+        if df.empty:
+            raise HTTPException(status_code=404, detail="未找到该股票的历史数据")
+        
+        # 2. 准备 K 线绘图数据 (只取最近 60 天给 Mini Chart)
+        plot_df = df.tail(60).copy()
+        plot_df['time'] = plot_df['日期'].astype(str)
+        
+        # 映射字段名给前端 lightweight-charts
+        records = []
+        for _, row in plot_df.iterrows():
+            records.append({
+                "time": row['time'],
+                "open": float(row['开盘']),
+                "high": float(row['最高']),
+                "low": float(row['最低']),
+                "close": float(row['收盘']),
+                "value": float(row['成交量']),
+                "EMA5": float(row.get('EMA5', 0)),
+                "EMA20": float(row.get('EMA20', 0)),
+                "EMA60": float(row.get('EMA60', 0)),
+                "RSI": float(row.get('RSI', 0)),
+                "MACD": float(row.get('MACD_HIST', 0))
+            })
+            
+        return {
+            "code": code,
+            "data": records,
+            "indicators": {
+                "rsi": float(df.iloc[-1].get('RSI', 0)),
+                "dif": float(df.iloc[-1].get('MACD_DIF', 0)),
+                "dea": float(df.iloc[-1].get('MACD_DEA', 0)),
+                "hist": float(df.iloc[-1].get('MACD_HIST', 0)),
+                "ema5": float(df.iloc[-1].get('EMA5', 0)),
+                "ema20": float(df.iloc[-1].get('EMA20', 0)),
+                "ema60": float(df.iloc[-1].get('EMA60', 0))
+            }
+        }
+    except Exception as e:
+        print(f"Error fetching stock detail for {code}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/scan/dates")
 async def get_history_dates():
     """获取历史扫描日期列表"""
@@ -469,6 +670,72 @@ async def get_history_dates():
 async def get_history_results(date: str):
     """获取指定日期的历史选股结果"""
     return get_scan_history_by_date(date)
+
+# --- Paper Trading Endpoints ---
+@app.post("/api/paper/add")
+def add_paper_trade(trade: PaperTradeCreate):
+    engine = get_db_engine()
+    if not engine: return {"status": "error"}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text('''
+                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status)
+                VALUES (:code, :name, :price, :date, :price, 'OPEN')
+                ON CONFLICT (code, entry_date) DO NOTHING
+            '''), {
+                "code": trade.code,
+                "name": trade.name,
+                "price": trade.price,
+                "date": datetime.now().strftime("%Y-%m-%d")
+            })
+            conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Error adding paper trade: {e}")
+        return {"status": "error", "detail": str(e)}
+
+@app.get("/api/paper/list")
+def list_paper_trades():
+    engine = get_db_engine()
+    if not engine: return []
+    try:
+        df = pd.read_sql("SELECT * FROM paper_trading ORDER BY entry_date DESC", engine)
+        return df.to_dict('records')
+    except:
+        return []
+
+@app.delete("/api/paper/remove/{id}")
+def remove_paper_trade(id: int):
+    engine = get_db_engine()
+    if not engine: return {"status": "error"}
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM paper_trading WHERE id = :id"), {"id": id})
+            conn.commit()
+        return {"status": "success"}
+    except:
+        return {"status": "error"}
+
+@app.get("/api/paper/list")
+def list_paper_trades():
+    return list_trades(engine)
+
+@app.delete("/api/paper/remove/{id}")
+def remove_paper_trade_api(id: int):
+    return remove_trade(id, engine)
+
+@app.get("/api/test/push")
+def test_push_notification():
+    """测试 Bark 推送功能"""
+    mock_data = [
+        {"code": "600519", "name": "测试茅台", "price": 1800.0},
+        {"code": "300750", "name": "测试时代", "price": 450.0}
+    ]
+    try:
+        msg = send_intraday_notification(mock_data)
+        return {"status": "success", "message": f"Push sent: {msg}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn

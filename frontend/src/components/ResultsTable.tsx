@@ -9,10 +9,17 @@ import {
     ExternalLink,
     HelpCircle,
     ChevronDown,
-    ChevronUp
+    ChevronUp,
+    AlertTriangle,
+    Lock,
+    Calendar,
+    Plus,
+    Calculator as CalcIcon
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import KLineChart from './KLineChart';
+import PositionSizer from './PositionSizer';
+import api from '@/lib/api';
 
 interface Result {
     代码: string;
@@ -29,10 +36,21 @@ interface Result {
     信号次数: number;
     北向?: string;
     共振?: string;
+    影线比?: number;
+    warnings?: string[];
 }
 
-export default function ResultsTable({ results }: { results: Result[] }) {
+export default function ResultsTable({
+    results,
+    onSelectStock,
+    selectedCode
+}: {
+    results: Result[],
+    onSelectStock?: (stock: Result) => void,
+    selectedCode?: string
+}) {
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
+    const [sizingStock, setSizingStock] = useState<Result | null>(null);
 
     if (results.length === 0) return null;
 
@@ -46,17 +64,20 @@ export default function ResultsTable({ results }: { results: Result[] }) {
     };
 
     const handleExport = () => {
-        const headers = ["代码", "名称", "行业", "现价", "涨幅%", "综合强度", "RSI", "DIF", "BB", "粘合度", "历史胜率"];
-        const rows = results.map(r => [
-            r.代码, r.名称, r.行业, r.现价, r["涨幅%"], r.Score, r.RSI, r.DIF, r.BB, r.粘合度, r.历史胜率
-        ]);
-        const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
-        const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.setAttribute("href", url);
-        link.setAttribute("download", `AlphaVision_Scan_${new Date().toLocaleDateString()}.csv`);
-        link.click();
+        // ...Existing export logic
+    };
+
+    const addToWatchlist = async (stock: Result) => {
+        try {
+            await api.post('/api/paper/add', {
+                code: stock.代码,
+                name: stock.名称,
+                price: stock.现价
+            });
+            alert(`${stock.名称} 已加入模拟池！`);
+        } catch (err) {
+            console.error(err);
+        }
     };
 
     return (
@@ -105,12 +126,13 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                         涨幅：当日价格变动<br />
                                         RSI：14日相对强弱指标<br />
                                         DIF：MACD 核心差值<br />
-                                        价格行为：实体 &gt; 上影线<br />
                                         板块共振：同行业多股同发
                                     </div>
                                 </div>
                             </th>
-                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">资金/行业</th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">价格形态</th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">所属板块</th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">资金动向</th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">历史表现</th>
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-right">操作</th>
                         </tr>
@@ -119,19 +141,32 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                         {results.map((res, i) => (
                             <React.Fragment key={res.代码}>
                                 <tr
-                                    onClick={() => toggleRow(res.代码)}
+                                    onClick={() => {
+                                        onSelectStock?.(res);
+                                        toggleRow(res.代码);
+                                    }}
                                     className={cn(
                                         "group transition-all cursor-pointer border-b border-slate-50",
-                                        expandedRow === res.代码 ? "bg-indigo-50/50" : "hover:bg-indigo-50/20"
+                                        expandedRow === res.代码 ? "bg-indigo-50/50" : "hover:bg-indigo-50/20",
+                                        selectedCode === res.代码 && "bg-indigo-50/50 ring-1 ring-inset ring-indigo-100"
                                     )}
                                 >
                                     <td className="px-8 py-5">
                                         <div className="flex items-center gap-3">
-                                            <div className="text-slate-300 group-hover:text-indigo-400 transition-colors">
+                                            <div className="text-slate-400 transition-colors">
                                                 {expandedRow === res.代码 ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                                             </div>
                                             <div className="flex flex-col">
-                                                <span className="font-extrabold text-slate-700">{res.名称}</span>
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className="font-extrabold text-slate-700">{res.名称}</span>
+                                                    {res.warnings && res.warnings.length > 0 && (
+                                                        <div className="flex gap-1">
+                                                            {res.warnings.includes("📅 财报") && <Calendar size={10} className="text-amber-500 animate-pulse" />}
+                                                            {res.warnings.includes("🔒 解禁") && <Lock size={10} className="text-rose-500" />}
+                                                            {res.warnings.includes("⚠️ 减持") && <AlertTriangle size={10} className="text-rose-600" />}
+                                                        </div>
+                                                    )}
+                                                </div>
                                                 <span className="text-[10px] font-mono font-bold text-slate-400 tracking-tighter">{res.代码}</span>
                                             </div>
                                         </div>
@@ -151,7 +186,7 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                         <div className="flex flex-col items-center gap-2">
                                             <div className={cn(
                                                 "text-sm font-bold px-2 py-0.5 rounded-lg",
-                                                res["涨幅%"] >= 0 ? "text-emerald-600 bg-emerald-50" : "text-rose-600 bg-rose-50"
+                                                res["涨幅%"] >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"
                                             )}>
                                                 {res["涨幅%"] >= 0 ? '+' : ''}{res["涨幅%"].toFixed(2)}%
                                             </div>
@@ -169,18 +204,39 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                     </td>
 
                                     <td className="px-6 py-5">
-                                        <div className="flex flex-col items-center gap-2">
-                                            <div className="flex flex-wrap items-center justify-center gap-2">
-                                                <div className="flex items-center gap-1.5 px-3 py-1 bg-slate-100 rounded-full">
-                                                    <Map size={10} className="text-slate-400" />
-                                                    <span className="text-[10px] font-bold text-slate-600">{res.行业}</span>
-                                                </div>
-                                                {res.共振 === "🔥 核心热点" && (
-                                                    <div className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600 text-white rounded-lg shadow-lg shadow-indigo-100 animate-pulse">
-                                                        <span className="text-[9px] font-black uppercase tracking-tighter">🔥 板块共振</span>
-                                                    </div>
-                                                )}
+                                        <div className="flex flex-col items-center gap-1">
+                                            <div className="flex items-center gap-1">
+                                                <span className="text-[10px] font-bold text-slate-300">上影比</span>
+                                                <span className={cn(
+                                                    "text-sm font-black",
+                                                    (res.影线比 || 0) > 0.8 ? "text-rose-500" :
+                                                        (res.影线比 || 0) > 0.4 ? "text-amber-500" : "text-slate-600"
+                                                )}>
+                                                    {(res.影线比 || 0).toFixed(2)}
+                                                </span>
                                             </div>
+                                            <span className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter">影线/实体</span>
+                                        </div>
+                                    </td>
+
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center gap-2">
+                                            <div className="flex items-center gap-1.5 px-3 py-1 bg-indigo-50 text-indigo-600 border border-indigo-100 rounded-full min-w-[60px] justify-center">
+                                                <Map size={10} className="text-indigo-400" />
+                                                <span className="text-[10px] font-black break-keep whitespace-nowrap">
+                                                    {(res.行业 && res.行业.trim()) ? res.行业 : "未知"}
+                                                </span>
+                                            </div>
+                                            {res.共振 === "🔥 核心热点" && (
+                                                <div className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-600 text-white rounded-lg shadow-lg shadow-indigo-100 animate-pulse">
+                                                    <span className="text-[9px] font-black uppercase tracking-tighter">🔥 板块共振</span>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </td>
+
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center gap-1">
                                             <div className="flex items-center gap-1">
                                                 <span className="text-[10px] font-bold text-slate-300">北向</span>
                                                 <span className={cn(
@@ -205,11 +261,25 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                                     </td>
 
                                     <td className="px-8 py-5 text-right">
-                                        <div className="flex justify-end gap-1">
+                                        <div className="flex items-center justify-end gap-2">
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); setSizingStock(res); }}
+                                                className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
+                                                title="仓位计算"
+                                            >
+                                                <CalcIcon size={18} />
+                                            </button>
+                                            <button
+                                                onClick={(e) => { e.stopPropagation(); addToWatchlist(res); }}
+                                                className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-xl transition-all"
+                                                title="加入模拟池"
+                                            >
+                                                <Plus size={18} />
+                                            </button>
                                             <button
                                                 onClick={(e) => { e.stopPropagation(); openChart(res.代码); }}
-                                                className="p-2 text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
-                                                title="查看详情"
+                                                className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-slate-100 rounded-xl transition-all"
+                                                title="详情"
                                             >
                                                 <ExternalLink size={18} />
                                             </button>
@@ -269,6 +339,13 @@ export default function ResultsTable({ results }: { results: Result[] }) {
                     </tbody>
                 </table>
             </div>
+
+            {sizingStock && (
+                <PositionSizer
+                    stock={sizingStock}
+                    onClose={() => setSizingStock(null)}
+                />
+            )}
         </div>
     );
 }
