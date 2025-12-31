@@ -26,18 +26,18 @@ export default function Dashboard() {
     const [lastUpdated, setLastUpdated] = useState("");
 
     const [params, setParams] = useState({
-        threshold: 0.10,
-        vol_multiplier: 1.8,
+        threshold: 0.12,
+        vol_multiplier: 1.5,
         rsi_min: 55,
         use_macd_filter: true,
         use_bb_sqz: true,
         sqz_lookback: 10,
         use_weekly: true,
-        market_range: "包含科创板",
+        market_range: "全市场(除科创)",
         turnover_min: 3.0,
         mkt_cap_min: 0,
         use_rs_filter: true,
-        local_only: false
+        local_only: true
     });
 
     const [historyDates, setHistoryDates] = useState<string[]>([]);

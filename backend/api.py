@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from typing import List, Optional
 from datetime import datetime, timedelta
 import pandas as pd
@@ -16,7 +17,6 @@ BARK_KEY = "zVQJgaLZ4qApBq2d84NRTU" # 已自动提取您的 Key
 
 socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 
-import api as api_module # Assuming this is intended to be 'import api as api_module'
 from pydantic import BaseModel
 
 from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates
@@ -31,7 +31,8 @@ sync_progress = {
     "current": 0,
     "success": 0,
     "fail": 0,
-    "start_time": None
+    "start_time": None,
+    "status_text": "等待中..."
 }
 
 app = FastAPI(title="Alpha Vision API", version="5.1.0")
@@ -165,25 +166,49 @@ def get_sectors():
 def background_sync_task():
     global sync_progress
     from sync_data import sync_single_stock
-    from core.data import get_market_snapshot
+    from core.data import get_market_snapshot, get_sector_map
     from core.db import get_db_engine, init_db
     
     sync_progress["is_running"] = True
     sync_progress["start_time"] = datetime.now().isoformat()
     sync_progress["success"] = 0
     sync_progress["fail"] = 0
-    
+    sync_progress["current"] = 0
+    sync_progress["status_text"] = "正在初始化板块映射..."
+
     try:
-        snapshot = get_market_snapshot()
-        # 初始门槛：全A股包含市值 > 20亿的票
-        candidates = snapshot[snapshot['mkt_cap'] > 2000000000]
+        # Step 1: Ensure sectors are persisted in DB
+        sync_progress["status_text"] = "正在初始化板块映射..."
+        get_sector_map()
+        candidates = pd.DataFrame()
+        try:
+            snapshot = get_market_snapshot()
+            if not snapshot.empty:
+                candidates = snapshot[snapshot['mkt_cap'] > 2000000000]
+        except:
+            print("⚠️ Snapshot failed in sync task.")
+
+        if candidates.empty:
+            print("🔄 Snapshot unavailable, falling back to lightweight stock list...")
+            try:
+                df_codes = ak.stock_info_a_code_name()
+                candidates = df_codes.rename(columns={'code':'code', 'name':'name'})
+            except:
+                with get_db_engine().connect() as conn:
+                    candidates = pd.read_sql("SELECT DISTINCT code, name FROM daily_k", conn)
+
+        if candidates.empty:
+            print("❌ All methods to get stock list failed.")
+            sync_progress["is_running"] = False
+            return
+
         sync_progress["total"] = len(candidates)
+        sync_progress["status_text"] = f"正在对比本地数据 (共 {len(candidates)} 只)..."
         engine = get_db_engine()
         init_db(engine)
         
         # --- 核心优化：批量查询本地已同步日期 ---
         print("🔍 Checking existing data in batch...")
-        from sqlalchemy import text
         with engine.connect() as conn:
             query = text("SELECT code, MAX(date) as last_date FROM daily_k GROUP BY code")
             df_existing = pd.read_sql(query, engine)
@@ -213,6 +238,7 @@ def background_sync_task():
         start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
         max_workers = 15 # 稍微提升并发
         
+        sync_progress["status_text"] = f"正在同步核心标的 (待处理: {len(actual_tasks)})..."
         if actual_tasks:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
@@ -264,20 +290,51 @@ def scan_market(
 ):
     """全市场多因子共振扫描"""
     try:
-        snapshot_df = get_market_snapshot()
+        snapshot_df = pd.DataFrame()
+        engine = get_db_engine()
+        
+        # 1. 如果不是强制本地，尝试联网获取快照
+        if not local_only:
+            try:
+                snapshot_df = get_market_snapshot()
+            except:
+                print("⚠️ Network snapshot failed.")
+
+        # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
         if snapshot_df.empty:
-            if local_only:
-                print("⚠️ Snapshot failed, falling back to local DB for candidate list...")
-                # 从数据库提取最近一天的快照 (极简模拟)
-                try:
-                    with engine.connect() as conn:
-                        query = text("SELECT code, name, close as price, vol, close as open, 0 as pct_chg, 5 as turnover, 10000000000 as mkt_cap FROM daily_k WHERE date = (SELECT MAX(date) FROM daily_k) LIMIT 5000")
+            print(f"🔄 Switching to LOCAL DB mode (Local Only: {local_only})...")
+            try:
+                with engine.connect() as conn:
+                    print("📡 Querying DB for max_date...")
+                    max_date_res = conn.execute(text("SELECT MAX(date) FROM daily_k")).fetchone()
+                    if max_date_res and max_date_res[0]:
+                        max_date = max_date_res[0]
+                        print(f"📅 Found max_date in DB: {max_date}")
+                        query = text(f"""
+                            SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol, 
+                                   2.0 as pct_chg, 10.0 as turnover, 10000000000.0 as mkt_cap 
+                            FROM daily_k d
+                            LEFT JOIN stock_basic b ON d.code = b.code
+                            WHERE d.date = '{max_date}'
+                        """)
                         snapshot_df = pd.read_sql(query, engine)
-                except:
-                    pass
+                        print(f"📊 Loaded {len(snapshot_df)} rows from DB fallback.")
+                        # Fallback for name if join failed
+                        if not snapshot_df.empty:
+                            snapshot_df['name'] = snapshot_df['name'].fillna(snapshot_df['code'])
+                    else:
+                        print("❌ No data found in daily_k table.")
+            except Exception as e:
+                print(f"❌ Local fallback error: {e}")
+                pass
             
-            if snapshot_df.empty:
-                raise HTTPException(status_code=503, detail="无法获取市场快照数据，且本地无有效缓存")
+        if snapshot_df.empty:
+             detail_msg = "无法获取市场数据。"
+             if local_only:
+                 detail_msg += "【离线模式】已开启，但本地数据库尚未同步今日数据。请先执行【数据管理 -> 同步当日数据】。"
+             else:
+                 detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
+             raise HTTPException(status_code=503, detail=detail_msg)
         
         # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
         total_snapshot = len(snapshot_df)
@@ -380,8 +437,8 @@ def scan_market(
         results = sorted(results, key=lambda x: x['Score'], reverse=True)[:30]
         
         # 补充增强数据 (行业, 胜率)
-        from core.data import get_cached_data
-        sector_map = get_cached_data('sector_map', 86400) or {}
+        from core.data import get_sector_map
+        sector_map = get_sector_map() # This now handles DB + Memory cache
         
         def fetch_single_industry(res_item):
             code = res_item['代码']
@@ -715,14 +772,6 @@ def remove_paper_trade(id: int):
         return {"status": "success"}
     except:
         return {"status": "error"}
-
-@app.get("/api/paper/list")
-def list_paper_trades():
-    return list_trades(engine)
-
-@app.delete("/api/paper/remove/{id}")
-def remove_paper_trade_api(id: int):
-    return remove_trade(id, engine)
 
 @app.get("/api/test/push")
 def test_push_notification():
