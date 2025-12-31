@@ -120,7 +120,7 @@ export default function Sidebar({ syncProgress, onStartSync, activeView, onNavig
                                 />
                             </div>
                             <p className="mt-2 text-[9px] text-slate-400 leading-tight">
-                                正在并发下载历史日线并存入数据库...
+                                {syncProgress?.status_text || "正在同步数据，请稍候..."}
                             </p>
                         </div>
                     )}

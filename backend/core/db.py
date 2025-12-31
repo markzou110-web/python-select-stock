@@ -50,6 +50,13 @@ def init_db(engine=None):
     try:
         with engine.connect() as conn:
             conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS stock_basic (
+                    code VARCHAR(20) PRIMARY KEY,
+                    name VARCHAR(50),
+                    industry VARCHAR(100)
+                );
+            '''))
+            conn.execute(text('''
                 CREATE TABLE IF NOT EXISTS daily_k (
                     code VARCHAR(20),
                     date DATE,
@@ -238,3 +245,35 @@ def get_scan_dates(engine=None):
             return [str(row[0]) for row in res]
     except:
         return []
+
+def save_stock_basic(df, engine=None):
+    """保存股票基础信息 (板块、名称)"""
+    if engine is None: engine = get_db_engine()
+    if not engine or df.empty: return
+    try:
+        data = df[['code', 'name', 'industry']].copy()
+        temp_table = "stock_basic_temp"
+        data.to_sql(temp_table, engine, if_exists='replace', index=False)
+        with engine.connect() as conn:
+            conn.execute(text(f'''
+                INSERT INTO stock_basic (code, name, industry)
+                SELECT code, name, industry FROM {temp_table}
+                ON CONFLICT (code) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    industry = EXCLUDED.industry
+            '''))
+            conn.execute(text(f"DROP TABLE {temp_table}"))
+            conn.commit()
+    except Exception as e:
+        print(f"❌ save_stock_basic Error: {e}")
+
+def get_stock_basic_map(engine=None):
+    """获取股票基础信息映射 {code: industry}"""
+    if engine is None: engine = get_db_engine()
+    if not engine: return {}
+    try:
+        query = "SELECT code, industry FROM stock_basic"
+        df = pd.read_sql(query, engine)
+        return pd.Series(df.industry.values, index=df.code).to_dict()
+    except:
+        return {}

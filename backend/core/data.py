@@ -5,7 +5,7 @@ import random
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from .db import save_to_db, get_db_engine
+from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map
 
 # --- Simple Time-based Cache ---
 CACHE = {}
@@ -154,46 +154,62 @@ def get_hot_sectors():
     return []
 
 def get_sector_map():
-    """获取全市场个股行业映射 (重量级操作，缓存 24 小时)"""
+    """获取全市场个股行业映射 (重量级操作，优先读取数据库)"""
+    # 1. 内存缓存
     cached = get_cached_data('sector_map', 86400)
     if cached: return cached
 
+    # 2. 数据库缓存 (可靠性保障)
+    db_map = get_stock_basic_map()
+    if db_map:
+        set_cached_data('sector_map', db_map)
+        return db_map
+
+    print("🏗️ Building sector map from API and persisting to DB...")
+    sector_map = {}
     try:
         # 1. 获取所有行业板块名称
         df_board = ak.stock_board_industry_name_em()
         if df_board.empty: return {}
         
-        sector_map = {}
-        # 优化：只拉取前 50 个核心板块作为背景缓存，其余依赖扫描后的“点对点”查询
+        # 优化：只拉取前 50 个核心板块作为背景缓存
         all_boards = df_board['板块名称'].head(50).tolist()
         
-        # 2. 并发抓取成分股 (全量扫描可能触发封锁，此处采取稳健策略)
+        # 2. 并发抓取成分股
         def fetch_sector_with_retry(sector_name, retries=3):
             for i in range(retries):
                 try:
-                    time.sleep(random.uniform(0.5, 1.0)) # 更加温和
+                    time.sleep(random.uniform(0.5, 1.0))
                     df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
                     if not df_curr.empty:
-                        return sector_name, df_curr['代码'].tolist()
+                        return sector_name, df_curr[['代码', '名称']].copy()
                 except:
                     pass
             return None, None
 
-        print(f"🏗️ Building partial sector map for {len(all_boards)} core industries...")
+        all_basic_data = []
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_sector = {executor.submit(fetch_sector_with_retry, name): name for name in all_boards}
             
             for future in as_completed(future_to_sector):
                 try:
-                    s_name, codes = future.result(timeout=15)
-                    if codes:
-                        for c in codes: sector_map[c] = s_name
+                    s_name, df_codes = future.result(timeout=15)
+                    if df_codes is not None:
+                        for _, row in df_codes.iterrows():
+                            code, name = row['代码'], row['名称']
+                            sector_map[code] = s_name
+                            all_basic_data.append({'code': code, 'name': name, 'industry': s_name})
                 except:
                     continue
         
+        # 3. 持久化到数据库
+        if all_basic_data:
+            df_basic = pd.DataFrame(all_basic_data)
+            save_stock_basic(df_basic)
+            
         if sector_map: 
             set_cached_data('sector_map', sector_map)
-            print(f"✅ Full sector map built: {len(sector_map)} stocks mapped.")
+            print(f"✅ Full sector map built and persisted: {len(sector_map)} stocks mapped.")
         return sector_map
     except Exception as e:
         print(f"❌ Critical error in get_sector_map: {e}")
