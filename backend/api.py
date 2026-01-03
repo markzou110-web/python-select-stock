@@ -19,7 +19,7 @@ socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 
 from pydantic import BaseModel
 
-from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates
+from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates, get_setting, save_setting
 from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
@@ -111,8 +111,11 @@ class IntradaySentinel:
         self.last_top_5 = []
         self.thread = None
         self._stop = False
+        self.trigger_time = "14:20"
 
     def start(self):
+        # Load time from DB
+        self.trigger_time = get_setting("sentinel_time", "14:20")
         self._stop = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -120,12 +123,26 @@ class IntradaySentinel:
     def _run(self):
         while not self._stop:
             now = datetime.now()
-            # 14:30 trigger
-            if now.hour == 14 and now.minute == 30:
-                print("Sentinel Triggered: 14:30 check...")
-                if self.last_top_5:
-                    send_intraday_notification(self.last_top_5)
-                time.sleep(65) # Skip this minute
+            current_time = now.strftime("%H:%M")
+            
+            # Dynamic trigger time check
+            if current_time == self.trigger_time:
+                print(f"Sentinel Triggered at {self.trigger_time}: Automated check...")
+                try:
+                    # Run a full scan (local_only=True for speed in sentinel)
+                    results = run_market_scan(local_only=True)
+                    if results:
+                        self.last_top_5 = results[:5]
+                        send_intraday_notification(self.last_top_5)
+                except Exception as e:
+                    print(f"Sentinel Scan Error: {e}")
+                
+                time.sleep(60) # Skip this minute
+            
+            # Periodically refresh settings (every 10 mins)
+            if now.minute % 10 == 0 and now.second < 30:
+                self.trigger_time = get_setting("sentinel_time", "14:20")
+                
             time.sleep(30)
 
 sentinel = IntradaySentinel()
@@ -269,12 +286,12 @@ def start_sync(background_tasks: BackgroundTasks):
     background_tasks.add_task(background_sync_task)
     return {"status": "started"}
 
+
 @app.get("/api/sync/status")
 def get_sync_status():
     return sync_progress
 
-@app.get("/api/scan")
-def scan_market(
+def run_market_scan(
     threshold: float = 0.12,
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
@@ -282,13 +299,13 @@ def scan_market(
     use_bb_sqz: bool = True,
     sqz_lookback: int = 10,
     use_weekly: bool = True,
-    market_range: str = "包含科创板",
+    market_range: str = "全市场(除科创)",
     turnover_min: float = 3.0,
     mkt_cap_min: float = 0.0,
     use_rs_filter: bool = True,
-    local_only: bool = False
+    local_only: bool = True
 ):
-    """全市场多因子共振扫描"""
+    """Internal core scanning logic"""
     try:
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
@@ -718,17 +735,52 @@ def get_stock_detail(code: str):
         print(f"Error fetching stock detail for {code}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/scan/dates")
-async def get_history_dates():
-    """获取历史扫描日期列表"""
-    return get_scan_dates()
-
 @app.get("/api/scan/history")
 async def get_history_results(date: str):
     """获取指定日期的历史选股结果"""
     return get_scan_history_by_date(date)
 
-# --- Paper Trading Endpoints ---
+@app.get("/api/scan/dates")
+async def get_history_dates():
+    """获取历史扫描日期列表"""
+    return get_scan_dates()
+
+@app.get("/api/scan")
+def scan_market(
+    threshold: float = 0.12,
+    vol_multiplier: float = 1.5,
+    rsi_min: int = 55,
+    use_macd_filter: bool = True,
+    use_bb_sqz: bool = True,
+    sqz_lookback: int = 10,
+    use_weekly: bool = True,
+    market_range: str = "全市场(除科创)",
+    turnover_min: float = 3.0,
+    mkt_cap_min: float = 0.0,
+    use_rs_filter: bool = True,
+    local_only: bool = True
+):
+    """API Endpoint for market scan"""
+    return run_market_scan(
+        threshold, vol_multiplier, rsi_min, use_macd_filter, 
+        use_bb_sqz, sqz_lookback, use_weekly, market_range, 
+        turnover_min, mkt_cap_min, use_rs_filter, local_only
+    )
+
+@app.get("/api/settings")
+def get_settings_api():
+    return {
+        "sentinel_time": get_setting("sentinel_time", "14:20"),
+        "bark_key": BARK_KEY
+    }
+
+@app.post("/api/settings")
+def save_settings_api(data: dict):
+    if "sentinel_time" in data:
+        save_setting("sentinel_time", data["sentinel_time"])
+        sentinel.trigger_time = data["sentinel_time"] # Update live
+    return {"status": "success"}
+
 @app.post("/api/paper/add")
 def add_paper_trade(trade: PaperTradeCreate):
     engine = get_db_engine()

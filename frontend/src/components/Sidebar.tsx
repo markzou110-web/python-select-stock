@@ -127,8 +127,8 @@ export default function Sidebar({ syncProgress, onStartSync, activeView, onNavig
                 </div>
 
                 <div className="space-y-1 pt-2">
-                    <NavItem icon={<Search size={20} />} label="代码检索" />
-                    <NavItem icon={<Settings size={20} />} label="系统配置" />
+                    <NavItem icon={<Search size={20} />} label="代码检索" active={activeView === 'search'} onClick={() => onNavigate('search')} />
+                    <NavItem icon={<Settings size={20} />} label="系统配置" active={activeView === 'settings'} onClick={() => onNavigate('settings')} />
                 </div>
 
                 <div className="mt-6 p-4 rounded-2xl bg-indigo-600 text-white shadow-xl shadow-indigo-100 relative overflow-hidden">
