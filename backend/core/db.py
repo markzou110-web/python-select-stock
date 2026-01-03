@@ -277,3 +277,30 @@ def get_stock_basic_map(engine=None):
         return pd.Series(df.industry.values, index=df.code).to_dict()
     except:
         return {}
+
+def get_setting(key, default=None, engine=None):
+    """获取系统设置"""
+    if engine is None: engine = get_db_engine()
+    if not engine: return default
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT value FROM system_settings WHERE key = :key"), {"key": key}).fetchone()
+            return res[0] if res else default
+    except:
+        return default
+
+def save_setting(key, value, engine=None):
+    """保存系统设置"""
+    if engine is None: engine = get_db_engine()
+    if not engine: return False
+    try:
+        with engine.connect() as conn:
+            conn.execute(text('''
+                INSERT INTO system_settings (key, value) VALUES (:key, :value)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            '''), {"key": key, "value": str(value)})
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving setting {key}: {e}")
+        return False

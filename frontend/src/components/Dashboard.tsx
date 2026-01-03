@@ -9,6 +9,7 @@ import FilterModal from '@/components/FilterModal';
 import ResultsTable from '@/components/ResultsTable';
 import AIDeepDive from '@/components/AIDeepDive';
 import PaperTradingView from '@/components/PaperTradingView';
+import SettingsView from '@/components/SettingsView';
 import { marketApi } from '@/lib/api';
 import api from '@/lib/api';
 import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap } from 'lucide-react';
@@ -310,8 +311,10 @@ export default function Dashboard() {
                                 )}
                             </div>
                         </>
-                    ) : (
+                    ) : activeView === 'paper' ? (
                         <PaperTradingView />
+                    ) : (
+                        <SettingsView />
                     )}
                 </div>
 
