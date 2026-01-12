@@ -12,6 +12,22 @@ import threading
 import asyncio
 import akshare as ak
 import requests
+import math
+
+def sanitize_float(val):
+    """Sanitizes float values to be JSON compliant (converts NaN/Inf to 0)."""
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return 0.0
+    return val
+
+def sanitize_recursive(data):
+    """Recursively sanitizes a dictionary or list for JSON compliance."""
+    if isinstance(data, dict):
+        return {k: sanitize_recursive(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [sanitize_recursive(v) for v in data]
+    return sanitize_float(data)
 
 BARK_KEY = "zVQJgaLZ4qApBq2d84NRTU" # 已自动提取您的 Key
 
@@ -40,7 +56,12 @@ app = FastAPI(title="Alpha Vision API", version="5.1.0")
 # CORS Setup for React Frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace with specific frontend URL
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:8000", # For self-referencing if needed
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -111,7 +132,7 @@ class IntradaySentinel:
         self.last_top_5 = []
         self.thread = None
         self._stop = False
-        self.trigger_time = "14:20"
+        self.trigger_time = "14:30"
 
     def start(self):
         # Load time from DB
@@ -130,18 +151,32 @@ class IntradaySentinel:
                 print(f"Sentinel Triggered at {self.trigger_time}: Automated check...")
                 try:
                     # Run a full scan (local_only=True for speed in sentinel)
-                    results = run_market_scan(local_only=True)
+                    results = run_market_scan(local_only=False)
                     if results:
                         self.last_top_5 = results[:5]
                         send_intraday_notification(self.last_top_5)
                 except Exception as e:
-                    print(f"Sentinel Scan Error: {e}")
+                    error_msg = f"[{datetime.now()}] Sentinel Scan Error: {e}\n"
+                    print(error_msg)
+                    with open("sync_error.log", "a") as f:
+                        f.write(error_msg)
+                    
+                    # Robustness: If limit reached, try with higher turnover
+                    if "待扫描股票过多" in str(e):
+                        print("🔄 Sentinel: Attempting recovery with stricter turnover filter...")
+                        try:
+                            results = run_market_scan(local_only=False, turnover_min=5.0)
+                            if results:
+                                self.last_top_5 = results[:5]
+                                send_intraday_notification(self.last_top_5)
+                        except Exception as e2:
+                            print(f"❌ Sentinel: Recovery failed: {e2}")
                 
                 time.sleep(60) # Skip this minute
             
             # Periodically refresh settings (every 10 mins)
             if now.minute % 10 == 0 and now.second < 30:
-                self.trigger_time = get_setting("sentinel_time", "14:20")
+                self.trigger_time = get_setting("sentinel_time", "14:30")
                 
             time.sleep(30)
 
@@ -153,6 +188,9 @@ async def startup_event():
     init_db()
     
     print("🚀 Starting Intraday Sentinel...")
+    # Ensure default time is in DB
+    if get_setting("sentinel_time") is None:
+        save_setting("sentinel_time", "14:30")
     sentinel.start() # Start the sentinel thread
 
     # 异步预热核心缓存
@@ -371,6 +409,8 @@ def run_market_scan(
         ].copy()
         
         print(f"📊 Snapshot: {total_snapshot} stocks")
+        # 预存快照数据以便后续提取 PE 和 换手率
+        snapshot_lookup = {row['code']: row for _, row in snapshot_df.iterrows()}
         print(f"🔍 After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
         
         # 1. 处理科创板过滤
@@ -402,7 +442,7 @@ def run_market_scan(
                 print(f"⚠️ {market_range} filter failed: {e}")
 
         # 3. 安全检查：如果待扫描数量依然过多，提示用户缩小范围
-        max_allowed = 5000 if local_only else 1200
+        max_allowed = 5000 if local_only else 2000
         if len(candidates) > max_allowed:
             mode_desc = "本地" if local_only else "在线"
             raise HTTPException(
@@ -428,6 +468,7 @@ def run_market_scan(
                     single_stock_task, 
                 row['code'], row['name'], row['price'], row['vol'], row['open'],
                 threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
+                pe=row.get('pe', 0), turnover=row.get('turnover', 0),
                 local_only=local_only, engine=engine
             ): row for _, row in candidates.iterrows()
             }
@@ -516,7 +557,8 @@ def run_market_scan(
         # --- 持久化保存 ---
         save_scan_results(results, engine)
         
-        return results
+        # --- JSON Compliance Sanitization ---
+        return sanitize_recursive(results)
     except HTTPException as he:
         # 允许 HTTPException 直接通过，不再包装成 500
         raise he
@@ -525,7 +567,7 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None):
     from core.db import load_from_db
     import akshare as ak
     
@@ -581,12 +623,26 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                     print(f"⏩ [{code}] Weekly trend failed")
                     return {"reason": "周线趋势未走好"}
             
-            # 增加胜率
+            # 增加胜率和其他指标
             wr, sig_count = calculate_historical_win_rate(df)
             stats['历史胜率'] = f"{wr}%"
             stats['信号次数'] = sig_count
             stats['代码'] = code
             stats['名称'] = name
+            stats['PE'] = sanitize_float(pe)
+            stats['换手率'] = sanitize_float(turnover)
+            
+            # 计算量比 (今日成交量 / 前5日平均成交量)
+            if len(df) >= 6:
+                avg_vol_5 = df.iloc[-6:-1]['成交量'].mean()
+                stats['量比'] = sanitize_float(round(vol / avg_vol_5, 2)) if avg_vol_5 > 0 else 0
+            else:
+                stats['量比'] = 0
+                
+            # 最后兜底：清理 stats 中可能存在的 NaN/Inf
+            for k, v in stats.items():
+                stats[k] = sanitize_float(v)
+                
             return stats
         else:
             return stats # 返回包含失败原因的字典
@@ -770,7 +826,7 @@ def scan_market(
 @app.get("/api/settings")
 def get_settings_api():
     return {
-        "sentinel_time": get_setting("sentinel_time", "14:20"),
+        "sentinel_time": get_setting("sentinel_time", "14:30"),
         "bark_key": BARK_KEY
     }
 

@@ -37,6 +37,9 @@ interface Result {
     北向?: string;
     共振?: string;
     影线比?: number;
+    PE?: number;
+    换手率?: number;
+    量比?: number;
     warnings?: string[];
 }
 
@@ -51,8 +54,34 @@ export default function ResultsTable({
 }) {
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
     const [sizingStock, setSizingStock] = useState<Result | null>(null);
+    const [sortConfig, setSortConfig] = useState<{ key: keyof Result; direction: 'asc' | 'desc' } | null>(null);
 
     if (results.length === 0) return null;
+
+    const sortedResults = [...results].sort((a, b) => {
+        if (!sortConfig) return 0;
+        const aValue = a[sortConfig.key];
+        const bValue = b[sortConfig.key];
+
+        if (aValue === undefined || bValue === undefined) return 0;
+
+        if (aValue < bValue) return sortConfig.direction === 'asc' ? -1 : 1;
+        if (aValue > bValue) return sortConfig.direction === 'asc' ? 1 : -1;
+        return 0;
+    });
+
+    const requestSort = (key: keyof Result) => {
+        let direction: 'asc' | 'desc' = 'desc';
+        if (sortConfig && sortConfig.key === key && sortConfig.direction === 'desc') {
+            direction = 'asc';
+        }
+        setSortConfig({ key, direction });
+    };
+
+    const SortIcon = ({ columnKey }: { columnKey: keyof Result }) => {
+        if (!sortConfig || sortConfig.key !== columnKey) return null;
+        return sortConfig.direction === 'asc' ? <ChevronUp size={10} className="inline ml-1" /> : <ChevronDown size={10} className="inline ml-1" />;
+    };
 
     const toggleRow = (code: string) => {
         setExpandedRow(expandedRow === code ? null : code);
@@ -106,39 +135,30 @@ export default function ResultsTable({
                     <thead>
                         <tr className="bg-slate-50/50">
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">股票信息</th>
-                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">
-                                <div className="flex items-center justify-center gap-1 group/tooltip cursor-help relative">
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center cursor-pointer hover:bg-slate-100" onClick={() => requestSort('Score')}>
+                                <div className="flex items-center justify-center gap-1 group/tooltip relative">
                                     综合强度
+                                    <SortIcon columnKey="Score" />
                                     <HelpCircle size={10} />
-                                    <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 p-2 bg-slate-800 text-white text-[9px] rounded-lg opacity-0 group-hover/tooltip:opacity-100 transition-opacity pointer-events-none z-50 normal-case font-medium leading-relaxed">
-                                        计算公式：<br />
-                                        (量比 × 20) + (粘合度贡献 × 4000) + (RSI × 0.5)<br />
-                                        分数越高代表量价配合越完美。
-                                    </div>
+                                    {/* ...Tooltip... */}
                                 </div>
                             </th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">
-                                <div className="flex items-center justify-center gap-1 group/tooltip cursor-help relative">
-                                    技术指标
-                                    <HelpCircle size={10} />
-                                    <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 p-2 bg-slate-800 text-white text-[9px] rounded-lg opacity-0 group-hover/tooltip:opacity-100 transition-opacity pointer-events-none z-50 normal-case font-medium leading-relaxed">
-                                        包含：<br />
-                                        涨幅：当日价格变动<br />
-                                        RSI：14日相对强弱指标<br />
-                                        DIF：MACD 核心差值<br />
-                                        板块共振：同行业多股同发
-                                    </div>
-                                </div>
+                                技术指标
                             </th>
-                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">价格形态</th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center cursor-pointer hover:bg-slate-100" onClick={() => requestSort('影线比')}>
+                                价格形态 <SortIcon columnKey="影线比" />
+                            </th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">
+                                价值/流量
+                            </th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">所属板块</th>
-                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">资金动向</th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">历史表现</th>
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-right">操作</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-50">
-                        {results.map((res, i) => (
+                        {sortedResults.map((res, i) => (
                             <React.Fragment key={res.代码}>
                                 <tr
                                     onClick={() => {
@@ -237,15 +257,19 @@ export default function ResultsTable({
 
                                     <td className="px-6 py-5">
                                         <div className="flex flex-col items-center gap-1">
-                                            <div className="flex items-center gap-1">
-                                                <span className="text-[10px] font-bold text-slate-300">北向</span>
-                                                <span className={cn(
-                                                    "text-[10px] font-extrabold",
-                                                    res.北向?.includes("流入") ? "text-rose-500" :
-                                                        res.北向?.includes("流出") ? "text-emerald-500" : "text-slate-400"
-                                                )}>
-                                                    {res.北向 || "---"}
-                                                </span>
+                                            <div className="flex items-center gap-2">
+                                                <div className="flex flex-col items-center cursor-pointer hover:bg-slate-50 px-1 rounded" onClick={(e) => { e.stopPropagation(); requestSort('量比'); }}>
+                                                    <span className="text-[9px] font-bold text-slate-300">量比</span>
+                                                    <span className="text-[11px] font-black text-indigo-600">{res.量比 || '---'}</span>
+                                                </div>
+                                                <div className="flex flex-col items-center cursor-pointer hover:bg-slate-50 px-1 rounded" onClick={(e) => { e.stopPropagation(); requestSort('换手率'); }}>
+                                                    <span className="text-[9px] font-bold text-slate-300">换手</span>
+                                                    <span className="text-[11px] font-black text-slate-600">{res.换手率 || '---'}%</span>
+                                                </div>
+                                                <div className="flex flex-col items-center cursor-pointer hover:bg-slate-50 px-1 rounded" onClick={(e) => { e.stopPropagation(); requestSort('PE'); }}>
+                                                    <span className="text-[9px] font-bold text-slate-300">PE</span>
+                                                    <span className="text-[11px] font-black text-slate-600">{res.PE || '---'}</span>
+                                                </div>
                                             </div>
                                         </div>
                                     </td>
