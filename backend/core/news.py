@@ -9,6 +9,23 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+def retry_on_failure(max_retries=3, delay=1):
+    """重试装饰器"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait_time = delay * (2 ** attempt)  # 指数退避
+                        print(f"⚠️ 第 {attempt + 1} 次尝试失败，{wait_time}秒后重试...")
+                        time.sleep(wait_time)
+                    else:
+                        raise e
+            return wrapper
+    return decorator
+
 class NewsItem(BaseModel):
     """新闻数据模型"""
     title: str
@@ -32,6 +49,7 @@ class NewsCrawler:
 class EastMoneyCrawler(NewsCrawler):
     """东方财富新闻爬虫"""
 
+    @retry_on_failure(max_retries=3, delay=2)
     def fetch_stock_news(self, code: str) -> List[NewsItem]:
         """抓取个股新闻
 
