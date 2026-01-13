@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { Bell, Search, User, Play, Loader2, Clock } from 'lucide-react';
+import NewsNotification from './NewsNotification';
 
 interface HeaderProps {
     onScan: () => void;
@@ -44,6 +45,8 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters }: 
                         className="pl-10 pr-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-medium w-48 focus:ring-2 focus:ring-indigo-500 transition-all outline-none"
                     />
                 </div>
+
+                <NewsNotification />
 
                 <div className="w-10 h-10 bg-slate-100 rounded-full flex items-center justify-center text-slate-500 cursor-pointer hover:bg-indigo-50 hover:text-indigo-600 transition-all">
                     <User size={20} />

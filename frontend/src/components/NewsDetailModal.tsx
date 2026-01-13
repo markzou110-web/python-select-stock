@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { X, ExternalLink, Clock, TrendingUp, AlertTriangle, Loader2 } from 'lucide-react';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
+import SentimentAnalysis from './SentimentAnalysis';
 
 interface NewsItem {
     title: string;
@@ -128,7 +129,12 @@ export default function NewsDetailModal({
                             </button>
                         </div>
                     ) : (
-                        <div className="space-y-4">
+                        <div className="space-y-6">
+                            {/* Sentiment Analysis */}
+                            <SentimentAnalysis stockCode={stockCode} stockName={stockName} />
+
+                            {/* News List */}
+                            <div className="space-y-4">
                             {/* Actions */}
                             <div className="flex items-center justify-between mb-6">
                                 <span className="text-sm text-slate-500">
@@ -183,6 +189,8 @@ export default function NewsDetailModal({
                                     </div>
                                 </div>
                             ))}
+                                </div>
+                            </div>
                         </div>
                     )}
                 </div>

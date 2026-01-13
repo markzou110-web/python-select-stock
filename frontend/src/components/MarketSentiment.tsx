@@ -1,8 +1,9 @@
 "use client";
 
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, Flame } from 'lucide-react';
+import { TrendingUp, Flame, List } from 'lucide-react';
 import api from '@/lib/api';
+import ThemeStocks from './ThemeStocks';
 
 interface Theme {
     id: number;
@@ -15,6 +16,7 @@ interface Theme {
 export default function MarketSentiment() {
     const [themes, setThemes] = useState<Theme[]>([]);
     const [loading, setLoading] = useState(true);
+    const [selectedTheme, setSelectedTheme] = useState<Theme | null>(null);
 
     useEffect(() => {
         const fetchThemes = async () => {
@@ -70,7 +72,8 @@ export default function MarketSentiment() {
                 {themes.slice(0, 10).map((theme) => (
                     <div
                         key={theme.id}
-                        className="flex-shrink-0 bg-white border border-slate-200 rounded-2xl p-4 min-w-[200px]"
+                        onClick={() => setSelectedTheme(theme)}
+                        className="flex-shrink-0 bg-white border border-slate-200 rounded-2xl p-4 min-w-[200px] cursor-pointer hover:border-indigo-300 hover:shadow-lg transition-all"
                     >
                         <div className="flex items-center justify-between mb-2">
                             <span className="font-bold text-slate-800">{theme.name}</span>
@@ -79,17 +82,32 @@ export default function MarketSentiment() {
                         <div className="text-sm text-slate-500 mb-1">
                             热度: {theme.hotness.toFixed(0)}
                         </div>
-                        <div className="text-xs text-slate-400">
+                        <div className="text-xs text-slate-400 mb-2">
                             {getStageLabel(theme.life_cycle_stage)}
                         </div>
-                        {theme.leader_stock && (
-                            <div className="mt-2 text-xs font-mono text-indigo-600">
-                                龙头: {theme.leader_stock}
-                            </div>
-                        )}
+                        <div className="flex items-center justify-between">
+                            {theme.leader_stock && (
+                                <div className="text-xs font-mono text-indigo-600">
+                                    龙头: {theme.leader_stock}
+                                </div>
+                            )}
+                            <button className="text-xs text-indigo-500 hover:text-indigo-700 font-medium flex items-center gap-1">
+                                <List size={12} />
+                                成分股
+                            </button>
+                        </div>
                     </div>
                 ))}
             </div>
+
+            {selectedTheme && (
+                <ThemeStocks
+                    isOpen={!!selectedTheme}
+                    onClose={() => setSelectedTheme(null)}
+                    themeName={selectedTheme.name}
+                    themeId={selectedTheme.id}
+                />
+            )}
         </div>
     );
 }
