@@ -42,6 +42,7 @@ from core.strategy import check_strategy, calculate_historical_win_rate
 from core.news import EastMoneyCrawler, NewsDeduplicator
 from core.db_news import init_news_tables
 from core.theme_tracker import ThemeTracker
+from core.risk_detector import RiskDetector
 
 # 全局状态跟踪
 sync_progress = {
@@ -194,10 +195,12 @@ async def startup_event():
     init_news_tables()
 
     print("🎯 Initializing theme tracker...")
-    global theme_tracker
+    print("⚠️ Initializing risk detector...")
+    global theme_tracker, risk_detector
     engine = get_db_engine()
     if engine:
         theme_tracker = ThemeTracker(engine)
+        risk_detector = RiskDetector(engine)
 
     print("🚀 Starting Intraday Sentinel...")
     # Ensure default time is in DB
@@ -217,6 +220,7 @@ async def startup_event():
 crawler = EastMoneyCrawler()
 deduplicator = NewsDeduplicator()
 theme_tracker = None  # Will be initialized after DB is ready
+risk_detector = None  # Will be initialized after DB is ready
 
 @app.get("/api/health")
 def health_check():
@@ -265,6 +269,18 @@ def get_themes(limit: int = 10):
 
         themes = theme_tracker.get_top_themes(limit=limit)
         return {"data": themes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/news/risks")
+def get_risk_events(days: int = 30):
+    """获取所有风险事件"""
+    try:
+        if risk_detector is None:
+            return {"data": []}
+
+        risks = risk_detector.get_risk_events(days=days)
+        return {"data": risks}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
