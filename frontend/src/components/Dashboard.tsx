@@ -301,7 +301,7 @@ export default function Dashboard() {
                                     </button>
                                     <div className="mx-1 h-6 w-[1px] bg-slate-200" />
                                     <button
-                                        onClick={handleExport}
+                                        onClick={() => handleExport('csv')}
                                         className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
                                     >
                                         <Download size={20} />
