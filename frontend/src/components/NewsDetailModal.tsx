@@ -189,7 +189,6 @@ export default function NewsDetailModal({
                                     </div>
                                 </div>
                             ))}
-                                </div>
                             </div>
                         </div>
                     )}
