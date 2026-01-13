@@ -1,6 +1,6 @@
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 import time
@@ -147,3 +147,25 @@ class NewsDeduplicator:
                 seen_urls.add(item.url)
                 unique_items.append(item)
         return unique_items
+
+class NewsCache:
+    """新闻缓存管理器"""
+
+    def __init__(self, ttl_seconds=300):  # 默认 5 分钟
+        self.ttl = ttl_seconds
+        self.cache = {}
+
+    def get(self, key: str):
+        """获取缓存"""
+        if key in self.cache:
+            data, timestamp = self.cache[key]
+            if datetime.now() - timestamp < timedelta(seconds=self.ttl):
+                return data
+        return None
+
+    def set(self, key: str, data):
+        """设置缓存"""
+        self.cache[key] = (data, datetime.now())
+
+# 全局缓存实例
+news_cache = NewsCache(ttl_seconds=300)

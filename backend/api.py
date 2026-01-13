@@ -39,7 +39,7 @@ from core.db import get_db_engine, init_db, load_db_config, save_scan_results, g
 from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data, get_northbound_flow
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
-from core.news import EastMoneyCrawler, NewsDeduplicator
+from core.news import EastMoneyCrawler, NewsDeduplicator, news_cache
 from core.db_news import init_news_tables
 from core.theme_tracker import ThemeTracker
 from core.risk_detector import RiskDetector
@@ -228,12 +228,18 @@ def health_check():
 
 @app.get("/api/news/stock/{code}")
 def get_stock_news(code: str):
-    """获取个股新闻
+    """获取个股新闻（带缓存）
 
     Args:
         code: 股票代码
     """
     try:
+        # 检查缓存
+        cache_key = f"news_{code}"
+        cached_data = news_cache.get(cache_key)
+        if cached_data:
+            return cached_data
+
         # 爬取新闻
         news_items = crawler.fetch_stock_news(code)
 
@@ -251,7 +257,12 @@ def get_stock_news(code: str):
             for item in unique_items
         ]
 
-        return {"data": result, "count": len(result)}
+        response = {"data": result, "count": len(result)}
+
+        # 存入缓存
+        news_cache.set(cache_key, response)
+
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
