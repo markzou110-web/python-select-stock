@@ -41,6 +41,7 @@ from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
 from core.news import EastMoneyCrawler, NewsDeduplicator
 from core.db_news import init_news_tables
+from core.theme_tracker import ThemeTracker
 
 # 全局状态跟踪
 sync_progress = {
@@ -192,6 +193,12 @@ async def startup_event():
     print("📰 Initializing news tables...")
     init_news_tables()
 
+    print("🎯 Initializing theme tracker...")
+    global theme_tracker
+    engine = get_db_engine()
+    if engine:
+        theme_tracker = ThemeTracker(engine)
+
     print("🚀 Starting Intraday Sentinel...")
     # Ensure default time is in DB
     if get_setting("sentinel_time") is None:
@@ -209,6 +216,7 @@ async def startup_event():
 # Initialize news crawler and deduplicator
 crawler = EastMoneyCrawler()
 deduplicator = NewsDeduplicator()
+theme_tracker = None  # Will be initialized after DB is ready
 
 @app.get("/api/health")
 def health_check():
@@ -247,6 +255,18 @@ def get_stock_news(code: str):
 def refresh_stock_news(code: str):
     """手动刷新个股新闻（按需抓取）"""
     return get_stock_news(code)
+
+@app.get("/api/news/themes")
+def get_themes(limit: int = 10):
+    """获取热门题材列表"""
+    try:
+        if theme_tracker is None:
+            return {"data": []}
+
+        themes = theme_tracker.get_top_themes(limit=limit)
+        return {"data": themes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/market/indices")
 def get_indices():
