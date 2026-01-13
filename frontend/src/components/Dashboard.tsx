@@ -5,6 +5,7 @@ import Header from '@/components/Header';
 import Sidebar from '@/components/Sidebar';
 import MarketCard from '@/components/MarketCard';
 import SectorGrid from '@/components/SectorGrid';
+import MarketSentiment from '@/components/MarketSentiment';
 import FilterModal from '@/components/FilterModal';
 import ResultsTable from '@/components/ResultsTable';
 import AIDeepDive from '@/components/AIDeepDive';
@@ -152,22 +153,30 @@ export default function Dashboard() {
         }
     };
 
-    const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
+    const handleExport = async (format: 'csv' | 'excel') => {
+        if (results.length === 0) {
+            alert('暂无扫描结果可导出');
+            return;
+        }
 
-    const handleExport = () => {
-        if (results.length === 0) return;
-        const headers = ["代码", "名称", "行业", "现价", "涨幅%", "综合强度", "RSI", "DIF", "BB", "粘合度", "历史胜率"];
-        const rows = results.map(r => [
-            r.代码, r.名称, r.行业, r.现价, r["涨幅%"], r.Score, r.RSI, r.DIF, r.BB, r.粘合度, r.历史胜率
-        ]);
-        const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
-        const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.setAttribute("href", url);
-        link.setAttribute("download", `AlphaVision_Results_${new Date().toLocaleDateString()}.csv`);
-        link.click();
+        try {
+            const date = selectedDate || new Date().toISOString().split('T')[0];
+            const url = `/api/scan/export?date=${date}&format=${format}`;
+
+            // 创建一个隐藏的 a 标签来触发下载
+            const link = document.createElement('a');
+            link.href = `${api.defaults.baseURL || 'http://127.0.0.1:8000'}${url}`;
+            link.download = `scan_results_${date}.${format === 'excel' ? 'xlsx' : 'csv'}`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (e) {
+            console.error("Export failed", e);
+            alert('导出失败，请检查网络连接');
+        }
     };
+
+    const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
 
     return (
         <div className="flex h-screen overflow-hidden w-full">
@@ -202,6 +211,9 @@ export default function Dashboard() {
                             {/* Hot Sectors */}
                             <SectorGrid sectors={sectors} />
 
+                            {/* Hot Themes */}
+                            <MarketSentiment />
+
                             {/* Scan Actions & Filters */}
                             <div className="flex items-center justify-between pt-4 border-t border-slate-200">
                                 <div className="flex items-center gap-4">
@@ -223,6 +235,34 @@ export default function Dashboard() {
                                         <Filter size={18} />
                                         策略参数配置
                                     </button>
+
+                                    {/* Export Buttons */}
+                                    {results.length > 0 && (
+                                        <>
+                                            <div className="h-10 w-[1px] bg-slate-200 mx-2" />
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">
+                                                    导出
+                                                </span>
+                                                <button
+                                                    onClick={() => handleExport('csv')}
+                                                    className="flex items-center gap-2 px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-xl font-bold text-emerald-600 hover:bg-emerald-100 transition-all text-sm"
+                                                    title="导出为 CSV"
+                                                >
+                                                    <Download size={16} />
+                                                    CSV
+                                                </button>
+                                                <button
+                                                    onClick={() => handleExport('excel')}
+                                                    className="flex items-center gap-2 px-3 py-2 bg-blue-50 border border-blue-200 rounded-xl font-bold text-blue-600 hover:bg-blue-100 transition-all text-sm"
+                                                    title="导出为 Excel"
+                                                >
+                                                    <Download size={16} />
+                                                    Excel
+                                                </button>
+                                            </div>
+                                        </>
+                                    )}
 
                                     {/* History Selector */}
                                     {historyDates.length > 0 && (
