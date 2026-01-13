@@ -159,6 +159,18 @@ def load_from_db(code, start_date, engine=None):
     except:
         return pd.DataFrame()
 
+def delete_scan_history_by_date(date_str, engine=None):
+    """清除指定日期的所有扫描记录"""
+    if engine is None: engine = get_db_engine()
+    if not engine: return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM scan_history WHERE date = :date"), {"date": date_str})
+            conn.commit()
+            print(f"🗑️ 数据库：已清空 {date_str} 的历史扫描记录")
+    except Exception as e:
+        print(f"❌ 数据库：清空历史失败: {e}")
+
 def save_scan_results(results, engine=None):
     """持久化保存选股结果集"""
     if engine is None: engine = get_db_engine()

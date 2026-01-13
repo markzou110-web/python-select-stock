@@ -35,7 +35,7 @@ socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 
 from pydantic import BaseModel
 
-from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates, get_setting, save_setting
+from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates, get_setting, save_setting, delete_scan_history_by_date
 from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
@@ -555,6 +555,9 @@ def run_market_scan(
         sentinel.last_top_5 = results[:5]
 
         # --- 持久化保存 ---
+        # 扫描前清空今日旧数据，防止 Bug 修复前的“幽灵记录”残留在列表里
+        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        delete_scan_history_by_date(current_date_str, engine)
         save_scan_results(results, engine)
         
         # --- JSON Compliance Sanitization ---

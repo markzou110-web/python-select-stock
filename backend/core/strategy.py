@@ -20,7 +20,7 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     
     # --- 2. 突破动作 (Close > All MAs AND Close > Open) ---
     curr_ma_max = ma_max_all.iloc[-1]
-    is_breakout = (curr['收盘'] >= curr_ma_max) and (curr['收盘'] > curr['开盘'])
+    is_breakout = (curr['收盘'] > curr_ma_max) and (curr['收盘'] > curr['开盘'])
     
     # --- 3. 趋势与量能 ---
     is_trending = curr['收盘'] > curr['EMA60']
@@ -28,16 +28,20 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     # SOP: 量比 > 1.5
     is_volume = (vol_ratio >= vol_multiplier)
     
-    # --- 5. RSI 强度 ---
-    is_rsi_ok = curr['RSI'] >= rsi_min
+    # --- 5. RSI 强度 (对齐 Pine Script: rsi > rsi_min) ---
+    is_rsi_ok = curr['RSI'] > rsi_min
     
     # --- 6. MACD 优化 (SOP: 快线 > 慢线，红柱) ---
     is_macd_ok = curr['MACD_DIF'] > curr['MACD_DEA'] if use_macd_filter else True
     
     # --- 7. 相对强度 (RS) vs 指数 ---
     is_rs_ok = True
-    if use_rs_filter and 'RS' in df.columns and 'RS_MA50' in df.columns:
-        is_rs_ok = curr['RS'] > curr['RS_MA50']
+    if use_rs_filter:
+        if 'RS' in df.columns and 'RS_MA50' in df.columns:
+            is_rs_ok = curr['RS'] > curr['RS_MA50']
+        else:
+            # 如果强制要求 RS 过滤但数据缺失，则视为不通过 (防止跳过过滤器)
+            is_rs_ok = False
     
     # --- 8. 波动率收缩 (BB) ---
     is_bb_ok = True
@@ -62,8 +66,11 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         debug_info["reason"] = "近期未现均线粘合"
         return False, debug_info
 
-    # 综合判断
-    if is_breakout and is_volume and is_rsi_ok and is_macd_ok and is_bb_ok and is_rs_ok:
+    # 综合判断 (对齐 TradeView: trend_weekly_ok and was_squeeze_recent and (close > ma_max) and (close > ema5) and vol_ok and (rsi > rsi_min) and rs_strong and macd_condition)
+    # 注意：Pine Script 中 close > ma_max 已经涵盖了突破所有均线。
+    is_ema20_ok = curr['收盘'] > curr['EMA20']
+    
+    if was_squeeze_recent and is_breakout and is_ema20_ok and is_volume and is_rsi_ok and is_macd_ok and is_bb_ok and is_rs_ok:
         pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
         
         # 计算影线比 (Upper Shadow / Body) 用于显示
