@@ -66,11 +66,19 @@ class RiskDetector:
         """
         try:
             with self.engine.connect() as conn:
+                # 先清空今日的风险事件（避免重复）
+                conn.execute(text("""
+                    DELETE FROM risk_events WHERE event_date = CURRENT_DATE
+                """))
+
                 for event in risk_events:
+                    # 如果股票代码为空，跳过
+                    if not event.get("stock_code"):
+                        continue
+
                     conn.execute(text("""
                         INSERT INTO risk_events (stock_code, risk_type, risk_level, title, description, news_url, event_date)
                         VALUES (:stock_code, :risk_type, :risk_level, :title, :description, :news_url, :event_date)
-                        ON CONFLICT (stock_code, event_date, risk_type) DO NOTHING
                     """), {
                         "stock_code": event.get("stock_code"),
                         "risk_type": event["risk_type"],
