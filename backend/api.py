@@ -36,9 +36,11 @@ socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 from pydantic import BaseModel
 
 from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates, get_setting, save_setting, delete_scan_history_by_date
-from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data
+from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data, get_northbound_flow
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
+from core.news import EastMoneyCrawler, NewsDeduplicator
+from core.db_news import init_news_tables
 
 # 全局状态跟踪
 sync_progress = {
@@ -186,7 +188,10 @@ sentinel = IntradaySentinel()
 async def startup_event():
     print("🏗️ Initializing database...")
     init_db()
-    
+
+    print("📰 Initializing news tables...")
+    init_news_tables()
+
     print("🚀 Starting Intraday Sentinel...")
     # Ensure default time is in DB
     if get_setting("sentinel_time") is None:
@@ -201,9 +206,47 @@ async def startup_event():
     loop.run_in_executor(None, get_hot_sectors)
     # sector_map 极慢且涉及大量接口调用，延迟到首次扫描时生成，不在启动时抢占带宽
 
+# Initialize news crawler and deduplicator
+crawler = EastMoneyCrawler()
+deduplicator = NewsDeduplicator()
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "time": datetime.now().isoformat()}
+
+@app.get("/api/news/stock/{code}")
+def get_stock_news(code: str):
+    """获取个股新闻
+
+    Args:
+        code: 股票代码
+    """
+    try:
+        # 爬取新闻
+        news_items = crawler.fetch_stock_news(code)
+
+        # 去重
+        unique_items = deduplicator.deduplicate_by_tfidf(news_items)
+
+        # 转换为字典
+        result = [
+            {
+                "title": item.title,
+                "source": item.source,
+                "url": item.url,
+                "publish_time": item.publish_time.isoformat()
+            }
+            for item in unique_items
+        ]
+
+        return {"data": result, "count": len(result)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/news/refresh/{code}")
+def refresh_stock_news(code: str):
+    """手动刷新个股新闻（按需抓取）"""
+    return get_stock_news(code)
 
 @app.get("/api/market/indices")
 def get_indices():
@@ -527,6 +570,33 @@ def run_market_scan(
         
         for res in results:
             res['行业'] = industry_results.get(res['代码'], "未知")
+
+        # --- 北向资金数据补充 (Northbound Money Flow) ---
+        print(f"💰 Fetching northbound flow data for {len(results)} results...")
+        northbound_map = {}
+
+        def fetch_northbound_for_stock(res_item):
+            code = res_item['代码']
+            try:
+                nb_data = get_northbound_flow(code=code, days=3)
+                return code, nb_data
+            except Exception as e:
+                return code, {'net_flow': 0, 'trend': '---', 'recent_data': []}
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_nb = {executor.submit(fetch_northbound_for_stock, res): res for res in results}
+            for future in as_completed(future_to_nb):
+                try:
+                    code, nb_data = future.result(timeout=5)
+                    northbound_map[code] = nb_data
+                except:
+                    continue
+
+        for res in results:
+            code = res['代码']
+            nb_data = northbound_map.get(code, {'net_flow': 0, 'trend': '---', 'recent_data': []})
+            res['北向'] = f"{nb_data['trend']}" if nb_data['trend'] != '---' else '---'
+            res['北向净流入'] = nb_data['net_flow']
             
         # --- SOP: 板块共振 (Sector Resonance) 计算 ---
         industry_counts = {}
@@ -883,6 +953,100 @@ def remove_paper_trade(id: int):
         return {"status": "success"}
     except:
         return {"status": "error"}
+
+@app.get("/api/scan/export")
+def export_scan_results(
+    date: str = Query(None, description="导出日期 (YYYY-MM-DD), 不指定则导出最近一次"),
+    format: str = Query("csv", description="导出格式: csv 或 excel")
+):
+    """导出扫描结果为 CSV 或 Excel 文件
+
+    Returns:
+        FileResponse: 下载文件
+    """
+    from fastapi.responses import FileResponse
+    from pathlib import Path
+
+    engine = get_db_engine()
+    if not engine:
+        raise HTTPException(status_code=500, detail="数据库连接失败")
+
+    try:
+        # 确定导出日期
+        if not date:
+            dates = get_scan_dates(engine)
+            if not dates:
+                raise HTTPException(status_code=404, detail="暂无扫描结果")
+            date = dates[0]
+
+        # 获取扫描结果
+        results = get_scan_history_by_date(date, engine)
+        if not results:
+            raise HTTPException(status_code=404, detail=f"未找到 {date} 的扫描结果")
+
+        # 转换为 DataFrame
+        df = pd.DataFrame(results)
+
+        # 选择并重命名关键列
+        column_mapping = {
+            '代码': '代码',
+            '名称': '名称',
+            '现价': '现价',
+            '涨幅%': '涨跌幅(%)',
+            '量比': '量比',
+            '换手率': '换手率(%)',
+            'PE': '市盈率',
+            'RSI': 'RSI',
+            'DIF': 'MACD_DIF',
+            'BB': '布林带宽度',
+            '粘合度': '均线粘合度',
+            'Score': '评分',
+            '行业': '行业',
+            '历史胜率': '历史胜率(%)',
+            '信号次数': '信号次数',
+            '北向': '北向资金流向',
+            '北向净流入': '北向净流入(亿)',
+            '共振': '板块共振'
+        }
+
+        # 只保留存在的列
+        export_columns = [col for col in column_mapping.keys() if col in df.columns]
+        df_export = df[export_columns].copy()
+
+        # 重命名为中文列名
+        df_export.columns = [column_mapping[col] for col in export_columns]
+
+        # 格式化数值列
+        numeric_columns = ['现价', '涨跌幅(%)', '量比', '换手率(%)', '市盈率', 'RSI', 'MACD_DIF',
+                          '布林带宽度', '均线粘合度', '评分', '北向净流入(亿)']
+        for col in numeric_columns:
+            if col in df_export.columns:
+                df_export[col] = pd.to_numeric(df_export[col], errors='coerce').round(2)
+
+        # 生成文件
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_dir = Path("/tmp")
+
+        if format.lower() == "excel":
+            filename = f"scan_results_{date}_{timestamp}.xlsx"
+            filepath = temp_dir / filename
+            df_export.to_excel(filepath, index=False, engine='openpyxl')
+        else:  # csv
+            filename = f"scan_results_{date}_{timestamp}.csv"
+            filepath = temp_dir / filename
+            df_export.to_csv(filepath, index=False, encoding='utf-8-sig')
+
+        return FileResponse(
+            path=str(filepath),
+            filename=filename,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if format.lower() == "excel" else 'text/csv'
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
 @app.get("/api/test/push")
 def test_push_notification():
