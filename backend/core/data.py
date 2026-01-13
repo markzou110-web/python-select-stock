@@ -220,7 +220,7 @@ def get_index_hist(code):
     cache_key = f'index_hist_{code}'
     cached = get_cached_data(cache_key, 86400)
     if cached is not None: return cached
-    
+
     try:
         df = ak.index_zh_a_hist(symbol=code, period="daily")
         if not df.empty:
@@ -228,3 +228,100 @@ def get_index_hist(code):
         return df
     except:
         return pd.DataFrame()
+
+def get_northbound_flow(code=None, days=3):
+    """获取北向资金流向数据
+
+    Args:
+        code: 股票代码，如果为None则返回全市场北向资金流向
+        days: 查询天数 (默认3天)
+
+    Returns:
+        dict: {
+            'net_flow': 净流入金额 (亿元),
+            'trend': '流入' or '流出',
+            'recent_data': 最近几天的数据列表
+        }
+    """
+    cache_key = f'northbound_{code if code else "market"}_{days}'
+    cached = get_cached_data(cache_key, 1800)  # 缓存30分钟
+    if cached: return cached
+
+    try:
+        # 获取个股北向资金数据
+        if code:
+            # 个股北向资金历史数据
+            for attempt in range(2):
+                try:
+                    time.sleep(random.uniform(0.3, 0.8))
+                    df = ak.stock_em_hsgt_hist_stock(symbol=code, indicator="北向")
+                    if df is not None and not df.empty:
+                        # 取最近 days 天的数据
+                        df_recent = df.head(days)
+
+                        # 计算累计净流入
+                        total_flow = df_recent['今日持股数量'].iloc[0] - df_recent['今日持股数量'].iloc[-1]
+
+                        # 判断趋势
+                        trend = '流入' if total_flow > 0 else '流出' if total_flow < 0 else '持平'
+
+                        result = {
+                            'net_flow': abs(round(total_flow, 2)),
+                            'trend': trend,
+                            'recent_data': df_recent.to_dict('records')[:3]
+                        }
+                        set_cached_data(cache_key, result)
+                        return result
+                except Exception as e:
+                    if attempt < 1:
+                        time.sleep(1)
+                        continue
+                    print(f"⚠️ Northbound data fetch failed for {code}: {e}")
+                    break
+
+            # 返回默认值
+            return {
+                'net_flow': 0,
+                'trend': '---',
+                'recent_data': []
+            }
+        else:
+            # 全市场北向资金流向 (沪深股通)
+            for attempt in range(2):
+                try:
+                    time.sleep(random.uniform(0.3, 0.8))
+                    df = ak.stock_em_hsgt_north_net_flow_in_em(symbol="北向资金净流入")
+                    if df is not None and not df.empty:
+                        df_recent = df.head(days)
+
+                        # 计算累计净流入 (亿元)
+                        total_flow = df_recent['净流入'].sum()
+
+                        trend = '流入' if total_flow > 0 else '流出' if total_flow < 0 else '持平'
+
+                        result = {
+                            'net_flow': abs(round(total_flow, 2)),
+                            'trend': trend,
+                            'recent_data': df_recent.to_dict('records')[:3]
+                        }
+                        set_cached_data(cache_key, result)
+                        return result
+                except Exception as e:
+                    if attempt < 1:
+                        time.sleep(1)
+                        continue
+                    print(f"⚠️ Market northbound flow fetch failed: {e}")
+                    break
+
+            return {
+                'net_flow': 0,
+                'trend': '---',
+                'recent_data': []
+            }
+    except Exception as e:
+        print(f"❌ Error in get_northbound_flow: {e}")
+        return {
+            'net_flow': 0,
+            'trend': '---',
+            'recent_data': []
+        }

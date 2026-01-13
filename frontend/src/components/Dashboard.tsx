@@ -6,6 +6,7 @@ import Sidebar from '@/components/Sidebar';
 import MarketCard from '@/components/MarketCard';
 import SectorGrid from '@/components/SectorGrid';
 import MarketSentiment from '@/components/MarketSentiment';
+import RiskAlert from '@/components/RiskAlert';
 import FilterModal from '@/components/FilterModal';
 import ResultsTable from '@/components/ResultsTable';
 import AIDeepDive from '@/components/AIDeepDive';
@@ -213,6 +214,9 @@ export default function Dashboard() {
 
                             {/* Hot Themes */}
                             <MarketSentiment />
+
+                            {/* Risk Alert */}
+                            <RiskAlert />
 
                             {/* Scan Actions & Filters */}
                             <div className="flex items-center justify-between pt-4 border-t border-slate-200">

@@ -14,11 +14,13 @@ import {
     Lock,
     Calendar,
     Plus,
-    Calculator as CalcIcon
+    Calculator as CalcIcon,
+    Newspaper
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import KLineChart from './KLineChart';
 import PositionSizer from './PositionSizer';
+import NewsDetailModal from './NewsDetailModal';
 import api from '@/lib/api';
 
 interface Result {
@@ -54,6 +56,7 @@ export default function ResultsTable({
 }) {
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
     const [sizingStock, setSizingStock] = useState<Result | null>(null);
+    const [newsStock, setNewsStock] = useState<Result | null>(null);
     const [sortConfig, setSortConfig] = useState<{ key: keyof Result; direction: 'asc' | 'desc' } | null>(null);
 
     if (results.length === 0) return null;
@@ -287,6 +290,13 @@ export default function ResultsTable({
                                     <td className="px-8 py-5 text-right">
                                         <div className="flex items-center justify-end gap-2">
                                             <button
+                                                onClick={(e) => { e.stopPropagation(); setNewsStock(res); }}
+                                                className="p-2 text-slate-400 hover:text-orange-600 hover:bg-orange-50 rounded-xl transition-all"
+                                                title="相关新闻"
+                                            >
+                                                <Newspaper size={18} />
+                                            </button>
+                                            <button
                                                 onClick={(e) => { e.stopPropagation(); setSizingStock(res); }}
                                                 className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
                                                 title="仓位计算"
@@ -368,6 +378,15 @@ export default function ResultsTable({
                 <PositionSizer
                     stock={sizingStock}
                     onClose={() => setSizingStock(null)}
+                />
+            )}
+
+            {newsStock && (
+                <NewsDetailModal
+                    isOpen={!!newsStock}
+                    onClose={() => setNewsStock(null)}
+                    stockCode={newsStock.代码}
+                    stockName={newsStock.名称}
                 />
             )}
         </div>
