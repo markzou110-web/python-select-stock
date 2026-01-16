@@ -93,6 +93,7 @@ The strategy is documented in `Stock_Strategy.md`. Key principles:
 - Volume breakout (volume ratio > 1.5-2.0)
 - MACD golden cross (fast line > slow line, red bar)
 - RSI > 55
+- **Money Flow Filter (optional)**: Main capital inflow > 0 or same-day inflow > 10 million (新增)
 
 **Phase 2: Visual Validation**
 - Sector resonance (prefer 2-3 stocks from same industry)
@@ -114,7 +115,10 @@ The strategy is documented in `Stock_Strategy.md`. Key principles:
 - `GET /api/market/indices` - Market indices (Shanghai, Shenzhen, ChiNext)
 - `GET /api/market/sectors` - Sector performance ranking
 - `GET /api/market/snapshot` - Real-time market overview
-- `GET /api/scan` - Execute market scan with filters (code, sector, min_score, min_volume)
+- `GET /api/scan` - Execute market scan with filters
+  - 参数: code, sector, min_score, min_volume, use_money_flow (新增), money_flow_days (新增)
+  - use_money_flow: 是否启用资金流过滤（默认 false）
+  - money_flow_days: 资金流统计天数（默认 3）
 - `GET /api/scan/history` - Get historical scan results by date
 - `POST /api/sync` - Trigger data synchronization
 - `GET /api/sync/status` - Get sync progress
