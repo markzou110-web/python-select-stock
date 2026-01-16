@@ -213,3 +213,50 @@ def sync_stock_money_flow(code: str, engine=None) -> bool:
     except Exception as e:
         print(f"❌ 同步 {code} 资金流数据失败: {e}")
         return False
+
+
+def ensure_money_flow_available(code: str, days: int = 5) -> bool:
+    """
+    确保指定股票的资金流数据可用
+
+    如果数据缺失或过期（> 24 小时），触发快速同步（最近 N 天）
+
+    Args:
+        code: 股票代码
+        days: 同步天数
+
+    Returns:
+        bool: 是否数据可用
+    """
+    engine = get_db_engine()
+    if not engine:
+        return False
+
+    try:
+        # 检查数据库中最新的资金流数据日期
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                f"SELECT MAX(date) FROM money_flow_daily WHERE code='{code}'"
+            ))
+            last_date = result.fetchone()[0]
+
+        # 判断是否需要同步
+        need_sync = False
+        if last_date is None:
+            # 无历史数据，需要同步
+            need_sync = True
+            print(f"🔄 {code} 无资金流历史数据")
+        else:
+            days_diff = (datetime.now().date() - last_date).days
+            if days_diff > 1:  # 超过 1 天未更新
+                need_sync = True
+                print(f"🔄 {code} 资金流数据过期 ({days_diff} 天前)")
+
+        if need_sync:
+            sync_stock_money_flow(code, engine)
+
+        return True
+
+    except Exception as e:
+        print(f"❌ 检查 {code} 资金流数据状态失败: {e}")
+        return False
