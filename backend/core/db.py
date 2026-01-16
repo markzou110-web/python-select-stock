@@ -116,6 +116,17 @@ def init_db(engine=None):
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS vol_ratio FLOAT;"))
             except:
                 pass
+
+            # 资金流向字段扩展：daily_k 表
+            try:
+                conn.execute(text("ALTER TABLE daily_k ADD COLUMN IF NOT EXISTS main_net_inflow NUMERIC(15, 2);"))
+                conn.execute(text("ALTER TABLE daily_k ADD COLUMN IF NOT EXISTS super_large_net NUMERIC(15, 2);"))
+                conn.execute(text("ALTER TABLE daily_k ADD COLUMN IF NOT EXISTS large_net NUMERIC(15, 2);"))
+                conn.execute(text("ALTER TABLE daily_k ADD COLUMN IF NOT EXISTS medium_net NUMERIC(15, 2);"))
+                conn.execute(text("ALTER TABLE daily_k ADD COLUMN IF NOT EXISTS small_net NUMERIC(15, 2);"))
+                print("✅ daily_k 表资金流字段扩展完成")
+            except Exception as e:
+                print(f"⚠️ daily_k 表资金流字段扩展失败: {e}")
             conn.commit()
     except Exception as e:
         print(f"Database init failed: {e}")
