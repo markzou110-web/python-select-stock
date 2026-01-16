@@ -107,6 +107,28 @@ def init_db(engine=None):
                     value TEXT
                 );
             '''))
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS money_flow_daily (
+                    id SERIAL PRIMARY KEY,
+                    code VARCHAR(10),
+                    date DATE,
+                    main_net_inflow NUMERIC(15, 2),
+                    super_large_net NUMERIC(15, 2),
+                    large_net NUMERIC(15, 2),
+                    medium_net NUMERIC(15, 2),
+                    small_net NUMERIC(15, 2),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(code, date)
+                );
+            '''))
+            conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_money_flow_code_date
+                ON money_flow_daily(code, date);
+            '''))
+            conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_money_flow_date
+                ON money_flow_daily(date);
+            '''))
             # 兼容性迁移：确保新列存在
             try:
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
