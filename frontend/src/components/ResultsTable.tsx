@@ -42,6 +42,7 @@ interface Result {
     PE?: number;
     换手率?: number;
     量比?: number;
+    主力净流入?: number;
     warnings?: string[];
     is_signal?: boolean;
 }
@@ -189,6 +190,9 @@ export default function ResultsTable({
                             </th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center cursor-pointer hover:bg-slate-100" onClick={() => requestSort('历史胜率')}>
                                 历史表现 <SortIcon columnKey="历史胜率" />
+                            </th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-emerald-600 uppercase tracking-widest text-center cursor-pointer hover:bg-slate-100" onClick={() => requestSort('主力净流入')}>
+                                资金流 <SortIcon columnKey="主力净流入" />
                             </th>
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-right">操作</th>
                         </tr>
@@ -394,6 +398,20 @@ function StockRow({
                         <span className="text-sm font-black italic">{res.历史胜率}</span>
                         <span className="text-[9px] font-bold text-slate-400 tracking-tighter">({res.信号次数} 次信号)</span>
                     </div>
+                </td>
+
+                <td className="px-6 py-5 text-center">
+                    {res.主力净流入 !== undefined && res.主力净流入 !== null ? (
+                        <div className={cn(
+                            "flex flex-col items-center gap-1 font-black text-sm",
+                            res.主力净流入 > 0 ? "text-red-500" : res.主力净流入 < 0 ? "text-green-500" : "text-slate-400"
+                        )}>
+                            <span className="text-base">{res.主力净流入 > 0 ? '+' : ''}{(res.主力净流入 / 10000).toFixed(2)}亿</span>
+                            <span className="text-[9px] font-normal opacity-75">近3日</span>
+                        </div>
+                    ) : (
+                        <span className="text-slate-300 text-sm">—</span>
+                    )}
                 </td>
 
                 <td className="px-8 py-5 text-right">
