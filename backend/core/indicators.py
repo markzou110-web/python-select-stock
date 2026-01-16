@@ -18,11 +18,17 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     for p in periods:
         df[f'EMA{p}'] = df['收盘'].ewm(span=p, adjust=False).mean()
     
-    # RSI (14)
+    # RSI (14) - 对齐 TradeView ta.rsi (Wilder's Smoothing / RMA)
+    # Wilder's Smoothing 等价于 alpha = 1 / length 的 EWM
     delta = df['收盘'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    gain = (delta.where(delta > 0, 0))
+    loss = (-delta.where(delta < 0, 0))
+    
+    # 使用 RMA 公式 (alpha=1/14) 对齐 TV
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
     # MACD

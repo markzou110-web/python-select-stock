@@ -424,14 +424,18 @@ def run_market_scan(
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
     use_macd_filter: bool = True,
-    use_bb_sqz: bool = True,
+    use_bb_sqz: bool = False,
     sqz_lookback: int = 10,
     use_weekly: bool = True,
     market_range: str = "全市场(除科创)",
     turnover_min: float = 3.0,
     mkt_cap_min: float = 0.0,
     use_rs_filter: bool = True,
-    local_only: bool = True
+    local_only: bool = True,
+    strategy: str = "Resonance",
+    rf_period: int = 100,
+    rf_multiplier: float = 3.0,
+    only_signals: bool = False
 ):
     """Internal core scanning logic"""
     try:
@@ -556,11 +560,13 @@ def run_market_scan(
             future_to_stock = {
                 executor.submit(
                     single_stock_task, 
-                row['code'], row['name'], row['price'], row['vol'], row['open'],
-                threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
-                pe=row.get('pe', 0), turnover=row.get('turnover', 0),
-                local_only=local_only, engine=engine
-            ): row for _, row in candidates.iterrows()
+                    row['code'], row['name'], row['price'], row['vol'], row['open'],
+                    threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
+                    pe=row.get('pe', 0), turnover=row.get('turnover', 0),
+                    local_only=local_only, engine=engine,
+                    strategy=strategy, rf_period=rf_period, rf_multiplier=rf_multiplier,
+                    only_signals=only_signals
+                ): row for _, row in candidates.iterrows()
             }
             
             fail_reasons = {}
@@ -581,8 +587,12 @@ def run_market_scan(
         
         print(f"✅ Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
         
+        # 过滤出“买点”信号
+        if only_signals:
+            results = [r for r in results if r.get('is_signal') == True]
+
         # 排序并取 Top 30
-        results = sorted(results, key=lambda x: x['Score'], reverse=True)[:30]
+        results = sorted(results, key=lambda x: x.get('Score', 0), reverse=True)[:30]
         
         # 补充增强数据 (行业, 胜率)
         from core.data import get_sector_map
@@ -687,7 +697,7 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None, strategy="Resonance", rf_period=100, rf_multiplier=3.0, only_signals=False):
     from core.db import load_from_db
     import akshare as ak
     
@@ -720,28 +730,61 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 return {"reason": f"接口请求失败: {str(e)}"}
             
     if df.empty or len(df) < 120: 
-        print(f"⚠️ [{code}] Insufficient data ({len(df)})")
-        return None
+        return {"reason": f"历史数据不足({len(df)})"}
     
     try:
         df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price)
-        match, stats = check_strategy(
-            df, 
-            threshold=threshold, 
-            vol_multiplier=vol_multiplier, 
-            rsi_min=rsi_min, 
-            use_macd_filter=use_macd_filter, 
-            use_bb_sqz=use_bb_sqz, 
-            sqz_lookback=sqz_lookback, 
-            use_rs_filter=use_rs_filter
-        )
+        
+        if strategy == "Combined":
+            from core.strategy import check_range_filter_strategy, check_strategy
+            rf_match, rf_stats = check_range_filter_strategy(
+                df, period=rf_period, multiplier=rf_multiplier, rsi_min=rsi_min
+            )
+            res_match, res_stats = check_strategy(
+                df, threshold=threshold, vol_multiplier=vol_multiplier, rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter, use_bb_sqz=use_bb_sqz, 
+                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter
+            )
+            
+            match = rf_match and res_match
+            if match:
+                stats = res_stats.copy()
+                stats.update(rf_stats)
+                # 综合评分：取两者平均
+                stats['Score'] = round((res_stats['Score'] + rf_stats['Score']) / 2, 2)
+            else:
+                # 如果没全匹配，合并失败原因
+                reasons = []
+                if not res_match: reasons.append(res_stats.get('reason', 'Resonance未放量/粘合'))
+                if not rf_match: reasons.append(rf_stats.get('reason', 'RF未上穿'))
+                stats = {"reason": " & ".join(reasons)}
+        elif strategy == "Range Filter":
+            from core.strategy import check_range_filter_strategy
+            match, stats = check_range_filter_strategy(
+                df, 
+                period=rf_period, 
+                multiplier=rf_multiplier, 
+                rsi_min=rsi_min
+            )
+        else:
+            match, stats = check_strategy(
+                df, 
+                threshold=threshold, 
+                vol_multiplier=vol_multiplier, 
+                rsi_min=rsi_min, 
+                use_macd_filter=use_macd_filter, 
+                use_bb_sqz=use_bb_sqz, 
+                sqz_lookback=sqz_lookback, 
+                use_rs_filter=use_rs_filter
+            )
         
         if match:
             print(f"✨ [{code}] Resonance Match!")
             if use_weekly:
                 if not get_weekly_indicators(code, df=df, local_only=local_only): 
                     print(f"⏩ [{code}] Weekly trend failed")
-                    return {"reason": "周线趋势未走好"}
+                    stats['is_signal'] = False
+                    return stats # 返回包含失败原因的字典
             
             # 增加胜率和其他指标
             wr, sig_count = calculate_historical_win_rate(df)
@@ -762,15 +805,17 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             # 最后兜底：清理 stats 中可能存在的 NaN/Inf
             for k, v in stats.items():
                 stats[k] = sanitize_float(v)
-                
+            
+            stats['is_signal'] = True # Mark as a signal
             return stats
         else:
+            stats['is_signal'] = False # Mark as not a signal
             return stats # 返回包含失败原因的字典
     except Exception as e:
         print(f"❌ [{code}] Analysis error: {e}")
-        return {"reason": f"分析异常: {str(e)}"}
+        return {"reason": f"分析异常: {str(e)}", "is_signal": False}
     
-    return {"reason": "未知错误"}
+    return {"reason": "未知错误", "is_signal": False}
 
 @app.get("/api/stock/{code}/kline")
 async def get_stock_kline(code: str, local_only: bool = False):
@@ -927,21 +972,73 @@ def scan_market(
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
     use_macd_filter: bool = True,
-    use_bb_sqz: bool = True,
+    use_bb_sqz: bool = False,
     sqz_lookback: int = 10,
     use_weekly: bool = True,
     market_range: str = "全市场(除科创)",
     turnover_min: float = 3.0,
     mkt_cap_min: float = 0.0,
     use_rs_filter: bool = True,
-    local_only: bool = True
+    local_only: bool = True,
+    strategy: str = "Resonance",
+    rf_period: int = 100,
+    rf_multiplier: float = 3.0,
+    only_signals: bool = False
 ):
     """API Endpoint for market scan"""
     return run_market_scan(
         threshold, vol_multiplier, rsi_min, use_macd_filter, 
         use_bb_sqz, sqz_lookback, use_weekly, market_range, 
-        turnover_min, mkt_cap_min, use_rs_filter, local_only
+        turnover_min, mkt_cap_min, use_rs_filter, local_only,
+        strategy, rf_period, rf_multiplier, only_signals
     )
+
+@app.post("/api/scan")
+def scan_market_post(data: dict):
+    """API Endpoint for market scan (POST version to handle more parameters)"""
+    try:
+        threshold = data.get('threshold', 0.12)
+        vol_multiplier = data.get('vol_multiplier', 1.5)
+        rsi_min = data.get('rsi_min', 55)
+        use_macd_filter = data.get('use_macd_filter', True)
+        use_bb_sqz = data.get('use_bb_sqz', False)
+        sqz_lookback = data.get('sqz_lookback', 10)
+        use_weekly = data.get('use_weekly', True)
+        market_range = data.get('market_range', "全市场(除科创)")
+        turnover_min = data.get('turnover_min', 3.0)
+        mkt_cap_min = data.get('mkt_cap_min', 0.0)
+        use_rs_filter = data.get('use_rs_filter', True)
+        local_only = data.get('local_only', True)
+        strategy = data.get('strategy', 'Resonance')
+        rf_period = int(data.get('rf_period', 100))
+        rf_multiplier = float(data.get('rf_multiplier', 3.0))
+        only_signals = data.get('only_signals', False)
+
+        results = run_market_scan(
+            threshold=threshold,
+            vol_multiplier=vol_multiplier,
+            rsi_min=rsi_min,
+            use_macd_filter=use_macd_filter,
+            use_bb_sqz=use_bb_sqz,
+            sqz_lookback=sqz_lookback,
+            use_weekly=use_weekly,
+            market_range=market_range,
+            turnover_min=turnover_min,
+            mkt_cap_min=mkt_cap_min,
+            use_rs_filter=use_rs_filter,
+            local_only=local_only,
+            strategy=strategy,
+            rf_period=rf_period,
+            rf_multiplier=rf_multiplier,
+            only_signals=only_signals
+        )
+        return sanitize_recursive(results)
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/settings")
 def get_settings_api():

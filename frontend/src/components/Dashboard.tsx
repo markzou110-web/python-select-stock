@@ -40,7 +40,11 @@ export default function Dashboard() {
         turnover_min: 3.0,
         mkt_cap_min: 0,
         use_rs_filter: true,
-        local_only: true
+        local_only: true,
+        strategy: "Resonance",
+        rf_period: 100,
+        rf_multiplier: 3.0,
+        only_signals: false
     });
 
     const [historyDates, setHistoryDates] = useState<string[]>([]);

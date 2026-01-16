@@ -11,7 +11,7 @@ export const marketApi = {
     checkHealth: () => api.get('/api/health'),
     getIndices: () => api.get('/api/market/indices'),
     getSectors: () => api.get('/api/market/sectors'),
-    scanMarket: (params: any) => api.get('/api/scan', { params }),
+    scanMarket: (params: any) => api.post('/api/scan', params),
 };
 
 export default api;
