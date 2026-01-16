@@ -1,8 +1,14 @@
 import pandas as pd
 import numpy as np
+from .money_flow import get_individual_fund_flow, calculate_money_flow_score
 
-def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10, use_rs_filter=True):
-    """执行无门问禅：A股均线粘合战法 (Pine Script v5.0 Alignment)"""
+def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10, use_rs_filter=True, use_money_flow_filter=False, money_flow_days=3):
+    """执行无门问禅：A股均线粘合战法 (Pine Script v5.0 Alignment)
+
+    新增参数:
+    - use_money_flow_filter: 是否启用资金流过滤（默认 False 保持向后兼容）
+    - money_flow_days: 资金流统计天数（默认 3 日）
+    """
     if len(df) < 120: return False, {"reason": f"历史数据不足 ({len(df)}天)"}
 
     curr = df.iloc[-1]
@@ -49,6 +55,35 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         bb_quantile_20 = df['BB_Width'].iloc[-120:].quantile(0.2)
         is_bb_ok = curr['BB_Width'] <= bb_quantile_20
 
+    # --- 9. 资金流向过滤 (新增) ---
+    is_money_flow_ok = True
+    recent_main_flow = 0
+
+    if use_money_flow_filter:
+        code = df.iloc[-1].get('code', '')
+
+        # 优先从 DataFrame 中读取（如果已包含资金流数据）
+        if 'main_net_inflow' in df.columns:
+            recent_main_flow = df['main_net_inflow'].iloc[-money_flow_days:].sum()
+            curr_main_flow = df['main_net_inflow'].iloc[-1]
+
+            # 判断条件：
+            # 1. 最近 N 日主力净流入为正，或
+            # 2. 当日主力大幅流入（> 1000 万元）
+            is_money_flow_ok = (recent_main_flow > 0) or (curr_main_flow > 1000)
+        else:
+            # 如果 DataFrame 中无资金流数据，尝试从数据库获取
+            if code:
+                df_flow = get_individual_fund_flow(code, days=money_flow_days)
+                if not df_flow.empty:
+                    recent_main_flow = df_flow['main_net_inflow'].sum()
+                    is_money_flow_ok = (recent_main_flow > 0)
+                else:
+                    # 无数据时不通过
+                    is_money_flow_ok = False
+            else:
+                is_money_flow_ok = False
+
     debug_info = {
         "squeeze": round(sqz_ratios.iloc[-1], 4),
         "vol_ratio": round(vol_ratio, 2),
@@ -59,7 +94,9 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         "is_macd_ok": is_macd_ok,
         "is_bb_ok": is_bb_ok,
         "was_sqz_recent": was_squeeze_recent,
-        "is_rs_ok": is_rs_ok
+        "is_rs_ok": is_rs_ok,
+        "is_money_flow_ok": is_money_flow_ok,
+        "main_flow_3d": round(recent_main_flow, 2) if use_money_flow_filter else 0
     }
 
     if not was_squeeze_recent:
@@ -75,7 +112,7 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     was_breakout = (prev['收盘'] > ma_max_all.iloc[-2])
     is_signal = is_breakout and not was_breakout
 
-    if was_squeeze_recent and is_breakout and is_ema20_ok and is_volume and is_rsi_ok and is_macd_ok and is_bb_ok and is_rs_ok:
+    if was_squeeze_recent and is_breakout and is_ema20_ok and is_volume and is_rsi_ok and is_macd_ok and is_bb_ok and is_rs_ok and is_money_flow_ok:
         pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
         
         # 计算影线比 (Upper Shadow / Body) 用于显示
@@ -83,8 +120,28 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         upper_shadow = curr['最高'] - max(curr['收盘'], curr['开盘'])
         shadow_ratio = round(upper_shadow / body, 2) if body > 0 else 0
         
-        # SOP 评分权重调整：量能(40%) + 粘合(40%) + RSI(20%)
-        score = (vol_ratio * 25) + ((threshold - sqz_ratios.iloc[-1]) * 100 * 50) + (curr['RSI'] * 0.4)
+        # SOP 评分权重调整：启用资金流时使用新权重
+        flow_score = 0
+        if use_money_flow_filter:
+            # 新权重：量能(20%) + 粘合(40%) + RSI(20%) + 资金流(20%)
+            if 'main_net_inflow' in df.columns:
+                recent_flow_for_score = df['main_net_inflow'].iloc[-money_flow_days:].sum()
+            else:
+                code = curr.get('code', '')
+                if code:
+                    df_flow = get_individual_fund_flow(code, days=money_flow_days)
+                    recent_flow_for_score = df_flow['main_net_inflow'].sum() if not df_flow.empty else 0
+                else:
+                    recent_flow_for_score = 0
+
+            flow_score = calculate_money_flow_score(
+                pd.DataFrame({'main_net_inflow': [recent_flow_for_score]})
+            )
+            score = (vol_ratio * 20) + ((threshold - sqz_ratios.iloc[-1]) * 100 * 40) + (curr['RSI'] * 0.20) + flow_score
+        else:
+            # 原始权重：量能(25%) + 粘合(50%) + RSI(25%)
+            score = (vol_ratio * 25) + ((threshold - sqz_ratios.iloc[-1]) * 100 * 50) + (curr['RSI'] * 0.25)
+
         return True, {
             "Score": round(score, 2),
             "涨幅%": round(pct_change, 2),
@@ -96,9 +153,9 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
             "DIF": round(curr['MACD_DIF'], 3),
             "BB": round(curr['BB_Width'], 4),
             "影线比": shadow_ratio,
-            "is_signal": is_signal
+            "主力净流入": round(recent_main_flow, 2) if use_money_flow_filter else None
         }
-    
+
     # 详细失败原因 (SOP 术语)
     reasons = []
     if not is_breakout: reasons.append("未突破均线簇")
@@ -107,6 +164,7 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     if not is_macd_ok: reasons.append("MACD未金叉")
     if not is_bb_ok: reasons.append("布林带未收缩")
     if not is_rs_ok: reasons.append("弱于大盘(RS)")
+    if use_money_flow_filter and not is_money_flow_ok: reasons.append("主力资金流出")
     
     debug_info["reason"] = ",".join(reasons) if reasons else "多因子未共振"
     return False, debug_info
