@@ -435,9 +435,16 @@ def run_market_scan(
     strategy: str = "Resonance",
     rf_period: int = 100,
     rf_multiplier: float = 3.0,
-    only_signals: bool = False
+    only_signals: bool = False,
+    use_money_flow: bool = False,
+    money_flow_days: int = 3
 ):
-    """Internal core scanning logic"""
+    """Internal core scanning logic
+
+    新增参数:
+    - use_money_flow: 是否启用资金流向过滤
+    - money_flow_days: 资金流统计天数
+    """
     try:
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
@@ -742,8 +749,9 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             )
             res_match, res_stats = check_strategy(
                 df, threshold=threshold, vol_multiplier=vol_multiplier, rsi_min=rsi_min,
-                use_macd_filter=use_macd_filter, use_bb_sqz=use_bb_sqz, 
-                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter
+                use_macd_filter=use_macd_filter, use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter,
+                use_money_flow_filter=use_money_flow, money_flow_days=money_flow_days
             )
             
             match = rf_match and res_match
@@ -768,14 +776,16 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             )
         else:
             match, stats = check_strategy(
-                df, 
-                threshold=threshold, 
-                vol_multiplier=vol_multiplier, 
-                rsi_min=rsi_min, 
-                use_macd_filter=use_macd_filter, 
-                use_bb_sqz=use_bb_sqz, 
-                sqz_lookback=sqz_lookback, 
-                use_rs_filter=use_rs_filter
+                df,
+                threshold=threshold,
+                vol_multiplier=vol_multiplier,
+                rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter,
+                use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback,
+                use_rs_filter=use_rs_filter,
+                use_money_flow_filter=use_money_flow,
+                money_flow_days=money_flow_days
             )
         
         if match:
@@ -983,14 +993,22 @@ def scan_market(
     strategy: str = "Resonance",
     rf_period: int = 100,
     rf_multiplier: float = 3.0,
-    only_signals: bool = False
+    only_signals: bool = False,
+    use_money_flow: bool = False,
+    money_flow_days: int = 3
 ):
-    """API Endpoint for market scan"""
+    """API Endpoint for market scan
+
+    新增参数:
+    - use_money_flow: 是否启用资金流向过滤（默认 False）
+    - money_flow_days: 资金流统计天数（默认 3）
+    """
     return run_market_scan(
-        threshold, vol_multiplier, rsi_min, use_macd_filter, 
-        use_bb_sqz, sqz_lookback, use_weekly, market_range, 
+        threshold, vol_multiplier, rsi_min, use_macd_filter,
+        use_bb_sqz, sqz_lookback, use_weekly, market_range,
         turnover_min, mkt_cap_min, use_rs_filter, local_only,
-        strategy, rf_period, rf_multiplier, only_signals
+        strategy, rf_period, rf_multiplier, only_signals,
+        use_money_flow, money_flow_days
     )
 
 @app.post("/api/scan")
