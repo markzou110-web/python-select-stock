@@ -35,18 +35,10 @@ export default function ThemeStocks({ isOpen, onClose, themeName, themeId }: The
     const fetchThemeStocks = async () => {
         try {
             setLoading(true);
-            // TODO: 调用后端 API 获取题材成分股
-            // const res = await api.get(`/api/news/themes/${themeId}/stocks`);
-            // setStocks(res.data);
-
-            // 模拟数据
-            setStocks([
-                { code: '300750', name: '宁德时代', price: 185.50, change_pct: 3.2, volume: 1500000000, relevance: 0.95 },
-                { code: '688981', name: '中芯国际', price: 52.30, change_pct: -1.2, volume: 890000000, relevance: 0.88 },
-                { code: '603259', name: '药明康德', price: 78.90, change_pct: 1.5, volume: 650000000, relevance: 0.82 },
-                { code: '002594', name: '比亚迪', price: 258.40, change_pct: 2.8, volume: 2100000000, relevance: 0.78 },
-                { code: '300015', name: '爱尔眼科', price: 15.80, change_pct: -0.5, volume: 450000000, relevance: 0.75 },
-            ]);
+            const res = await api.get(`/api/news/themes/${themeId}/stocks`);
+            if (res.data && res.data.data) {
+                setStocks(res.data.data);
+            }
         } catch (e) {
             console.error("Failed to fetch theme stocks", e);
         } finally {

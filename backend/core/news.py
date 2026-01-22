@@ -23,7 +23,7 @@ def retry_on_failure(max_retries=3, delay=1):
                         time.sleep(wait_time)
                     else:
                         raise e
-            return wrapper
+        return wrapper
     return decorator
 
 class NewsItem(BaseModel):
@@ -39,7 +39,7 @@ class NewsCrawler:
 
     def __init__(self):
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
 
     def _random_delay(self):
@@ -51,62 +51,175 @@ class EastMoneyCrawler(NewsCrawler):
 
     @retry_on_failure(max_retries=3, delay=2)
     def fetch_stock_news(self, code: str) -> List[NewsItem]:
-        """抓取个股新闻
-
-        Args:
-            code: 股票代码（如 600519）
-        """
+        """抓取个股新闻"""
         self._random_delay()
-
-        url = f"http://finance.eastmoney.com/a/{code}.html"
-
+        # 修复：使用正确的东方财富个股新闻URL格式
+        # 格式：http://finance.eastmoney.com/a/cnazdd.html - 全市场
+        # 个股：http://emweb.eastmoney.com/news_f10_stk.aspx?code=SH600519
+        # 使用更简单的方案：从全局新闻中筛选
         try:
-            response = requests.get(url, headers=self.headers, timeout=10)
-            response.encoding = 'utf-8'
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # 方案：从全局新闻中通过代码筛选
+            global_news = self.fetch_global_news()
+            stock_news = []
 
-            news_items = []
+            # 获取股票名称（如果可用）
+            from .db import get_db_engine
+            from sqlalchemy import text
+            stock_name = None
+            try:
+                engine = get_db_engine()
+                if engine:
+                    with engine.connect() as conn:
+                        result = conn.execute(text("SELECT name FROM stock_basic WHERE code = :code"), {"code": code})
+                        row = result.fetchone()
+                        if row:
+                            stock_name = row[0]
+            except:
+                pass
 
-            # 东方财富新闻列表通常在特定的 div 或 ul 中
-            news_list = soup.find_all('div', class_='news_content')
+            # 筛选包含该股票代码或名称的新闻
+            for item in global_news:
+                title = item.title
+                # 检查是否包含6位代码
+                import re
+                if code in title or (stock_name and stock_name in title):
+                    stock_news.append(item)
 
-            for item in news_list[:20]:  # 限制最多抓取 20 条
-                try:
-                    title_elem = item.find('a')
-                    if not title_elem:
-                        continue
-
-                    title = title_elem.get_text(strip=True)
-                    url = title_elem.get('href', '')
-
-                    if not title or not url:
-                        continue
-
-                    # 提取时间
-                    time_elem = item.find('span', class_='time')
-                    publish_time = datetime.now()
-                    if time_elem:
-                        time_str = time_elem.get_text(strip=True)
-                        # 解析时间字符串（如 "2025-01-13 10:30"）
-                        # 简化版：直接用当前时间
-
-                    news_item = NewsItem(
-                        title=title,
-                        source='eastmoney',
-                        url=url,
-                        publish_time=publish_time
-                    )
-                    news_items.append(news_item)
-
-                except Exception as e:
-                    print(f"⚠️ 解析新闻失败: {e}")
-                    continue
-
-            return news_items
+            return stock_news[:20]
 
         except Exception as e:
             print(f"❌ 东方财富爬虫错误: {e}")
             return []
+
+    @retry_on_failure(max_retries=3, delay=2)
+    def fetch_global_news(self) -> List[NewsItem]:
+        """抓取市场滚动新闻列表"""
+        self._random_delay()
+        # 使用更稳健的财经导读汇总页
+        url = "http://finance.eastmoney.com/a/ccjdd.html"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            response.encoding = 'utf-8'
+            if response.status_code != 200:
+                print(f"⚠️ EastMoney returns status {response.status_code}")
+                return []
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            news_items = []
+            
+            # 使用更通用的链接提取方式，寻找包含 /a/ 和数字 ID 的正文链接
+            links = soup.find_all('a')
+            seen_urls = set()
+            
+            for a in links:
+                href = a.get('href', '')
+                title = a.get_text(strip=True)
+                
+                # 过滤条件：有标题，链接包含 /a/，链接以 .html 结尾
+                if title and len(title) > 8 and '/a/' in href and href.endswith('.html'):
+                    if href in seen_urls: continue
+                    seen_urls.add(href)
+                    
+                    full_url = href if href.startswith('http') else f"https:{href}"
+                    
+                    news_items.append(NewsItem(
+                        title=title,
+                        source='eastmoney',
+                        url=full_url,
+                        publish_time=datetime.now()
+                    ))
+                
+                if len(news_items) >= 60: break
+                
+            return news_items
+        except Exception as e:
+            print(f"❌ Global news fetch failed: {e}")
+            return []
+
+def save_news_items(engine, news_items: List[NewsItem]):
+    """将新闻存入数据库 news_raw 表，并自动关联股票"""
+    from sqlalchemy import text
+    if not engine or not news_items: return
+    
+    associator = NewsStockAssociator(engine)
+    
+    try:
+        with engine.connect() as conn:
+            for item in news_items:
+                # 1. 保存新闻
+                res = conn.execute(text("""
+                    INSERT INTO news_raw (title, source, url, publish_time)
+                    VALUES (:title, :source, :url, :publish_time)
+                    ON CONFLICT (url) DO UPDATE SET title = EXCLUDED.title
+                    RETURNING id
+                """), {
+                    "title": item.title,
+                    "source": item.source,
+                    "url": item.url,
+                    "publish_time": item.publish_time
+                })
+                news_id = res.fetchone()[0]
+                
+                # 2. 关联股票
+                stock_codes = associator.associate(item.title)
+                for code in stock_codes:
+                    conn.execute(text("""
+                        INSERT INTO news_stocks (news_id, stock_code, relevance)
+                        VALUES (:news_id, :stock_code, 1.0)
+                        ON CONFLICT (news_id, stock_code) DO NOTHING
+                    """), {"news_id": news_id, "stock_code": code})
+            
+            conn.commit()
+    except Exception as e:
+        print(f"❌ Save news and associate stocks failed: {e}")
+
+class NewsStockAssociator:
+    """新闻-股票自动关联器"""
+    
+    _stock_list_cache = None
+    _last_cache_time = 0
+
+    def __init__(self, engine):
+        self.engine = engine
+        self._refresh_stock_list()
+
+    def _refresh_stock_list(self):
+        """从数据库加载股票列表（名称和代码）"""
+        now = time.time()
+        if NewsStockAssociator._stock_list_cache and (now - NewsStockAssociator._last_cache_time < 3600):
+            return
+            
+        try:
+            from sqlalchemy import text
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT code, name FROM stock_basic"))
+                # 缓存为 {name: code} 字典，方便匹配
+                NewsStockAssociator._stock_list_cache = {row[1]: row[0] for row in result}
+                NewsStockAssociator._last_cache_time = now
+                print(f"✅ Loaded {len(NewsStockAssociator._stock_list_cache)} stocks for association.")
+        except Exception as e:
+            print(f"⚠️ Load stock list failed: {e}")
+            NewsStockAssociator._stock_list_cache = {}
+
+    def associate(self, title: str) -> List[str]:
+        """根据标题识别股票代码"""
+        if not title: return []
+        
+        found_codes = set()
+        
+        # 1. 提取 6 位数字代码
+        import re
+        codes = re.findall(r'\b\d{6}\b', title)
+        for c in codes:
+            found_codes.add(c)
+            
+        # 2. 匹配股票名称
+        if NewsStockAssociator._stock_list_cache:
+            for name, code in NewsStockAssociator._stock_list_cache.items():
+                if len(name) >= 2 and name in title:
+                    found_codes.add(code)
+                    
+        return list(found_codes)
 
 class NewsDeduplicator:
     """新闻去重器"""
@@ -115,7 +228,7 @@ class NewsDeduplicator:
         self.similarity_threshold = similarity_threshold
         self.vectorizer = TfidfVectorizer(
             max_features=1000,
-            stop_words=None,  # 中文暂无停用词
+            stop_words=None,
             ngram_range=(1, 2)
         )
 
@@ -123,41 +236,27 @@ class NewsDeduplicator:
         """使用 TF-IDF 相似度去重"""
         if len(news_items) <= 1:
             return news_items
-
         titles = [item.title for item in news_items]
-
         try:
-            # 计算标题的 TF-IDF 矩阵
             tfidf_matrix = self.vectorizer.fit_transform(titles)
-
-            # 计算相似度矩阵
             similarity_matrix = cosine_similarity(tfidf_matrix)
-
-            # 找出重复的新闻
             to_remove = set()
             for i in range(len(news_items)):
-                if i in to_remove:
-                    continue
+                if i in to_remove: continue
                 for j in range(i + 1, len(news_items)):
-                    if j in to_remove:
-                        continue
+                    if j in to_remove: continue
                     if similarity_matrix[i][j] > self.similarity_threshold:
-                        # 保留发布时间较晚的（通常更详细）
                         if news_items[i].publish_time < news_items[j].publish_time:
                             to_remove.add(i)
                         else:
                             to_remove.add(j)
-
-            # 返回未重复的新闻
             unique_items = [item for i, item in enumerate(news_items) if i not in to_remove]
             return unique_items
-
         except Exception as e:
-            print(f"⚠️ TF-IDF 去重失败，回退到简单去重: {e}")
+            print(f"⚠️ TF-IDF 去重失败: {e}")
             return self._deduplicate_by_url(news_items)
 
     def _deduplicate_by_url(self, news_items: List[NewsItem]) -> List[NewsItem]:
-        """回退方案：基于 URL 去重"""
         seen_urls = set()
         unique_items = []
         for item in news_items:
@@ -169,12 +268,11 @@ class NewsDeduplicator:
 class NewsCache:
     """新闻缓存管理器"""
 
-    def __init__(self, ttl_seconds=300):  # 默认 5 分钟
+    def __init__(self, ttl_seconds=300):
         self.ttl = ttl_seconds
         self.cache = {}
 
     def get(self, key: str):
-        """获取缓存"""
         if key in self.cache:
             data, timestamp = self.cache[key]
             if datetime.now() - timestamp < timedelta(seconds=self.ttl):
@@ -182,8 +280,6 @@ class NewsCache:
         return None
 
     def set(self, key: str, data):
-        """设置缓存"""
         self.cache[key] = (data, datetime.now())
 
-# 全局缓存实例
 news_cache = NewsCache(ttl_seconds=300)

@@ -14,7 +14,7 @@ def sync_single_stock(code, name, start_time, engine):
         # 1. 查询本地数据库中该股的最后日期
         last_date = None
         with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT MAX(date) FROM daily_k WHERE code='{code}'"))
+            result = conn.execute(text("SELECT MAX(date) FROM daily_k WHERE code = :code"), {"code": code})
             last_date = result.fetchone()[0]
         
         # 2. 判断同步起点
@@ -126,7 +126,7 @@ def sync_all_money_flow(workers=5, force_full=False):
         print("❌ 无法获取股票列表")
         return
 
-    stock_list = [{'code': k, 'name': v} for k, v in stock_map.items()}
+    stock_list = [{'code': k, 'name': v} for k, v in stock_map.items()]
     print(f"🔄 开始同步 {len(stock_list)} 只股票的资金流数据...")
 
     engine = get_db_engine()

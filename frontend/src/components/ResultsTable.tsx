@@ -202,7 +202,7 @@ export default function ResultsTable({
                             if (groupBy === "none") {
                                 return sortedResults.map((res, i) => (
                                     <StockRow
-                                        key={res.代码}
+                                        key={`${res.代码}-${res.名称}-${i}`}
                                         res={res}
                                         expandedRow={expandedRow}
                                         toggleRow={toggleRow}
@@ -233,9 +233,9 @@ export default function ResultsTable({
                                                 </div>
                                             </td>
                                         </tr>
-                                        {groupResults.map((res) => (
+                                        {groupResults.map((res, i) => (
                                             <StockRow
-                                                key={res.代码}
+                                                key={`${res.代码}-${res.名称}-${i}`}
                                                 res={res}
                                                 expandedRow={expandedRow}
                                                 toggleRow={toggleRow}
@@ -291,7 +291,7 @@ function StockRow({
     openChart: (code: string) => void
 }) {
     return (
-        <React.Fragment key={res.代码}>
+        <React.Fragment>
             <tr
                 onClick={() => {
                     onSelectStock?.(res);

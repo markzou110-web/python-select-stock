@@ -1,4 +1,12 @@
+import os
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+
+# 加载 .env 文件（如果存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # 如果没有安装 python-dotenv，跳过
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from typing import List, Optional
@@ -15,7 +23,18 @@ import requests
 import math
 
 def sanitize_float(val):
-    """Sanitizes float values to be JSON compliant (converts NaN/Inf to 0)."""
+    """Sanitizes float values to be JSON compliant (converts NaN/Inf to 0, numpy types to native)."""
+    import numpy as np
+
+    # Convert numpy types to native Python types
+    if isinstance(val, np.integer):
+        return int(val)
+    elif isinstance(val, np.floating):
+        val = float(val)
+    elif isinstance(val, np.ndarray):
+        return val.tolist()
+
+    # Handle native float special values
     if isinstance(val, float):
         if math.isnan(val) or math.isinf(val):
             return 0.0
@@ -29,11 +48,11 @@ def sanitize_recursive(data):
         return [sanitize_recursive(v) for v in data]
     return sanitize_float(data)
 
-BARK_KEY = "zVQJgaLZ4qApBq2d84NRTU" # 已自动提取您的 Key
+BARK_KEY = os.getenv("BARK_KEY", "")
 
 socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates, get_setting, save_setting, delete_scan_history_by_date
 from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data, get_northbound_flow
@@ -43,6 +62,7 @@ from core.news import EastMoneyCrawler, NewsDeduplicator, news_cache
 from core.db_news import init_news_tables
 from core.theme_tracker import ThemeTracker
 from core.risk_detector import RiskDetector
+from core.sentiment_analyzer import SentimentAnalyzer
 
 # 全局状态跟踪
 sync_progress = {
@@ -67,8 +87,8 @@ app.add_middleware(
         "http://127.0.0.1:8000", # For self-referencing if needed
     ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 
 import asyncio
@@ -79,27 +99,108 @@ class PaperTradeCreate(BaseModel):
     name: str
     price: float
 
+class ScanRequest(BaseModel):
+    """Scan request validation model"""
+    threshold: float = Field(ge=0, le=1, default=0.12, description="均线粘合阈值 (0-1)")
+    vol_multiplier: float = Field(gt=0, le=10, default=1.5, description="量能倍数")
+    rsi_min: int = Field(ge=0, le=100, default=55, description="RSI最小值")
+    use_macd_filter: bool = True
+    use_bb_sqz: bool = False
+    sqz_lookback: int = Field(ge=1, le=50, default=10, description="粘合回看天数")
+    use_weekly: bool = True
+    market_range: str = Field(
+        default="全市场(除科创)",
+        description="市场范围"
+    )
+    turnover_min: float = Field(ge=0, le=100, default=3.0, description="最小换手率")
+    mkt_cap_min: float = Field(ge=0, default=0.0, description="最小市值(亿)")
+    use_rs_filter: bool = True
+    local_only: bool = True
+    strategy: str = Field(default="Resonance", description="策略类型")
+    rf_period: int = Field(ge=10, le=200, default=100, description="RF周期")
+    rf_multiplier: float = Field(gt=0, le=10, default=3.0, description="RF倍数")
+    only_signals: bool = False
+    use_money_flow: bool = False
+    money_flow_days: int = Field(ge=1, le=30, default=3, description="资金流统计天数")
+
+    @field_validator('strategy')
+    @classmethod
+    def validate_strategy(cls, v: str) -> str:
+        allowed_strategies = ["Resonance", "Range Filter", "Combined"]
+        if v not in allowed_strategies:
+            raise ValueError(f"策略必须是以下之一: {', '.join(allowed_strategies)}")
+        return v
+
+    @field_validator('market_range')
+    @classmethod
+    def validate_market_range(cls, v: str) -> str:
+        # Allow basic market range options
+        allowed_ranges = [
+            "全市场(除科创)", "包含科创板",
+            "沪深300", "上证50", "中证500", "中证1000"
+        ]
+        if v not in allowed_ranges:
+            raise ValueError(f"市场范围必须是以下之一: {', '.join(allowed_ranges)}")
+        return v
+
 def fetch_mine_sweeper_data():
     """Gathers risk data: earnings, unlocks, and reductions."""
-    today = datetime.now().strftime("%Y%m%d")
+    now = datetime.now()
+    today = now.strftime("%Y%m%d")
     data = {"earnings": [], "unlocks": [], "reductions": []}
     
     try:
         import akshare as ak
-        # 1. Earnings (Next 7 days)
-        df_earnings = ak.stock_report_disclosure_around_cn(symbol="利好利空")
-        if df_earnings is not None and not df_earnings.empty:
-            data["earnings"] = df_earnings[df_earnings['公告日期'] >= today]['股票代码'].tolist()
+        
+        # 1. Earnings Forecast (Replacing deprecated stock_report_disclosure_around_cn)
+        # Determine the target report period (e.g., Annual report forecast in Q1)
+        year = now.year
+        month = now.month
+        if month <= 3:
+            report_period = f"{year-1}1231"
+        elif month <= 6:
+            report_period = f"{year}0331"
+        elif month <= 9:
+            report_period = f"{year}0630"
+        else:
+            report_period = f"{year}0930"
             
-        # 2. Unlocks (Next 30 days)
-        df_unlocks = ak.stock_restricted_release_queue_em()
-        if df_unlocks is not None and not df_unlocks.empty:
-            data["unlocks"] = df_unlocks['代码'].tolist()
+        # 1. Earnings Forecast (Replacing deprecated stock_report_disclosure_around_cn)
+        try:
+            # Determine the target report period (e.g., Annual report forecast in Q1)
+            year = now.year
+            month = now.month
+            if month <= 3:
+                report_period = f"{year-1}1231"
+            elif month <= 6:
+                report_period = f"{year}0331"
+            elif month <= 9:
+                report_period = f"{year}0630"
+            else:
+                report_period = f"{year}0930"
+                
+            df_earnings = ak.stock_yjyg_em(date=report_period)
+            if df_earnings is not None and not df_earnings.empty:
+                data["earnings"] = df_earnings['股票代码'].tolist()
+        except Exception as e:
+            print(f"Earnings fetch error: {e}")
+
+        # 2. Unlocks (Next 30 days - Using Sina for stock codes)
+        try:
+            df_unlocks = ak.stock_restricted_release_queue_sina()
+            if df_unlocks is not None and not df_unlocks.empty:
+                data["unlocks"] = df_unlocks['代码'].tolist()
+        except Exception as e:
+            print(f"Unlocks fetch error: {e}")
             
         # 3. Reductions (Major shareholders)
-        df_reduce = ak.stock_dzjy_mrtj_em()
-        if df_reduce is not None and not df_reduce.empty:
-            data["reductions"] = df_reduce['证券代码'].tolist()
+        try:
+            df_reduce = ak.stock_dzjy_mrtj()
+            if df_reduce is not None and not df_reduce.empty:
+                col_name = '证券代码' if '证券代码' in df_reduce.columns else '代码'
+                data["reductions"] = df_reduce[col_name].tolist()
+        except Exception as e:
+            print(f"Reductions fetch error: {e}")
             
     except Exception as e:
         print(f"Mine Sweeper Error: {e}")
@@ -186,6 +287,35 @@ class IntradaySentinel:
 
 sentinel = IntradaySentinel()
 
+def background_news_sync():
+    """定期抓取全球新闻并更新题材"""
+    from core.news import EastMoneyCrawler, save_news_items
+    from core.db import get_db_engine
+    
+    crawler = EastMoneyCrawler()
+    engine = get_db_engine()
+    
+    print("📰 Starting background news sync...")
+    while True:
+        try:
+            # 1. 抓取全局新闻
+            news_items = crawler.fetch_global_news()
+            if news_items:
+                print(f"📦 Fetched {len(news_items)} global news items. Saving to DB...")
+                save_news_items(engine, news_items)
+            
+            # 2. 更新题材热度
+            if theme_tracker:
+                print("🔥 Updating themes based on new data...")
+                theme_tracker.update_themes()
+                
+            # 3. 每 30 分钟同步一次
+            time.sleep(1800)
+        except Exception as e:
+            print(f"❌ Background news sync error: {e}")
+            time.sleep(300) # Error backoff
+
+
 @app.on_event("startup")
 async def startup_event():
     print("🏗️ Initializing database...")
@@ -196,17 +326,31 @@ async def startup_event():
 
     print("🎯 Initializing theme tracker...")
     print("⚠️ Initializing risk detector...")
-    global theme_tracker, risk_detector
+    print("🎭 Initializing sentiment analyzer...")
+    global theme_tracker, risk_detector, sentiment_analyzer
     engine = get_db_engine()
     if engine:
         theme_tracker = ThemeTracker(engine)
         risk_detector = RiskDetector(engine)
+        sentiment_analyzer = SentimentAnalyzer()
 
     print("🚀 Starting Intraday Sentinel...")
     # Ensure default time is in DB
     if get_setting("sentinel_time") is None:
         save_setting("sentinel_time", "14:30")
     sentinel.start() # Start the sentinel thread
+
+    # Trigger initial theme update and start background news sync
+    if theme_tracker:
+        print("🔥 Running initial theme update...")
+        try:
+            theme_tracker.update_themes()
+        except Exception as e:
+            print(f"⚠️ Initial theme update failed: {e}")
+
+        print("📰 Starting background news sync thread...")
+        threading.Thread(target=background_news_sync, daemon=True).start()
+
 
     # 异步预热核心缓存
     from core.data import get_index_data, get_hot_sectors
@@ -221,6 +365,7 @@ crawler = EastMoneyCrawler()
 deduplicator = NewsDeduplicator()
 theme_tracker = None  # Will be initialized after DB is ready
 risk_detector = None  # Will be initialized after DB is ready
+sentiment_analyzer = None  # Will be initialized after DB is ready
 
 @app.get("/api/health")
 def health_check():
@@ -283,6 +428,58 @@ def get_themes(limit: int = 10):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/news/themes/{theme_id}/stocks")
+def get_theme_stocks_api(theme_id: int):
+    """获取题材成分股及最新市场价"""
+    try:
+        if theme_tracker is None:
+            return {"data": []}
+
+        # 1. 获取关联股票列表 (code, name, relevance)
+        stocks = theme_tracker.get_theme_stocks(theme_id)
+        if not stocks:
+            return {"data": []}
+
+        # 2. 获取市场快照以补充实时价格
+        from core.data import get_market_snapshot
+        snapshot_df = pd.DataFrame()
+        try:
+            snapshot_df = get_market_snapshot()
+        except:
+            print("⚠️ Endpoint snapshot failed, falling back to basic info.")
+
+        results = []
+        for s in stocks:
+            code = s['code']
+            # 从快照中查找最新价格和涨跌幅
+            price = 0.0
+            change_pct = 0.0
+            volume = 0.0
+            
+            if not snapshot_df.empty:
+                # 兼容代码格式 (有的快照包含后缀，有的不包含)
+                match = snapshot_df[snapshot_df['code'].str.contains(code)]
+                if not match.empty:
+                    row = match.iloc[0]
+                    price = float(row.get('price', 0))
+                    change_pct = float(row.get('pct_chg', 0))
+                    volume = float(row.get('amount', 0)) # amount 通常指成交额
+            
+            results.append({
+                "code": code,
+                "name": s['name'],
+                "price": price,
+                "change_pct": change_pct,
+                "volume": volume,
+                "relevance": s['relevance']
+            })
+
+        return {"data": results}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/news/risks")
 def get_risk_events(days: int = 30):
     """获取所有风险事件"""
@@ -293,6 +490,102 @@ def get_risk_events(days: int = 30):
         risks = risk_detector.get_risk_events(days=days)
         return {"data": risks}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/news/sentiment/{code}")
+def get_stock_sentiment(code: str, days: int = 30):
+    """获取个股新闻情绪分析
+
+    Args:
+        code: 股票代码
+        days: 分析最近多少天的新闻（默认30天）
+    """
+    try:
+        if sentiment_analyzer is None:
+            return {
+                "positive": 0,
+                "negative": 0,
+                "neutral": 0,
+                "average_score": 0.0,
+                "trend": "stable",
+                "news_analyzed": 0
+            }
+
+        from sqlalchemy import text
+        engine = get_db_engine()
+        if not engine:
+            raise HTTPException(status_code=500, detail="数据库连接失败")
+
+        with engine.connect() as conn:
+            # 获取该股票最近N天的关联新闻
+            result = conn.execute(text("""
+                SELECT DISTINCT nr.title, nr.publish_time
+                FROM news_raw nr
+                JOIN news_stocks ns ON nr.id = ns.news_id
+                WHERE ns.stock_code = :code
+                AND nr.publish_time >= NOW() - INTERVAL '1 day' * :days
+                ORDER BY nr.publish_time DESC
+                LIMIT 50
+            """), {"code": code, "days": days})
+
+            news_items = result.fetchall()
+
+            if not news_items:
+                return {
+                    "positive": 0,
+                    "negative": 0,
+                    "neutral": 0,
+                    "average_score": 0.0,
+                    "trend": "stable",
+                    "news_analyzed": 0
+                }
+
+            # 分析每条新闻的情绪
+            positive_count = 0
+            negative_count = 0
+            neutral_count = 0
+            total_score = 0.0
+            scores = []
+
+            for (title, publish_time) in news_items:
+                sentiment = sentiment_analyzer.analyze_sentiment(title)
+                if sentiment:
+                    total_score += sentiment.score
+                    scores.append(sentiment.score)
+
+                    if sentiment.label == "positive":
+                        positive_count += 1
+                    elif sentiment.label == "negative":
+                        negative_count += 1
+                    else:
+                        neutral_count += 1
+
+            # 计算平均分和趋势
+            avg_score = total_score / len(news_items) if news_items else 0.0
+
+            # 判断趋势：比较最近一半和更早一半的平均分
+            trend = "stable"
+            if len(scores) >= 4:
+                mid = len(scores) // 2
+                recent_avg = sum(scores[:mid]) / mid
+                older_avg = sum(scores[mid:]) / (len(scores) - mid)
+                if recent_avg - older_avg > 0.5:
+                    trend = "up"
+                elif older_avg - recent_avg > 0.5:
+                    trend = "down"
+
+            return {
+                "positive": positive_count,
+                "negative": negative_count,
+                "neutral": neutral_count,
+                "average_score": round(avg_score, 2),
+                "trend": trend,
+                "news_analyzed": len(news_items)
+            }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/market/indices")
@@ -572,7 +865,9 @@ def run_market_scan(
                     pe=row.get('pe', 0), turnover=row.get('turnover', 0),
                     local_only=local_only, engine=engine,
                     strategy=strategy, rf_period=rf_period, rf_multiplier=rf_multiplier,
-                    only_signals=only_signals
+                    only_signals=only_signals,
+                    use_money_flow=use_money_flow,
+                    money_flow_days=money_flow_days
                 ): row for _, row in candidates.iterrows()
             }
             
@@ -607,60 +902,84 @@ def run_market_scan(
         
         def fetch_single_industry(res_item):
             code = res_item['代码']
+            name = res_item['名称']
             industry = sector_map.get(code, "未知")
-            if industry == "未知":
+            
+            # 如果名称是代码（说明本地没查到名）或者行业未知，尝试联网获取详情
+            if industry == "未知" or name == code:
                 try:
                     import akshare as ak
                     info_df = ak.stock_individual_info_em(symbol=code)
                     if not info_df.empty:
-                        industry_val = info_df[info_df['item'] == '行业分类']['value'].values
+                        # 提取名称
+                        name_val = info_df[info_df['item'] == '股票简称']['value'].values
+                        if len(name_val) > 0:
+                            name = name_val[0]
+                        # 提取行业
+                        industry_val = info_df[info_df['item'] == '行业']['value'].values
                         if len(industry_val) > 0:
-                            return code, industry_val[0]
+                            industry = industry_val[0]
+                        
+                        return code, name, industry
                 except:
                     pass
-            return code, industry
+            return code, name, industry
 
         # 并发补充结果详情，避免 30 个股票串行查询导致的超时
-        print(f"🏷️ Supplementing industry info for {len(results)} results in parallel...")
+        print(f"🏷️ Supplementing industry and name info for {len(results)} results in parallel...")
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_industry = {executor.submit(fetch_single_industry, res): res for res in results}
-            industry_results = {}
-            for future in as_completed(future_to_industry):
+            future_to_details = {executor.submit(fetch_single_industry, res): res for res in results}
+            extra_info = {}
+            for future in as_completed(future_to_details):
                 try:
-                    code, ind = future.result(timeout=10)
-                    industry_results[code] = ind
+                    code, name, ind = future.result(timeout=10)
+                    extra_info[code] = {"name": name, "industry": ind}
                 except:
                     continue
         
         for res in results:
-            res['行业'] = industry_results.get(res['代码'], "未知")
+            info = extra_info.get(res['代码'], {})
+            if info:
+                res['名称'] = info.get('name', res['名称'])
+                res['行业'] = info.get('industry', "未知")
 
-        # --- 北向资金数据补充 (Northbound Money Flow) ---
-        print(f"💰 Fetching northbound flow data for {len(results)} results...")
-        northbound_map = {}
+        # --- SOP: 资金流数据补充 (Northbound & Main Flow) ---
+        print(f"💰 Fetching fund flow data for {len(results)} results...")
+        flow_map = {}
 
-        def fetch_northbound_for_stock(res_item):
+        def fetch_flows_for_stock(res_item):
             code = res_item['代码']
             try:
+                from core.money_flow import get_individual_fund_flow
                 nb_data = get_northbound_flow(code=code, days=3)
-                return code, nb_data
+                main_flow_df = get_individual_fund_flow(code=code, days=3)
+                main_flow = main_flow_df['main_net_inflow'].sum() if not main_flow_df.empty else 0
+                return code, {
+                    'nb': nb_data,
+                    'main': main_flow
+                }
             except Exception as e:
-                return code, {'net_flow': 0, 'trend': '---', 'recent_data': []}
+                return code, {
+                    'nb': {'net_flow': 0, 'trend': '---', 'recent_data': []},
+                    'main': 0
+                }
 
         with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_nb = {executor.submit(fetch_northbound_for_stock, res): res for res in results}
-            for future in as_completed(future_to_nb):
+            future_to_flow = {executor.submit(fetch_flows_for_stock, res): res for res in results}
+            for future in as_completed(future_to_flow):
                 try:
-                    code, nb_data = future.result(timeout=5)
-                    northbound_map[code] = nb_data
+                    code, data = future.result(timeout=10)
+                    flow_map[code] = data
                 except:
                     continue
-
+        
         for res in results:
             code = res['代码']
-            nb_data = northbound_map.get(code, {'net_flow': 0, 'trend': '---', 'recent_data': []})
+            data = flow_map.get(code, {'nb': {'net_flow': 0, 'trend': '---', 'recent_data': []}, 'main': 0})
+            nb_data = data['nb']
             res['北向'] = f"{nb_data['trend']}" if nb_data['trend'] != '---' else '---'
             res['北向净流入'] = nb_data['net_flow']
+            res['主力净流入'] = data['main'] if res.get('主力净流入') is None else res['主力净流入']
             
         # --- SOP: 板块共振 (Sector Resonance) 计算 ---
         industry_counts = {}
@@ -704,8 +1023,9 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None, strategy="Resonance", rf_period=100, rf_multiplier=3.0, only_signals=False):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None, strategy="Resonance", rf_period=100, rf_multiplier=3.0, only_signals=False, use_money_flow=False, money_flow_days=3):
     from core.db import load_from_db
+    from core.strategy import check_range_filter_strategy, check_strategy
     import akshare as ak
     
     target_date = datetime.now()
@@ -743,7 +1063,6 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price)
         
         if strategy == "Combined":
-            from core.strategy import check_range_filter_strategy, check_strategy
             rf_match, rf_stats = check_range_filter_strategy(
                 df, period=rf_period, multiplier=rf_multiplier, rsi_min=rsi_min
             )
@@ -767,7 +1086,6 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 if not rf_match: reasons.append(rf_stats.get('reason', 'RF未上穿'))
                 stats = {"reason": " & ".join(reasons)}
         elif strategy == "Range Filter":
-            from core.strategy import check_range_filter_strategy
             match, stats = check_range_filter_strategy(
                 df, 
                 period=rf_period, 
@@ -790,18 +1108,21 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         
         if match:
             print(f"✨ [{code}] Resonance Match!")
+            
+            # 确保代码和名称在任何早期返回前被设置
+            stats['代码'] = code
+            stats['名称'] = name
+            
             if use_weekly:
                 if not get_weekly_indicators(code, df=df, local_only=local_only): 
                     print(f"⏩ [{code}] Weekly trend failed")
                     stats['is_signal'] = False
-                    return stats # 返回包含失败原因的字典
+                    return stats # 返回包含代码/名称的字典
             
             # 增加胜率和其他指标
             wr, sig_count = calculate_historical_win_rate(df)
             stats['历史胜率'] = f"{wr}%"
             stats['信号次数'] = sig_count
-            stats['代码'] = code
-            stats['名称'] = name
             stats['PE'] = sanitize_float(pe)
             stats['换手率'] = sanitize_float(turnover)
             
@@ -1012,43 +1333,31 @@ def scan_market(
     )
 
 @app.post("/api/scan")
-def scan_market_post(data: dict):
-    """API Endpoint for market scan (POST version to handle more parameters)"""
-    try:
-        threshold = data.get('threshold', 0.12)
-        vol_multiplier = data.get('vol_multiplier', 1.5)
-        rsi_min = data.get('rsi_min', 55)
-        use_macd_filter = data.get('use_macd_filter', True)
-        use_bb_sqz = data.get('use_bb_sqz', False)
-        sqz_lookback = data.get('sqz_lookback', 10)
-        use_weekly = data.get('use_weekly', True)
-        market_range = data.get('market_range', "全市场(除科创)")
-        turnover_min = data.get('turnover_min', 3.0)
-        mkt_cap_min = data.get('mkt_cap_min', 0.0)
-        use_rs_filter = data.get('use_rs_filter', True)
-        local_only = data.get('local_only', True)
-        strategy = data.get('strategy', 'Resonance')
-        rf_period = int(data.get('rf_period', 100))
-        rf_multiplier = float(data.get('rf_multiplier', 3.0))
-        only_signals = data.get('only_signals', False)
+def scan_market_post(request: ScanRequest):
+    """API Endpoint for market scan (POST version to handle more parameters)
 
+    Request body is validated using ScanRequest model with proper constraints.
+    """
+    try:
         results = run_market_scan(
-            threshold=threshold,
-            vol_multiplier=vol_multiplier,
-            rsi_min=rsi_min,
-            use_macd_filter=use_macd_filter,
-            use_bb_sqz=use_bb_sqz,
-            sqz_lookback=sqz_lookback,
-            use_weekly=use_weekly,
-            market_range=market_range,
-            turnover_min=turnover_min,
-            mkt_cap_min=mkt_cap_min,
-            use_rs_filter=use_rs_filter,
-            local_only=local_only,
-            strategy=strategy,
-            rf_period=rf_period,
-            rf_multiplier=rf_multiplier,
-            only_signals=only_signals
+            threshold=request.threshold,
+            vol_multiplier=request.vol_multiplier,
+            rsi_min=request.rsi_min,
+            use_macd_filter=request.use_macd_filter,
+            use_bb_sqz=request.use_bb_sqz,
+            sqz_lookback=request.sqz_lookback,
+            use_weekly=request.use_weekly,
+            market_range=request.market_range,
+            turnover_min=request.turnover_min,
+            mkt_cap_min=request.mkt_cap_min,
+            use_rs_filter=request.use_rs_filter,
+            local_only=request.local_only,
+            strategy=request.strategy,
+            rf_period=request.rf_period,
+            rf_multiplier=request.rf_multiplier,
+            only_signals=request.only_signals,
+            use_money_flow=request.use_money_flow,
+            money_flow_days=request.money_flow_days
         )
         return sanitize_recursive(results)
     except HTTPException as he:

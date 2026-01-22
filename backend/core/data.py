@@ -254,13 +254,14 @@ def get_northbound_flow(code=None, days=3):
             for attempt in range(2):
                 try:
                     time.sleep(random.uniform(0.3, 0.8))
-                    df = ak.stock_em_hsgt_hist_stock(symbol=code, indicator="北向")
-                    if df is not None and not df.empty:
+                    df = ak.stock_hsgt_individual_em(symbol=code)
+                    # 个股北向资金使用“今日增持资金”(元)
+                    if df is not None and not df.empty and '今日增持资金' in df.columns:
                         # 取最近 days 天的数据
                         df_recent = df.head(days)
 
-                        # 计算累计净流入
-                        total_flow = df_recent['今日持股数量'].iloc[0] - df_recent['今日持股数量'].iloc[-1]
+                        # 计算累计净流入 (转换为万元)
+                        total_flow = df_recent['今日增持资金'].fillna(0).sum() / 10000.0
 
                         # 判断趋势
                         trend = '流入' if total_flow > 0 else '流出' if total_flow < 0 else '持平'
@@ -272,10 +273,17 @@ def get_northbound_flow(code=None, days=3):
                         }
                         set_cached_data(cache_key, result)
                         return result
+                    else:
+                        # Stock not in northbound program or no data available
+                        break
                 except Exception as e:
                     if attempt < 1:
                         time.sleep(1)
                         continue
+                    # Check if it's the known akshare bug for stocks not in northbound program
+                    if "'NoneType' object is not subscriptable" in str(e):
+                        # Stock not in northbound program - silent skip
+                        break
                     print(f"⚠️ Northbound data fetch failed for {code}: {e}")
                     break
 
@@ -290,12 +298,12 @@ def get_northbound_flow(code=None, days=3):
             for attempt in range(2):
                 try:
                     time.sleep(random.uniform(0.3, 0.8))
-                    df = ak.stock_em_hsgt_north_net_flow_in_em(symbol="北向资金净流入")
-                    if df is not None and not df.empty:
+                    df = ak.stock_hsgt_hist_em(symbol="北向资金")
+                    if df is not None and not df.empty and '当日成交净买额' in df.columns:
                         df_recent = df.head(days)
 
                         # 计算累计净流入 (亿元)
-                        total_flow = df_recent['净流入'].sum()
+                        total_flow = df_recent['当日成交净买额'].sum()
 
                         trend = '流入' if total_flow > 0 else '流出' if total_flow < 0 else '持平'
 

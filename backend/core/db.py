@@ -130,6 +130,23 @@ def init_db(engine=None):
                 ON money_flow_daily(date);
             '''))
             # 兼容性迁移：确保新列存在
+            # 性能优化：为常用查询字段添加索引
+            conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_daily_k_code_date
+                ON daily_k(code, date);
+            '''))
+            conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_daily_k_date
+                ON daily_k(date);
+            '''))
+            conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_scan_history_score
+                ON scan_history(score DESC);
+            '''))
+            conn.execute(text('''
+                CREATE INDEX IF NOT EXISTS idx_scan_history_date
+                ON scan_history(date DESC);
+            '''))
             try:
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS shadow_ratio FLOAT;"))
@@ -162,9 +179,10 @@ def save_to_db(df, code, engine=None):
         data = df[['日期', '开盘', '最高', '最低', '收盘', '成交量']].copy()
         data['code'] = code
         data = data.rename(columns={'日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'vol'})
-        
-        # 使用唯一的临时表名，防止多线程冲突
-        temp_table_name = f"daily_k_temp_{code}"
+
+        # 使用安全的临时表名（移除潜在危险字符，防止SQL注入）
+        safe_code = ''.join(c for c in code if c.isalnum())
+        temp_table_name = f"daily_k_temp_{safe_code}"
         data.to_sql(temp_table_name, engine, if_exists='replace', index=False)
         with engine.connect() as conn:
             conn.execute(text(f'''
@@ -172,7 +190,7 @@ def save_to_db(df, code, engine=None):
                 SELECT code, CAST(date AS DATE), open, high, low, close, vol FROM {temp_table_name}
                 ON CONFLICT (code, date) DO NOTHING
             '''))
-            conn.execute(text(f"DROP TABLE {temp_table_name}"))
+            conn.execute(text(f"DROP TABLE IF EXISTS {temp_table_name}"))
             conn.commit()
     except Exception as e:
         with open("sync_error.log", "a") as f:
@@ -184,12 +202,17 @@ def load_from_db(code, start_date, engine=None):
         engine = get_db_engine()
     if not engine: return pd.DataFrame()
     try:
-        query = f"SELECT date as \"日期\", open as \"开盘\", high as \"最高\", low as \"最低\", close as \"收盘\", vol as \"成交量\" FROM daily_k WHERE code='{code}' AND date >= '{start_date}' ORDER BY date ASC"
-        df = pd.read_sql(query, engine)
+        query = text("""
+            SELECT code as "code", date as "日期", open as "开盘", high as "最高", low as "最低", close as "收盘", vol as "成交量"
+            FROM daily_k
+            WHERE code = :code AND date >= :start_date
+            ORDER BY date ASC
+        """)
+        df = pd.read_sql(query, engine, params={"code": code, "start_date": start_date})
         if not df.empty:
             df['日期'] = df['日期'].apply(lambda x: x.strftime('%Y-%m-%d'))
         return df
-    except:
+    except Exception:
         return pd.DataFrame()
 
 def delete_scan_history_by_date(date_str, engine=None):

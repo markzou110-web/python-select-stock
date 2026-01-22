@@ -1,8 +1,9 @@
 "use client";
 
 import React, { useState, useEffect } from 'react';
-import { TrendingUp, TrendingDown, Minus, BarChart3 } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, BarChart3, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import api from '@/lib/api';
 
 interface SentimentData {
     positive: number;
@@ -10,6 +11,7 @@ interface SentimentData {
     neutral: number;
     average_score: number;
     trend: 'up' | 'down' | 'stable';
+    news_analyzed: number;
 }
 
 interface SentimentAnalysisProps {
@@ -20,6 +22,7 @@ interface SentimentAnalysisProps {
 export default function SentimentAnalysis({ stockCode, stockName }: SentimentAnalysisProps) {
     const [sentiment, setSentiment] = useState<SentimentData | null>(null);
     const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
         fetchSentiment();
@@ -27,20 +30,17 @@ export default function SentimentAnalysis({ stockCode, stockName }: SentimentAna
 
     const fetchSentiment = async () => {
         try {
-            // TODO: 调用后端 API 获取情绪分析数据
-            // const res = await api.get(`/api/news/sentiment/${stockCode}`);
-            // setSentiment(res.data);
+            setLoading(true);
+            setError(null);
 
-            // 模拟数据
-            setSentiment({
-                positive: 15,
-                negative: 3,
-                neutral: 7,
-                average_score: 2.3,
-                trend: 'up'
-            });
-        } catch (e) {
+            const res = await api.get(`/api/news/sentiment/${stockCode}?days=30`);
+
+            if (res.data) {
+                setSentiment(res.data);
+            }
+        } catch (e: any) {
             console.error("Failed to fetch sentiment", e);
+            setError(e.response?.data?.detail || "获取情绪分析失败");
         } finally {
             setLoading(false);
         }
@@ -48,14 +48,36 @@ export default function SentimentAnalysis({ stockCode, stockName }: SentimentAna
 
     if (loading) {
         return (
-            <div className="animate-pulse bg-slate-100 rounded-xl p-4 h-32">
+            <div className="animate-pulse bg-gradient-to-br from-slate-50 to-slate-100 rounded-xl p-5 border border-slate-200">
                 <div className="h-4 bg-slate-200 rounded w-1/3 mb-3"></div>
                 <div className="h-8 bg-slate-200 rounded w-2/3"></div>
             </div>
         );
     }
 
-    if (!sentiment) return null;
+    if (error) {
+        return (
+            <div className="bg-gradient-to-br from-amber-50 to-orange-50 rounded-xl p-5 border border-amber-200">
+                <div className="flex items-center gap-2 text-amber-700 mb-2">
+                    <AlertCircle size={18} />
+                    <h4 className="font-bold">情绪分析暂不可用</h4>
+                </div>
+                <p className="text-xs text-amber-600">{error}</p>
+            </div>
+        );
+    }
+
+    if (!sentiment || sentiment.news_analyzed === 0) {
+        return (
+            <div className="bg-gradient-to-br from-slate-50 to-slate-100 rounded-xl p-5 border border-slate-200">
+                <div className="flex items-center gap-2 text-slate-600 mb-2">
+                    <BarChart3 size={18} />
+                    <h4 className="font-bold">情绪分析</h4>
+                </div>
+                <p className="text-sm text-slate-500">最近30天暂无相关新闻</p>
+            </div>
+        );
+    }
 
     const total = sentiment.positive + sentiment.negative + sentiment.neutral;
     const positivePct = total > 0 ? Math.round((sentiment.positive / total) * 100) : 0;
@@ -69,6 +91,9 @@ export default function SentimentAnalysis({ stockCode, stockName }: SentimentAna
                 <div className="flex items-center gap-2">
                     <BarChart3 size={18} className="text-indigo-600" />
                     <h4 className="font-bold text-slate-800">情绪分析</h4>
+                    <span className="text-xs text-slate-400 bg-white px-2 py-0.5 rounded-full">
+                        {sentiment.news_analyzed}条新闻
+                    </span>
                 </div>
                 <div className={cn(
                     "flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold",

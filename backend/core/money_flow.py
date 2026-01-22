@@ -73,11 +73,12 @@ def get_individual_fund_flow(code: str, days: int = 5) -> pd.DataFrame:
             # 转换日期格式
             df['date'] = pd.to_datetime(df['date'])
 
-            # 确保数值类型
+            # 确保数值类型并转换为“万元” (akshare 返回的是“元”)
             numeric_columns = ['main_net_inflow', 'super_large_net', 'large_net', 'medium_net', 'small_net']
             for col in numeric_columns:
                 if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                    # 关键修复：除以 10,000 转换为万元
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0) / 10000.0
 
             # 缓存结果
             set_cached_data(cache_key, df)
@@ -182,7 +183,8 @@ def sync_stock_money_flow(code: str, engine=None) -> bool:
         # 获取最新资金流日期
         with engine.connect() as conn:
             result = conn.execute(
-                text(f"SELECT MAX(date) FROM money_flow_daily WHERE code='{code}'")
+                text("SELECT MAX(date) FROM money_flow_daily WHERE code = :code"),
+                {"code": code}
             )
             last_date = result.fetchone()[0]
 
@@ -236,8 +238,8 @@ def ensure_money_flow_available(code: str, days: int = 5) -> bool:
         # 检查数据库中最新的资金流数据日期
         with engine.connect() as conn:
             result = conn.execute(text(
-                f"SELECT MAX(date) FROM money_flow_daily WHERE code='{code}'"
-            ))
+                "SELECT MAX(date) FROM money_flow_daily WHERE code = :code"
+            ), {"code": code})
             last_date = result.fetchone()[0]
 
         # 判断是否需要同步

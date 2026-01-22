@@ -278,6 +278,7 @@ def check_range_filter_strategy(df, period=100, multiplier=3.0, rsi_min=55):
             "粘合度": 0, # Range Filter 无此指标
             "DIF": round(curr.get('MACD_DIF', 0), 3),
             "BB": round(curr.get('BB_Width', 0), 4),
+            "主力净流入": None,  # Range Filter results will be supplemented in api.py
             "is_signal": True # Range Filter 匹配即为上穿信号
         }
 
