@@ -7,6 +7,17 @@ try:
     load_dotenv()
 except ImportError:
     pass  # 如果没有安装 python-dotenv，跳过
+# 强制禁用代理，仅使用本地网络直连 (启动时立即执行)
+def force_direct_connection():
+    import os
+    proxy_vars = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "ALL_PROXY", "all_proxy"]
+    for var in proxy_vars:
+        if var in os.environ:
+            del os.environ[var]
+    os.environ["NO_PROXY"] = "*"
+
+force_direct_connection()
+
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from typing import List, Optional
@@ -55,14 +66,13 @@ socket.setdefaulttimeout(30) # 防止网络请求无限挂起
 from pydantic import BaseModel, Field, field_validator
 
 from core.db import get_db_engine, init_db, load_db_config, save_scan_results, get_scan_history_by_date, get_scan_dates, get_setting, save_setting, delete_scan_history_by_date
-from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data, get_northbound_flow
+from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data, get_northbound_flow, safe_ak_call, get_index_hist
 from core.indicators import calculate_indicators, get_weekly_indicators
 from core.strategy import check_strategy, calculate_historical_win_rate
 from core.news import EastMoneyCrawler, NewsDeduplicator, news_cache
 from core.db_news import init_news_tables
 from core.theme_tracker import ThemeTracker
 from core.risk_detector import RiskDetector
-from core.sentiment_analyzer import SentimentAnalyzer
 
 # 全局状态跟踪
 sync_progress = {
@@ -179,7 +189,8 @@ def fetch_mine_sweeper_data():
             else:
                 report_period = f"{year}0930"
                 
-            df_earnings = ak.stock_yjyg_em(date=report_period)
+            from core.data import safe_ak_call
+            df_earnings = safe_ak_call("stock_yjyg_em", date=report_period)
             if df_earnings is not None and not df_earnings.empty:
                 data["earnings"] = df_earnings['股票代码'].tolist()
         except Exception as e:
@@ -187,7 +198,8 @@ def fetch_mine_sweeper_data():
 
         # 2. Unlocks (Next 30 days - Using Sina for stock codes)
         try:
-            df_unlocks = ak.stock_restricted_release_queue_sina()
+            from core.data import safe_ak_call
+            df_unlocks = safe_ak_call("stock_restricted_release_queue_sina")
             if df_unlocks is not None and not df_unlocks.empty:
                 data["unlocks"] = df_unlocks['代码'].tolist()
         except Exception as e:
@@ -195,7 +207,8 @@ def fetch_mine_sweeper_data():
             
         # 3. Reductions (Major shareholders)
         try:
-            df_reduce = ak.stock_dzjy_mrtj()
+            from core.data import safe_ak_call
+            df_reduce = safe_ak_call("stock_dzjy_mrtj")
             if df_reduce is not None and not df_reduce.empty:
                 col_name = '证券代码' if '证券代码' in df_reduce.columns else '代码'
                 data["reductions"] = df_reduce[col_name].tolist()
@@ -326,13 +339,11 @@ async def startup_event():
 
     print("🎯 Initializing theme tracker...")
     print("⚠️ Initializing risk detector...")
-    print("🎭 Initializing sentiment analyzer...")
-    global theme_tracker, risk_detector, sentiment_analyzer
+    global theme_tracker, risk_detector
     engine = get_db_engine()
     if engine:
         theme_tracker = ThemeTracker(engine)
         risk_detector = RiskDetector(engine)
-        sentiment_analyzer = SentimentAnalyzer()
 
     print("🚀 Starting Intraday Sentinel...")
     # Ensure default time is in DB
@@ -365,7 +376,6 @@ crawler = EastMoneyCrawler()
 deduplicator = NewsDeduplicator()
 theme_tracker = None  # Will be initialized after DB is ready
 risk_detector = None  # Will be initialized after DB is ready
-sentiment_analyzer = None  # Will be initialized after DB is ready
 
 @app.get("/api/health")
 def health_check():
@@ -492,113 +502,17 @@ def get_risk_events(days: int = 30):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/news/sentiment/{code}")
-def get_stock_sentiment(code: str, days: int = 30):
-    """获取个股新闻情绪分析
-
-    Args:
-        code: 股票代码
-        days: 分析最近多少天的新闻（默认30天）
-    """
-    try:
-        if sentiment_analyzer is None:
-            return {
-                "positive": 0,
-                "negative": 0,
-                "neutral": 0,
-                "average_score": 0.0,
-                "trend": "stable",
-                "news_analyzed": 0
-            }
-
-        from sqlalchemy import text
-        engine = get_db_engine()
-        if not engine:
-            raise HTTPException(status_code=500, detail="数据库连接失败")
-
-        with engine.connect() as conn:
-            # 获取该股票最近N天的关联新闻
-            result = conn.execute(text("""
-                SELECT DISTINCT nr.title, nr.publish_time
-                FROM news_raw nr
-                JOIN news_stocks ns ON nr.id = ns.news_id
-                WHERE ns.stock_code = :code
-                AND nr.publish_time >= NOW() - INTERVAL '1 day' * :days
-                ORDER BY nr.publish_time DESC
-                LIMIT 50
-            """), {"code": code, "days": days})
-
-            news_items = result.fetchall()
-
-            if not news_items:
-                return {
-                    "positive": 0,
-                    "negative": 0,
-                    "neutral": 0,
-                    "average_score": 0.0,
-                    "trend": "stable",
-                    "news_analyzed": 0
-                }
-
-            # 分析每条新闻的情绪
-            positive_count = 0
-            negative_count = 0
-            neutral_count = 0
-            total_score = 0.0
-            scores = []
-
-            for (title, publish_time) in news_items:
-                sentiment = sentiment_analyzer.analyze_sentiment(title)
-                if sentiment:
-                    total_score += sentiment.score
-                    scores.append(sentiment.score)
-
-                    if sentiment.label == "positive":
-                        positive_count += 1
-                    elif sentiment.label == "negative":
-                        negative_count += 1
-                    else:
-                        neutral_count += 1
-
-            # 计算平均分和趋势
-            avg_score = total_score / len(news_items) if news_items else 0.0
-
-            # 判断趋势：比较最近一半和更早一半的平均分
-            trend = "stable"
-            if len(scores) >= 4:
-                mid = len(scores) // 2
-                recent_avg = sum(scores[:mid]) / mid
-                older_avg = sum(scores[mid:]) / (len(scores) - mid)
-                if recent_avg - older_avg > 0.5:
-                    trend = "up"
-                elif older_avg - recent_avg > 0.5:
-                    trend = "down"
-
-            return {
-                "positive": positive_count,
-                "negative": negative_count,
-                "neutral": neutral_count,
-                "average_score": round(avg_score, 2),
-                "trend": trend,
-                "news_analyzed": len(news_items)
-            }
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/api/market/indices")
 def get_indices():
     """获取主要指数行情"""
     print("📡 Request: GET /api/market/indices")
-    return get_index_data()
+    return sanitize_recursive(get_index_data())
 
 @app.get("/api/market/sectors")
 def get_sectors():
     """获取热门行业板块"""
     print("📡 Request: GET /api/market/sectors")
-    return get_hot_sectors()
+    return sanitize_recursive(get_hot_sectors())
 
 # --- Sync Logic ---
 def background_sync_task():
@@ -629,11 +543,12 @@ def background_sync_task():
         if candidates.empty:
             print("🔄 Snapshot unavailable, falling back to lightweight stock list...")
             try:
-                df_codes = ak.stock_info_a_code_name()
+                from core.data import safe_ak_call
+                df_codes = safe_ak_call("stock_info_a_code_name")
                 candidates = df_codes.rename(columns={'code':'code', 'name':'name'})
             except:
                 with get_db_engine().connect() as conn:
-                    candidates = pd.read_sql("SELECT DISTINCT code, name FROM daily_k", conn)
+                    candidates = pd.read_sql("SELECT code, name FROM stock_basic", conn)
 
         if candidates.empty:
             print("❌ All methods to get stock list failed.")
@@ -700,6 +615,7 @@ def background_sync_task():
     finally:
         sync_progress["is_running"] = False
 
+@app.post("/api/sync/start")
 @app.post("/api/sync/daily")
 def start_sync(background_tasks: BackgroundTasks):
     if sync_progress["is_running"]:
@@ -709,7 +625,7 @@ def start_sync(background_tasks: BackgroundTasks):
 
 
 @app.get("/api/sync/status")
-def get_sync_status():
+async def get_sync_status():
     return sync_progress
 
 def run_market_scan(
@@ -754,23 +670,35 @@ def run_market_scan(
             print(f"🔄 Switching to LOCAL DB mode (Local Only: {local_only})...")
             try:
                 with engine.connect() as conn:
-                    print("📡 Querying DB for max_date...")
+                        print("📡 Finding most recent complete date in DB (>3000 stocks)...")
+                        # 查找最近一个“完整”的交易日（至少有3000只股票）
+                        date_query = text("""
+                            SELECT date FROM daily_k 
+                            GROUP BY date 
+                            HAVING COUNT(*) > 3000 
+                            ORDER BY date DESC LIMIT 1
+                        """)
+                        max_date_res = conn.execute(date_query).fetchone()
+                        
+                if max_date_res:
+                    max_date = max_date_res[0]
+                    print(f"📅 Falling back to latest complete data from: {max_date}")
+                    query = text(f"""
+                        SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol, 
+                               1.0 as pct_chg, 5.0 as turnover, 5000000000.0 as mkt_cap 
+                        FROM daily_k d
+                        LEFT JOIN stock_basic b ON d.code = b.code
+                        WHERE d.date = '{max_date}'
+                    """)
+                    snapshot_df = pd.read_sql(query, engine)
+                    print(f"📊 Loaded {len(snapshot_df)} rows from DB ({max_date}).")
+                else:
+                    # 彻底兜底：最后一次尝试不限制数量
                     max_date_res = conn.execute(text("SELECT MAX(date) FROM daily_k")).fetchone()
                     if max_date_res and max_date_res[0]:
                         max_date = max_date_res[0]
-                        print(f"📅 Found max_date in DB: {max_date}")
-                        query = text(f"""
-                            SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol, 
-                                   2.0 as pct_chg, 10.0 as turnover, 10000000000.0 as mkt_cap 
-                            FROM daily_k d
-                            LEFT JOIN stock_basic b ON d.code = b.code
-                            WHERE d.date = '{max_date}'
-                        """)
+                        query = text(f"SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol, 1.0 as pct_chg, 5.0 as turnover, 5000000000.0 as mkt_cap FROM daily_k d LEFT JOIN stock_basic b ON d.code = b.code WHERE d.date = '{max_date}'")
                         snapshot_df = pd.read_sql(query, engine)
-                        print(f"📊 Loaded {len(snapshot_df)} rows from DB fallback.")
-                        # Fallback for name if join failed
-                        if not snapshot_df.empty:
-                            snapshot_df['name'] = snapshot_df['name'].fillna(snapshot_df['code'])
                     else:
                         print("❌ No data found in daily_k table.")
             except Exception as e:
@@ -827,16 +755,16 @@ def run_market_scan(
                 
         if target_index:
             try:
-                import akshare as ak
-                cons_df = ak.index_stock_cons(symbol=target_index)
+                from core.data import safe_ak_call
+                cons_df = safe_ak_call("index_stock_cons", symbol=target_index)
                 if not cons_df.empty:
                     cons_codes = cons_df['品种代码'].tolist()
                     candidates = candidates[candidates['code'].isin(cons_codes)]
             except Exception as e:
                 print(f"⚠️ {market_range} filter failed: {e}")
 
-        # 3. 安全检查：如果待扫描数量依然过多，提示用户缩小范围
-        max_allowed = 5000 if local_only else 2000
+        # 3. 安全检查：如果待扫描扫描数量依然过多，提示用户缩小范围
+        max_allowed = 6000 if local_only else 2000
         if len(candidates) > max_allowed:
             mode_desc = "本地" if local_only else "在线"
             raise HTTPException(
@@ -908,8 +836,8 @@ def run_market_scan(
             # 如果名称是代码（说明本地没查到名）或者行业未知，尝试联网获取详情
             if industry == "未知" or name == code:
                 try:
-                    import akshare as ak
-                    info_df = ak.stock_individual_info_em(symbol=code)
+                    from core.data import safe_ak_call
+                    info_df = safe_ak_call("stock_individual_info_em", symbol=code)
                     if not info_df.empty:
                         # 提取名称
                         name_val = info_df[info_df['item'] == '股票简称']['value'].values
@@ -1046,7 +974,8 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         else:
             try:
                 print(f"📉 [{code}] Fetching fresh data...")
-                df_new = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
+                from core.data import safe_ak_call
+                df_new = safe_ak_call("stock_zh_a_hist", symbol=code, period="daily", start_date=start_date, adjust="qfq")
                 if isinstance(df_new, pd.DataFrame) and not df_new.empty:
                     df = df_new
                     from core.db import save_to_db
@@ -1166,7 +1095,8 @@ async def get_stock_kline(code: str, local_only: bool = False):
         try:
             print(f"📉 API: Fetching K-line for {code}...")
             start_fetch = (target_date - timedelta(days=300)).strftime("%Y%m%d")
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_fetch, adjust="qfq")
+            from core.data import safe_ak_call
+            df = safe_ak_call("stock_zh_a_hist", symbol=code, period="daily", start_date=start_fetch, adjust="qfq")
             if not df.empty:
                 from core.db import save_to_db
                 save_to_db(df, code, engine)
@@ -1227,7 +1157,8 @@ def fetch_stock_data_with_indicators(code: str):
     if is_stale or df.empty:
         try:
              start_date = (target_date - timedelta(days=365)).strftime("%Y%m%d")
-             df_new = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
+             from core.data import safe_ak_call
+             df_new = safe_ak_call("stock_zh_a_hist", symbol=code, period="daily", start_date=start_date, adjust="qfq")
              if not df_new.empty:
                  df = df_new
                  save_to_db(df, code, engine)

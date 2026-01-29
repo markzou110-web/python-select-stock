@@ -176,9 +176,23 @@ def save_to_db(df, code, engine=None):
         engine = get_db_engine()
     if not engine or df.empty: return
     try:
-        data = df[['日期', '开盘', '最高', '最低', '收盘', '成交量']].copy()
+        # 支持多种列名映射（适配东财和新浪）
+        mapping = {
+            '日期': 'date', 'date': 'date',
+            '开盘': 'open', 'open': 'open',
+            '最高': 'high', 'high': 'high',
+            '最低': 'low', 'low': 'low',
+            '收盘': 'close', 'close': 'close',
+            '成交量': 'vol', 'volume': 'vol'
+        }
+        
+        # 提取存在的列
+        cols_to_use = [c for c in df.columns if c in mapping]
+        data = df[cols_to_use].copy()
+        
+        # 重命名为统一格式
+        data = data.rename(columns={c: mapping[c] for c in cols_to_use})
         data['code'] = code
-        data = data.rename(columns={'日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'vol'})
 
         # 使用安全的临时表名（移除潜在危险字符，防止SQL注入）
         safe_code = ''.join(c for c in code if c.isalnum())

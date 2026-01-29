@@ -95,7 +95,8 @@ def get_weekly_indicators(code, df=None, local_only=False):
             temp_df.set_index('日期', inplace=True)
             df_w = temp_df['收盘'].resample('W').last().dropna().to_frame()
         else:
-            df_w = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
+            from .data import safe_ak_call
+            df_w = safe_ak_call("stock_zh_a_hist", symbol=code, period="weekly", adjust="qfq")
             
         if len(df_w) < 30: return False
             

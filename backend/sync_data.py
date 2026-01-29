@@ -37,7 +37,8 @@ def sync_single_stock(code, name, start_time, engine):
             fetch_start = (last_date + timedelta(days=1)).strftime("%Y%m%d")
         
         # 3. 执行拉取
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=fetch_start, adjust="qfq")
+        from core.data import safe_ak_call
+        df = safe_ak_call("stock_zh_a_hist", symbol=code, period="daily", start_date=fetch_start, adjust="qfq")
         if not df.empty:
             save_to_db(df, code, engine)
             return True, "downloaded"
@@ -57,7 +58,8 @@ def sync_all_market(mkt_cap_min=5000000000, max_workers=10):
 
     print("🚀 正在获取市场快照...")
     try:
-        snapshot = ak.stock_zh_a_spot_em()
+        from core.data import safe_ak_call
+        snapshot = safe_ak_call("stock_zh_a_spot_em")
         candidates = snapshot[snapshot['总市值'] > mkt_cap_min]
         total = len(candidates)
         print(f"📦 发现 {total} 只符合条件（市值 > {mkt_cap_min/1e8}亿）的股票")

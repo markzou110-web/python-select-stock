@@ -4,19 +4,12 @@ import React, { useState, useEffect } from 'react';
 import { X, ExternalLink, Clock, TrendingUp, AlertTriangle, Loader2 } from 'lucide-react';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
-import SentimentAnalysis from './SentimentAnalysis';
 
 interface NewsItem {
     title: string;
     source: string;
     url: string;
     publish_time: string;
-}
-
-interface SentimentAnalysis {
-    score: number;
-    label: string;
-    reason: string;
 }
 
 interface NewsDetailModalProps {
@@ -33,7 +26,6 @@ export default function NewsDetailModal({
     stockName
 }: NewsDetailModalProps) {
     const [news, setNews] = useState<NewsItem[]>([]);
-    const [sentiment, setSentiment] = useState<SentimentAnalysis | null>(null);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
 
@@ -64,28 +56,6 @@ export default function NewsDetailModal({
             console.error("Failed to refresh news", e);
         } finally {
             setRefreshing(false);
-        }
-    };
-
-    const getSentimentIcon = (label: string) => {
-        switch (label) {
-            case 'positive':
-                return <TrendingUp className="text-emerald-500" size={20} />;
-            case 'negative':
-                return <AlertTriangle className="text-red-500" size={20} />;
-            default:
-                return <Clock className="text-slate-400" size={20} />;
-        }
-    };
-
-    const getSentimentColor = (label: string) => {
-        switch (label) {
-            case 'positive':
-                return 'bg-emerald-50 text-emerald-700 border-emerald-200';
-            case 'negative':
-                return 'bg-red-50 text-red-700 border-red-200';
-            default:
-                return 'bg-slate-50 text-slate-700 border-slate-200';
         }
     };
 
@@ -130,65 +100,62 @@ export default function NewsDetailModal({
                         </div>
                     ) : (
                         <div className="space-y-6">
-                            {/* Sentiment Analysis */}
-                            <SentimentAnalysis stockCode={stockCode} stockName={stockName} />
-
                             {/* News List */}
                             <div className="space-y-4">
-                            {/* Actions */}
-                            <div className="flex items-center justify-between mb-6">
-                                <span className="text-sm text-slate-500">
-                                    找到 {news.length} 条相关新闻
-                                </span>
-                                <button
-                                    onClick={handleRefresh}
-                                    disabled={refreshing}
-                                    className={cn(
-                                        "flex items-center gap-2 px-4 py-2 rounded-xl font-medium transition-colors",
-                                        "bg-indigo-50 text-indigo-600 hover:bg-indigo-100",
-                                        "disabled:opacity-50"
-                                    )}
-                                >
-                                    {refreshing ? (
-                                        <>
-                                            <Loader2 size={16} className="animate-spin" />
-                                            刷新中...
-                                        </>
-                                    ) : (
-                                        '刷新新闻'
-                                    )}
-                                </button>
-                            </div>
-
-                            {/* News List */}
-                            {news.map((item, index) => (
-                                <div
-                                    key={index}
-                                    className="p-5 bg-slate-50 rounded-xl border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50/50 transition-all"
-                                >
-                                    <div className="flex items-start justify-between gap-4">
-                                        <div className="flex-1">
-                                            <h4 className="font-semibold text-slate-800 mb-2 leading-snug">
-                                                {item.title}
-                                            </h4>
-                                            <div className="flex items-center gap-3 text-xs text-slate-500">
-                                                <span className="font-medium">{item.source}</span>
-                                                <span>•</span>
-                                                <span>{new Date(item.publish_time).toLocaleString('zh-CN')}</span>
-                                            </div>
-                                        </div>
-                                        <a
-                                            href={item.url}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="flex-shrink-0 p-2 hover:bg-white rounded-lg transition-colors"
-                                            title="查看原文"
-                                        >
-                                            <ExternalLink size={18} className="text-indigo-500" />
-                                        </a>
-                                    </div>
+                                {/* Actions */}
+                                <div className="flex items-center justify-between mb-6">
+                                    <span className="text-sm text-slate-500">
+                                        找到 {news.length} 条相关新闻
+                                    </span>
+                                    <button
+                                        onClick={handleRefresh}
+                                        disabled={refreshing}
+                                        className={cn(
+                                            "flex items-center gap-2 px-4 py-2 rounded-xl font-medium transition-colors",
+                                            "bg-indigo-50 text-indigo-600 hover:bg-indigo-100",
+                                            "disabled:opacity-50"
+                                        )}
+                                    >
+                                        {refreshing ? (
+                                            <>
+                                                <Loader2 size={16} className="animate-spin" />
+                                                刷新中...
+                                            </>
+                                        ) : (
+                                            '刷新新闻'
+                                        )}
+                                    </button>
                                 </div>
-                            ))}
+
+                                {/* News List */}
+                                {news.map((item, index) => (
+                                    <div
+                                        key={index}
+                                        className="p-5 bg-slate-50 rounded-xl border border-slate-200 hover:border-indigo-200 hover:bg-indigo-50/50 transition-all"
+                                    >
+                                        <div className="flex items-start justify-between gap-4">
+                                            <div className="flex-1">
+                                                <h4 className="font-semibold text-slate-800 mb-2 leading-snug">
+                                                    {item.title}
+                                                </h4>
+                                                <div className="flex items-center gap-3 text-xs text-slate-500">
+                                                    <span className="font-medium">{item.source}</span>
+                                                    <span>•</span>
+                                                    <span>{new Date(item.publish_time).toLocaleString('zh-CN')}</span>
+                                                </div>
+                                            </div>
+                                            <a
+                                                href={item.url}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="flex-shrink-0 p-2 hover:bg-white rounded-lg transition-colors"
+                                                title="查看原文"
+                                            >
+                                                <ExternalLink size={18} className="text-indigo-500" />
+                                            </a>
+                                        </div>
+                                    </div>
+                                ))}
                             </div>
                         </div>
                     )}

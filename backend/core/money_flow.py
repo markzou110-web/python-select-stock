@@ -48,13 +48,14 @@ def get_individual_fund_flow(code: str, days: int = 5) -> pd.DataFrame:
             # 确定 market 参数（上海/深圳）
             market = 'sz' if code.startswith('0') or code.startswith('3') else 'sh'
 
-            df = ak.stock_individual_fund_flow(stock=code, market=market)
+            from .data import safe_ak_call
+            df = safe_ak_call("stock_individual_fund_flow", stock=code, market=market)
 
             if df.empty:
                 return pd.DataFrame()
 
             # 数据清洗和重命名
-            df = df.head(days)
+            df = df.tail(days)
 
             # 标准化列名
             column_mapping = {
