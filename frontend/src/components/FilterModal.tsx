@@ -231,19 +231,22 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                 </label>
                             </div>
 
+                            <ToggleItem
+                                label="💰 主力资金流入过滤"
+                                active={params.use_money_flow || false}
+                                onClick={() => setParams({ ...params, use_money_flow: !params.use_money_flow })}
+                            />
+
                             <div className="pt-2">
-                                <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-emerald-100 bg-emerald-50/20 cursor-pointer transition-all hover:bg-emerald-50/40">
-                                    <div className="flex-1">
-                                        <span className="block font-bold text-emerald-700">💰 主力资金流入过滤</span>
-                                        <span className="text-[10px] text-emerald-400 font-medium">只显示主力资金净流入的股票</span>
-                                    </div>
+                                <FilterItem label="🎯 指定选股日期 (默认今日)">
                                     <input
-                                        type="checkbox"
-                                        checked={params.use_money_flow || false}
-                                        onChange={e => setParams({ ...params, use_money_flow: e.target.checked })}
-                                        className="w-5 h-5 rounded border-emerald-300 text-emerald-600 focus:ring-emerald-500"
+                                        type="date"
+                                        value={params.scan_date || ""}
+                                        onChange={e => setParams({ ...params, scan_date: e.target.value })}
+                                        className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500 cursor-pointer"
                                     />
-                                </label>
+                                    <p className="text-[10px] text-slate-400 font-medium mt-1">※ 历史选股需要本地已有当日同步数据</p>
+                                </FilterItem>
                             </div>
                         </div>
                     </div>

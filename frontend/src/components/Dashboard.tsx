@@ -44,7 +44,8 @@ export default function Dashboard() {
         strategy: "Resonance",
         rf_period: 100,
         rf_multiplier: 3.0,
-        only_signals: false
+        only_signals: false,
+        scan_date: ""
     });
 
     const [historyDates, setHistoryDates] = useState<string[]>([]);

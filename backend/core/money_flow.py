@@ -112,10 +112,10 @@ def calculate_money_flow_score(df_flow: pd.DataFrame) -> float:
         return 0.0
 
     # 最近 3 日主力净流入（万元）
-    recent_main_flow = df_flow['main_net_inflow'].head(3).sum()
+    recent_main_flow = df_flow['main_net_inflow'].tail(3).sum()
 
-    # 评分：每 1 亿流入得 20 分，封顶 20 分
-    score = min(abs(recent_main_flow) / 10000 * 20, 20)
+    # 评分：每 1 亿流入得 20 分，封顶 20 分 (仅限正流入)
+    score = min(max(0, recent_main_flow) / 10000 * 20, 20)
 
     return round(score, 2)
 

@@ -132,6 +132,7 @@ class ScanRequest(BaseModel):
     only_signals: bool = False
     use_money_flow: bool = False
     money_flow_days: int = Field(ge=1, le=30, default=3, description="资金流统计天数")
+    scan_date: Optional[str] = Field(default=None, description="选股日期 (YYYY-MM-DD)")
 
     @field_validator('strategy')
     @classmethod
@@ -279,11 +280,15 @@ class IntradaySentinel:
                     with open("sync_error.log", "a") as f:
                         f.write(error_msg)
                     
-                    # Robustness: If limit reached, try with higher turnover
+                    # Robustness: If limit reached, try with higher turnover and smaller range
                     if "待扫描股票过多" in str(e):
-                        print("🔄 Sentinel: Attempting recovery with stricter turnover filter...")
+                        print("🔄 Sentinel: Attempting recovery with stricter filters...")
                         try:
-                            results = run_market_scan(local_only=False, turnover_min=5.0)
+                            # Try with higher turnover AND limiting to major indices if needed
+                            results = run_market_scan(local_only=False, turnover_min=8.0, market_range="沪深300")
+                            if not results:
+                                results = run_market_scan(local_only=True) # Last resort: use local data cache
+                            
                             if results:
                                 self.last_top_5 = results[:5]
                                 send_intraday_notification(self.last_top_5)
@@ -646,11 +651,13 @@ def run_market_scan(
     rf_multiplier: float = 3.0,
     only_signals: bool = False,
     use_money_flow: bool = False,
-    money_flow_days: int = 3
+    money_flow_days: int = Field(ge=1, le=30, default=3, description="资金流统计天数"),
+    scan_date: str = None
 ):
     """Internal core scanning logic
 
-    新增参数:
+    参数说明:
+    - scan_date: 指定的历史日期 (YYYY-MM-DD)
     - use_money_flow: 是否启用资金流向过滤
     - money_flow_days: 资金流统计天数
     """
@@ -658,8 +665,28 @@ def run_market_scan(
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
         
-        # 1. 如果不是强制本地，尝试联网获取快照
-        if not local_only:
+        if scan_date:
+             print(f"🕒 Historical Scan Mode: Targeting {scan_date}...")
+             try:
+                 with engine.connect() as conn:
+                     query = text(f"""
+                         SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol, 
+                                1.0 as pct_chg, 5.0 as turnover, 5000000000.0 as mkt_cap 
+                         FROM daily_k d
+                         LEFT JOIN stock_basic b ON d.code = b.code
+                         WHERE d.date = '{scan_date}'
+                     """)
+                     snapshot_df = pd.read_sql(query, engine)
+                     if snapshot_df.empty:
+                         raise HTTPException(status_code=400, detail=f"数据库中未找到 {scan_date} 的完整数据，请确保已执行数据同步。")
+                     print(f"📊 Loaded {len(snapshot_df)} rows for historical date: {scan_date}")
+             except Exception as e:
+                 if isinstance(e, HTTPException): raise e
+                 print(f"❌ Historical snapshot load error: {e}")
+                 raise HTTPException(status_code=500, detail=f"加载历史快照失败: {str(e)}")
+        
+        # 2. 如果不是强制本地，尝试联网获取快照
+        elif not local_only:
             try:
                 snapshot_df = get_market_snapshot()
             except:
@@ -763,8 +790,8 @@ def run_market_scan(
             except Exception as e:
                 print(f"⚠️ {market_range} filter failed: {e}")
 
-        # 3. 安全检查：如果待扫描扫描数量依然过多，提示用户缩小范围
-        max_allowed = 6000 if local_only else 2000
+        # 3. 安全检查：如果待扫描数量仍过多，提示缩小范围
+        max_allowed = 6000 if local_only else 5000
         if len(candidates) > max_allowed:
             mode_desc = "本地" if local_only else "在线"
             raise HTTPException(
@@ -795,7 +822,8 @@ def run_market_scan(
                     strategy=strategy, rf_period=rf_period, rf_multiplier=rf_multiplier,
                     only_signals=only_signals,
                     use_money_flow=use_money_flow,
-                    money_flow_days=money_flow_days
+                    money_flow_days=money_flow_days,
+                    scan_date=scan_date
                 ): row for _, row in candidates.iterrows()
             }
             
@@ -951,12 +979,12 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None, strategy="Resonance", rf_period=100, rf_multiplier=3.0, only_signals=False, use_money_flow=False, money_flow_days=3):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, pe=0, turnover=0, local_only=False, engine=None, strategy="Resonance", rf_period=100, rf_multiplier=3.0, only_signals=False, use_money_flow=False, money_flow_days=3, scan_date=None):
     from core.db import load_from_db
     from core.strategy import check_range_filter_strategy, check_strategy
     import akshare as ak
     
-    target_date = datetime.now()
+    target_date = datetime.strptime(scan_date, "%Y-%m-%d") if scan_date else datetime.now()
     start_date = (target_date - timedelta(days=250)).strftime("%Y%m%d")
     end_date_str = target_date.strftime("%Y-%m-%d")
     
@@ -1247,11 +1275,13 @@ def scan_market(
     rf_multiplier: float = 3.0,
     only_signals: bool = False,
     use_money_flow: bool = False,
-    money_flow_days: int = 3
+    money_flow_days: int = 3,
+    scan_date: str = None
 ):
     """API Endpoint for market scan
 
-    新增参数:
+    参数说明:
+    - scan_date: 选股日期 (YYYY-MM-DD)
     - use_money_flow: 是否启用资金流向过滤（默认 False）
     - money_flow_days: 资金流统计天数（默认 3）
     """
@@ -1260,7 +1290,7 @@ def scan_market(
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
         turnover_min, mkt_cap_min, use_rs_filter, local_only,
         strategy, rf_period, rf_multiplier, only_signals,
-        use_money_flow, money_flow_days
+        use_money_flow, money_flow_days, scan_date
     )
 
 @app.post("/api/scan")
