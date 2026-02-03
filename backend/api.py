@@ -36,6 +36,11 @@ import math
 def sanitize_float(val):
     """Sanitizes float values to be JSON compliant (converts NaN/Inf to 0, numpy types to native)."""
     import numpy as np
+    import math
+
+    # Handle None or pandas NA
+    if val is None or (hasattr(val, 'isna') and val.isna()) or (isinstance(val, float) and math.isnan(val)):
+        return 0.0
 
     # Convert numpy types to native Python types
     if isinstance(val, np.integer):
@@ -49,7 +54,14 @@ def sanitize_float(val):
     if isinstance(val, float):
         if math.isnan(val) or math.isinf(val):
             return 0.0
-    return val
+    
+    try:
+        # Final attempt to ensure it's a number if it looks like one
+        if isinstance(val, (int, float)):
+            return val
+        return float(val)
+    except (ValueError, TypeError):
+        return val
 
 def sanitize_recursive(data):
     """Recursively sanitizes a dictionary or list for JSON compliance."""
@@ -523,6 +535,7 @@ def get_sectors():
 def background_sync_task():
     global sync_progress
     from sync_data import sync_single_stock
+    from core.money_flow import sync_stock_money_flow
     from core.data import get_market_snapshot, get_sector_map
     from core.db import get_db_engine, init_db
     
@@ -579,28 +592,62 @@ def background_sync_task():
         if today.weekday() == 5: target_sync_date = today - timedelta(days=1)
         elif today.weekday() == 6: target_sync_date = today - timedelta(days=2)
         target_sync_date = target_sync_date.date()
-        
-        # 预过滤：将不需要下载的票直接标记为成功
+
+        # 批量获取资金流最后同步日期
+        print("🔍 Checking existing money flow data...")
+        with engine.connect() as conn:
+            query_mf = text("SELECT code, MAX(date) as last_date FROM money_flow_daily GROUP BY code")
+            df_mf_existing = pd.read_sql(query_mf, engine)
+            mf_existing_map = pd.Series(df_mf_existing.last_date.values, index=df_mf_existing.code).to_dict()
+
+        # 预过滤：判断 K 线或资金流是否需要更新
         actual_tasks = []
         for _, row in candidates.iterrows():
             code = row['code']
-            last_date = existing_map.get(code)
-            if last_date and last_date >= target_sync_date:
+            last_date_k = existing_map.get(code)
+            last_date_mf = mf_existing_map.get(code)
+            
+            need_k = not last_date_k or last_date_k < target_sync_date
+            need_mf = not last_date_mf or last_date_mf < target_sync_date
+            
+            if need_k or need_mf:
+                row_copy = row.copy()
+                row_copy['need_k'] = need_k
+                row_copy['need_mf'] = need_mf
+                actual_tasks.append(row_copy)
+            else:
                 sync_progress["success"] += 1
                 sync_progress["current"] += 1
-            else:
-                actual_tasks.append(row)
         
-        print(f"⚡ {len(candidates) - len(actual_tasks)} stocks skipped (up-to-date). {len(actual_tasks)} to sync.")
+        print(f"⚡ {len(candidates) - len(actual_tasks)} stocks skipped. {len(actual_tasks)} to sync.")
         
         start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
         max_workers = 15 # 稍微提升并发
         
-        sync_progress["status_text"] = f"正在同步核心标的 (待处理: {len(actual_tasks)})..."
+        sync_progress["status_text"] = f"正在同步核心数据 (待处理: {len(actual_tasks)})..."
+        
+        def full_sync_task(row, engine, start_date):
+            code = row['code']
+            name = row['name']
+            k_ok = True
+            mf_ok = True
+            
+            # 1. 同步 K 线
+            if row.get('need_k', True):
+                k_ok, status = sync_single_stock(code, name, start_date, engine)
+            else:
+                status = "skipped"
+                
+            # 2. 同步资金流
+            if row.get('need_mf', True):
+                mf_ok = sync_stock_money_flow(code, engine)
+                
+            return (k_ok and mf_ok), status
+
         if actual_tasks:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(sync_single_stock, row['code'], row['name'], start_date, engine): row['code'] 
+                    executor.submit(full_sync_task, row, engine, start_date): row['code'] 
                     for row in actual_tasks
                 }
                 
@@ -611,7 +658,7 @@ def background_sync_task():
                     else:
                         sync_progress["fail"] += 1
                     sync_progress["current"] += 1
-                    # 动态延迟：如果是真正下载了且任务还很多，稍作休息；如果是跳过或报错，不停留
+                    
                     if status == "downloaded" and sync_progress["current"] % 5 == 0:
                         time.sleep(0.5)
                 
@@ -1229,7 +1276,7 @@ def get_stock_detail(code: str):
                 "MACD": float(row.get('MACD_HIST', 0))
             })
             
-        return {
+        result = {
             "code": code,
             "data": records,
             "indicators": {
@@ -1242,8 +1289,11 @@ def get_stock_detail(code: str):
                 "ema60": float(df.iloc[-1].get('EMA60', 0))
             }
         }
+        return sanitize_recursive(result)
     except Exception as e:
-        print(f"Error fetching stock detail for {code}: {e}")
+        import traceback
+        print(f"Error fetching stock detail for {code}:")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/scan/history")
