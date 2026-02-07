@@ -47,12 +47,15 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     
     df['Vol_MA20'] = df['成交量'].rolling(window=20).mean()
 
-    # KDJ Indicator (随机指标)
+    # KDJ Indicator (随机指标) - Vectorized using EWM
     # 计算n日内的最高价和最低价
     low_min = df['最低'].rolling(window=9).min()
     high_max = df['最高'].rolling(window=9).max()
     # RSV = (收盘价 - 最低价) / (最高价 - 最低价) * 100
-    df['KDJ_RSV'] = (df['收盘'] - low_min) / (high_max - low_min) * 100
+    # Handle division by zero if high equals low
+    denominator = high_max - low_min
+    df['KDJ_RSV'] = np.where(denominator == 0, 50, (df['收盘'] - low_min) / denominator * 100)
+    
     # K = 2/3 * 前一日K + 1/3 * 当日RSV
     df['KDJ_K'] = df['KDJ_RSV'].ewm(alpha=1/3, adjust=False).mean()
     # D = 2/3 * 前一日D + 1/3 * 当日K
@@ -60,9 +63,10 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     # J = 3 * K - 2 * D
     df['KDJ_J'] = 3 * df['KDJ_K'] - 2 * df['KDJ_D']
 
-    # OBV (On-Balance Volume) 能量潮
+    # OBV (On-Balance Volume) 能量潮 - Fully Vectorized
+    # Use numpy check for trend direction to replace apply
     df['OBV_Change'] = df['收盘'].diff()
-    df['OBV_Direction'] = df['OBV_Change'].apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
+    df['OBV_Direction'] = np.sign(df['OBV_Change']).fillna(0)
     df['OBV'] = (df['OBV_Direction'] * df['成交量']).cumsum()
 
     # ATR (Average True Range) 平均真实波幅

@@ -14,6 +14,7 @@ import PaperTradingView from '@/components/PaperTradingView';
 import SettingsView from '@/components/SettingsView';
 import { marketApi } from '@/lib/api';
 import api from '@/lib/api';
+import BacktestView from '@/components/BacktestView';
 import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -362,6 +363,8 @@ export default function Dashboard() {
                         </>
                     ) : activeView === 'paper' ? (
                         <PaperTradingView />
+                    ) : activeView === 'backtest' ? (
+                        <BacktestView />
                     ) : (
                         <SettingsView />
                     )}

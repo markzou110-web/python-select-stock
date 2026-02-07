@@ -404,3 +404,13 @@ def save_setting(key, value, engine=None):
     except Exception as e:
         print(f"Error saving setting {key}: {e}")
         return False
+
+def get_settings_all(engine=None):
+    if not engine: engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("SELECT key, value FROM system_settings")).fetchall()
+            return {row[0]: row[1] for row in res}
+    except Exception as e:
+        print(f"Error fetching all settings: {e}")
+        return {}

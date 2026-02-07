@@ -11,7 +11,8 @@ import {
     Cpu,
     RefreshCw,
     Database,
-    Clock
+    Clock,
+    History
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -127,8 +128,10 @@ export default function Sidebar({ syncProgress, onStartSync, activeView, onNavig
                 </div>
 
                 <div className="space-y-1 pt-2">
-                    <NavItem icon={<Search size={20} />} label="代码检索" active={activeView === 'search'} onClick={() => onNavigate('search')} />
-                    <NavItem icon={<Settings size={20} />} label="系统配置" active={activeView === 'settings'} onClick={() => onNavigate('settings')} />
+                    <NavItem icon={<Search size={20} />} label="选股扫描" active={activeView === 'scanner'} onClick={() => onNavigate('scanner')} />
+                    <NavItem icon={<TrendingUp size={20} />} label="模拟交易" active={activeView === 'paper'} onClick={() => onNavigate('paper')} />
+                    <NavItem icon={<Clock size={20} />} label="策略回测" active={activeView === 'backtest'} onClick={() => onNavigate('backtest')} />
+                    <NavItem icon={<Settings size={20} />} label="系统设置" active={activeView === 'settings'} onClick={() => onNavigate('settings')} />
                 </div>
 
                 <div className="mt-6 p-4 rounded-2xl bg-indigo-600 text-white shadow-xl shadow-indigo-100 relative overflow-hidden">
