@@ -44,3 +44,12 @@ Database: stock_db
 testing 
 
 
+# 后端启动
+cd /Users/liangzou/Desktop/AI_Tools/python-select-stock/backend
+source venv_new/bin/activate
+uvicorn api:app --port 8000
+
+# 前端启动
+cd /Users/liangzou/Desktop/AI_Tools/python-select-stock/backend
+source venv_new/bin/activate
+uvicorn api:app --port 8000

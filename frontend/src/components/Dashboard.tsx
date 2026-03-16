@@ -38,8 +38,12 @@ export default function Dashboard() {
         turnover_min: 3.0,
         mkt_cap_min: 0,
         use_rs_filter: true,
-        local_only: true
+        local_only: true,
+        data_date: "" as string  // 新增：选股使用的数据日期
     });
+
+    // 可用的数据日期列表
+    const [availableDates, setAvailableDates] = useState<Array<{date: string, stock_count: number}>>([]);
 
     const [historyDates, setHistoryDates] = useState<string[]>([]);
     const [selectedDate, setSelectedDate] = useState<string>("");
@@ -100,18 +104,27 @@ export default function Dashboard() {
         }
     }, [results.length]);
 
+    const fetchAvailableDates = useCallback(async () => {
+        try {
+            const res = await api.get('/api/scan/available-dates');
+            setAvailableDates(res.data.dates || []);
+        } catch (e) {
+            console.error("Failed to fetch available dates", e);
+        }
+    }, []);
+
     useEffect(() => {
         const init = async () => {
             setLoading(true);
             setLastUpdated(new Date().toLocaleTimeString());
-            await Promise.all([fetchMarketData(), fetchSyncStatus(), fetchHistory()]);
+            await Promise.all([fetchMarketData(), fetchSyncStatus(), fetchHistory(), fetchAvailableDates()]);
             setLoading(false);
         };
         init();
 
         const intervalId = setInterval(fetchSyncStatus, 5000);
         return () => clearInterval(intervalId);
-    }, [fetchMarketData, fetchSyncStatus, fetchHistory]);
+    }, [fetchMarketData, fetchSyncStatus, fetchHistory, fetchAvailableDates]);
 
     const startSync = async () => {
         try {
@@ -125,16 +138,49 @@ export default function Dashboard() {
     const handleScan = async () => {
         setIsScanning(true);
         setResults([]);
+        const startTime = Date.now();
+
+        // 更新扫描状态的定时器
+        const statusInterval = setInterval(() => {
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            console.log(`扫描进行中... 已耗时: ${elapsed}秒`);
+        }, 5000);
+
         try {
             const res = await marketApi.scanMarket(params);
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            console.log(`扫描完成! 耗时: ${elapsed}秒, 找到 ${res.data.length} 只股票`);
             setResults(res.data);
             setSelectedDate(new Date().toISOString().split('T')[0]);
             fetchHistory(); // 刷新日期列表
         } catch (e: any) {
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             console.error("Scan Error Detail:", e);
             const errorMsg = e.response?.data?.detail || e.message;
-            alert(`扫描失败: ${errorMsg}\n\n请检查后端终端输出或网络连接。`);
+
+            // 更详细的错误信息
+            let fullMessage = `扫描失败 (耗时: ${elapsed}秒)\n\n`;
+            if (e.code === 'ECONNABORTED' || e.message.includes('timeout')) {
+                fullMessage += `错误类型: 请求超时\n`;
+                fullMessage += `\n可能原因:\n`;
+                fullMessage += `1. 扫描股票数量过多，请缩小市场范围或调高筛选条件\n`;
+                fullMessage += `2. 网络连接不稳定，请检查网络设置\n`;
+                fullMessage += `3. 后端处理缓慢，请查看后端日志\n`;
+                fullMessage += `\n建议操作:\n`;
+                fullMessage += `- 勾选"仅本地数据"选项\n`;
+                fullMessage += `- 提高"最小换手率"阈值\n`;
+                fullMessage += `- 选择"沪深300"等较小市场范围`;
+            } else if (e.response?.status === 503) {
+                fullMessage += `错误类型: 服务不可用\n\n${errorMsg}`;
+            } else if (e.response?.status === 400) {
+                fullMessage += `错误类型: 参数错误\n\n${errorMsg}`;
+            } else {
+                fullMessage += `错误: ${errorMsg}`;
+            }
+
+            alert(fullMessage);
         } finally {
+            clearInterval(statusInterval);
             setIsScanning(false);
         }
     };
@@ -324,6 +370,7 @@ export default function Dashboard() {
                     params={params}
                     setParams={setParams}
                     onScan={handleScan}
+                    availableDates={availableDates}
                 />
             </div>
         </div>

@@ -1,8 +1,9 @@
 "use client";
 
-import React from 'react';
-import { X, Check } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { X, Check, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import api from '@/lib/api';
 
 interface FilterModalProps {
     isOpen: boolean;
@@ -10,9 +11,10 @@ interface FilterModalProps {
     params: any;
     setParams: (params: any) => void;
     onScan: () => void;
+    availableDates?: Array<{ date: string; stock_count: number }>;
 }
 
-export default function FilterModal({ isOpen, onClose, params, setParams, onScan }: FilterModalProps) {
+export default function FilterModal({ isOpen, onClose, params, setParams, onScan, availableDates = [] }: FilterModalProps) {
     if (!isOpen) return null;
 
     return (
@@ -125,6 +127,25 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                 <option value="中证500">中证500</option>
                                 <option value="中证1000">中证1000</option>
                             </select>
+                        </FilterItem>
+
+                        {/* 数据日期选择器 */}
+                        <FilterItem label="📅 选股数据日期">
+                            <select
+                                value={params.data_date || ""}
+                                onChange={e => setParams({ ...params, data_date: e.target.value })}
+                                className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
+                            >
+                                <option value="">🔄 自动选择最新日期</option>
+                                {availableDates.slice(0, 15).map((d) => (
+                                    <option key={d.date} value={d.date}>
+                                        📅 {d.date} ({d.stock_count}只股票)
+                                    </option>
+                                ))}
+                            </select>
+                            <p className="text-[10px] text-slate-400 mt-1">
+                                选择使用哪一天的数据进行选股，留空则自动使用最新可用日期
+                            </p>
                         </FilterItem>
 
                         <div className="pt-4 border-t border-slate-100">

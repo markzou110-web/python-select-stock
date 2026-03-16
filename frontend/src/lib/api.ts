@@ -2,8 +2,30 @@ import axios from 'axios';
 
 const api = axios.create({
     baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000',
-    timeout: 300000,
+    timeout: 600000,  // 增加到10分钟
 });
+
+// 请求拦截器 - 添加开始时间
+api.interceptors.request.use((config) => {
+    config.metadata = { startTime: Date.now() };
+    return config;
+});
+
+// 响应拦截器 - 记录耗时
+api.interceptors.response.use(
+    (response) => {
+        const duration = Date.now() - response.config.metadata.startTime;
+        console.log(`API ${response.config.url?.split('?')[0]} completed in ${duration}ms`);
+        return response;
+    },
+    (error) => {
+        if (error.config) {
+            const duration = Date.now() - (error.config.metadata?.startTime || 0);
+            console.error(`API ${error.config.url?.split('?')[0]} failed after ${duration}ms:`, error.message);
+        }
+        return Promise.reject(error);
+    }
+);
 
 console.log("API Base URL:", api.defaults.baseURL);
 
