@@ -2,25 +2,48 @@ import akshare as ak
 import pandas as pd
 import time
 import random
+import os
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map
+from typing import Dict, List, Any, Optional, Tuple
+from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map, validate_stock_code
+from .logging_config import logger
+
+# --- 禁用代理以避免连接问题 ---
+# 禁用 requests 和 urllib 的代理
+os.environ['NO_PROXY'] = '*'
+os.environ['HTTP_PROXY'] = ''
+os.environ['HTTPS_PROXY'] = ''
+os.environ['http_proxy'] = ''
+os.environ['https_proxy'] = ''
 
 # --- Simple Time-based Cache ---
-CACHE = {}
+CACHE: Dict[str, Tuple[Any, float]] = {}
 
-def get_cached_data(key, ttl_seconds):
+def get_cached_data(key: str, ttl_seconds: int) -> Optional[Any]:
+    """
+    Get data from cache if still valid.
+
+    Args:
+        key: Cache key
+        ttl_seconds: Time-to-live in seconds
+
+    Returns:
+        Cached data or None if expired/not found
+    """
     if key in CACHE:
         data, timestamp = CACHE[key]
         if time.time() - timestamp < ttl_seconds:
             return data
     return None
 
-def set_cached_data(key, data):
+
+def set_cached_data(key: str, data: Any) -> None:
+    """Store data in cache with current timestamp."""
     CACHE[key] = (data, time.time())
 
-def get_market_snapshot():
+def get_market_snapshot() -> pd.DataFrame:
     """获取全市场实时快照 (v5.1 - 强化防封与缓存)"""
     max_retries = 3
     for attempt in range(max_retries):
@@ -45,94 +68,124 @@ def get_market_snapshot():
             if attempt < max_retries - 1:
                 # 增强退避等待
                 wait_time = (attempt + 1) * 4
-                print(f"⚠️ Snapshot fetch failed (attempt {attempt+1}), retrying in {wait_time}s... Error: {e}")
+                logger.warning(f"Snapshot fetch failed (attempt {attempt+1}), retrying in {wait_time}s... Error: {e}")
                 time.sleep(wait_time)
                 continue
-            print(f"❌ Error fetching snapshot after {max_retries} attempts: {e}")
+            logger.error(f"Error fetching snapshot after {max_retries} attempts: {e}")
             return pd.DataFrame()
 
-def sync_stock(code, name, engine=None):
-    """同步单只股票的缺失数据"""
+def sync_stock(code: str, name: str, engine=None) -> bool:
+    """
+    同步单只股票的缺失数据
+
+    Args:
+        code: Stock code
+        name: Stock name
+        engine: Database engine (optional)
+
+    Returns:
+        True if successful, False otherwise
+    """
     from sqlalchemy import text
+
+    # Validate stock code
+    if not validate_stock_code(code):
+        logger.error(f"Invalid stock code: {code}")
+        return False
+
     if engine is None:
         engine = get_db_engine()
-    if not engine: return False
+    if not engine:
+        return False
+
     try:
-        # 获取最新日期
+        # 获取最新日期 - 使用参数化查询
         with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT MAX(date) FROM daily_k WHERE code='{code}'"))
+            result = conn.execute(
+                text("SELECT MAX(date) FROM daily_k WHERE code = :code"),
+                {"code": code}
+            )
             last_date = result.fetchone()[0]
-        
+
         if last_date:
             fetch_start = (last_date + timedelta(days=1)).strftime("%Y%m%d")
         else:
             fetch_start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
-            
+
         today_str = datetime.now().strftime("%Y%m%d")
         if last_date and last_date.strftime("%Y%m%d") >= today_str:
              return True
-             
+
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=fetch_start, adjust="qfq")
         if not df.empty:
             save_to_db(df, code, engine=engine)
         return True
     except Exception as e:
-        with open("sync_error.log", "a") as f:
-            f.write(f"[{datetime.now()}] sync_stock Error ({code}): {str(e)}\n")
+        logger.error(f"sync_stock Error ({code}): {e}")
         return False
 
-def get_index_data():
+def get_index_data() -> Dict[str, Dict[str, float]]:
     """获取主要指数实时行情 (并发拉取 + 缓存)"""
     cached = get_cached_data('index_data', 60)
-    if cached: return cached
+    if cached:
+        return cached
 
     indices = {
-        "上证": "000001", 
-        "创业板": "399006", 
-        "沪深300": "000300", 
-        "科创50": "000688", 
+        "上证": "000001",
+        "创业板": "399006",
+        "沪深300": "000300",
+        "科创50": "000688",
         "中证1000": "000852"
     }
-    
-    def fetch_one_with_retry(name, code, retries=3):
+
+    def fetch_one_with_retry(name: str, code: str, retries: int = 2) -> Tuple[str, Optional[Dict[str, float]]]:
         for i in range(retries):
             try:
-                # 策略：首推快速超时 (5s)，失败后再用长超时 (10s)
-                to = 5 if i == 0 else 10
-                # 给底层 akshare 增加环境超时，如果底层不支持，外层 ThreadPoolExecutor 会切断
-                df = ak.index_zh_a_hist(symbol=code, period="daily", 
+                # 增加随机延迟避免并发请求被限流
+                time.sleep(random.uniform(0.3, 0.8))
+                df = ak.index_zh_a_hist(symbol=code, period="daily",
                                        start_date=(datetime.now() - timedelta(days=10)).strftime("%Y%m%d"))
                 if not df.empty:
                     curr = df.iloc[-1]
                     prev = df.iloc[-2] if len(df) > 1 else curr
                     pct = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
-                    return name, {'price': curr['收盘'], 'pct': pct}
+                    return name, {'price': float(curr['收盘']), 'pct': round(pct, 2)}
             except Exception as e:
                 if i < retries - 1:
-                    time.sleep(random.uniform(0.5, 1.5)) # 避峰重试
+                    time.sleep(random.uniform(0.5, 1.5))
                 else:
-                    print(f"❌ Index fetch totally failed for {name} after {retries} attempts: {e}")
+                    logger.debug(f"Index fetch failed for {name}: {str(e)[:50]}")
         return name, None
 
     res = {}
     # 降低并发度，减少 EastMoney 连通重置风险
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(fetch_one_with_retry, name, code) for name, code in indices.items()]
-        for future in futures:
-            try:
-                # 总执行过程超时设长，允许内部重试耗时
-                name, data = future.result(timeout=40)
-                if data: res[name] = data
-            except:
-                pass
-    
-    if res: set_cached_data('index_data', res)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(fetch_one_with_retry, name, code) for name, code in indices.items()]
+            for future in futures:
+                try:
+                    name, data = future.result(timeout=20)
+                    if data:
+                        res[name] = data
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 如果获取失败但有过期缓存，返回过期缓存
+    if not res and 'index_data' in CACHE:
+        logger.debug("Using expired cache for index data")
+        return CACHE['index_data'][0]
+
+    if res:
+        set_cached_data('index_data', res)
     return res
 
-def get_hot_sectors():
+def get_hot_sectors() -> List[Dict[str, Any]]:
     """获取热门行业板块指数 (缓存 10 分钟)"""
     cached = get_cached_data('hot_sectors', 600)
-    if cached: return cached
+    if cached:
+        return cached
 
     for i in range(3):
         try:
@@ -148,16 +201,24 @@ def get_hot_sectors():
                     })
                 set_cached_data('hot_sectors', hot_sectors)
                 return hot_sectors
-        except:
-            if i < 2: time.sleep(1)
-            
+        except Exception as e:
+            if i < 2:
+                time.sleep(1)
+            logger.debug(f"Hot sectors fetch attempt {i+1} failed: {e}")
+
+    # 如果获取失败但有过期缓存，返回过期缓存
+    if 'hot_sectors' in CACHE:
+        logger.debug("Using expired cache for hot sectors")
+        return CACHE['hot_sectors'][0]
+
     return []
 
-def get_sector_map():
+def get_sector_map() -> Dict[str, str]:
     """获取全市场个股行业映射 (重量级操作，优先读取数据库)"""
     # 1. 内存缓存
     cached = get_cached_data('sector_map', 86400)
-    if cached: return cached
+    if cached:
+        return cached
 
     # 2. 数据库缓存 (可靠性保障)
     db_map = get_stock_basic_map()
@@ -165,32 +226,33 @@ def get_sector_map():
         set_cached_data('sector_map', db_map)
         return db_map
 
-    print("🏗️ Building sector map from API and persisting to DB...")
+    logger.info("Building sector map from API and persisting to DB...")
     sector_map = {}
     try:
         # 1. 获取所有行业板块名称
         df_board = ak.stock_board_industry_name_em()
-        if df_board.empty: return {}
-        
+        if df_board.empty:
+            return {}
+
         # 优化：只拉取前 50 个核心板块作为背景缓存
         all_boards = df_board['板块名称'].head(50).tolist()
-        
+
         # 2. 并发抓取成分股
-        def fetch_sector_with_retry(sector_name, retries=3):
+        def fetch_sector_with_retry(sector_name: str, retries: int = 3) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
             for i in range(retries):
                 try:
                     time.sleep(random.uniform(0.5, 1.0))
                     df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
                     if not df_curr.empty:
                         return sector_name, df_curr[['代码', '名称']].copy()
-                except:
+                except Exception:
                     pass
             return None, None
 
         all_basic_data = []
         with ThreadPoolExecutor(max_workers=5) as executor:
             future_to_sector = {executor.submit(fetch_sector_with_retry, name): name for name in all_boards}
-            
+
             for future in as_completed(future_to_sector):
                 try:
                     s_name, df_codes = future.result(timeout=15)
@@ -199,32 +261,42 @@ def get_sector_map():
                             code, name = row['代码'], row['名称']
                             sector_map[code] = s_name
                             all_basic_data.append({'code': code, 'name': name, 'industry': s_name})
-                except:
+                except Exception:
                     continue
-        
+
         # 3. 持久化到数据库
         if all_basic_data:
             df_basic = pd.DataFrame(all_basic_data)
             save_stock_basic(df_basic)
-            
-        if sector_map: 
+
+        if sector_map:
             set_cached_data('sector_map', sector_map)
-            print(f"✅ Full sector map built and persisted: {len(sector_map)} stocks mapped.")
+            logger.info(f"Full sector map built and persisted: {len(sector_map)} stocks mapped.")
         return sector_map
     except Exception as e:
-        print(f"❌ Critical error in get_sector_map: {e}")
+        logger.error(f"Critical error in get_sector_map: {e}")
         return {}
 
-def get_index_hist(code):
-    """获取指数历史用于基准计算 (缓存 24 小时)"""
+def get_index_hist(code: str) -> pd.DataFrame:
+    """
+    获取指数历史用于基准计算 (缓存 24 小时)
+
+    Args:
+        code: Index code
+
+    Returns:
+        DataFrame with historical index data
+    """
     cache_key = f'index_hist_{code}'
     cached = get_cached_data(cache_key, 86400)
-    if cached is not None: return cached
-    
+    if cached is not None:
+        return cached
+
     try:
         df = ak.index_zh_a_hist(symbol=code, period="daily")
         if not df.empty:
             set_cached_data(cache_key, df)
         return df
-    except:
+    except Exception as e:
+        logger.debug(f"Error fetching index hist for {code}: {e}")
         return pd.DataFrame()

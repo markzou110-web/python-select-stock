@@ -2,8 +2,8 @@ import pandas as pd
 import numpy as np
 import akshare as ak
 
-def calculate_indicators(df, current_price=None, current_vol=None, current_open=None, periods=[5, 10, 20, 60]):
-    """计算 EMA，支持注入当前快照价格以对齐 (v2.6.5 修复阳线判断)"""
+def calculate_indicators(df, current_price=None, current_vol=None, current_open=None, periods=[5, 10, 20, 60], bench_df=None):
+    """计算 EMA, MACD, BB, RSI 和 RS (Optimized)"""
     if df.empty: return df
     
     # 注入实时数据
@@ -12,7 +12,6 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
         last_row['收盘'] = float(current_price)
         if current_vol is not None: last_row['成交量'] = float(current_vol)
         if current_open is not None: last_row['开盘'] = float(current_open)
-        # 如果日期相同则覆盖，否则追加（通常用于盘中实时对齐）
         df.iloc[-1] = last_row
 
     for p in periods:
@@ -22,8 +21,8 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     delta = df['收盘'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    rs_raw = gain / loss.replace(0, np.nan) # Avoid division by zero
+    df['RSI'] = 100 - (100 / (1 + rs_raw.fillna(0)))
     
     # MACD
     ema12 = df['收盘'].ewm(span=12, adjust=False).mean()
@@ -37,19 +36,31 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     std = df['收盘'].rolling(window=20).std()
     df['BB_Upper'] = df['BB_Mid'] + 2 * std
     df['BB_Lower'] = df['BB_Mid'] - 2 * std
-    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid'].replace(0, np.nan)
     
     df['Vol_MA20'] = df['成交量'].rolling(window=20).mean()
     
-    # Relative Strength (RS) vs SSE (000001) - 简易版
+    # Squeeze Ratio Pre-calculation
+    if all(col in df.columns for col in ['EMA5', 'EMA10', 'EMA20', 'EMA60']):
+        ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
+        df['Sqz_Ratio'] = (df[ma_cols].max(axis=1) - df[ma_cols].min(axis=1)) / df[ma_cols].min(axis=1).replace(0, np.nan)
+
+    # Relative Strength (RS) vs SSE (000001) - Optimized with pre-filtered bench_df
     try:
-        from .data import get_index_hist
-        bench_df = get_index_hist("000001")
-        if not bench_df.empty:
-            # 对齐日期
-            df = df.merge(bench_df[['日期', '收盘']], on='日期', suffixes=('', '_bench'), how='left')
-            df['RS'] = df['收盘'] / df['收盘_bench']
+        if bench_df is not None and not bench_df.empty:
+            df = df.merge(bench_df, on='日期', suffixes=('', '_bench'), how='left')
+            df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
             df['RS_MA50'] = df['RS'].rolling(window=50).mean()
+        else:
+            # Fallback (mostly for K-line where bench_df might not be passed)
+            from .data import get_index_hist
+            b_df = get_index_hist("000001")
+            if not b_df.empty:
+                min_date, max_date = df['日期'].min(), df['日期'].max()
+                b_slice = b_df[(b_df['日期'] >= min_date) & (b_df['日期'] <= max_date)][['日期', '收盘']]
+                df = df.merge(b_slice, on='日期', suffixes=('', '_bench'), how='left')
+                df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
+                df['RS_MA50'] = df['RS'].rolling(window=50).mean()
     except: pass
 
     return df
@@ -77,5 +88,5 @@ def get_weekly_indicators(code, df=None, local_only=False):
         curr = df_w.iloc[-1]
         return curr['EMA10w'] > curr['EMA30w']
     except Exception as e:
-        print(f"⚠️ Weekly indicator failed for {code}: {e}")
+        logger.debug(f"Weekly indicator failed for {code}: {e}")
         return False

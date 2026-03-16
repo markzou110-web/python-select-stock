@@ -1,45 +1,71 @@
 import os
 import json
+import re
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
+from typing import Optional, Dict, Any, List
+from .logging_config import logger
 
 # 获取项目根目录下的配置文件路径
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(BASE_DIR, "db_config.json")
 
-def load_db_config():
+
+def validate_stock_code(code: str) -> bool:
+    """
+    Validate Chinese stock code format (6 digits, starting with 0, 1, 3, or 6).
+    Helps prevent SQL injection via code parameter.
+    """
+    return bool(re.match(r'^[0-36]\d{5}$', str(code)))
+
+
+def validate_table_name(name: str) -> bool:
+    """
+    Validate table name to prevent SQL injection.
+    Only allows alphanumeric characters and underscores.
+    """
+    return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(name)))
+
+
+def load_db_config() -> Dict[str, Any]:
     """从本地文件加载数据库配置"""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
                 return json.load(f)
-        except:
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Failed to load db config: {e}")
             return {}
     return {}
 
-def save_db_config(config):
+def save_db_config(config: Dict[str, Any]) -> bool:
     """保存数据库配置到本地文件"""
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
-    except:
-        pass
+        return True
+    except (OSError, TypeError) as e:
+        logger.error(f"Failed to save db config: {e}")
+        return False
 
-def get_db_engine(db_config=None):
+def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
     """根据配置获取数据库引擎"""
     if not db_config:
         db_config = load_db_config()
-        
+
     if not db_config:
         return None
-        
+
     try:
         url = f"postgresql://{db_config['user']}:{db_config['pwd']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
         engine = create_engine(url, pool_size=10, max_overflow=20)
         return engine
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid db config: {e}")
+        return None
     except Exception as e:
-        print(f"Error creating engine: {e}")
+        logger.error(f"Error creating engine: {e}")
         return None
 
 def init_db(engine=None):
@@ -105,26 +131,49 @@ def init_db(engine=None):
             try:
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS shadow_ratio FLOAT;"))
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Column migration skipped (may already exist): {e}")
             conn.commit()
     except Exception as e:
-        print(f"Database init failed: {e}")
+        logger.error(f"Database init failed: {e}")
 
-def save_to_db(df, code, engine=None):
-    """将数据保存到 PostgreSQL (增量)"""
+def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
+    """
+    将数据保存到 PostgreSQL (增量)
+
+    Args:
+        df: DataFrame with columns ['日期', '开盘', '最高', '最低', '收盘', '成交量']
+        code: Stock code (validated)
+        engine: Database engine (optional)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    # Validate stock code to prevent SQL injection
+    if not validate_stock_code(code):
+        logger.error(f"Invalid stock code format: {code}")
+        return False
+
     if engine is None:
         engine = get_db_engine()
-    if not engine or df.empty: return
+    if not engine or df.empty:
+        return False
+
     try:
         data = df[['日期', '开盘', '最高', '最低', '收盘', '成交量']].copy()
         data['code'] = code
         data = data.rename(columns={'日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'vol'})
-        
+
         # 使用唯一的临时表名，防止多线程冲突
+        # 验证临时表名格式
         temp_table_name = f"daily_k_temp_{code}"
+        if not validate_table_name(temp_table_name):
+            logger.error(f"Invalid temp table name: {temp_table_name}")
+            return False
+
         data.to_sql(temp_table_name, engine, if_exists='replace', index=False)
         with engine.connect() as conn:
+            # 使用参数化查询避免 SQL 注入 (临时表名已验证)
             conn.execute(text(f'''
                 INSERT INTO daily_k (code, date, open, high, low, close, vol)
                 SELECT code, CAST(date AS DATE), open, high, low, close, vol FROM {temp_table_name}
@@ -132,29 +181,66 @@ def save_to_db(df, code, engine=None):
             '''))
             conn.execute(text(f"DROP TABLE {temp_table_name}"))
             conn.commit()
+        return True
     except Exception as e:
-        with open("sync_error.log", "a") as f:
-            f.write(f"[{datetime.now()}] save_to_db Error ({code}): {str(e)}\n")
+        logger.error(f"save_to_db Error ({code}): {e}")
+        return False
 
-def load_from_db(code, start_date, engine=None):
-    """从 PostgreSQL 读取历史数据"""
+def load_from_db(code: str, start_date: str, engine=None) -> pd.DataFrame:
+    """
+    从 PostgreSQL 读取历史数据
+
+    Args:
+        code: Stock code (validated)
+        start_date: Start date string (YYYY-MM-DD)
+        engine: Database engine (optional)
+
+    Returns:
+        DataFrame with historical data
+    """
+    # Validate stock code
+    if not validate_stock_code(code):
+        logger.error(f"Invalid stock code format: {code}")
+        return pd.DataFrame()
+
     if engine is None:
         engine = get_db_engine()
-    if not engine: return pd.DataFrame()
+    if not engine:
+        return pd.DataFrame()
+
     try:
-        query = f"SELECT date as \"日期\", open as \"开盘\", high as \"最高\", low as \"最低\", close as \"收盘\", vol as \"成交量\" FROM daily_k WHERE code='{code}' AND date >= '{start_date}' ORDER BY date ASC"
-        df = pd.read_sql(query, engine)
+        # 使用参数化查询防止 SQL 注入
+        query = text("""
+            SELECT date as "日期", open as "开盘", high as "最高",
+                   low as "最低", close as "收盘", vol as "成交量"
+            FROM daily_k
+            WHERE code = :code AND date >= :start_date
+            ORDER BY date ASC
+        """)
+        df = pd.read_sql(query, engine, params={"code": code, "start_date": start_date})
         if not df.empty:
             df['日期'] = df['日期'].apply(lambda x: x.strftime('%Y-%m-%d'))
         return df
-    except:
+    except Exception as e:
+        logger.error(f"Error loading from DB for {code}: {e}")
         return pd.DataFrame()
 
-def save_scan_results(results, engine=None):
-    """持久化保存选股结果集"""
-    if engine is None: engine = get_db_engine()
-    if not engine or not results: return
-    
+def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
+    """
+    持久化保存选股结果集
+
+    Args:
+        results: List of scan result dictionaries
+        engine: Database engine (optional)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine or not results:
+        return False
+
     try:
         current_date = datetime.now().strftime("%Y-%m-%d")
         with engine.connect() as conn:
@@ -197,18 +283,34 @@ def save_scan_results(results, engine=None):
                     "shadow_ratio": float(r.get('影线比', 0))
                 })
             conn.commit()
-            print(f"💾 数据库：已成功保存 {len(results)} 条选股记录 ({current_date})")
+            logger.info(f"Saved {len(results)} scan records to database ({current_date})")
+        return True
     except Exception as e:
-        print(f"❌ 数据库：保存选股结果失败: {e}")
+        logger.error(f"Failed to save scan results: {e}")
+        return False
 
-def get_scan_history_by_date(date_str, engine=None):
-    """按日期获取历史选股结果"""
-    if engine is None: engine = get_db_engine()
-    if not engine: return []
+def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]:
+    """
+    按日期获取历史选股结果
+
+    Args:
+        date_str: Date string (YYYY-MM-DD)
+        engine: Database engine (optional)
+
+    Returns:
+        List of scan result dictionaries
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
+        return []
+
     try:
-        query = f"SELECT * FROM scan_history WHERE date = '{date_str}' ORDER BY score DESC"
-        df = pd.read_sql(query, engine)
-        if df.empty: return []
+        # 使用参数化查询防止 SQL 注入
+        query = text("SELECT * FROM scan_history WHERE date = :date ORDER BY score DESC")
+        df = pd.read_sql(query, engine, params={"date": date_str})
+        if df.empty:
+            return []
         
         # 转换回前端需要的格式
         results = []
@@ -232,24 +334,79 @@ def get_scan_history_by_date(date_str, engine=None):
             })
         return results
     except Exception as e:
-        print(f"Error loading scan history: {e}")
+        logger.error(f"Error loading scan history for {date_str}: {e}")
         return []
 
-def get_scan_dates(engine=None):
-    """获取所有有选股记录的日期"""
-    if engine is None: engine = get_db_engine()
-    if not engine: return []
+def get_scan_dates(engine=None) -> List[str]:
+    """
+    获取所有有选股记录的日期
+
+    Args:
+        engine: Database engine (optional)
+
+    Returns:
+        List of date strings (YYYY-MM-DD)
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
+        return []
+
     try:
         with engine.connect() as conn:
             res = conn.execute(text("SELECT DISTINCT date FROM scan_history ORDER BY date DESC"))
             return [str(row[0]) for row in res]
-    except:
+    except Exception as e:
+        logger.error(f"Error getting scan dates: {e}")
         return []
 
-def save_stock_basic(df, engine=None):
-    """保存股票基础信息 (板块、名称)"""
-    if engine is None: engine = get_db_engine()
-    if not engine or df.empty: return
+def get_available_dates(engine=None) -> List[Dict[str, Any]]:
+    """
+    获取可用于选股的数据日期列表
+
+    Args:
+        engine: Database engine (optional)
+
+    Returns:
+        List of dicts with 'date' and 'stock_count' keys
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
+        return []
+
+    try:
+        with engine.connect() as conn:
+            query = text("""
+                SELECT date, COUNT(DISTINCT code) as stock_count
+                FROM daily_k
+                GROUP BY date
+                HAVING COUNT(DISTINCT code) >= 500
+                ORDER BY date DESC
+                LIMIT 30
+            """)
+            result = conn.execute(query)
+            return [{"date": str(row[0]), "stock_count": int(row[1])} for row in result.fetchall()]
+    except Exception as e:
+        logger.error(f"Error getting available dates: {e}")
+        return []
+
+def save_stock_basic(df: pd.DataFrame, engine=None) -> bool:
+    """
+    保存股票基础信息 (板块、名称)
+
+    Args:
+        df: DataFrame with columns ['code', 'name', 'industry']
+        engine: Database engine (optional)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine or df.empty:
+        return False
+
     try:
         data = df[['code', 'name', 'industry']].copy()
         temp_table = "stock_basic_temp"
@@ -264,35 +421,79 @@ def save_stock_basic(df, engine=None):
             '''))
             conn.execute(text(f"DROP TABLE {temp_table}"))
             conn.commit()
+        return True
     except Exception as e:
-        print(f"❌ save_stock_basic Error: {e}")
+        logger.error(f"save_stock_basic Error: {e}")
+        return False
 
-def get_stock_basic_map(engine=None):
-    """获取股票基础信息映射 {code: industry}"""
-    if engine is None: engine = get_db_engine()
-    if not engine: return {}
-    try:
-        query = "SELECT code, industry FROM stock_basic"
-        df = pd.read_sql(query, engine)
-        return pd.Series(df.industry.values, index=df.code).to_dict()
-    except:
+def get_stock_basic_map(engine=None) -> Dict[str, str]:
+    """
+    获取股票基础信息映射 {code: industry}
+
+    Args:
+        engine: Database engine (optional)
+
+    Returns:
+        Dictionary mapping stock codes to industries
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
         return {}
 
-def get_setting(key, default=None, engine=None):
-    """获取系统设置"""
-    if engine is None: engine = get_db_engine()
-    if not engine: return default
     try:
-        with engine.connect() as conn:
-            res = conn.execute(text("SELECT value FROM system_settings WHERE key = :key"), {"key": key}).fetchone()
-            return res[0] if res else default
-    except:
+        query = text("SELECT code, industry FROM stock_basic")
+        df = pd.read_sql(query, engine)
+        return pd.Series(df.industry.values, index=df.code).to_dict()
+    except Exception as e:
+        logger.error(f"Error loading stock basic map: {e}")
+        return {}
+
+def get_setting(key: str, default: Any = None, engine=None) -> Any:
+    """
+    获取系统设置
+
+    Args:
+        key: Setting key
+        default: Default value if key not found
+        engine: Database engine (optional)
+
+    Returns:
+        Setting value or default
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
         return default
 
-def save_setting(key, value, engine=None):
-    """保存系统设置"""
-    if engine is None: engine = get_db_engine()
-    if not engine: return False
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(
+                text("SELECT value FROM system_settings WHERE key = :key"),
+                {"key": key}
+            ).fetchone()
+            return res[0] if res else default
+    except Exception as e:
+        logger.debug(f"Error getting setting {key}: {e}")
+        return default
+
+def save_setting(key: str, value: Any, engine=None) -> bool:
+    """
+    保存系统设置
+
+    Args:
+        key: Setting key
+        value: Setting value
+        engine: Database engine (optional)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
+        return False
+
     try:
         with engine.connect() as conn:
             conn.execute(text('''
@@ -302,5 +503,5 @@ def save_setting(key, value, engine=None):
             conn.commit()
         return True
     except Exception as e:
-        print(f"Error saving setting {key}: {e}")
+        logger.error(f"Error saving setting {key}: {e}")
         return False
