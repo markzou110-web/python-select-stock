@@ -11,18 +11,20 @@ import {
     Cpu,
     RefreshCw,
     Database,
-    Clock
+    Clock,
+    Square
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface SidebarProps {
     syncProgress: any;
     onStartSync: () => void;
+    onStopSync: () => void;
     activeView: string;
     onNavigate: (view: string) => void;
 }
 
-export default function Sidebar({ syncProgress, onStartSync, activeView, onNavigate }: SidebarProps) {
+export default function Sidebar({ syncProgress, onStartSync, onStopSync, activeView, onNavigate }: SidebarProps) {
     const isRunning = syncProgress?.is_running;
     const progress = syncProgress?.total > 0 ? (syncProgress.current / syncProgress.total) * 100 : 0;
     const [alertMsg, setAlertMsg] = React.useState<string | null>(null);
@@ -122,6 +124,14 @@ export default function Sidebar({ syncProgress, onStartSync, activeView, onNavig
                             <p className="mt-2 text-[9px] text-slate-400 leading-tight">
                                 {syncProgress?.status_text || "正在同步数据，请稍候..."}
                             </p>
+                            
+                            <button
+                                onClick={onStopSync}
+                                className="mt-3 w-full flex items-center justify-center gap-1.5 py-1.5 bg-red-50 text-red-600 rounded-lg text-[10px] font-bold border border-red-100 hover:bg-red-100 transition-all"
+                            >
+                                <Square size={10} fill="currentColor" />
+                                立即停止同步
+                            </button>
                         </div>
                     )}
                 </div>

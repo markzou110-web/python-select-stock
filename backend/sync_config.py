@@ -64,7 +64,7 @@ MARKET_CONFIG = {
     "min_market_cap": 5000000000,   # 最小市值（50亿）
     "include_st": True,             # 是否包含ST股
     "include_new": True,            # 是否包含新股
-    "include_bj": True,             # 是否包含北交所
+    "include_bj": False,            # 是否包含北交所
 }
 
 # 数据时间范围

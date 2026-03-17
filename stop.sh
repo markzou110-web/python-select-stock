@@ -9,26 +9,31 @@ echo " Alpha Vision 停止"
 echo "============================================================"
 echo ""
 
-# 读取保存的PID
+# 1. 停止后端
 if [ -f ".backend_pid" ]; then
     BACKEND_PID=$(cat .backend_pid)
-    echo "停止后端 (PID: $BACKEND_PID)..."
-    kill $BACKEND_PID 2>/dev/null && echo "  后端已停止" || echo "  后端进程不存在"
+    echo "停止记录的后端 (PID: $BACKEND_PID)..."
+    kill $BACKEND_PID 2>/dev/null
     rm -f .backend_pid
-else
-    echo "未找到后端PID文件，尝试查找进程..."
-    pkill -f "python3 api.py" && echo "  后端已停止" || echo "  未找到运行中的后端"
 fi
 
+# 强制清理所有 api.py 相关的 Python 进程
+echo "清理所有残留的后端进程 (api.py)..."
+pkill -9 -f "api.py" && echo "  已清理" || echo "  未发现残留进程"
+
+# 2. 停止前端
 if [ -f ".frontend_pid" ]; then
     FRONTEND_PID=$(cat .frontend_pid)
-    echo "停止前端 (PID: $FRONTEND_PID)..."
-    kill $FRONTEND_PID 2>/dev/null && echo "  前端已停止" || echo "  前端进程不存在"
+    echo "停止记录的前端 (PID: $FRONTEND_PID)..."
+    kill $FRONTEND_PID 2>/dev/null
     rm -f .frontend_pid
-else
-    echo "未找到前端PID文件，尝试查找进程..."
-    pkill -f "next dev" && echo "  前端已停止" || echo "  未找到运行中的前端"
 fi
+
+# 强制清理所有 Next.js/Node 相关的开发进程
+echo "清理所有残留的前端进程 (next/node)..."
+pkill -9 -f "next-dev" 2>/dev/null
+pkill -9 -f "next dev" 2>/dev/null
+echo "  前端进程已清理"
 
 echo ""
 echo "============================================================"

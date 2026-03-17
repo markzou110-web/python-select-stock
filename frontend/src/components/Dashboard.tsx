@@ -135,6 +135,15 @@ export default function Dashboard() {
         }
     };
 
+    const stopSync = async () => {
+        try {
+            await api.post('/api/sync/stop');
+            fetchSyncStatus();
+        } catch (e) {
+            console.error("Sync stop failed", e);
+        }
+    };
+
     const handleScan = async () => {
         setIsScanning(true);
         setResults([]);
@@ -220,6 +229,7 @@ export default function Dashboard() {
             <Sidebar
                 syncProgress={syncProgress}
                 onStartSync={startSync}
+                onStopSync={stopSync}
                 activeView={activeView}
                 onNavigate={setActiveView}
             />

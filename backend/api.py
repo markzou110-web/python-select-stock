@@ -43,7 +43,8 @@ sync_progress = {
     "success": 0,
     "fail": 0,
     "start_time": None,
-    "status_text": "等待中..."
+    "status_text": "等待中...",
+    "stop_requested": False
 }
 
 @asynccontextmanager
@@ -259,6 +260,7 @@ def background_sync_task():
 
     with sync_progress_lock:
         sync_progress["is_running"] = True
+        sync_progress["stop_requested"] = False
         sync_progress["start_time"] = datetime.now().isoformat()
         sync_progress["success"] = 0
         sync_progress["fail"] = 0
@@ -294,7 +296,8 @@ def background_sync_task():
         with engine.connect() as conn:
             # 获取所有股票代码
             all_codes_result = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
-            all_codes = [row[0] for row in all_codes_result]
+            # 仅包含：沪深主板(60, 00)、创业板(30)、科创板(688)
+            all_codes = [row[0] for row in all_codes_result if row[0].startswith(('60', '688', '00', '30'))]
 
         if not all_codes:
             logger.error("No stocks found in database")
@@ -308,16 +311,20 @@ def background_sync_task():
 
         logger.info(f"Starting sync for {len(all_codes)} stocks using multi-source...")
 
-        # 执行批量同步（使用腾讯等稳定数据源）
+        # 执行批量同步（支持中途停止）
         results = syncer.sync_batch(
             all_codes,
-            delay_range=(1.2, 2.5),
+            delay_range=(0.0, 0.1),
             progress_callback=lambda current, total, success, failed: update_sync_progress(
                 current, total, success, failed, len(all_codes)
-            )
+            ),
+            max_workers=8
         )
 
-        logger.info(f"Sync completed: {results}")
+        if sync_progress["stop_requested"]:
+            logger.info("Sync task was stopped by user.")
+        else:
+            logger.info(f"Sync completed normally: {results}")
 
     except Exception as e:
         logger.error(f"Background sync error: {e}")
@@ -329,13 +336,27 @@ def background_sync_task():
 
 
 def update_sync_progress(current: int, total: int, success: int, failed: int, overall_total: int):
-    """更新同步进度回调"""
+    """更新同步进度回调，并返回是否应该继续"""
     with sync_progress_lock:
         sync_progress["current"] = current
         sync_progress["success"] = success
         sync_progress["fail"] = failed
         sync_progress["total"] = overall_total
+        if sync_progress["stop_requested"]:
+            sync_progress["status_text"] = f"正在停止... ({current}/{total})"
+            return False
         sync_progress["status_text"] = f"正在同步... ({current}/{total})"
+        return True
+
+@app.post("/api/sync/stop")
+def stop_sync():
+    """Stop the ongoing synchronization."""
+    with sync_progress_lock:
+        if not sync_progress["is_running"]:
+            return {"status": "not_running"}
+        sync_progress["stop_requested"] = True
+        sync_progress["status_text"] = "停止指令已发送，等待当前股票处理完成..."
+    return {"status": "stopping"}
 
 @app.post("/api/sync/daily")
 def start_sync(background_tasks: BackgroundTasks):
@@ -458,16 +479,16 @@ def run_market_scan(
         # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
         total_snapshot = len(snapshot_df)
 
-        # SOP: 剔除 ST、北交所 (8, 4, 920开头)、退市整理
+        # SOP: 仅保留 沪深主板(60, 00)、创业板(30)、科创板(688)；剔除 ST、退市整理
         snapshot_df['code_str'] = snapshot_df['code'].astype(str)
         snapshot_df['name_str'] = snapshot_df['name'].astype(str)
-
+        
+        is_target_market = snapshot_df['code_str'].str.startswith(('60', '688', '00', '30'))
         is_not_st = ~snapshot_df['name_str'].str.contains('ST|退', case=False)
-        is_not_bj = ~snapshot_df['code_str'].str.startswith(('8', '4', '920'))
 
         candidates = snapshot_df[
             (snapshot_df['pct_chg'] > 0) &
-            is_not_st & is_not_bj &
+            is_target_market & is_not_st &
             (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000) &  # UI 传过来的是"亿"为单位
             (snapshot_df['turnover'] >= turnover_min)
         ].copy()

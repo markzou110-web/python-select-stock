@@ -133,8 +133,12 @@ class DataSource(ABC):
 
     def record_failure(self, error: str):
         """记录失败调用"""
-        self.fail_count += 1
         self.last_error = error[:100]
+        # 忽略部分不支持的股票解析异常，不统计为数据源崩溃
+        if any(err in error for err in ["list index", "invalid literal", "KeyError", "not found"]):
+            return
+            
+        self.fail_count += 1
         if self.fail_count >= 3:
             self.status = DataSourceStatus.UNAVAILABLE
 
@@ -147,7 +151,7 @@ class EastMoneyDataSource(DataSource):
 
     def __init__(self):
         super().__init__("东方财富")
-        self.priority = 1  # 优先级（1最高）
+        self.priority = 3  # 被代理/网络封锁，降级
 
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         try:
@@ -230,7 +234,7 @@ class TencentDataSource(DataSource):
 
     def __init__(self):
         super().__init__("腾讯财经")
-        self.priority = 3
+        self.priority = 0  # 优先级最高，当前网络最稳定
 
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         # 腾讯没有直接获取所有股票的接口，使用新浪的
@@ -243,43 +247,52 @@ class TencentDataSource(DataSource):
 
     def format_code(self, code: str) -> str:
         """腾讯需要带交易所前缀"""
-        if code.startswith('6'):
+        if code.startswith('6') or code.startswith('9'):
             return f'sh{code}'
-        elif code.startswith('0') or code.startswith('3'):
+        elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
             return f'sz{code}'
         elif code.startswith('8') or code.startswith('4'):
             return f'bj{code}'
-        return code
+        return f'sz{code}'
 
     def get_hist_data(self, code: str, start_date: str) -> Optional[pd.DataFrame]:
-        try:
-            symbol = self.format_code(code)
-            df = ak.stock_zh_a_hist_tx(symbol=symbol)
+        symbol = self.format_code(code)
+        df = None
+        for attempt in range(5):
+            try:
+                # Add dates to make it specific and avoid pulling 20 years of history if not needed.
+                start = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}" # Convert YYYYMMDD to YYYY-MM-DD for Tencent
+                end = datetime.now().strftime("%Y-%m-%d")
+                df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end)
+                break
+            except Exception as e:
+                logger.debug(f"腾讯数据源尝试 {attempt+1}/5 失败 ({code}): {e}")
+                if attempt == 4:
+                    raise
+                time.sleep(round(random.uniform(0.5, 1.5), 2))
 
-            if df.empty:
-                return None
+        if df is None or df.empty:
+            return None
 
-            # 腾讯返回的列名：date, open, close, high, low, amount
-            df = df.rename(columns={
-                'date': '日期',
-                'open': '开盘',
-                'high': '最高',
-                'low': '最低',
-                'close': '收盘',
-                'amount': '成交额'
-            })
+        # 腾讯返回的列名：date, open, close, high, low, amount
+        df = df.rename(columns={
+            'date': '日期',
+            'open': '开盘',
+            'high': '最高',
+            'low': '最低',
+            'close': '收盘',
+            'amount': '成交额'
+        })
 
-            # 腾讯没有成交量，用成交额填充
-            df['成交量'] = df['成交额']
+        # 腾讯没有成交量，用成交额填充
+        df['成交量'] = df['成交额']
 
-            # 筛选日期
-            start_dt = datetime.strptime(start_date, "%Y%m%d")
-            df['日期'] = pd.to_datetime(df['日期']).dt.date
-            df = df[df['日期'] >= start_dt.date()]
+        # 筛选日期
+        start_dt = datetime.strptime(start_date, "%Y%m%d")
+        df['日期'] = pd.to_datetime(df['日期']).dt.date
+        df = df[df['日期'] >= start_dt.date()]
 
-            return df
-        except Exception as e:
-            raise
+        return df
 
 
 class TushareDataSource(DataSource):
@@ -291,7 +304,7 @@ class TushareDataSource(DataSource):
     def __init__(self, token: Optional[str] = None):
         super().__init__("Tushare")
         self.token = token or config.TUSHARE_TOKEN
-        self.priority = 0  # 最高优先级
+        self.priority = 4  # 速率限制严重，作为最后备用
         self.pro = None
         
         if self.token:
@@ -516,7 +529,8 @@ class MultiSourceSync:
             # 检查是否需要同步
             today = datetime.now().date()
             if last_date:
-                if (today - last_date).days <= 1:
+                # 只有当数据库日期已经等于或超过今天，才跳过
+                if last_date >= today:
                     result["success"] = True
                     result["message"] = "已是最新"
                     return result
@@ -530,13 +544,13 @@ class MultiSourceSync:
             return result
 
         # 尝试使用不同数据源
-        for attempt in range(max_retries):
-            source = self.manager.get_available_source()
+        sources_to_try = [s for s in self.manager.sources if s.is_available()]
+        
+        if not sources_to_try:
+            result["message"] = "无可用数据源"
+            return result
 
-            if not source:
-                result["message"] = "无可用数据源"
-                return result
-
+        for source in sources_to_try:
             try:
                 df = source.get_hist_data(code, start_date)
 
@@ -558,29 +572,28 @@ class MultiSourceSync:
                     return result
 
             except Exception as e:
-                logger.warning(f"{source.name} 同步 {code} 失败: {str(e)}")
-                source.record_failure(str(e))
+                err_msg = str(e)
+                if any(err in err_msg for err in ["list index", "invalid literal", "KeyError", "not found"]):
+                    logger.debug(f"{source.name} 无法解析或不支持 {code}: {err_msg}")
+                else:
+                    logger.warning(f"{source.name} 同步 {code} 失败: {err_msg}", exc_info=True)
+                    source.record_failure(err_msg)
 
-                # 切换到下一个数据源
-                self.manager.rotate_source()
-
-                # 短暂延迟
+                # 短暂延迟后切换下个数据源（仅针对此支股票，不影响全局）
                 time.sleep(1)
 
-        result["message"] = "所有数据源均失败"
+        result["message"] = "所有的可用数据源均未返回数据"
         return result
 
-    def sync_batch(self, codes: List[str], delay_range=(1.2, 2.5), progress_callback=None) -> Dict[str, Any]:
+    def sync_batch(self, codes: List[str], delay_range=(0.0, 0.1), progress_callback=None, max_workers=5) -> Dict[str, Any]:
         """
-        批量同步股票
+        批量同步股票 (Enhanced with Threading)
 
         Args:
             codes: 股票代码列表
-            delay_range: 请求间隔范围
+            delay_range: 请求间隔范围 (在使用线程池时主要起轻微错峰作用)
             progress_callback: 进度回调函数 callback(current, total, success, failed)
-
-        Returns:
-            同步结果汇总
+            max_workers: 最大并发线程数
         """
         results = {
             "total": len(codes),
@@ -589,32 +602,53 @@ class MultiSourceSync:
             "skipped": 0,
             "details": []
         }
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+        
+        lock = threading.Lock()
+        completed_count = 0
+        stop_flag = False
 
-        for i, code in enumerate(codes, 1):
-            result = self.sync_single_stock(code)
-            results["details"].append(result)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_code = {executor.submit(self.sync_single_stock, code): code for code in codes}
+            
+            for future in as_completed(future_to_code):
+                if stop_flag:
+                    break
+                    
+                code = future_to_code[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"success": False, "message": f"崩溃异常: {exc}", "source": "Unknown"}
 
-            if result["success"]:
-                if "已是最新" in result["message"] or "无新数据" in result["message"]:
-                    results["skipped"] += 1
-                else:
-                    results["success"] += 1
-                    logger.debug(f"[{i}/{len(codes)}] {code}: {result['message']} (来源: {result['source']})")
-            else:
-                results["failed"] += 1
-                logger.warning(f"[{i}/{len(codes)}] {code}: {result['message']}")
+                with lock:
+                    completed_count += 1
+                    results["details"].append(result)
 
-            # 调用进度回调
-            if progress_callback:
-                progress_callback(i, len(codes), results["success"], results["failed"])
+                    if result.get("success"):
+                        if "已是最新" in result.get("message", "") or "无新数据" in result.get("message", ""):
+                            results["skipped"] += 1
+                        else:
+                            results["success"] += 1
+                            logger.debug(f"[{completed_count}/{len(codes)}] {code}: {result['message']} (来源: {result.get('source')})")
+                    else:
+                        results["failed"] += 1
+                        logger.warning(f"[{completed_count}/{len(codes)}] {code}: {result['message']}")
 
-            # 随机延迟
-            time.sleep(random.uniform(*delay_range))
-
-            # 每50只报告进度
-            if i % 50 == 0:
-                logger.info(f"进度: {i}/{len(codes)}, 成功: {results['success']}, "
-                          f"失败: {results['failed']}, 跳过: {results['skipped']}")
+                    # 调用进度回调
+                    if progress_callback:
+                        if progress_callback(completed_count, len(codes), results["success"], results["failed"]) is False:
+                            logger.info("收到停止指令，同步任务中断...")
+                            stop_flag = True
+                            
+                    if completed_count % 50 == 0:
+                        logger.info(f"进度: {completed_count}/{len(codes)}, 成功: {results['success']}, "
+                                  f"失败: {results['failed']}, 跳过: {results['skipped']}")
+                
+                if delay_range[1] > 0 and not stop_flag:
+                    time.sleep(random.uniform(*delay_range))
 
         return results
 
