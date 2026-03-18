@@ -35,21 +35,21 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     <div className="space-y-6">
                         <FilterItem label="粘合度阈值 (0.01~0.30)">
                             <input
-                                type="range" min="0.01" max="0.30" step="0.01" value={params.threshold}
+                                type="range" min="0.01" max="0.30" step="0.01" value={params.threshold || 0}
                                 onChange={e => setParams({ ...params, threshold: parseFloat(e.target.value) })}
                                 className="w-full accent-indigo-600"
                             />
                             <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
                                 <span>极限粘合 (0.01)</span>
-                                <span className="text-indigo-600 font-extrabold text-xs">{params.threshold.toFixed(2)}</span>
+                                <span className="text-indigo-600 font-extrabold text-xs">{(Number(params.threshold) || 0).toFixed(2)}</span>
                                 <span>宽容粘合 (0.30)</span>
                             </div>
                         </FilterItem>
 
                         <FilterItem label="量比倍数 (1.0~5.0)">
                             <input
-                                type="number" step="0.1" value={params.vol_multiplier}
-                                onChange={e => setParams({ ...params, vol_multiplier: parseFloat(e.target.value) })}
+                                type="number" step="0.1" value={isNaN(params.vol_multiplier) ? '' : params.vol_multiplier}
+                                onChange={e => setParams({ ...params, vol_multiplier: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
                                 className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                             />
                         </FilterItem>
@@ -67,15 +67,15 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                             />
                             <FilterItem label="最小换手率 (%)">
                                 <input
-                                    type="number" step="0.5" value={params.turnover_min}
-                                    onChange={e => setParams({ ...params, turnover_min: parseFloat(e.target.value) })}
+                                    type="number" step="0.5" value={isNaN(params.turnover_min) ? '' : params.turnover_min}
+                                    onChange={e => setParams({ ...params, turnover_min: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
                                     className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                                 />
                             </FilterItem>
                             <FilterItem label="最小市值 (亿)">
                                 <input
-                                    type="number" step="10" value={params.mkt_cap_min}
-                                    onChange={e => setParams({ ...params, mkt_cap_min: parseFloat(e.target.value) })}
+                                    type="number" step="10" value={isNaN(params.mkt_cap_min) ? '' : params.mkt_cap_min}
+                                    onChange={e => setParams({ ...params, mkt_cap_min: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
                                     className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                                 />
                             </FilterItem>
@@ -94,16 +94,16 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     <div className="space-y-6">
                         <FilterItem label="RSI 最小强度 (30~80)">
                             <input
-                                type="number" value={params.rsi_min}
-                                onChange={e => setParams({ ...params, rsi_min: parseInt(e.target.value) })}
+                                type="number" value={isNaN(params.rsi_min) ? '' : params.rsi_min}
+                                onChange={e => setParams({ ...params, rsi_min: e.target.value === '' ? NaN : parseInt(e.target.value) })}
                                 className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                             />
                         </FilterItem>
 
                         <FilterItem label="粘合回溯天数 (1~30)">
                             <input
-                                type="number" value={params.sqz_lookback}
-                                onChange={e => setParams({ ...params, sqz_lookback: parseInt(e.target.value) })}
+                                type="number" value={isNaN(params.sqz_lookback) ? '' : params.sqz_lookback}
+                                onChange={e => setParams({ ...params, sqz_lookback: e.target.value === '' ? NaN : parseInt(e.target.value) })}
                                 className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                             />
                         </FilterItem>

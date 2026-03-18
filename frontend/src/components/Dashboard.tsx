@@ -156,7 +156,16 @@ export default function Dashboard() {
         }, 5000);
 
         try {
-            const res = await marketApi.scanMarket(params);
+            // 清理 params，防止将 NaN 发向后端
+            const cleanParams = { ...params };
+            Object.keys(cleanParams).forEach(key => {
+                const val = (cleanParams as any)[key];
+                if (typeof val === 'number' && isNaN(val)) {
+                    delete (cleanParams as any)[key];
+                }
+            });
+
+            const res = await marketApi.scanMarket(cleanParams);
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             console.log(`扫描完成! 耗时: ${elapsed}秒, 找到 ${res.data.length} 只股票`);
             setResults(res.data);

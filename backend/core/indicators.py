@@ -90,3 +90,81 @@ def get_weekly_indicators(code, df=None, local_only=False):
     except Exception as e:
         logger.debug(f"Weekly indicator failed for {code}: {e}")
         return False
+def batch_calculate_indicators(df, snapshot_df=None, periods=[5, 10, 20, 60], bench_df=None):
+    """
+    全市场批量向量化指标计算 (v6.0 - 极致提速)
+    df: 包含所有股票历史的大 DataFrame，必须按 [code, 日期] 排序
+    snapshot_df: 今日实时快照 (可选)
+    bench_df: 大盘指数历史 (用于计算 RS)
+    """
+    if df.empty: return df
+    
+    # --- 1. 数据对齐与准备 ---
+    # 确保日期格式统一
+    if not pd.api.types.is_datetime64_any_dtype(df['日期']):
+         df['日期'] = pd.to_datetime(df['日期'])
+    
+    # 按照代码和日期严格排序，这对于 ewm 和 rolling 很重要
+    df = df.sort_values(['code', '日期'])
+    
+    # 分组对象
+    group = df.groupby('code', sort=False)
+    
+    # --- 2. 向量化计算 EMA ---
+    for p in periods:
+        # 使用 pandas 原生的 groupby.ewm，速度极快
+        df[f'EMA{p}'] = group['收盘'].ewm(span=p, adjust=False).mean().reset_index(level=0, drop=True)
+    
+    # --- 3. 向量化计算 RSI (14) ---
+    delta = group['收盘'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # 临时列用于 rolling 计算
+    df['_gain'] = gain
+    df['_loss'] = loss
+    
+    avg_gain = df.groupby('code', sort=False)['_gain'].rolling(window=14).mean().reset_index(level=0, drop=True)
+    avg_loss = df.groupby('code', sort=False)['_loss'].rolling(window=14).mean().reset_index(level=0, drop=True)
+    
+    rs_raw = avg_gain / avg_loss.replace(0, np.nan)
+    df['RSI'] = 100 - (100 / (1 + rs_raw.fillna(0)))
+    df.drop(columns=['_gain', '_loss'], inplace=True)
+    
+    # --- 4. 向量化计算 MACD ---
+    ema12 = group['收盘'].ewm(span=12, adjust=False).mean().reset_index(level=0, drop=True)
+    ema26 = group['收盘'].ewm(span=26, adjust=False).mean().reset_index(level=0, drop=True)
+    df['MACD_DIF'] = ema12 - ema26
+    df['MACD_DEA'] = df.groupby('code', sort=False)['MACD_DIF'].ewm(span=9, adjust=False).mean().reset_index(level=0, drop=True)
+    df['MACD_HIST'] = (df['MACD_DIF'] - df['MACD_DEA']) * 2
+    
+    # --- 5. 向量化计算布林带 (20) ---
+    df['BB_Mid'] = group['收盘'].rolling(window=20).mean().reset_index(level=0, drop=True)
+    std = group['收盘'].rolling(window=20).std().reset_index(level=0, drop=True)
+    df['BB_Upper'] = df['BB_Mid'] + 2 * std
+    df['BB_Lower'] = df['BB_Mid'] - 2 * std
+    df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid'].replace(0, np.nan)
+    
+    # 量能均线
+    df['Vol_MA20'] = group['成交量'].rolling(window=20).mean().reset_index(level=0, drop=True)
+    
+    # --- 6. 均线粘合度 (Squeeze Ratio) ---
+    # 这里不需要 groupby，因为是同一行不同列的操作
+    ma_cols = [f'EMA{p}' for p in periods]
+    df['Sqz_Ratio'] = (df[ma_cols].max(axis=1) - df[ma_cols].min(axis=1)) / df[ma_cols].min(axis=1).replace(0, np.nan)
+    
+    # --- 7. 相对强度 (RS) vs 基准 ---
+    if bench_df is not None and not bench_df.empty:
+        # 指数日期对齐
+        bench_df = bench_df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(bench_df['日期']):
+             bench_df['日期'] = pd.to_datetime(bench_df['日期'])
+        
+        # 准备合并
+        df = df.merge(bench_df[['日期', '收盘']], on='日期', suffixes=('', '_bench'), how='left')
+        df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
+        # RS MA50 也需要分组
+        df['RS_MA50'] = df.groupby('code', sort=False)['RS'].rolling(window=50).mean().reset_index(level=0, drop=True)
+        df.drop(columns=['收盘_bench'], inplace=True)
+        
+    return df

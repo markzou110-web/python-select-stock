@@ -550,21 +550,18 @@ def run_market_scan(
             bench_slice = bench_df.loc[mask, ['日期', '收盘']].copy()
             logger.info(f"Pre-filtered benchmark data: {len(bench_slice)} points.")
         
-        # 核心优化：批量拉取所有候选标的的 250 天历史数据，避免在线程内重复查询数据库
+        # 核心优化：批量拉取所有候选标的的历史数据，并进行向量化指标计算
         logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
         start_time = time.time()
-        # If data_date is specified, use it as end_date, otherwise use today
         end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
         start_date_hist = (datetime.strptime(end_date_hist, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
         candidate_codes = candidates['code'].tolist()
-        hist_map = {}
-
+        
+        dfs = []
         try:
-            # 分批拉取防止 SQL 语句过长 - 使用参数化查询
-            chunk_size = 800
+            chunk_size = 1000
             for i in range(0, len(candidate_codes), chunk_size):
                 chunk = candidate_codes[i:i + chunk_size]
-                # 使用参数化查询防止 SQL 注入
                 placeholders = ", ".join([f":code_{j}" for j in range(len(chunk))])
                 params = {f"code_{j}": c for j, c in enumerate(chunk)}
                 params["start_date"] = start_date_hist
@@ -575,55 +572,74 @@ def run_market_scan(
                            low as "最低", close as "收盘", vol as "成交量"
                     FROM daily_k
                     WHERE code IN ({placeholders}) AND date >= :start_date AND date <= :end_date
-                    ORDER BY date ASC
+                    ORDER BY code, date ASC
                 """)
                 with engine.connect() as conn:
                     chunk_df = pd.read_sql(query, conn, params=params)
                     if not chunk_df.empty:
-                        # 统一日期格式为字符串，确保比较和后续计算速度
-                        if pd.api.types.is_datetime64_any_dtype(chunk_df['日期']):
-                            chunk_df['日期'] = chunk_df['日期'].dt.strftime('%Y-%m-%d')
-                        elif chunk_df['日期'].dtype == 'object':
-                            # Ensure it's string explicitly if needed
-                            chunk_df['日期'] = chunk_df['日期'].astype(str).str[:10]
-                        
-                        # 按代码分组并存入映射
-                        for code, group in chunk_df.groupby('code'):
-                            hist_map[code] = group
-            logger.info(f"Pre-loaded history for {len(hist_map)} stocks.")
-        except Exception as e:
-            logger.warning(f"Batch loading failed: {e}. Falling back to individual queries.")
+                        dfs.append(chunk_df)
+            
+            if not dfs:
+                logger.error("No historical data found for candidates.")
+                raise HTTPException(status_code=404, detail="本地历史数据缺失，请先同步数据。")
 
-        # 并发扫描逻辑 - 调整并发数以平衡 CPU 负载
-        workers = 12 if local_only else 8
+            master_df = pd.concat(dfs).reset_index(drop=True)
+            logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
+
+            # --- 向量化指标计算 ---
+            from core.indicators import batch_calculate_indicators
+            master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
+            logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
+
+            # 按代码切分，供并发扫描使用
+            hist_map = {code: group for code, group in master_df.groupby('code')}
+            
+        except Exception as e:
+            logger.error(f"Batch processing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"数据预处理失败: {str(e)}")
+
+        # 并发扫描逻辑 - 执行策略筛选和周线确认
+        workers = 24  # 向量化后主压力在周线重采样，可提高并发
+        logger.info(f"Starting strategy scan for {len(candidates)} stocks (workers={workers})...")
+        
+        results = []
+        fail_reasons = {}
+        none_count = 0
+        processed_count = 0
+        
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_stock = {
                 executor.submit(
                     single_stock_task,
-                row['code'], row['name'], row['price'], row['vol'], row['open'],
-                threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
-                local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
-                bench_df=bench_slice
-            ): row for _, row in candidates.iterrows()
+                    row['code'], row['name'], row['price'], row['vol'], row['open'],
+                    threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
+                    local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
+                    bench_df=bench_slice
+                ): row for _, row in candidates.iterrows()
             }
             
-            fail_reasons = {}
-            none_count = 0
             for future in as_completed(future_to_stock):
+                processed_count += 1
+                if processed_count % 200 == 0:
+                    logger.info(f"Scan Progress: {processed_count}/{len(future_to_stock)} stocks processed...")
+                
                 try:
-                    # 单个股票分析超时设为 30s，防止某一个接口挂起卡死全场
-                    res = future.result(timeout=30)
+                    res = future.result(timeout=60)
                     if isinstance(res, dict) and 'Score' in res:
                         results.append(res)
                     elif isinstance(res, dict):
-                        reason = res.get('reason', '未知原因')
+                        reason = res.get('reason', '未知')
                         fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
                     elif res is None:
                         none_count += 1
                 except Exception as e:
                     fail_reasons[f"异常: {str(e)[:30]}"] = fail_reasons.get(f"异常: {str(e)[:30]}", 0) + 1
 
-            logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}, Silent=None({none_count})")
+            logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
+            if fail_reasons:
+                logger.info(f"Rejection Summary: {fail_reasons}")
             if fail_reasons:
                 logger.info(f"Rejection Summary: {fail_reasons}")
 
@@ -721,56 +737,37 @@ def run_market_scan(
         raise HTTPException(status_code=500, detail=str(e))
 
 def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None):
-    from core.db import load_from_db
-    import akshare as ak
-
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
     elif isinstance(target_date, str):
         target_date = datetime.strptime(target_date, "%Y-%m-%d")
 
-    start_date = (target_date - timedelta(days=250)).strftime("%Y%m%d")
-    end_date_str = target_date.strftime("%Y-%m-%d")
-    
     # 优先使用预加载的数据
     if preloaded_df is not None and not preloaded_df.empty:
-        df = preloaded_df
+        df = preloaded_df.copy()
     else:
+        from core.db import load_from_db
         df = load_from_db(code, (target_date - timedelta(days=360)).strftime("%Y-%m-%d"), engine)
-        if not df.empty and pd.api.types.is_datetime64_any_dtype(df['日期']):
-            df['日期'] = df['日期'].dt.strftime('%Y-%m-%d')
     
-    # 逻辑调整：如果是 local_only，且数据库为空，则直接跳过
-    if df.empty and local_only:
-        return {"reason": "本地数据缺失 (Local-Only 模式已开启)"}
+    if df.empty:
+        return {"reason": "数据库无此股票历史数据"}
 
-    stale_threshold = (target_date - timedelta(days=3)).strftime("%Y-%m-%d")
-    if df.empty or df.iloc[-1]['日期'] < stale_threshold:
-        if local_only:
-            # 即使数据旧，也尝试用现有的，如果没有则跳过
-            if df.empty: return {"reason": "数据库无此代码数据"}
-            logger.warning(f"[{code}] Using stale local data (Local-Only)")
-        else:
-            try:
-                logger.info(f"[{code}] Fetching fresh data...")
-                df_new = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
-                if isinstance(df_new, pd.DataFrame) and not df_new.empty:
-                    df = df_new
-                    from core.db import save_to_db
-                    save_to_db(df, code, engine) 
-                    time.sleep(random.uniform(0.1, 0.3))
-            except Exception as e:
-                logger.error(f"[{code}] Hist fetch error: {e}")
-                return {"reason": f"接口请求失败: {str(e)}"}
-            
-    if df.empty or len(df) < 120: 
-        logger.debug(f"[{code}] Insufficient data ({len(df)})")
-        return None
+    # 统一日期格式为字符串，确保计算和合并的一致性
+    if pd.api.types.is_datetime64_any_dtype(df['日期']):
+        df['日期'] = df['日期'].dt.strftime('%Y-%m-%d')
+    else:
+        df['日期'] = df['日期'].astype(str).str[:10]
+    
+    if len(df) < 120: 
+        return {"reason": f"样本不足({len(df)})"}
     
     try:
-        from core.indicators import calculate_indicators
-        df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df)
+        # 技术指标计算 - 如果预加载的数据已经包含指标，则跳过
+        if 'RSI' not in df.columns:
+            df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df)
+        
+        # 策略筛选
         match, stats = check_strategy(
             df, 
             threshold=threshold, 
@@ -783,24 +780,19 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         )
         
         if match:
-            logger.info(f"[{code}] Resonance Match!")
+            # 周线趋势过滤
             if use_weekly:
-                from core.indicators import get_weekly_indicators
                 if not get_weekly_indicators(code, df=df, local_only=local_only): 
-                    logger.info(f"[{code}] Weekly trend failed")
-                    return {"reason": "周线趋势未走好"}
+                    return {"reason": "周线波段未走强"}
             
-            # 胜率计算已移至外层 Top 30 逻辑中，避免在此高并发环节进行昂贵计算
             stats['代码'] = code
             stats['名称'] = name
             return stats
         else:
-            return stats # 返回包含失败原因的字典
+            return stats 
     except Exception as e:
-        logger.error(f"[{code}] Analysis error: {e}")
-        return {"reason": f"分析异常: {str(e)}"}
-    
-    return {"reason": "未知错误"}
+        logger.error(f"[{code}] 分析异常: {str(e)}")
+        return {"reason": "策略计算异常"}
 
 @app.get("/api/stock/{code}/kline")
 async def get_stock_kline(code: str, local_only: bool = False):
