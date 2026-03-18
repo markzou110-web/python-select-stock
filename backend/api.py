@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -292,15 +292,33 @@ def background_sync_task():
         available_count = sum(1 for info in report.values() if info['status'] == 'available')
         logger.info(f"Available data sources: {available_count}/{len(report)}")
 
-        # 获取需要同步的股票代码（从本地数据库获取）
+        # 获取需要同步的股票代码（优先从 stock_basic 获取，兜底从 daily_k 获取）
         with engine.connect() as conn:
-            # 获取所有股票代码
-            all_codes_result = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
+            # 尝试从 stock_basic 获取所有有效标的
+            all_codes_result = conn.execute(text("SELECT code FROM stock_basic ORDER BY code")).fetchall()
+            if not all_codes_result:
+                all_codes_result = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
+            
+            # 如果数据库里啥都没有，尝试联网获取一次基础列表
+            if not all_codes_result:
+                logger.info("Database empty, fetching fresh stock list from data sources...")
+                fresh_list = syncer.get_stock_list() # This calls the underlying source's get_stock_list
+                if fresh_list is not None and not fresh_list.empty:
+                    from core.db import save_stock_basic
+                    # 数据源返回中文列名，需要转换为英文列名以匹配 save_stock_basic 的期望格式
+                    fresh_list = fresh_list.rename(columns={'代码': 'code', '名称': 'name', '所属行业': 'industry'})
+                    save_stock_basic(fresh_list, engine)
+                    all_codes = fresh_list['code'].tolist()
+                else:
+                    all_codes = []
+            else:
+                all_codes = [row[0] for row in all_codes_result]
+
             # 仅包含：沪深主板(60, 00)、创业板(30)、科创板(688)
-            all_codes = [row[0] for row in all_codes_result if row[0].startswith(('60', '688', '00', '30'))]
+            all_codes = [c for c in all_codes if str(c).startswith(('60', '688', '00', '30'))]
 
         if not all_codes:
-            logger.error("No stocks found in database")
+            logger.error("No stocks found in database or network list")
             with sync_progress_lock:
                 sync_progress["is_running"] = False
             return
@@ -584,6 +602,39 @@ def run_market_scan(
                 raise HTTPException(status_code=404, detail="本地历史数据缺失，请先同步数据。")
 
             master_df = pd.concat(dfs).reset_index(drop=True)
+            
+            # --- 注入实盘快照数据 ---
+            # snapshot_df 包含了我们要筛选的标的的实时数据
+            # 如果是本地历史回测 (local_only 且 snapshot 从 db fallback 加载)，master_df 已经包含该日数据，不可重复添加
+            # 我们通过判断 snapshot 的日期是否大于 master_df 中的最大日期来决定是否追加
+            snapshot_date = getattr(snapshot_df, 'attrs', {}).get('data_date', datetime.now().strftime("%Y-%m-%d"))
+            # 确保 snapshot_date 是字符串格式
+            if isinstance(snapshot_date, date):
+                snapshot_date = snapshot_date.strftime("%Y-%m-%d")
+            else:
+                snapshot_date = str(snapshot_date)[:10]
+
+            db_max_date = master_df['日期'].max()
+            if isinstance(db_max_date, pd.Timestamp):
+                db_max_date = db_max_date.strftime("%Y-%m-%d")
+            else:
+                db_max_date = str(db_max_date)[:10]
+
+            if snapshot_date > db_max_date and not candidates.empty:
+                logger.info(f"Appending real-time snapshot data ({snapshot_date}) to historical data...")
+                snap_to_append = candidates[['code', 'open', 'high', 'low', 'price', 'vol']].copy()
+                snap_to_append = snap_to_append.rename(columns={
+                    'open': '开盘',
+                    'high': '最高',
+                    'low': '最低',
+                    'price': '收盘',
+                    'vol': '成交量'
+                })
+                snap_to_append['日期'] = snapshot_date
+                master_df = pd.concat([master_df, snap_to_append], ignore_index=True)
+                # 重新排序并重置索引，确保 batch calculation 的索引对齐逻辑正常工作
+                master_df = master_df.sort_values(['code', '日期']).reset_index(drop=True)
+
             logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
 
             # --- 向量化指标计算 ---

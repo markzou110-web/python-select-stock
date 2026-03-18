@@ -156,7 +156,25 @@ class EastMoneyDataSource(DataSource):
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         try:
             df = ak.stock_zh_a_spot_em()
-            return df[['代码', '名称', '所属行业']].copy()
+            # 检查可用列，akshare 可能会更改列名
+            available_cols = df.columns.tolist()
+            required_cols = []
+            if '代码' in available_cols:
+                required_cols.append('代码')
+            if '名称' in available_cols:
+                required_cols.append('名称')
+            if '所属行业' in available_cols:
+                required_cols.append('所属行业')
+
+            if not required_cols or '代码' not in available_cols:
+                logger.warning(f"东方财富获取股票列表失败: 缺少必要列，可用列: {available_cols[:5]}")
+                return None
+
+            result = df[required_cols].copy()
+            # 如果没有行业列，添加默认值
+            if '所属行业' not in result.columns:
+                result['所属行业'] = '未知'
+            return result
         except Exception as e:
             logger.warning(f"东方财富获取股票列表失败: {e}")
             return None
@@ -191,7 +209,25 @@ class SinaDataSource(DataSource):
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         try:
             df = ak.stock_zh_a_spot()
-            return df[['代码', '名称', '所属行业']].copy()
+            # 检查可用列，akshare 可能会更改列名
+            available_cols = df.columns.tolist()
+            required_cols = []
+            if '代码' in available_cols:
+                required_cols.append('代码')
+            if '名称' in available_cols:
+                required_cols.append('名称')
+            if '所属行业' in available_cols:
+                required_cols.append('所属行业')
+
+            if not required_cols or '代码' not in available_cols:
+                logger.warning(f"新浪财经获取股票列表失败: 缺少必要列，可用列: {available_cols[:5]}")
+                return None
+
+            result = df[required_cols].copy()
+            # 如果没有行业列，添加默认值
+            if '所属行业' not in result.columns:
+                result['所属行业'] = '未知'
+            return result
         except Exception as e:
             logger.warning(f"新浪财经获取股票列表失败: {e}")
             return None
@@ -214,6 +250,9 @@ class SinaDataSource(DataSource):
                 'close': '收盘',
                 'volume': '成交量'
             })
+            
+            # 新浪的成交量单位是股，我们需要统一转换为手 (100股=1手)
+            df['成交量'] = df['成交量'] / 100.0
 
             # 筛选日期
             start_dt = datetime.strptime(start_date, "%Y%m%d")
@@ -240,7 +279,25 @@ class TencentDataSource(DataSource):
         # 腾讯没有直接获取所有股票的接口，使用新浪的
         try:
             df = ak.stock_zh_a_spot()
-            return df[['代码', '名称', '所属行业']].copy()
+            # 检查可用列，akshare 可能会更改列名
+            available_cols = df.columns.tolist()
+            required_cols = []
+            if '代码' in available_cols:
+                required_cols.append('代码')
+            if '名称' in available_cols:
+                required_cols.append('名称')
+            if '所属行业' in available_cols:
+                required_cols.append('所属行业')
+
+            if not required_cols or '代码' not in available_cols:
+                logger.warning(f"腾讯财经获取股票列表失败: 缺少必要列，可用列: {available_cols[:5]}")
+                return None
+
+            result = df[required_cols].copy()
+            # 如果没有行业列，添加默认值
+            if '所属行业' not in result.columns:
+                result['所属行业'] = '未知'
+            return result
         except Exception as e:
             logger.warning(f"腾讯财经获取股票列表失败: {e}")
             return None
@@ -327,13 +384,15 @@ class TushareDataSource(DataSource):
             df = self.pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry')
             if df.empty:
                 return None
-            
+
             # 格式化列名
             df = df.rename(columns={
                 'symbol': '代码',
                 'name': '名称',
                 'industry': '所属行业'
             })
+            # 填充缺失的行业信息
+            df['所属行业'] = df['所属行业'].fillna('未知')
             return df[['代码', '名称', '所属行业']]
         except Exception as e:
             logger.warning(f"Tushare 获取股票列表失败: {e}")
@@ -497,6 +556,28 @@ class MultiSourceSync:
     def __init__(self, manager: Optional[DataSourceManager] = None):
         self.manager = manager or DataSourceManager()
         self.engine = get_db_engine()
+
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """
+        从所有可用数据源尝试获取股票列表
+
+        Returns:
+            DataFrame with columns: [code, name, industry]
+        """
+        for source in self.manager.sources:
+            if not source.is_available():
+                continue
+            try:
+                df = source.get_stock_list()
+                if df is not None and not df.empty:
+                    # 统一格式为英文列名：code, name, industry
+                    df = df.rename(columns={'代码': 'code', '名称': 'name', '所属行业': 'industry'})
+                    source.record_success()
+                    return df
+            except Exception as e:
+                source.record_failure(str(e))
+                logger.warning(f"数据源 {source.name} 获取股票列表失败: {e}")
+        return None
 
     def sync_single_stock(self, code: str, max_retries: int = 3) -> Dict[str, Any]:
         """
