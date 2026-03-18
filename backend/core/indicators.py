@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
 import akshare as ak
+from core.logging_config import logger
 
-def calculate_indicators(df, current_price=None, current_vol=None, current_open=None, periods=[5, 10, 20, 60], bench_df=None):
+def calculate_indicators(df, current_price=None, current_vol=None, current_open=None, periods=[5, 10, 20, 60], bench_df=None, enable_pine_indicators=False):
     """计算 EMA, MACD, BB, RSI 和 RS (Optimized)"""
     if df.empty: return df
     
@@ -62,6 +63,173 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
                 df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
                 df['RS_MA50'] = df['RS'].rolling(window=50).mean()
     except: pass
+
+    # Pine Script 策略指标 (可选启用)
+    if enable_pine_indicators:
+        df = calculate_pine_indicators(df)
+
+    return df
+
+def calculate_pine_indicators(df):
+    """
+    计算 Pine Script 策略中的核心指标
+    - Range Filter
+    - SuperTrend
+    - RQK (Rational Quadratic Kernel)
+    - Half Trend
+    - QQE Mod
+    """
+    if df.empty or len(df) < 50:
+        return df
+
+    # 确保日期格式统一
+    if not pd.api.types.is_datetime64_any_dtype(df['日期']):
+        df['日期'] = pd.to_datetime(df['日期'])
+
+    # --- Range Filter ---
+    # 基于 ATR 的趋势过滤器
+    high_low = df['最高'] - df['最低']
+    atr_range = high_low.rolling(window=14).mean()
+    df['RF_Filter'] = df['收盘'].where(
+        df['收盘'] > df['收盘'].shift(1),
+        df['收盘'].shift(1)
+    )
+    for i in range(1, len(df)):
+        if df.loc[df.index[i], '收盘'] > df.loc[df.index[i-1], 'RF_Filter']:
+            df.loc[df.index[i], 'RF_Filter'] = df.loc[df.index[i], '收盘'] - atr_range.iloc[i]
+        else:
+            df.loc[df.index[i], 'RF_Filter'] = df.loc[df.index[i], '收盘'] + atr_range.iloc[i]
+
+    df['RF_Upward'] = df['收盘'] > df['RF_Filter']
+    df['RF_Downward'] = df['收盘'] < df['RF_Filter']
+
+    # --- SuperTrend ---
+    atr_period = 10
+    multiplier = 3.0
+    high_low = df['最高'] - df['最低']
+    atr = high_low.rolling(window=atr_period).mean()
+
+    df['ST_Basic_Upper'] = df['收盘'] + multiplier * atr
+    df['ST_Basic_Lower'] = df['收盘'] - multiplier * atr
+
+    # SuperTrend 逻辑
+    df['ST_Trend'] = 1  # 1 for uptrend, -1 for downtrend
+    for i in range(1, len(df)):
+        prev_trend = df.loc[df.index[i-1], 'ST_Trend']
+        prev_basic_upper = df.loc[df.index[i-1], 'ST_Basic_Upper']
+        prev_basic_lower = df.loc[df.index[i-1], 'ST_Basic_Lower']
+        curr_close = df.loc[df.index[i], '收盘']
+
+        if prev_trend == -1:
+            if curr_close > prev_basic_upper:
+                df.loc[df.index[i], 'ST_Trend'] = 1
+        else:
+            if curr_close < prev_basic_lower:
+                df.loc[df.index[i], 'ST_Trend'] = -1
+
+    # 平滑 SuperTrend 线
+    df['ST_Upper'] = df['ST_Basic_Upper'].copy()
+    df['ST_Lower'] = df['ST_Basic_Lower'].copy()
+
+    # 更新 SuperTrend 线
+    for i in range(1, len(df)):
+        if df.loc[df.index[i-1], 'ST_Trend'] == 1:
+            df.loc[df.index[i], 'ST_Upper'] = max(df.loc[df.index[i], 'ST_Basic_Upper'], df.loc[df.index[i-1], 'ST_Upper'])
+        else:
+            df.loc[df.index[i], 'ST_Lower'] = min(df.loc[df.index[i], 'ST_Basic_Lower'], df.loc[df.index[i-1], 'ST_Lower'])
+
+    df['ST_Signal'] = df['ST_Trend'] == 1
+
+    # --- RQK (Rational Quadratic Kernel) 回归 ---
+    # 使用简化的核回归实现
+    def calculate_rqk(close_prices, window=20):
+        if len(close_prices) < window:
+            return pd.Series([np.nan] * len(close_prices), index=close_prices.index)
+
+        # 简化版 RQK：使用指数加权移动平均的变体
+        alpha = 2.0 / (window + 1)
+        weights = np.exp(-alpha * np.arange(window))
+        weights = weights / weights.sum()
+
+        rqk_values = [np.nan] * window  # 初始 NaN 值
+        for i in range(window, len(close_prices)):
+            recent_prices = close_prices.iloc[i-window:i].values
+            rqk_value = (recent_prices * weights).sum()
+            rqk_values.append(rqk_value)
+
+        return pd.Series(rqk_values, index=close_prices.index)
+
+    df['RQK_Value'] = calculate_rqk(df['收盘'], window=20)
+
+    # RQK 趋势信号
+    df['RQK_Up'] = df['RQK_Value'] > df['RQK_Value'].shift(1)
+    df['RQK_Down'] = df['RQK_Value'] < df['RQK_Value'].shift(1)
+
+    # --- Half Trend ---
+    amplitude = 2
+    channel_deviation = 2
+
+    # Half Trend 计算
+    df['HT_High'] = df['最高'].rolling(window=amplitude).max()
+    df['HT_Low'] = df['最低'].rolling(window=amplitude).min()
+
+    ht_trend = 0
+    ht_upward = []
+
+    for i in range(len(df)):
+        if i == 0:
+            ht_upward.append(False)
+            continue
+
+        prev_trend = ht_trend
+        high_ma = df['HT_High'].iloc[i]
+        low_ma = df['HT_Low'].iloc[i]
+
+        if prev_trend == 0:  # 当前上升趋势
+            if df['最低'].iloc[i] < low_ma and df['收盘'].iloc[i] < df['开盘'].iloc[i]:
+                ht_trend = 1  # 转为下降
+        else:  # 当前下降趋势
+            if df['最高'].iloc[i] > high_ma and df['收盘'].iloc[i] > df['开盘'].iloc[i]:
+                ht_trend = 0  # 转为上升
+
+        ht_upward.append(ht_trend == 0)
+
+    df['HT_Long'] = ht_upward
+    df['HT_Short'] = ~df['HT_Long']
+
+    # --- QQE Mod ---
+    rsi_period = 6
+    smoothing = 5
+    qqe_factor = 3
+
+    # 计算 QQE
+    delta = df['收盘'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=rsi_period * 2 - 1).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=rsi_period * 2 - 1).mean()
+
+    rs = gain / loss.replace(0, np.nan)
+    rsi_ma = rs.ewm(span=smoothing, adjust=False).mean()
+
+    atr_rsi = abs(rsi_ma - rsi_ma.shift(1)).rolling(window=rsi_period * 2 - 1).mean()
+    dar = atr_rsi.ewm(span=rsi_period * 2 - 1, adjust=False).mean() * qqe_factor
+
+    df['QQE_LongBand'] = rsi_ma + dar
+    df['QQE_ShortBand'] = rsi_ma - dar
+
+    # QQE 趋势
+    qqe_trend = 1
+    for i in range(1, len(df)):
+        prev_long_band = df.loc[df.index[i-1], 'QQE_LongBand']
+        prev_short_band = df.loc[df.index[i-1], 'QQE_ShortBand']
+        if pd.notna(prev_long_band) and pd.notna(prev_short_band):
+            if prev_long_band > prev_short_band:
+                qqe_trend = 1
+            else:
+                qqe_trend = -1
+        df.loc[df.index[i], 'QQE_Trend'] = qqe_trend
+
+    df['QQE_Long'] = df['QQE_Trend'] == 1
+    df['QQE_Short'] = df['QQE_Trend'] == -1
 
     return df
 

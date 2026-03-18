@@ -26,8 +26,8 @@ from core.db import (
     get_setting, save_setting, validate_stock_code
 )
 from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data
-from core.indicators import calculate_indicators, get_weekly_indicators
-from core.strategy import check_strategy, calculate_historical_win_rate
+from core.indicators import calculate_indicators, get_weekly_indicators, calculate_pine_indicators
+from core.strategy import check_strategy, check_pine_strategy, calculate_historical_win_rate, calculate_pine_win_rate
 
 # Bark Key from config (not hardcoded)
 BARK_KEY = config.BARK_KEY
@@ -406,13 +406,15 @@ def run_market_scan(
     mkt_cap_min: float = 0.0,
     use_rs_filter: bool = True,
     local_only: bool = True,
-    data_date: Optional[str] = None
+    data_date: Optional[str] = None,
+    strategy_type: str = "squeeze"  # 新增: 策略类型 "squeeze"=均线粘合, "pine"=Pine Script多指标
 ):
     """
     Internal core scanning logic
 
     Args:
         data_date: 指定使用的数据日期 (YYYY-MM-DD 格式)，为 None 时自动选择最新日期
+        strategy_type: 策略类型 "squeeze"=均线粘合策略, "pine"=Pine Script多指标共振策略
     """
     try:
         snapshot_df = pd.DataFrame()
@@ -667,7 +669,7 @@ def run_market_scan(
                     row['code'], row['name'], row['price'], row['vol'], row['open'],
                     threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
                     local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
-                    bench_df=bench_slice
+                    bench_df=bench_slice, strategy_type=strategy_type
                 ): row for _, row in candidates.iterrows()
             }
             
@@ -701,18 +703,23 @@ def run_market_scan(
         
         # 补充增强数据 (行业, 胜率) - 核心优化：只对最终入选的 30 只股票计算胜率
         logger.info(f"Calculating historical win rate and supplements for top {len(results)} matches...")
-        from core.strategy import calculate_historical_win_rate
+        from core.strategy import calculate_historical_win_rate, calculate_pine_win_rate
         for res in results:
             code = res['代码']
             # Find the history in hist_map
             df_hist = hist_map.get(code)
             if df_hist is not None and not df_hist.empty:
                 # 重新应用指标计算以确保完整（或者我们可以重用分析时的 df，但由于并发，这里重新算更简单）
-                from core.indicators import calculate_indicators
-                # Note: We don't have price/vol/open here directly, but indicators should already be in df_hist if we were careful
-                # Let's assume we need to calculate them if they are missing or just recalculate for safety
-                df_labeled = calculate_indicators(df_hist, bench_df=bench_slice)
-                wr, sig_count = calculate_historical_win_rate(df_labeled)
+                from core.indicators import calculate_indicators, calculate_pine_indicators
+                # 根据策略类型计算不同的胜率
+                if strategy_type == "pine":
+                    df_labeled = calculate_indicators(df_hist, bench_df=bench_slice, enable_pine_indicators=True)
+                    if 'RF_Upward' not in df_labeled.columns:
+                        df_labeled = calculate_pine_indicators(df_labeled)
+                    wr, sig_count = calculate_pine_win_rate(df_labeled)
+                else:
+                    df_labeled = calculate_indicators(df_hist, bench_df=bench_slice)
+                    wr, sig_count = calculate_historical_win_rate(df_labeled)
                 res['历史胜率'] = f"{wr}%"
                 res['信号次数'] = sig_count
 
@@ -787,7 +794,7 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze"):
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
@@ -816,31 +823,49 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     try:
         # 技术指标计算 - 如果预加载的数据已经包含指标，则跳过
         if 'RSI' not in df.columns:
-            df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df)
-        
-        # 策略筛选
-        match, stats = check_strategy(
-            df, 
-            threshold=threshold, 
-            vol_multiplier=vol_multiplier, 
-            rsi_min=rsi_min, 
-            use_macd_filter=use_macd_filter, 
-            use_bb_sqz=use_bb_sqz, 
-            sqz_lookback=sqz_lookback, 
-            use_rs_filter=use_rs_filter
-        )
-        
-        if match:
-            # 周线趋势过滤
-            if use_weekly:
-                if not get_weekly_indicators(code, df=df, local_only=local_only): 
-                    return {"reason": "周线波段未走强"}
-            
-            stats['代码'] = code
-            stats['名称'] = name
-            return stats
+            # Pine Script 策略需要额外的指标
+            enable_pine = (strategy_type == "pine")
+            df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df, enable_pine_indicators=enable_pine)
+
+            # 如果是 Pine 策略且指标已计算但缺少 Pine 特定指标，需要补充计算
+            if enable_pine and 'RF_Upward' not in df.columns:
+                df = calculate_pine_indicators(df)
+
+        # 根据策略类型选择不同的筛选逻辑
+        if strategy_type == "pine":
+            # Pine Script 多指标共振策略
+            match, stats = check_pine_strategy(df, min_signals=3)
+
+            if match:
+                stats['代码'] = code
+                stats['名称'] = name
+                return stats
+            else:
+                return stats
         else:
-            return stats 
+            # 默认均线粘合策略
+            match, stats = check_strategy(
+                df,
+                threshold=threshold,
+                vol_multiplier=vol_multiplier,
+                rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter,
+                use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback,
+                use_rs_filter=use_rs_filter
+            )
+
+            if match:
+                # 周线趋势过滤
+                if use_weekly:
+                    if not get_weekly_indicators(code, df=df, local_only=local_only):
+                        return {"reason": "周线波段未走强"}
+
+                stats['代码'] = code
+                stats['名称'] = name
+                return stats
+            else:
+                return stats
     except Exception as e:
         logger.error(f"[{code}] 分析异常: {str(e)}")
         return {"reason": "策略计算异常"}
@@ -1035,18 +1060,22 @@ def scan_market(
     mkt_cap_min: float = 0.0,
     use_rs_filter: bool = True,
     local_only: bool = True,
-    data_date: Optional[str] = None
+    data_date: Optional[str] = None,
+    strategy_type: str = "squeeze"  # 新增: 策略类型选择
 ):
     """
     API Endpoint for market scan
 
     Args:
         data_date: 指定使用的数据日期 (YYYY-MM-DD 格式)，为 None 时自动选择最新日期
+        strategy_type: 策略类型
+            - "squeeze": 均线粘合策略 (默认)
+            - "pine": Pine Script 多指标共振策略
     """
     return run_market_scan(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
-        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date
+        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type
     )
 
 @app.get("/api/settings")
