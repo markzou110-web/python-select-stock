@@ -30,6 +30,28 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     </button>
                 </div>
 
+                {/* 策略选择器 */}
+                <div className="px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
+                    <FilterItem label="🎯 选择选股策略">
+                        <div className="grid grid-cols-2 gap-3">
+                            <StrategyOption
+                                title="均线粘合策略"
+                                description="传统均线粘合突破战法，适合捕捉蓄势后的爆发行情"
+                                active={params.strategy_type === "squeeze"}
+                                onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
+                                icon="📊"
+                            />
+                            <StrategyOption
+                                title="Pine Script 多指标"
+                                description="TradingView Pine Script 策略，Range Filter + SuperTrend + RQK + Half Trend + QQE 多指标共振"
+                                active={params.strategy_type === "pine"}
+                                onClick={() => setParams({ ...params, strategy_type: "pine" })}
+                                icon="🚀"
+                            />
+                        </div>
+                    </FilterItem>
+                </div>
+
                 <div className="p-8 grid grid-cols-2 gap-8">
                     {/* Column 1 */}
                     <div className="space-y-6">
@@ -203,6 +225,49 @@ function ToggleItem({ label, active, onClick }: { label: string, active: boolean
                 active ? "bg-indigo-600 text-white" : "bg-slate-200 text-transparent"
             )}>
                 <Check size={14} strokeWidth={3} />
+            </div>
+        </div>
+    );
+}
+
+function StrategyOption({
+    title,
+    description,
+    active,
+    onClick,
+    icon
+}: {
+    title: string;
+    description: string;
+    active: boolean;
+    onClick: () => void;
+    icon: string;
+}) {
+    return (
+        <div
+            onClick={onClick}
+            className={cn(
+                "relative p-4 rounded-xl border-2 cursor-pointer transition-all",
+                active
+                    ? "border-indigo-500 bg-indigo-50/50 ring-2 ring-indigo-200"
+                    : "border-slate-200 bg-white hover:border-indigo-200 hover:bg-indigo-50/20"
+            )}
+        >
+            <div className="flex items-start gap-3">
+                <span className="text-2xl">{icon}</span>
+                <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between">
+                        <h4 className={cn("font-bold text-sm", active ? "text-indigo-700" : "text-slate-700")}>
+                            {title}
+                        </h4>
+                        {active && (
+                            <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center">
+                                <Check size={12} className="text-white" strokeWidth={3} />
+                            </div>
+                        )}
+                    </div>
+                    <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">{description}</p>
+                </div>
             </div>
         </div>
     );

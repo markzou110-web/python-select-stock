@@ -27,6 +27,7 @@ export default function Dashboard() {
     const [lastUpdated, setLastUpdated] = useState("");
 
     const [params, setParams] = useState({
+        strategy_type: "squeeze" as "squeeze" | "pine",  // 策略类型: squeeze=均线粘合, pine=Pine Script多指标
         threshold: 0.12,
         vol_multiplier: 1.5,
         rsi_min: 55,
