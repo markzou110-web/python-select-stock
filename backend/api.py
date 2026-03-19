@@ -347,16 +347,23 @@ def background_sync_task():
 
         if sync_progress["stop_requested"]:
             logger.info("Sync task was stopped by user.")
+            with sync_progress_lock:
+                sync_progress["status_text"] = "已停止"
         else:
             logger.info(f"Sync completed normally: {results}")
+            with sync_progress_lock:
+                sync_progress["status_text"] = f"同步完成: 成功{results['success']}, 跳过{results.get('skipped', 0)}, 失败{results['failed']}"
 
     except Exception as e:
         logger.error(f"Background sync error: {e}")
         import traceback
         traceback.print_exc()
+        with sync_progress_lock:
+            sync_progress["status_text"] = f"同步出错: {str(e)[:50]}"
     finally:
         with sync_progress_lock:
             sync_progress["is_running"] = False
+            sync_progress["stop_requested"] = False  # 重置停止标志
 
 
 def update_sync_progress(current: int, total: int, success: int, failed: int, overall_total: int):
