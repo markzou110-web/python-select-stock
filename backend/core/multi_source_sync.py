@@ -666,7 +666,7 @@ class MultiSourceSync:
         result["message"] = "所有的可用数据源均未返回数据"
         return result
 
-    def sync_batch(self, codes: List[str], delay_range=(0.0, 0.1), progress_callback=None, max_workers=5) -> Dict[str, Any]:
+    def sync_batch(self, codes: List[str], delay_range=(0.0, 0.1), progress_callback=None, max_workers=5, check_stop=None) -> Dict[str, Any]:
         """
         批量同步股票 (Enhanced with Threading)
 
@@ -675,6 +675,7 @@ class MultiSourceSync:
             delay_range: 请求间隔范围 (在使用线程池时主要起轻微错峰作用)
             progress_callback: 进度回调函数 callback(current, total, success, failed)
             max_workers: 最大并发线程数
+            check_stop: 检查是否应该停止的回调函数，返回 True 表示应该停止
         """
         results = {
             "total": len(codes),
@@ -683,21 +684,31 @@ class MultiSourceSync:
             "skipped": 0,
             "details": []
         }
-        
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
-        
+
         lock = threading.Lock()
         completed_count = 0
         stop_flag = False
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_code = {executor.submit(self.sync_single_stock, code): code for code in codes}
-            
+
             for future in as_completed(future_to_code):
+                # 每处理完一只股票就检查停止请求
+                if not stop_flag:
+                    if check_stop and check_stop():
+                        logger.info("收到停止指令，中断同步...")
+                        stop_flag = True
+
                 if stop_flag:
+                    # 取消剩余的任务
+                    for f in future_to_code:
+                        if not f.done():
+                            f.cancel()
                     break
-                    
+
                 code = future_to_code[future]
                 try:
                     result = future.result()
@@ -723,11 +734,11 @@ class MultiSourceSync:
                         if progress_callback(completed_count, len(codes), results["success"], results["failed"]) is False:
                             logger.info("收到停止指令，同步任务中断...")
                             stop_flag = True
-                            
+
                     if completed_count % 50 == 0:
                         logger.info(f"进度: {completed_count}/{len(codes)}, 成功: {results['success']}, "
                                   f"失败: {results['failed']}, 跳过: {results['skipped']}")
-                
+
                 if delay_range[1] > 0 and not stop_flag:
                     time.sleep(random.uniform(*delay_range))
 

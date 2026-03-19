@@ -329,6 +329,11 @@ def background_sync_task():
 
         logger.info(f"Starting sync for {len(all_codes)} stocks using multi-source...")
 
+        # 定义停止检查函数
+        def should_stop():
+            with sync_progress_lock:
+                return sync_progress.get("stop_requested", False)
+
         # 执行批量同步（支持中途停止）
         results = syncer.sync_batch(
             all_codes,
@@ -336,7 +341,8 @@ def background_sync_task():
             progress_callback=lambda current, total, success, failed: update_sync_progress(
                 current, total, success, failed, len(all_codes)
             ),
-            max_workers=8
+            max_workers=8,
+            check_stop=should_stop  # 传入停止检查回调
         )
 
         if sync_progress["stop_requested"]:
