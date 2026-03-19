@@ -408,15 +408,9 @@ def run_market_scan(
     local_only: bool = True,
     data_date: Optional[str] = None,
     strategy_type: str = "squeeze",  # 新增: 策略类型 "squeeze"=均线粘合, "pine"=Pine Script多指标
-    pine_min_signals: int = 3  # Pine策略: 最小共振信号数 (1-5)
+    pine_min_signals: int = 3,  # Pine策略: 最小共振信号数 (1-5)
+    min_data_days: int = None  # 最小数据天数，None时自动根据策略选择
 ):
-    """
-    Internal core scanning logic
-
-    Args:
-        data_date: 指定使用的数据日期 (YYYY-MM-DD 格式)，为 None 时自动选择最新日期
-        strategy_type: 策略类型 "squeeze"=均线粘合策略, "pine"=Pine Script多指标共振策略
-    """
     try:
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
@@ -670,7 +664,7 @@ def run_market_scan(
                     row['code'], row['name'], row['price'], row['vol'], row['open'],
                     threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
                     local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
-                    bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals
+                    bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days
                 ): row for _, row in candidates.iterrows()
             }
             
@@ -807,7 +801,7 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None):
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
@@ -831,7 +825,11 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         df['日期'] = df['日期'].astype(str).str[:10]
 
     # 根据策略类型设置最小数据要求
-    min_days = 50 if strategy_type == "pine" else 120
+    if min_data_days is None:
+        min_days = 50 if strategy_type == "pine" else 120
+    else:
+        min_days = min_data_days
+
     if len(df) < min_days:
         return {"reason": f"样本不足({len(df)})"}
 
@@ -1077,7 +1075,8 @@ def scan_market(
     local_only: bool = True,
     data_date: Optional[str] = None,
     strategy_type: str = "squeeze",  # 新增: 策略类型选择
-    pine_min_signals: int = 3  # Pine策略: 最小共振信号数 (1-5)
+    pine_min_signals: int = 3,  # Pine策略: 最小共振信号数 (1-5)
+    min_data_days: int = None  # 最小数据天数，None时自动根据策略选择
 ):
     """
     API Endpoint for market scan
@@ -1088,11 +1087,12 @@ def scan_market(
             - "squeeze": 均线粘合策略 (默认)
             - "pine": Pine Script 多指标共振策略
         pine_min_signals: Pine策略的最小共振信号数 (1-5)，至少需要多少个指标看涨才触发信号
+        min_data_days: 最小数据天数，留空时自动选择(Pine策略50天，均线粘合120天)
     """
     return run_market_scan(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
-        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals
+        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days
     )
 
 @app.get("/api/settings")

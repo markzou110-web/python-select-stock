@@ -93,6 +93,26 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         onClick={() => setParams({ ...params, use_macd_filter: !params.use_macd_filter })}
                                     />
                                 </div>
+
+                                <FilterItem label="📅 最小数据天数">
+                                    <div className="flex items-center gap-4">
+                                        <input
+                                            type="range" min="60" max="250" step="10" value={params.min_data_days || 120}
+                                            onChange={e => setParams({ ...params, min_data_days: parseInt(e.target.value) })}
+                                            className="flex-1 accent-indigo-600"
+                                        />
+                                        <div className="w-16 h-12 rounded-xl bg-indigo-100 flex items-center justify-center">
+                                            <span className="text-sm font-bold text-indigo-600">{params.min_data_days || 120}天</span>
+                                        </div>
+                                    </div>
+                                    <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
+                                        <span>60天</span>
+                                        <span>250天</span>
+                                    </div>
+                                    <p className="text-[10px] text-indigo-500 mt-2">
+                                        股票至少需要有多少天的历史数据才会被扫描
+                                    </p>
+                                </FilterItem>
                             </>
                         )}
 
@@ -116,6 +136,26 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     </div>
                                     <p className="text-[10px] text-purple-500 mt-2">
                                         至少需要多少个指标(Range Filter/SuperTrend/RQK/Half Trend/QQE)同时看涨才触发信号
+                                    </p>
+                                </FilterItem>
+
+                                <FilterItem label="📅 最小数据天数">
+                                    <div className="flex items-center gap-4">
+                                        <input
+                                            type="range" min="30" max="250" step="10" value={params.min_data_days || 60}
+                                            onChange={e => setParams({ ...params, min_data_days: parseInt(e.target.value) })}
+                                            className="flex-1 accent-purple-600"
+                                        />
+                                        <div className="w-16 h-12 rounded-xl bg-purple-100 flex items-center justify-center">
+                                            <span className="text-sm font-bold text-purple-600">{params.min_data_days || 60}天</span>
+                                        </div>
+                                    </div>
+                                    <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
+                                        <span>30天</span>
+                                        <span>250天</span>
+                                    </div>
+                                    <p className="text-[10px] text-purple-500 mt-2">
+                                        股票至少需要有多少天的历史数据才会被扫描，天数越多被排除的股票越多
                                     </p>
                                 </FilterItem>
 
