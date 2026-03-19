@@ -651,8 +651,26 @@ def run_market_scan(
             logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
 
             # --- 向量化指标计算 ---
-            from core.indicators import batch_calculate_indicators
+            from core.indicators import batch_calculate_indicators, calculate_pine_indicators
             master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
+
+            # Pine Script 策略需要额外的指标计算
+            if strategy_type == "pine":
+                logger.info("Calculating Pine Script indicators...")
+                # 对每只股票单独计算 Pine 指标（这些指标不适合批量向量化）
+                pine_results = []
+                for code, group in master_df.groupby('code'):
+                    try:
+                        df_pine = calculate_pine_indicators(group.copy())
+                        pine_results.append(df_pine)
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate Pine indicators for {code}: {e}")
+                        pine_results.append(group)  # 保留原数据
+
+                if pine_results:
+                    master_df = pd.concat(pine_results, ignore_index=True)
+                logger.info(f"Pine Script indicators calculated.")
+
             logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
 
             # 按代码切分，供并发扫描使用
