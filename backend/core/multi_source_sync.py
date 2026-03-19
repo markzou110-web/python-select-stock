@@ -598,27 +598,46 @@ class MultiSourceSync:
             "message": ""
         }
 
-        # 获取最后日期
+        # 获取最后日期和数据天数
         try:
             with self.engine.connect() as conn:
+                # 获取最后日期
                 res = conn.execute(
                     text("SELECT MAX(date) FROM daily_k WHERE code = :code"),
                     {"code": code}
                 )
                 last_date = res.fetchone()[0]
 
-            # 检查是否需要同步
+                # 获取数据天数
+                res_count = conn.execute(
+                    text("SELECT COUNT(*) FROM daily_k WHERE code = :code"),
+                    {"code": code}
+                )
+                data_count = res_count.fetchone()[0]
+
             today = datetime.now().date()
+
+            # 确保至少有 120 天的数据（用于 Pine Script 策略）
+            min_required_days = 120
+
             if last_date:
-                # 只有当数据库日期已经等于或超过今天，才跳过
-                if last_date >= today:
+                # 检查数据天数是否足够
+                if data_count < min_required_days:
+                    # 数据不足，需要补齐历史数据
+                    needed_start_date = today - timedelta(days=min_required_days + 10)  # 多取10天作为缓冲
+                    start_date = needed_start_date.strftime("%Y%m%d")
+                    result["message"] = f"数据不足({data_count}天)，补齐历史数据..."
+                elif last_date >= today:
+                    # 数据足够且已是最新
                     result["success"] = True
-                    result["message"] = "已是最新"
+                    result["message"] = f"已是最新 ({data_count}天)"
                     return result
-                start_date = (last_date + timedelta(days=1)).strftime("%Y%m%d")
+                else:
+                    # 数据足够但不是最新，增量更新
+                    start_date = (last_date + timedelta(days=1)).strftime("%Y%m%d")
             else:
-                # 无历史数据，获取最近一年的数据
-                start_date = (today - timedelta(days=365)).strftime("%Y%m%d")
+                # 无历史数据，获取足够的历史数据
+                start_date = (today - timedelta(days=min_required_days + 10)).strftime("%Y%m%d")
 
         except Exception as e:
             result["message"] = f"查询失败: {e}"
