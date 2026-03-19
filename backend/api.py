@@ -694,8 +694,20 @@ def run_market_scan(
             logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
             if fail_reasons:
                 logger.info(f"Rejection Summary: {fail_reasons}")
-            if fail_reasons:
-                logger.info(f"Rejection Summary: {fail_reasons}")
+
+            # Pine 策略额外统计
+            if strategy_type == "pine":
+                pine_stats = {}
+                for reason, count in fail_reasons.items():
+                    if "信号不足" in reason:
+                        # 提取信号数，如 "信号不足 (2/3)"
+                        import re
+                        match = re.search(r'\((\d+)/(\d+)\)', reason)
+                        if match:
+                            signals = int(match.group(1))
+                            pine_stats[signals] = pine_stats.get(signals, 0) + count
+                if pine_stats:
+                    logger.info(f"Pine Strategy Signal Distribution: {pine_stats}")
 
         logger.info(f"Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
         
@@ -817,10 +829,12 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         df['日期'] = df['日期'].dt.strftime('%Y-%m-%d')
     else:
         df['日期'] = df['日期'].astype(str).str[:10]
-    
-    if len(df) < 120: 
+
+    # 根据策略类型设置最小数据要求
+    min_days = 50 if strategy_type == "pine" else 120
+    if len(df) < min_days:
         return {"reason": f"样本不足({len(df)})"}
-    
+
     try:
         # 技术指标计算 - 如果预加载的数据已经包含指标，则跳过
         if 'RSI' not in df.columns:
