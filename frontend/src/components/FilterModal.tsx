@@ -17,6 +17,8 @@ interface FilterModalProps {
 export default function FilterModal({ isOpen, onClose, params, setParams, onScan, availableDates = [] }: FilterModalProps) {
     if (!isOpen) return null;
 
+    const isPineStrategy = params.strategy_type === "pine";
+
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
             <div className="bg-white rounded-3xl w-full max-w-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
@@ -55,86 +57,157 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 <div className="p-8 grid grid-cols-2 gap-8">
                     {/* Column 1 */}
                     <div className="space-y-6">
-                        <FilterItem label="粘合度阈值 (0.01~0.30)">
-                            <input
-                                type="range" min="0.01" max="0.30" step="0.01" value={params.threshold || 0}
-                                onChange={e => setParams({ ...params, threshold: parseFloat(e.target.value) })}
-                                className="w-full accent-indigo-600"
-                            />
-                            <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
-                                <span>极限粘合 (0.01)</span>
-                                <span className="text-indigo-600 font-extrabold text-xs">{(Number(params.threshold) || 0).toFixed(2)}</span>
-                                <span>宽容粘合 (0.30)</span>
-                            </div>
-                        </FilterItem>
+                        {/* 均线粘合策略专用参数 */}
+                        {!isPineStrategy && (
+                            <>
+                                <FilterItem label="粘合度阈值 (0.01~0.30)">
+                                    <input
+                                        type="range" min="0.01" max="0.30" step="0.01" value={params.threshold || 0}
+                                        onChange={e => setParams({ ...params, threshold: parseFloat(e.target.value) })}
+                                        className="w-full accent-indigo-600"
+                                    />
+                                    <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
+                                        <span>极限粘合 (0.01)</span>
+                                        <span className="text-indigo-600 font-extrabold text-xs">{(Number(params.threshold) || 0).toFixed(2)}</span>
+                                        <span>宽容粘合 (0.30)</span>
+                                    </div>
+                                </FilterItem>
 
-                        <FilterItem label="量比倍数 (1.0~5.0)">
+                                <FilterItem label="量比倍数 (1.0~5.0)">
+                                    <input
+                                        type="number" step="0.1" value={isNaN(params.vol_multiplier) ? '' : params.vol_multiplier}
+                                        onChange={e => setParams({ ...params, vol_multiplier: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
+                                        className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
+                                    />
+                                </FilterItem>
+
+                                <div className="space-y-3 pt-2">
+                                    <ToggleItem
+                                        label="启用周线趋势过滤"
+                                        active={params.use_weekly}
+                                        onClick={() => setParams({ ...params, use_weekly: !params.use_weekly })}
+                                    />
+                                    <ToggleItem
+                                        label="🔥 MACD 必须处于金叉 (红柱)"
+                                        active={params.use_macd_filter}
+                                        onClick={() => setParams({ ...params, use_macd_filter: !params.use_macd_filter })}
+                                    />
+                                </div>
+                            </>
+                        )}
+
+                        {/* Pine Script 策略专用参数 */}
+                        {isPineStrategy && (
+                            <>
+                                <FilterItem label="🎯 最小共振信号数">
+                                    <div className="flex items-center gap-4">
+                                        <input
+                                            type="range" min="1" max="5" step="1" value={params.pine_min_signals || 3}
+                                            onChange={e => setParams({ ...params, pine_min_signals: parseInt(e.target.value) })}
+                                            className="flex-1 accent-purple-600"
+                                        />
+                                        <div className="w-16 h-12 rounded-xl bg-purple-100 flex items-center justify-center">
+                                            <span className="text-xl font-bold text-purple-600">{params.pine_min_signals || 3}</span>
+                                        </div>
+                                    </div>
+                                    <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
+                                        <span>宽松 (1)</span>
+                                        <span>严格 (5)</span>
+                                    </div>
+                                    <p className="text-[10px] text-purple-500 mt-2">
+                                        至少需要多少个指标(Range Filter/SuperTrend/RQK/Half Trend/QQE)同时看涨才触发信号
+                                    </p>
+                                </FilterItem>
+
+                                <div className="p-4 rounded-xl bg-purple-50 border border-purple-100 space-y-2">
+                                    <h4 className="text-xs font-bold text-purple-700">📊 Pine Script 策略说明</h4>
+                                    <ul className="text-[10px] text-purple-600 space-y-1">
+                                        <li>• <strong>Range Filter</strong>: 基于 ATR 的范围过滤器</li>
+                                        <li>• <strong>SuperTrend</strong>: 超级趋势指标</li>
+                                        <li>• <strong>RQK</strong>: 核回归趋势分析</li>
+                                        <li>• <strong>Half Trend</strong>: 半趋势确认</li>
+                                        <li>• <strong>QQE Mod</strong>: 量化指标带</li>
+                                    </ul>
+                                </div>
+                            </>
+                        )}
+
+                        <FilterItem label="最小换手率 (%)">
                             <input
-                                type="number" step="0.1" value={isNaN(params.vol_multiplier) ? '' : params.vol_multiplier}
-                                onChange={e => setParams({ ...params, vol_multiplier: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
+                                type="number" step="0.5" value={isNaN(params.turnover_min) ? '' : params.turnover_min}
+                                onChange={e => setParams({ ...params, turnover_min: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
                                 className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                             />
                         </FilterItem>
 
-                        <div className="space-y-3 pt-2">
-                            <ToggleItem
-                                label="启用周线趋势过滤"
-                                active={params.use_weekly}
-                                onClick={() => setParams({ ...params, use_weekly: !params.use_weekly })}
+                        <FilterItem label="最小市值 (亿)">
+                            <input
+                                type="number" step="10" value={isNaN(params.mkt_cap_min) ? '' : params.mkt_cap_min}
+                                onChange={e => setParams({ ...params, mkt_cap_min: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
+                                className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
                             />
-                            <ToggleItem
-                                label="🔥 MACD 必须处于金叉 (红柱)"
-                                active={params.use_macd_filter}
-                                onClick={() => setParams({ ...params, use_macd_filter: !params.use_macd_filter })}
-                            />
-                            <FilterItem label="最小换手率 (%)">
-                                <input
-                                    type="number" step="0.5" value={isNaN(params.turnover_min) ? '' : params.turnover_min}
-                                    onChange={e => setParams({ ...params, turnover_min: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
-                                    className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
-                                />
-                            </FilterItem>
-                            <FilterItem label="最小市值 (亿)">
-                                <input
-                                    type="number" step="10" value={isNaN(params.mkt_cap_min) ? '' : params.mkt_cap_min}
-                                    onChange={e => setParams({ ...params, mkt_cap_min: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
-                                    className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
-                                />
-                            </FilterItem>
-                            <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-slate-100 cursor-pointer transition-all hover:bg-slate-50">
-                                <span className="flex-1 font-semibold text-slate-600">相对强度过滤 (RS)</span>
-                                <input
-                                    type="checkbox" checked={params.use_rs_filter}
-                                    onChange={e => setParams({ ...params, use_rs_filter: e.target.checked })}
-                                    className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                                />
-                            </label>
-                        </div>
+                        </FilterItem>
                     </div>
 
                     {/* Column 2 */}
                     <div className="space-y-6">
-                        <FilterItem label="RSI 最小强度 (30~80)">
-                            <input
-                                type="number" value={isNaN(params.rsi_min) ? '' : params.rsi_min}
-                                onChange={e => setParams({ ...params, rsi_min: e.target.value === '' ? NaN : parseInt(e.target.value) })}
-                                className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
-                            />
-                        </FilterItem>
+                        {/* 均线粘合策略专用参数 */}
+                        {!isPineStrategy && (
+                            <>
+                                <FilterItem label="RSI 最小强度 (30~80)">
+                                    <input
+                                        type="number" value={isNaN(params.rsi_min) ? '' : params.rsi_min}
+                                        onChange={e => setParams({ ...params, rsi_min: e.target.value === '' ? NaN : parseInt(e.target.value) })}
+                                        className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
+                                    />
+                                </FilterItem>
 
-                        <FilterItem label="粘合回溯天数 (1~30)">
-                            <input
-                                type="number" value={isNaN(params.sqz_lookback) ? '' : params.sqz_lookback}
-                                onChange={e => setParams({ ...params, sqz_lookback: e.target.value === '' ? NaN : parseInt(e.target.value) })}
-                                className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
-                            />
-                        </FilterItem>
+                                <FilterItem label="粘合回溯天数 (1~30)">
+                                    <input
+                                        type="number" value={isNaN(params.sqz_lookback) ? '' : params.sqz_lookback}
+                                        onChange={e => setParams({ ...params, sqz_lookback: e.target.value === '' ? NaN : parseInt(e.target.value) })}
+                                        className="w-full px-4 py-2 bg-slate-100 border-none rounded-xl text-sm font-bold text-slate-900 outline-none ring-offset-2 focus:ring-2 focus:ring-indigo-500"
+                                    />
+                                </FilterItem>
 
-                        <ToggleItem
-                            label="极致波动率收缩 (BB)"
-                            active={params.use_bb_sqz}
-                            onClick={() => setParams({ ...params, use_bb_sqz: !params.use_bb_sqz })}
-                        />
+                                <ToggleItem
+                                    label="极致波动率收缩 (BB)"
+                                    active={params.use_bb_sqz}
+                                    onClick={() => setParams({ ...params, use_bb_sqz: !params.use_bb_sqz })}
+                                />
+
+                                <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-slate-100 cursor-pointer transition-all hover:bg-slate-50">
+                                    <span className="flex-1 font-semibold text-slate-600">相对强度过滤 (RS)</span>
+                                    <input
+                                        type="checkbox" checked={params.use_rs_filter}
+                                        onChange={e => setParams({ ...params, use_rs_filter: e.target.checked })}
+                                        className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                                    />
+                                </label>
+                            </>
+                        )}
+
+                        {/* Pine Script 策略专用参数 - 添加一些通用过滤选项 */}
+                        {isPineStrategy && (
+                            <>
+                                <div className="p-4 rounded-xl bg-gradient-to-br from-purple-50 to-indigo-50 border border-purple-100">
+                                    <h4 className="text-xs font-bold text-purple-700 mb-2">💡 使用建议</h4>
+                                    <ul className="text-[10px] text-purple-600 space-y-1">
+                                        <li>• 信号数设为 <strong>3</strong>：平衡信号数量和质量</li>
+                                        <li>• 信号数设为 <strong>4-5</strong>：更严格，信号较少但准确度高</li>
+                                        <li>• 信号数设为 <strong>1-2</strong>：较宽松，捕捉更多机会</li>
+                                    </ul>
+                                </div>
+
+                                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200">
+                                    <h4 className="text-xs font-bold text-slate-700 mb-2">📈 信号说明</h4>
+                                    <p className="text-[10px] text-slate-500 leading-relaxed">
+                                        Pine Script 策略通过 5 个独立技术指标的共振来识别趋势启动点。
+                                        当多个指标同时看涨时，产生买入信号。信号数越多，趋势确认度越高。
+                                    </p>
+                                </div>
+                            </>
+                        )}
 
                         <FilterItem label="市场范围限制">
                             <select
@@ -191,7 +264,10 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     <button onClick={onClose} className="px-6 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-200 transition-all">取消</button>
                     <button
                         onClick={() => { onScan(); onClose(); }}
-                        className="px-8 py-2.5 premium-gradient text-white rounded-xl font-bold shadow-lg shadow-indigo-100 transition-all hover:scale-105 active:scale-95"
+                        className={cn(
+                            "px-8 py-2.5 text-white rounded-xl font-bold shadow-lg transition-all hover:scale-105 active:scale-95",
+                            isPineStrategy ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : "premium-gradient"
+                        )}
                     >
                         保存并执行
                     </button>

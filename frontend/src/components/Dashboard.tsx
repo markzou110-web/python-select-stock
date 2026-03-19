@@ -28,6 +28,7 @@ export default function Dashboard() {
 
     const [params, setParams] = useState({
         strategy_type: "squeeze" as "squeeze" | "pine",  // 策略类型: squeeze=均线粘合, pine=Pine Script多指标
+        pine_min_signals: 3,  // Pine策略: 最小共振信号数
         threshold: 0.12,
         vol_multiplier: 1.5,
         rsi_min: 55,
