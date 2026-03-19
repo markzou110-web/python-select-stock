@@ -738,11 +738,11 @@ def run_market_scan(
                     logger.info(f"Pine Strategy Signal Distribution: {pine_stats}")
 
         logger.info(f"Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
+
+        # 排序并取 Top 100
+        results = sorted(results, key=lambda x: x['Score'], reverse=True)[:100]
         
-        # 排序并取 Top 30
-        results = sorted(results, key=lambda x: x['Score'], reverse=True)[:30]
-        
-        # 补充增强数据 (行业, 胜率) - 核心优化：只对最终入选的 30 只股票计算胜率
+        # 补充增强数据 (行业, 胜率) - 只对最终入选的 100 只股票计算胜率
         logger.info(f"Calculating historical win rate and supplements for top {len(results)} matches...")
         from core.strategy import calculate_historical_win_rate, calculate_pine_win_rate
         for res in results:
