@@ -422,8 +422,11 @@ def run_market_scan(
     data_date: Optional[str] = None,
     strategy_type: str = "squeeze",  # 新增: 策略类型 "squeeze"=均线粘合, "pine"=Pine Script多指标
     pine_min_signals: int = 3,  # Pine策略: 最小共振信号数 (1-5)
-    min_data_days: int = None  # 最小数据天数，None时自动根据策略选择
+    min_data_days: Optional[int] = None  # 最小数据天数，None时自动根据策略选择
 ):
+    # 调试日志：确认接收到的策略类型
+    logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}")
+
     try:
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
@@ -1102,6 +1105,8 @@ def scan_market(
         pine_min_signals: Pine策略的最小共振信号数 (1-5)，至少需要多少个指标看涨才触发信号
         min_data_days: 最小数据天数，留空时自动选择(Pine策略50天，均线粘合120天)
     """
+    # 调试日志：确认接收到的参数
+    logger.info(f"[SCAN] strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}")
     return run_market_scan(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
