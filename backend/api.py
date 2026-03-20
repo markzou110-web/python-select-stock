@@ -599,11 +599,13 @@ def run_market_scan(
                 params["end_date"] = end_date_hist
 
                 query = text(f"""
-                    SELECT code, date as "日期", open as "开盘", high as "最高",
-                           low as "最低", close as "收盘", vol as "成交量"
-                    FROM daily_k
-                    WHERE code IN ({placeholders}) AND date >= :start_date AND date <= :end_date
-                    ORDER BY code, date ASC
+                    SELECT d.code, d.date as "日期", d.open as "开盘", d.high as "最高",
+                           d.low as "最低", d.close as "收盘", d.vol as "成交量",
+                           b.name
+                    FROM daily_k d
+                    LEFT JOIN stock_basic b ON d.code = b.code
+                    WHERE d.code IN ({placeholders}) AND d.date >= :start_date AND d.date <= :end_date
+                    ORDER BY d.code, d.date ASC
                 """)
                 with engine.connect() as conn:
                     chunk_df = pd.read_sql(query, conn, params=params)
