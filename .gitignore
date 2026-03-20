@@ -1,2 +1,12 @@
 *.db
 *.log
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+node_modules/
+.venv/
+.env
+.backend_pid
+.frontend_pid
+.DS_Store
