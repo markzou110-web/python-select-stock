@@ -14,10 +14,13 @@ CONFIG_FILE = os.path.join(BASE_DIR, "db_config.json")
 
 def validate_stock_code(code: str) -> bool:
     """
-    Validate Chinese stock code format (6 digits, starting with 0, 1, 3, or 6).
-    Helps prevent SQL injection via code parameter.
+    Validate Chinese stock code format (6 digits).
+    Includes:
+    - 00xxxx, 30xxxx (SZ)
+    - 60xxxx, 68xxxx, 900xxx (SH)
+    - 43xxxx, 83xxxx, 87xxxx, 88xxxx, 92xxxx (BJ)
     """
-    return bool(re.match(r'^[0-36]\d{5}$', str(code)))
+    return bool(re.match(r'^[0-9]\d{5}$', str(code)))
 
 
 def validate_table_name(name: str) -> bool:

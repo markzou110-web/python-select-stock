@@ -11,6 +11,7 @@ from enum import Enum
 
 import pandas as pd
 import akshare as ak
+import threading
 from sqlalchemy import text
 
 from core.db import get_db_engine, save_to_db, validate_stock_code
@@ -139,7 +140,14 @@ class DataSource(ABC):
             return
             
         self.fail_count += 1
-        if self.fail_count >= 3:
+        
+        # 补充：检测是否因为限流导致的失败
+        if any(keyword in error.lower() for keyword in ["rate", "429", "每分钟", "接口访问", "访问该接口"]):
+            self.status = DataSourceStatus.RATE_LIMITED
+            self.last_check_time = datetime.now()
+            logger.info(f"数据源 {self.name} 已触发限流，进入等待状态...")
+            
+        elif self.fail_count >= 3:
             self.status = DataSourceStatus.UNAVAILABLE
 
 
@@ -232,10 +240,21 @@ class SinaDataSource(DataSource):
             logger.warning(f"新浪财经获取股票列表失败: {e}")
             return None
 
+    def format_code(self, code: str) -> str:
+        """新浪需要带交易所前缀"""
+        if code.startswith('6') or code.startswith('900'):
+            return f'sh{code}'
+        elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
+            return f'sz{code}'
+        elif code.startswith('8') or code.startswith('4') or code.startswith('920'):
+            return f'bj{code}'
+        return code
+
     def get_hist_data(self, code: str, start_date: str) -> Optional[pd.DataFrame]:
         try:
+            symbol = self.format_code(code)
             df = ak.stock_zh_a_daily(
-                symbol=code,
+                symbol=symbol,
                 adjust="qfq"
             )
             if df.empty:
@@ -304,11 +323,14 @@ class TencentDataSource(DataSource):
 
     def format_code(self, code: str) -> str:
         """腾讯需要带交易所前缀"""
-        if code.startswith('6') or code.startswith('9'):
+        # 60xxxx/68xxxx 为沪市主板/科创板，900xxx 为沪市B股
+        if code.startswith('6') or code.startswith('900'):
             return f'sh{code}'
+        # 00xxxx/30xxxx 为深市主板/创业板，20xxxx 为深市B股
         elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
             return f'sz{code}'
-        elif code.startswith('8') or code.startswith('4'):
+        # 8xxxxx/4xxxxx/920xxx 为北交所/新三板
+        elif code.startswith('8') or code.startswith('4') or code.startswith('920'):
             return f'bj{code}'
         return f'sz{code}'
 
@@ -358,6 +380,11 @@ class TushareDataSource(DataSource):
     需要提供 TUSHARE_TOKEN
     """
 
+    # 类级别锁和频率限制器 (全实例共享，确保多线程同步时不超频)
+    _lock = threading.Lock()
+    _last_call_time = 0.0
+    _min_interval = 1.3  # 60秒/50次 = 1.2s，取1.3s更安全
+
     def __init__(self, token: Optional[str] = None):
         super().__init__("Tushare")
         self.token = token or config.TUSHARE_TOKEN
@@ -380,6 +407,14 @@ class TushareDataSource(DataSource):
         if not self.pro:
             return None
         try:
+            # 使用频率控制锁
+            with TushareDataSource._lock:
+                now = time.time()
+                elapsed = now - TushareDataSource._last_call_time
+                if elapsed < TushareDataSource._min_interval:
+                    time.sleep(TushareDataSource._min_interval - elapsed)
+                TushareDataSource._last_call_time = time.time()
+
             # 获取上市股票列表
             df = self.pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry')
             if df.empty:
@@ -400,11 +435,11 @@ class TushareDataSource(DataSource):
 
     def format_code(self, code: str) -> str:
         """Tushare 需要 ts_code (例如 000001.SZ)"""
-        if code.startswith('6'):
+        if code.startswith('6') or code.startswith('900'):
             return f'{code}.SH'
-        elif code.startswith('0') or code.startswith('3'):
+        elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
             return f'{code}.SZ'
-        elif code.startswith('8') or code.startswith('4'):
+        elif code.startswith('8') or code.startswith('4') or code.startswith('920'):
             return f'{code}.BJ'
         return code
 
@@ -413,6 +448,15 @@ class TushareDataSource(DataSource):
             return None
         try:
             ts_code = self.format_code(code)
+            
+            # 使用频率控制锁
+            with TushareDataSource._lock:
+                now = time.time()
+                elapsed = now - TushareDataSource._last_call_time
+                if elapsed < TushareDataSource._min_interval:
+                    time.sleep(TushareDataSource._min_interval - elapsed)
+                TushareDataSource._last_call_time = time.time()
+                
             # Tushare pro daily 接口
             df = self.pro.daily(ts_code=ts_code, start_date=start_date)
             
@@ -593,6 +637,8 @@ class MultiSourceSync:
                     df['code'] = df['code'].apply(clean_code)
                     # 剔除无意义的占位名（深市、沪市等）
                     df = df[~df['name'].str.contains('深市|沪市', na=False)]
+                    # 剔除北交所股票 (43, 83, 87, 88, 92 等开头)
+                    df = df[~df['code'].str.startswith(('4', '8', '92'))]
                     # 去重
                     df = df.drop_duplicates(subset=['code'])
                     
