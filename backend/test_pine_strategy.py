@@ -64,10 +64,10 @@ def test_pine_indicators():
     # 验证结果
     required_columns = [
         'RF_Filter', 'RF_Upward', 'RF_Downward',
-        'ST_Basic_Upper', 'ST_Basic_Lower', 'ST_Trend', 'ST_Signal',
-        'RQK_Value', 'RQK_Up', 'RQK_Down',
-        'HT_High', 'HT_Low', 'HT_Long', 'HT_Short',
-        'QQE_LongBand', 'QQE_ShortBand', 'QQE_Long', 'QQE_Short'
+        'ST_Signal',
+        'RQK_Value', 'RQK_Up',
+        'HT_High', 'HT_Low', 'HT_Long',
+        'QQE_Long'
     ]
 
     print("\n检查生成的 Pine 指标列:")
@@ -95,29 +95,27 @@ def test_pine_strategy():
 
     from core.strategy import check_pine_strategy
 
-    # 生成测试数据并计算指标
+    # 生成测试数据
     df = generate_test_data(100)
+    df['Vol_MA20'] = df['成交量'].rolling(window=20).mean()
 
     # 手动构造测试信号 (确保有共振)
     # 让最新 5 行的所有指标都看涨
     df['RF_Upward'] = False
     df['RF_Downward'] = False
-    df['ST_Signal'] = False
-    df['RQK_Up'] = False
-    df['RQK_Down'] = False
-    df['HT_Long'] = False
-    df['HT_Short'] = False
     df['QQE_Long'] = False
-    df['QQE_Short'] = False
 
     # 设置最新行为看涨
     df.loc[df.index[-1], 'RF_Upward'] = True
-    df.loc[df.index[-1], 'ST_Signal'] = True
-    df.loc[df.index[-1], 'RQK_Up'] = True
-    df.loc[df.index[-1], 'HT_Long'] = True
     df.loc[df.index[-1], 'QQE_Long'] = True
+    df.loc[df.index[-1], '成交量'] = df.loc[df.index[-1], 'Vol_MA20'] * 2
+    df.loc[df.index[-1], '收盘'] = df.loc[df.index[-1], '开盘'] + 10 # 阳线
+    df.loc[df.index[-1], '最高'] = df.loc[df.index[-1], '收盘'] # 无上影线
     df.loc[df.index[-1], 'code'] = '600000'
     df.loc[df.index[-1], 'name'] = '测试股票'
+    
+    # 强制让 RF_Upward 通过 (现在它需要 close > filter)
+    df.loc[df.index[-1], 'RF_Filter'] = df.loc[df.index[-1], '收盘'] - 1
 
     # 测试策略检查
     match, result = check_pine_strategy(df, min_signals=3)

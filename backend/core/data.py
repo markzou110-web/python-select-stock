@@ -222,7 +222,9 @@ def get_sector_map() -> Dict[str, str]:
 
     # 2. 数据库缓存 (可靠性保障)
     db_map = get_stock_basic_map()
-    if db_map:
+    # 增加校验：如果绝大部分是'未知'，说明需要重新爬取行业分布
+    unknown_count = list(db_map.values()).count('未知')
+    if db_map and (len(db_map) == 0 or unknown_count / len(db_map) < 0.5):
         set_cached_data('sector_map', db_map)
         return db_map
 
@@ -232,10 +234,12 @@ def get_sector_map() -> Dict[str, str]:
         # 1. 获取所有行业板块名称
         df_board = ak.stock_board_industry_name_em()
         if df_board.empty:
-            return {}
+            # 策略：如果东财接口失效，尝试使用 Tushare 兜底
+            return _get_sector_map_from_tushare()
 
-        # 优化：只拉取前 50 个核心板块作为背景缓存
-        all_boards = df_board['板块名称'].head(50).tolist()
+        # 获取所有行业板块 (不仅是前 50 个)
+        all_boards = df_board['板块名称'].tolist()
+        logger.info(f"Found {len(all_boards)} industry boards to map.")
 
         # 2. 并发抓取成分股
         def fetch_sector_with_retry(sector_name: str, retries: int = 3) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
@@ -275,7 +279,32 @@ def get_sector_map() -> Dict[str, str]:
         return sector_map
     except Exception as e:
         logger.error(f"Critical error in get_sector_map: {e}")
-        return {}
+        # 发生严重错误时，尝试使用 Tushare 兜底
+        return _get_sector_map_from_tushare()
+
+def _get_sector_map_from_tushare() -> Dict[str, str]:
+    """使用 Tushare 作为行业映射的备选方案"""
+    try:
+        from core.multi_source_sync import TushareDataSource
+        ts_source = TushareDataSource()
+        if not ts_source.pro:
+            return {}
+            
+        logger.info("Fetching sector map from Tushare backup...")
+        df_ts = ts_source.get_stock_list()
+        if df_ts is not None and not df_ts.empty:
+            # 基础同步器中返回的是 ['代码', '名称', '所属行业']，存储前需统一重命名
+            df_ts = df_ts.rename(columns={'代码': 'code', '名称': 'name', '所属行业': 'industry'})
+            
+            # 存入数据库以持久化
+            from core.db import save_stock_basic, get_db_engine
+            save_stock_basic(df_ts, get_db_engine())
+            
+            # 返回映射字典
+            return pd.Series(df_ts['industry'].values, index=df_ts['code']).to_dict()
+    except Exception as e:
+        logger.warning(f"Tushare fallback failed: {e}")
+    return {}
 
 def get_index_hist(code: str) -> pd.DataFrame:
     """

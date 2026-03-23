@@ -361,7 +361,7 @@ class TushareDataSource(DataSource):
     def __init__(self, token: Optional[str] = None):
         super().__init__("Tushare")
         self.token = token or config.TUSHARE_TOKEN
-        self.priority = 4  # 速率限制严重，作为最后备用
+        self.priority = 1  # 提高优先级，因为 Tushare 提供完整的行业信息
         self.pro = None
         
         if self.token:
@@ -572,6 +572,30 @@ class MultiSourceSync:
                 if df is not None and not df.empty:
                     # 统一格式为英文列名：code, name, industry
                     df = df.rename(columns={'代码': 'code', '名称': 'name', '所属行业': 'industry'})
+                    
+                    # 核心改动：清理代码格式，确保统一为6位纯数字字符串
+                    def clean_code(c):
+                        try:
+                            c_str = str(c).strip().lower()
+                            # 剔除 sh/sz/bj 前缀
+                            if c_str.startswith(('sz', 'sh', 'bj')):
+                                c_str = c_str[2:]
+                            # 剔除 .0 (来自之前的 float 转换错误)
+                            if c_str.endswith('.0'):
+                                c_str = c_str[:-2]
+                            # 补齐6位 (例如 '1' -> '000001')
+                            if c_str.isdigit() and len(c_str) < 6:
+                                c_str = c_str.zfill(6)
+                            return c_str
+                        except:
+                            return str(c)
+                            
+                    df['code'] = df['code'].apply(clean_code)
+                    # 剔除无意义的占位名（深市、沪市等）
+                    df = df[~df['name'].str.contains('深市|沪市', na=False)]
+                    # 去重
+                    df = df.drop_duplicates(subset=['code'])
+                    
                     source.record_success()
                     return df
             except Exception as e:

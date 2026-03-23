@@ -417,7 +417,11 @@ def save_stock_basic(df: pd.DataFrame, engine=None) -> bool:
                 SELECT code, name, industry FROM {temp_table}
                 ON CONFLICT (code) DO UPDATE SET
                     name = EXCLUDED.name,
-                    industry = EXCLUDED.industry
+                    industry = CASE 
+                        WHEN EXCLUDED.industry = '未知' AND stock_basic.industry IS NOT NULL AND stock_basic.industry != '未知' 
+                        THEN stock_basic.industry 
+                        ELSE EXCLUDED.industry 
+                    END
             '''))
             conn.execute(text(f"DROP TABLE {temp_table}"))
             conn.commit()

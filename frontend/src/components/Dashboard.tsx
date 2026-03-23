@@ -27,7 +27,7 @@ export default function Dashboard() {
     const [lastUpdated, setLastUpdated] = useState("");
 
     const [params, setParams] = useState({
-        strategy_type: "squeeze" as "squeeze" | "pine",  // 策略类型: squeeze=均线粘合, pine=Pine Script多指标
+        strategy_type: "squeeze" as "squeeze" | "pine" | "both",  // 策略类型: squeeze=均线粘合, pine=Pine Script多指标, both=同时满足
         pine_min_signals: 3,  // Pine策略: 最小共振信号数
         min_data_days: 60,  // 最小数据天数
         threshold: 0.12,

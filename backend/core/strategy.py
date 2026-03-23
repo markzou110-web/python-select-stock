@@ -142,148 +142,139 @@ def calculate_historical_win_rate(df):
 
 def check_pine_strategy(df, min_signals=3):
     """
-    Pine Script 多指标共振策略
-
-    基于 TradingView Pine Script 策略的多指标共振系统：
-    - Range Filter (范围过滤器)
-    - SuperTrend (超级趋势)
-    - RQK (Rational Quadratic Kernel 核回归)
-    - Half Trend (半趋势)
-    - QQE Mod (量化指标)
-
-    Args:
-        df: 包含 Pine Script 指标的 DataFrame
-        min_signals: 最少需要多少个指标共振才触发信号
-
-    Returns:
-        (is_match, debug_info): 是否匹配策略和调试信息
+    Pine Script 多指标共振策略 (基于用户截图优化的 3 指标核心版)
+    核心指标：Range Filter, Volume, QQE Mod
     """
     if df is None or df.empty:
         return False, {"reason": "数据为空"}
 
-    # 检查必需的 Pine Script 指标列是否存在
-    required_indicators = [
-        'RF_Upward', 'RF_Downward',  # Range Filter
-        'ST_Signal',  # SuperTrend
-        'RQK_Up', 'RQK_Down',  # RQK
-        'HT_Long', 'HT_Short',  # Half Trend
-        'QQE_Long', 'QQE_Short'  # QQE Mod
-    ]
-
-    missing_indicators = [ind for ind in required_indicators if ind not in df.columns]
-    if missing_indicators:
-        return False, {"reason": f"缺少 Pine Script 指标: {', '.join(missing_indicators)}"}
-
+    # 1. 基础指标计算
     curr = df.iloc[-1]
+    
+    # --- 指标 1: Range Filter (必选) ---
+    rf_bullish = False
+    if 'RF_Upward' in df.columns:
+        rf_bullish = curr['RF_Upward'] and not df.iloc[-1].get('RF_Downward', False)
+    
+    # --- 指标 2: QQE Mod (核心共振) ---
+    qqe_bullish = False
+    if 'QQE_Long' in df.columns:
+        qqe_bullish = curr['QQE_Long']
 
-    # 1. Range Filter 信号
-    rf_bullish = curr['RF_Upward'] and not curr['RF_Downward']
+    # --- 指标 3: Volume (量能确认) ---
+    vol_bullish = False
+    if '成交量' in df.columns and 'Vol_MA20' in df.columns:
+        # 更加严格：至少放量 20%
+        vol_bullish = curr['成交量'] > curr['Vol_MA20'] * 1.2
+    
+    # --- 核心过滤 (SOP 规范) ---
+    # 1. 阳线过滤 (必须是阳线)
+    is_bull_candle = curr['收盘'] > curr['开盘']
+    
+    # 2. 影线过滤 (上影线不能过长)
+    body = abs(curr['收盘'] - curr['开盘'])
+    upper_shadow = curr['最高'] - max(curr['收盘'], curr['开盘'])
+    shadow_ratio = round(upper_shadow / body, 2) if body > 0 else 0
+    is_shadow_ok = shadow_ratio < 0.5
 
-    # 2. SuperTrend 信号
-    st_bullish = curr['ST_Signal']
-
-    # 3. RQK 信号 (检查最近趋势)
-    rqk_bullish = curr['RQK_Up'] and not curr['RQK_Down']
-
-    # 4. Half Trend 信号
-    ht_bullish = curr['HT_Long'] and not curr['HT_Short']
-
-    # 5. QQE 信号
-    qqe_bullish = curr['QQE_Long'] and not curr['QQE_Short']
-
-    # 统计看涨信号数量
-    bullish_signals = sum([rf_bullish, st_bullish, rqk_bullish, ht_bullish, qqe_bullish])
-
-    # 确认没有看跌信号主导 (至少 3 个指标共振)
-    is_match = bullish_signals >= min_signals
+    # 统计核心 3 指标看涨数量
+    core_signals = sum([rf_bullish, qqe_bullish, vol_bullish])
+    
+    # 最终判断：共振信号足 + 是阳线 + 影线可接受
+    is_match = (core_signals >= min_signals) and is_bull_candle and is_shadow_ok
 
     debug_info = {
-        "RF": "看涨" if rf_bullish else "看跌/中性",
-        "SuperTrend": "看涨" if st_bullish else "看跌",
-        "RQK": "看涨" if rqk_bullish else "看跌/中性",
-        "HalfTrend": "看涨" if ht_bullish else "看跌",
-        "QQE": "看涨" if qqe_bullish else "看跌",
-        "bullish_signals": bullish_signals,
-        "min_required": min_signals
+        "RangeFilter": "✅" if rf_bullish else "❌",
+        "QQE_Mod": "✅" if qqe_bullish else "❌",
+        "Volume": "✅" if vol_bullish else "❌",
+        "core_signals": f"{core_signals}/3",
+        "is_bull": "✅" if is_bull_candle else "❌",
+        "shadow_ok": "✅" if is_shadow_ok else "❌"
     }
+
+    # 辅助判断 (用于加分)
+    st_bullish = curr.get('ST_Signal', False)
+    rqk_bullish = curr.get('RQK_Up', False)
 
     if is_match:
         # 计算评分 (基于信号数量和一致性)
-        score = bullish_signals * 20  # 5 个指标，每个 20 分
-
-        # 添加额外的评分因子
+        score = core_signals * 30 + (10 if st_bullish else 0) + (10 if rqk_bullish else 0)
+        
+        # 计算辅助显示数据 (用于前端表格)
         prev = df.iloc[-2]
-
+        pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
+        
         # 价格动能 (最近 3 天涨幅)
         pct_change_3d = (curr['收盘'] - df['收盘'].iloc[-4]) / df['收盘'].iloc[-4] * 100 if len(df) >= 4 else 0
-
-        # 量能确认
-        vol_ratio = curr['成交量'] / df['成交量'].iloc[-20:].mean() if len(df) >= 20 else 1
-
+        
+        # 影线统计 (重复计算以便返回)
         return True, {
-            "Score": round(score, 1),
+            "Score": round(float(score), 1),
             "现价": curr['收盘'],
             "代码": curr.get('code', 'N/A'),
             "名称": curr.get('name', 'N/A'),
-            "信号数": f"{bullish_signals}/5",
+            "涨幅%": round(pct_change, 2),
+            "信号数": f"{core_signals}/3",
             "3日涨幅%": round(pct_change_3d, 2),
-            "量能比": round(vol_ratio, 2),
-            "RF": debug_info["RF"],
-            "ST": debug_info["SuperTrend"],
-            "RQK": debug_info["RQK"],
-            "HT": debug_info["HalfTrend"],
-            "QQE": debug_info["QQE"]
+            "RSI": round(curr.get('RSI', 0), 1),
+            "DIF": round(curr.get('MACD_DIF', 0), 3),
+            "BB": round(curr.get('BB_Width', 0), 4),
+            "粘合度": round(curr.get('Sqz_Ratio', 0), 4),
+            "影线比": shadow_ratio,
+            "RF": "看涨" if rf_bullish else "看跌",
+            "QQE": "看涨" if qqe_bullish else "看跌",
+            "成交量": "放量" if vol_bullish else "缩量"
         }
     else:
-        debug_info["reason"] = f"信号不足 ({bullish_signals}/{min_signals})"
+        reasons = []
+        if core_signals < min_signals: reasons.append(f"信号不足({core_signals}/3)")
+        if not is_bull_candle: reasons.append("非阳线")
+        if not is_shadow_ok: reasons.append(f"影线过长({shadow_ratio})")
+        debug_info["reason"] = ",".join(reasons) if reasons else "条件冲突"
         return False, debug_info
 
 
 def calculate_pine_win_rate(df, min_signals=3):
     """
-    计算 Pine Script 策略的历史胜率
-
-    Args:
-        df: 包含 Pine Script 指标的 DataFrame
-        min_signals: 最少需要的共振信号数
-
-    Returns:
-        (win_rate, signal_count): 胜率和信号次数
+    计算 Pine Script 策略的历史胜率 (基于 3 指标模型)
     """
     if df.empty or len(df) < 60:
         return 0, 0
 
     try:
-        # 检查是否已计算 Pine 指标
-        if 'RF_Upward' not in df.columns:
-            return 0, 0
+        # 1. 核心共振点计算
+        rf_bullish = (df['RF_Upward'] & ~df.get('RF_Downward', False)).astype(int)
+        qqe_bullish = df.get('QQE_Long', False).astype(int)
+        vol_bullish = (df['成交量'] > df.get('Vol_MA20', df['成交量'].rolling(20).mean())).astype(int)
 
-        # 找出历史信号点 (需要至少 3 个指标共振)
-        bullish_count = (
-            (df['RF_Upward'] & ~df['RF_Downward']).astype(int) +
-            (df['ST_Signal']).astype(int) +
-            (df['RQK_Up'] & ~df['RQK_Down']).astype(int) +
-            (df['HT_Long'] & ~df['HT_Short']).astype(int) +
-            (df['QQE_Long'] & ~df['QQE_Short']).astype(int)
-        )
+        bullish_count = rf_bullish + qqe_bullish + vol_bullish
 
-        # 找出信号点 (至少需要 min_signals 个指标看涨)
-        signal_indices = df.index[(bullish_count >= min_signals) & (df.index < len(df) - 5)]
+        # 找出信号点 (至少满足 min_signals 个)
+        # 限制范围：离当前最新日期至少留出 5 天用于计算盈亏
+        valid_range = df.index < len(df) - 5
+        signal_mask = (bullish_count >= min_signals) & valid_range
+        signal_indices = df.index[signal_mask]
 
         if len(signal_indices) == 0:
             return 0, 0
 
+        # 2. 盈亏统计 (3% 目标价)
         success_count = 0
+        close_vals = df['收盘'].values
+        high_vals = df['最高'].values
+        
         for idx in signal_indices:
-            entry_price = df.loc[idx, '收盘']
-            # 未来 5 天最高价
-            if idx + 5 < len(df):
-                future_max = df.loc[idx+1:idx+5, '最高'].max()
-                if (future_max - entry_price) / entry_price >= 0.03:
-                    success_count += 1
+            entry_price = close_vals[idx]
+            # 未来 5 天内是否存在最高价涨幅达到 3% 的点?
+            future_max = np.max(high_vals[idx+1 : idx+6])
+            if (future_max - entry_price) / entry_price >= 0.03:
+                success_count += 1
 
         win_rate = round(success_count / len(signal_indices) * 100, 1)
         return win_rate, len(signal_indices)
+
+    except Exception as e:
+        return 0, 0
 
     except Exception as e:
         return 0, 0

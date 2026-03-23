@@ -65,6 +65,7 @@ async def lifespan(app: FastAPI):
     logger.info("Pre-warming Index and Sector cache...")
     loop.run_in_executor(None, get_index_data)
     loop.run_in_executor(None, get_hot_sectors)
+    loop.run_in_executor(None, get_sector_map)
     # 异步预热地雷数据
     loop.run_in_executor(None, fetch_mine_sweeper_data)
     
@@ -292,26 +293,30 @@ def background_sync_task():
         available_count = sum(1 for info in report.values() if info['status'] == 'available')
         logger.info(f"Available data sources: {available_count}/{len(report)}")
 
-        # 获取需要同步的股票代码（优先从 stock_basic 获取，兜底从 daily_k 获取）
-        with engine.connect() as conn:
-            # 尝试从 stock_basic 获取所有有效标的
-            all_codes_result = conn.execute(text("SELECT code FROM stock_basic ORDER BY code")).fetchall()
-            if not all_codes_result:
-                all_codes_result = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
+        # 1. 强制联网获取/更新最新的股票基础列表 (确保包含实时名称、行业和板块)
+        with sync_progress_lock:
+            sync_progress["status_text"] = "正在获取最新股票基础列表..."
+        
+        logger.info("Fetching fresh stock list from data sources...")
+        fresh_list = syncer.get_stock_list()
+        if fresh_list is not None and not fresh_list.empty:
+            from core.db import save_stock_basic
+            save_stock_basic(fresh_list, engine)
+            all_codes = fresh_list['code'].tolist()
+            logger.info(f"Updated stock_basic with {len(fresh_list)} records from cloud.")
             
-            # 如果数据库里啥都没有，尝试联网获取一次基础列表
-            if not all_codes_result:
-                logger.info("Database empty, fetching fresh stock list from data sources...")
-                fresh_list = syncer.get_stock_list() # This calls the underlying source's get_stock_list
-                if fresh_list is not None and not fresh_list.empty:
-                    from core.db import save_stock_basic
-                    # 数据源返回中文列名，需要转换为英文列名以匹配 save_stock_basic 的期望格式
-                    fresh_list = fresh_list.rename(columns={'代码': 'code', '名称': 'name', '所属行业': 'industry'})
-                    save_stock_basic(fresh_list, engine)
-                    all_codes = fresh_list['code'].tolist()
-                else:
-                    all_codes = []
-            else:
+            # 2. 立即补充行业映射 (防止被联网数据覆盖为'未知')
+            with sync_progress_lock:
+                sync_progress["status_text"] = "正在补充行业/板块映射..."
+            logger.info("Filling missing sector information from industry boards...")
+            get_sector_map()
+        else:
+            # 联网获取失败，从数据库兜底获取同步列表
+            logger.warning("Cloud fetch failed, using DB fallback for code list.")
+            with engine.connect() as conn:
+                all_codes_result = conn.execute(text("SELECT code FROM stock_basic ORDER BY code")).fetchall()
+                if not all_codes_result:
+                    all_codes_result = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
                 all_codes = [row[0] for row in all_codes_result]
 
             # 仅包含：沪深主板(60, 00)、创业板(30)、科创板(688)
@@ -656,22 +661,18 @@ def run_market_scan(
             from core.indicators import batch_calculate_indicators, calculate_pine_indicators
             master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
 
-            # Pine Script 策略需要额外的指标计算
-            if strategy_type == "pine":
-                logger.info("Calculating Pine Script indicators...")
-                # 对每只股票单独计算 Pine 指标（这些指标不适合批量向量化）
-                pine_results = []
-                for code, group in master_df.groupby('code'):
-                    try:
-                        df_pine = calculate_pine_indicators(group.copy())
-                        pine_results.append(df_pine)
-                    except Exception as e:
-                        logger.warning(f"Failed to calculate Pine indicators for {code}: {e}")
-                        pine_results.append(group)  # 保留原数据
+            # Pine Script 策略或 同时启用 策略需要额外的指标计算
+            if strategy_type in ["pine", "both"]:
+                logger.info("Calculating Pine Script indicators in parallel...")
+                # 对每只股票单独计算 Pine 指标 (使用并行加速)
+                groups = [group.copy() for _, group in master_df.groupby('code')]
+                
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    pine_results = list(executor.map(calculate_pine_indicators, groups))
 
                 if pine_results:
                     master_df = pd.concat(pine_results, ignore_index=True)
-                logger.info(f"Pine Script indicators calculated.")
+                logger.info(f"Parallel Pine Script indicators calculation completed.")
 
             logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
 
@@ -692,7 +693,14 @@ def run_market_scan(
         fail_reasons = {}
         none_count = 0
         processed_count = 0
-        
+
+        # DEBUG: Check if name column exists in candidates
+        logger.info(f"DEBUG: candidates columns: {candidates.columns.tolist()}")
+        if 'name' in candidates.columns:
+            logger.info(f"DEBUG: Sample candidate names: {candidates['name'].head(10).tolist()}")
+        else:
+            logger.warning("DEBUG: 'name' column NOT found in candidates!")
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_stock = {
                 executor.submit(
@@ -725,8 +733,8 @@ def run_market_scan(
             if fail_reasons:
                 logger.info(f"Rejection Summary: {fail_reasons}")
 
-            # Pine 策略额外统计
-            if strategy_type == "pine":
+            # Pine 策略或 同时启用 策略额外统计
+            if strategy_type in ["pine", "both"]:
                 pine_stats = {}
                 for reason, count in fail_reasons.items():
                     if "信号不足" in reason:
@@ -744,60 +752,49 @@ def run_market_scan(
         # 排序并取 Top 100
         results = sorted(results, key=lambda x: x['Score'], reverse=True)[:100]
         
-        # 补充增强数据 (行业, 胜率) - 只对最终入选的 100 只股票计算胜率
-        logger.info(f"Calculating historical win rate and supplements for top {len(results)} matches...")
+        # 补充增强数据 (行业, 胜率) - 并发处理 Top 100
+        logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
         from core.strategy import calculate_historical_win_rate, calculate_pine_win_rate
-        for res in results:
-            code = res['代码']
-            # Find the history in hist_map
-            df_hist = hist_map.get(code)
-            if df_hist is not None and not df_hist.empty:
-                # 重新应用指标计算以确保完整（或者我们可以重用分析时的 df，但由于并发，这里重新算更简单）
-                from core.indicators import calculate_indicators, calculate_pine_indicators
-                # 根据策略类型计算不同的胜率
+        from core.indicators import calculate_indicators
+        from core.data import get_sector_map
+        sector_map = get_sector_map()
+
+        def process_supplement(res):
+            try:
+                code = res['代码']
+                # 1. 计算胜率
+                df_hist = hist_map.get(code)
+                # 并发中重新计算指标 (Top 100 规模可控)
+                enable_pine = (strategy_type in ["pine", "both"])
+                df_labeled = calculate_indicators(df_hist, bench_df=bench_slice, enable_pine_indicators=enable_pine)
                 if strategy_type == "pine":
-                    df_labeled = calculate_indicators(df_hist, bench_df=bench_slice, enable_pine_indicators=True)
-                    if 'RF_Upward' not in df_labeled.columns:
-                        df_labeled = calculate_pine_indicators(df_labeled)
                     wr, sig_count = calculate_pine_win_rate(df_labeled)
+                elif strategy_type == "both":
+                    wr, sig_count = calculate_pine_win_rate(df_labeled) # Both 优先使用 Pine 胜率显示，或者可以取平均
                 else:
-                    df_labeled = calculate_indicators(df_hist, bench_df=bench_slice)
                     wr, sig_count = calculate_historical_win_rate(df_labeled)
                 res['历史胜率'] = f"{wr}%"
                 res['信号次数'] = sig_count
+                
+                # 2. 获取行业
+                industry = sector_map.get(code, "未知")
+                if industry == "未知":
+                    try:
+                        import akshare as ak
+                        info_df = ak.stock_individual_info_em(symbol=code)
+                        if not info_df.empty:
+                            industry_val = info_df[info_df['item'] == '行业分类']['value'].values
+                            if len(industry_val) > 0:
+                                industry = industry_val[0]
+                    except: pass
+                res['行业'] = industry
+            except Exception as e:
+                logger.error(f"Supplement error for {res.get('代码')}: {e}")
+            return res
 
-        from core.data import get_sector_map
-        sector_map = get_sector_map() # This now handles DB + Memory cache
-        
-        def fetch_single_industry(res_item):
-            code = res_item['代码']
-            industry = sector_map.get(code, "未知")
-            if industry == "未知":
-                try:
-                    import akshare as ak
-                    info_df = ak.stock_individual_info_em(symbol=code)
-                    if not info_df.empty:
-                        industry_val = info_df[info_df['item'] == '行业分类']['value'].values
-                        if len(industry_val) > 0:
-                            return code, industry_val[0]
-                except:
-                    pass
-            return code, industry
-
-        # 并发补充结果详情，避免 30 个股票串行查询导致的超时
-        logger.info(f"Supplementing industry info for {len(results)} results in parallel...")
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_industry = {executor.submit(fetch_single_industry, res): res for res in results}
-            industry_results = {}
-            for future in as_completed(future_to_industry):
-                try:
-                    code, ind = future.result(timeout=10)
-                    industry_results[code] = ind
-                except Exception:
-                    continue
-        
-        for res in results:
-            res['行业'] = industry_results.get(res['代码'], "未知")
+        # 使用线程池并发补充 100 只股票
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            list(executor.map(process_supplement, results))
             
         # --- SOP: 板块共振 (Sector Resonance) 计算 ---
         industry_counts = {}
@@ -838,6 +835,10 @@ def run_market_scan(
         raise HTTPException(status_code=500, detail=str(e))
 
 def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None):
+    # DEBUG: Log name for first few stocks
+    if isinstance(code, str) and code in ['600000', '000001', '000002', '600519']:
+        logger.info(f"DEBUG single_stock_task[{code}]: name='{name}', type={type(name)}")
+
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
@@ -863,6 +864,8 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     # 根据策略类型设置最小数据要求
     if min_data_days is None:
         min_days = 50 if strategy_type == "pine" else 120
+        if strategy_type == "both":
+            min_days = 120
     else:
         min_days = min_data_days
 
@@ -872,11 +875,11 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     try:
         # 技术指标计算 - 如果预加载的数据已经包含指标，则跳过
         if 'RSI' not in df.columns:
-            # Pine Script 策略需要额外的指标
-            enable_pine = (strategy_type == "pine")
+            # Pine Script 策略或 同时启用 需要额外的指标
+            enable_pine = (strategy_type in ["pine", "both"])
             df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df, enable_pine_indicators=enable_pine)
 
-            # 如果是 Pine 策略且指标已计算但缺少 Pine 特定指标，需要补充计算
+            # 如果包含 Pine 策略且指标已计算但缺少 Pine 特定指标，需要补充计算
             if enable_pine and 'RF_Upward' not in df.columns:
                 df = calculate_pine_indicators(df)
 
@@ -884,13 +887,40 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         if strategy_type == "pine":
             # Pine Script 多指标共振策略
             match, stats = check_pine_strategy(df, min_signals=pine_min_signals)
-
             if match:
                 stats['代码'] = code
                 stats['名称'] = name
                 return stats
             else:
                 return stats
+        elif strategy_type == "both":
+            # 同时满足：均线粘合 + Pine Script 共振
+            match_sqz, stats_sqz = check_strategy(
+                df, threshold=threshold, vol_multiplier=vol_multiplier, rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter, use_bb_sqz=use_bb_sqz, 
+                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter
+            )
+            if not match_sqz:
+                return stats_sqz
+                
+            match_pine, stats_pine = check_pine_strategy(df, min_signals=pine_min_signals)
+            if not match_pine:
+                return stats_pine
+                
+            # 两者都满足，合并结果
+            # 周线趋势过滤 (针对 Squeeze 部分)
+            if use_weekly:
+                if not get_weekly_indicators(code, df=df, local_only=local_only):
+                    return {"reason": "周线波段未走强"}
+            
+            combined_stats = stats_pine.copy()
+            combined_stats.update(stats_sqz)
+            # 分数取加权 (Pine 50% + Squeeze 50%)
+            combined_stats['Score'] = (stats_pine['Score'] + stats_sqz['Score']) / 2
+            combined_stats['代码'] = code
+            combined_stats['名称'] = name
+            combined_stats['reason'] = "双重策略共振"
+            return combined_stats
         else:
             # 默认均线粘合策略
             match, stats = check_strategy(

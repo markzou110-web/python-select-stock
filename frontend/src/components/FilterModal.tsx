@@ -17,11 +17,12 @@ interface FilterModalProps {
 export default function FilterModal({ isOpen, onClose, params, setParams, onScan, availableDates = [] }: FilterModalProps) {
     if (!isOpen) return null;
 
-    const isPineStrategy = params.strategy_type === "pine";
+    const showSqueezeParams = params.strategy_type === "squeeze" || params.strategy_type === "both";
+    const showPineParams = params.strategy_type === "pine" || params.strategy_type === "both";
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
-            <div className="bg-white rounded-3xl w-full max-w-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 text-slate-800">
+            <div className="bg-white rounded-3xl w-full max-w-4xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
                 <div className="flex items-center justify-between px-8 py-6 border-b border-slate-100 bg-slate-50/50">
                     <div>
                         <h3 className="text-xl font-bold text-slate-800">🔬 高级策略筛选</h3>
@@ -35,20 +36,27 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 {/* 策略选择器 */}
                 <div className="px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
                     <FilterItem label="🎯 选择选股策略">
-                        <div className="grid grid-cols-2 gap-3">
+                        <div className="grid grid-cols-3 gap-3">
                             <StrategyOption
                                 title="均线粘合策略"
-                                description="传统均线粘合突破战法，适合捕捉蓄势后的爆发行情"
+                                description="传统均线粘合突破战法"
                                 active={params.strategy_type === "squeeze"}
                                 onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
                                 icon="📊"
                             />
                             <StrategyOption
                                 title="Pine Script 多指标"
-                                description="TradingView Pine Script 策略，Range Filter + SuperTrend + RQK + Half Trend + QQE 多指标共振"
+                                description="Range Filter/QQE 等共振"
                                 active={params.strategy_type === "pine"}
                                 onClick={() => setParams({ ...params, strategy_type: "pine" })}
                                 icon="🚀"
+                            />
+                            <StrategyOption
+                                title="双重强力共振"
+                                description="同时满足均线粘合与多指标信号"
+                                active={params.strategy_type === "both"}
+                                onClick={() => setParams({ ...params, strategy_type: "both" })}
+                                icon="🔥"
                             />
                         </div>
                     </FilterItem>
@@ -58,7 +66,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     {/* Column 1 */}
                     <div className="space-y-6">
                         {/* 均线粘合策略专用参数 */}
-                        {!isPineStrategy && (
+                        {showSqueezeParams && (
                             <>
                                 <FilterItem label="粘合度阈值 (0.01~0.30)">
                                     <input
@@ -117,7 +125,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         )}
 
                         {/* Pine Script 策略专用参数 */}
-                        {isPineStrategy && (
+                        {showPineParams && (
                             <>
                                 <FilterItem label="🎯 最小共振信号数">
                                     <div className="flex items-center gap-4">
@@ -192,7 +200,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     {/* Column 2 */}
                     <div className="space-y-6">
                         {/* 均线粘合策略专用参数 */}
-                        {!isPineStrategy && (
+                        {showSqueezeParams && (
                             <>
                                 <FilterItem label="RSI 最小强度 (30~80)">
                                     <input
@@ -228,7 +236,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         )}
 
                         {/* Pine Script 策略专用参数 - 添加一些通用过滤选项 */}
-                        {isPineStrategy && (
+                        {showPineParams && (
                             <>
                                 <div className="p-4 rounded-xl bg-gradient-to-br from-purple-50 to-indigo-50 border border-purple-100">
                                     <h4 className="text-xs font-bold text-purple-700 mb-2">💡 使用建议</h4>
@@ -306,7 +314,9 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         onClick={() => { onScan(); onClose(); }}
                         className={cn(
                             "px-8 py-2.5 text-white rounded-xl font-bold shadow-lg transition-all hover:scale-105 active:scale-95",
-                            isPineStrategy ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : "premium-gradient"
+                            params.strategy_type === "pine" ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : 
+                            params.strategy_type === "both" ? "bg-gradient-to-r from-indigo-600 to-emerald-600 shadow-emerald-100" :
+                            "premium-gradient"
                         )}
                     >
                         保存并执行
