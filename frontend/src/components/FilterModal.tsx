@@ -19,6 +19,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
 
     const showSqueezeParams = params.strategy_type === "squeeze" || params.strategy_type === "both";
     const showPineParams = params.strategy_type === "pine" || params.strategy_type === "both";
+    const showConsensusParams = params.strategy_type === "consensus";
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 text-slate-800">
@@ -36,7 +37,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 {/* 策略选择器 */}
                 <div className="px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
                     <FilterItem label="🎯 选择选股策略">
-                        <div className="grid grid-cols-3 gap-3">
+                        <div className="grid grid-cols-4 gap-2">
                             <StrategyOption
                                 title="均线粘合策略"
                                 description="传统均线粘合突破战法"
@@ -53,10 +54,17 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                             />
                             <StrategyOption
                                 title="双重强力共振"
-                                description="同时满足均线粘合与多指标信号"
+                                description="均线粘合 + Pine 信号"
                                 active={params.strategy_type === "both"}
                                 onClick={() => setParams({ ...params, strategy_type: "both" })}
                                 icon="🔥"
+                            />
+                            <StrategyOption
+                                title="Azul 共识策略"
+                                description="放量突破+高低点结构"
+                                active={params.strategy_type === "consensus"}
+                                onClick={() => setParams({ ...params, strategy_type: "consensus" })}
+                                icon="💎"
                             />
                         </div>
                     </FilterItem>
@@ -177,6 +185,52 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         <li>• <strong>QQE Mod</strong>: 量化指标带</li>
                                     </ul>
                                 </div>
+                            </>
+                        )}
+
+                        {showConsensusParams && (
+                            <>
+                                <div className="p-4 rounded-xl bg-blue-50 border border-blue-100 space-y-2">
+                                    <h4 className="text-xs font-bold text-blue-700">💎 Azul 共识策略说明</h4>
+                                    <ul className="text-[10px] text-blue-600 space-y-1">
+                                        <li>• <strong>场景博弈</strong>: 确认行业/题材处于景气期</li>
+                                        <li>• <strong>图表验证</strong>: 均线多头 + HH突破</li>
+                                        <li>• <strong>沉积体质</strong>: 过去5天放量上涨多于下跌</li>
+                                        <li>• <strong>大阳突破</strong>: 实体 &gt; 2.5% + 成交量 &gt; 1.8倍</li>
+                                    </ul>
+                                </div>
+                                
+                                <FilterItem label="量比倍数 (建议 &gt; 1.8)">
+                                    <input
+                                        type="number" step="0.5" value={isNaN(params.vol_multiplier) ? '' : params.vol_multiplier}
+                                        onChange={e => setParams({ ...params, vol_multiplier: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
+                                        className="w-full px-4 py-2 bg-blue-50/50 border-none rounded-xl text-sm font-bold text-blue-900 outline-none focus:ring-2 focus:ring-blue-500"
+                                    />
+                                </FilterItem>
+
+                                <ToggleItem
+                                    label="启用周线大均线过滤"
+                                    active={params.use_weekly}
+                                    onClick={() => setParams({ ...params, use_weekly: !params.use_weekly })}
+                                />
+
+                                {params.use_weekly && (
+                                    <FilterItem label="📈 周线均线周期">
+                                        <select
+                                            value={params.weekly_ma_period}
+                                            onChange={e => setParams({ ...params, weekly_ma_period: parseInt(e.target.value) })}
+                                            className="w-full px-4 py-2 bg-blue-50/50 border-none rounded-xl text-sm font-bold text-blue-900 outline-none focus:ring-2 focus:ring-blue-500"
+                                        >
+                                            <option value={10}>MA10w (10周 ≈ 2.5个月) — 灵敏</option>
+                                            <option value={20}>MA20w (20周 ≈ 5个月) — 推荐</option>
+                                            <option value={30}>MA30w (30周 ≈ 7个月) — 平衡</option>
+                                            <option value={60}>MA60w (60周 ≈ 15个月) — 严格</option>
+                                        </select>
+                                        <p className="text-[10px] text-blue-500 mt-1">
+                                            周期越长，要求长期趋势越强，但会过滤掉更多处于反转初期的股票
+                                        </p>
+                                    </FilterItem>
+                                )}
                             </>
                         )}
 
@@ -316,6 +370,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                             "px-8 py-2.5 text-white rounded-xl font-bold shadow-lg transition-all hover:scale-105 active:scale-95",
                             params.strategy_type === "pine" ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : 
                             params.strategy_type === "both" ? "bg-gradient-to-r from-indigo-600 to-emerald-600 shadow-emerald-100" :
+                            params.strategy_type === "consensus" ? "bg-gradient-to-r from-blue-600 to-cyan-600 shadow-blue-100" :
                             "premium-gradient"
                         )}
                     >

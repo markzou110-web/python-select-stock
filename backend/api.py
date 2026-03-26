@@ -27,7 +27,10 @@ from core.db import (
 )
 from core.data import get_market_snapshot, sync_stock, get_index_data, get_hot_sectors, get_sector_map, get_cached_data, set_cached_data
 from core.indicators import calculate_indicators, get_weekly_indicators, calculate_pine_indicators
-from core.strategy import check_strategy, check_pine_strategy, calculate_historical_win_rate, calculate_pine_win_rate
+from core.strategy import (
+    check_strategy, check_pine_strategy, check_consensus_strategy,
+    calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
+)
 
 # Bark Key from config (not hardcoded)
 BARK_KEY = config.BARK_KEY
@@ -425,12 +428,13 @@ def run_market_scan(
     use_rs_filter: bool = True,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "squeeze",  # 新增: 策略类型 "squeeze"=均线粘合, "pine"=Pine Script多指标
-    pine_min_signals: int = 3,  # Pine策略: 最小共振信号数 (1-5)
-    min_data_days: Optional[int] = None  # 最小数据天数，None时自动根据策略选择
+    strategy_type: str = "squeeze",
+    pine_min_signals: int = 3,
+    min_data_days: Optional[int] = None,
+    weekly_ma_period: int = 20  # 周线均线周期 (10/20/30/60)
 ):
     # 调试日志：确认接收到的策略类型
-    logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}")
+    logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
 
     try:
         snapshot_df = pd.DataFrame()
@@ -708,7 +712,8 @@ def run_market_scan(
                     row['code'], row['name'], row['price'], row['vol'], row['open'],
                     threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
                     local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
-                    bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days
+                    bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days,
+                    weekly_ma_period=weekly_ma_period
                 ): row for _, row in candidates.iterrows()
             }
             
@@ -771,6 +776,8 @@ def run_market_scan(
                     wr, sig_count = calculate_pine_win_rate(df_labeled)
                 elif strategy_type == "both":
                     wr, sig_count = calculate_pine_win_rate(df_labeled) # Both 优先使用 Pine 胜率显示，或者可以取平均
+                elif strategy_type == "consensus":
+                    wr, sig_count = calculate_consensus_win_rate(df_labeled)
                 else:
                     wr, sig_count = calculate_historical_win_rate(df_labeled)
                 res['历史胜率'] = f"{wr}%"
@@ -834,10 +841,10 @@ def run_market_scan(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20):
     # DEBUG: Log name for first few stocks
     if isinstance(code, str) and code in ['600000', '000001', '000002', '600519']:
-        logger.info(f"DEBUG single_stock_task[{code}]: name='{name}', type={type(name)}")
+        logger.info(f"DEBUG single_stock_task[{code}]: name='{name}', strategy={strategy_type}")
 
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
@@ -863,8 +870,11 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
 
     # 根据策略类型设置最小数据要求
     if min_data_days is None:
-        min_days = 50 if strategy_type == "pine" else 120
-        if strategy_type == "both":
+        if strategy_type == "pine":
+            min_days = 50
+        elif strategy_type == "consensus":
+            min_days = 130 # 需要 60 周或足够长的日线来模拟
+        else: # squeeze or both
             min_days = 120
     else:
         min_days = min_data_days
@@ -908,19 +918,34 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 return stats_pine
                 
             # 两者都满足，合并结果
-            # 周线趋势过滤 (针对 Squeeze 部分)
+            # 周线趋势过滤
+            is_w_ok = True
             if use_weekly:
-                if not get_weekly_indicators(code, df=df, local_only=local_only):
+                is_w_ok = get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period)
+                if not is_w_ok:
                     return {"reason": "周线波段未走强"}
             
             combined_stats = stats_pine.copy()
             combined_stats.update(stats_sqz)
-            # 分数取加权 (Pine 50% + Squeeze 50%)
+            # 分数取平均
             combined_stats['Score'] = (stats_pine['Score'] + stats_sqz['Score']) / 2
             combined_stats['代码'] = code
             combined_stats['名称'] = name
             combined_stats['reason'] = "双重策略共振"
             return combined_stats
+        elif strategy_type == "consensus":
+            # Azul "共识" 策略
+            is_w_ok = True
+            if use_weekly:
+                is_w_ok = get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period)
+            
+            match, stats = check_consensus_strategy(df, is_weekly_ok=is_w_ok, vol_multiplier=vol_multiplier)
+            if match:
+                stats['代码'] = code
+                stats['名称'] = name
+                return stats
+            else:
+                return stats
         else:
             # 默认均线粘合策略
             match, stats = check_strategy(
@@ -937,7 +962,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             if match:
                 # 周线趋势过滤
                 if use_weekly:
-                    if not get_weekly_indicators(code, df=df, local_only=local_only):
+                    if not get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period):
                         return {"reason": "周线波段未走强"}
 
                 stats['代码'] = code
@@ -1140,27 +1165,27 @@ def scan_market(
     use_rs_filter: bool = True,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "squeeze",  # 新增: 策略类型选择
-    pine_min_signals: int = 3,  # Pine策略: 最小共振信号数 (1-5)
-    min_data_days: int = None  # 最小数据天数，None时自动根据策略选择
+    strategy_type: str = "squeeze",
+    pine_min_signals: int = 3,
+    min_data_days: int = None,
+    weekly_ma_period: int = 20  # 周线均线周期
 ):
     """
     API Endpoint for market scan
 
     Args:
         data_date: 指定使用的数据日期 (YYYY-MM-DD 格式)，为 None 时自动选择最新日期
-        strategy_type: 策略类型
-            - "squeeze": 均线粘合策略 (默认)
-            - "pine": Pine Script 多指标共振策略
-        pine_min_signals: Pine策略的最小共振信号数 (1-5)，至少需要多少个指标看涨才触发信号
-        min_data_days: 最小数据天数，留空时自动选择(Pine策略50天，均线粘合120天)
+        strategy_type: 策略类型 (squeeze/pine/both/consensus)
+        pine_min_signals: Pine策略的最小共振信号数 (1-5)
+        min_data_days: 最小数据天数
+        weekly_ma_period: 周线大均线周期 (10/20/30/60)
     """
-    # 调试日志：确认接收到的参数
-    logger.info(f"[SCAN] strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}")
+    logger.info(f"[SCAN] strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
     return run_market_scan(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
-        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days
+        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days,
+        weekly_ma_period=weekly_ma_period
     )
 
 @app.get("/api/settings")
@@ -1204,17 +1229,145 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
         return {"status": "error", "detail": "Internal server error"}
 
 @app.get("/api/paper/list")
-def list_paper_trades() -> List[Dict[str, Any]]:
-    """List all paper trades"""
+def list_paper_trades() -> Dict[str, Any]:
+    """List all paper trades with live P&L tracking"""
     engine = get_db_engine()
     if not engine:
-        return []
+        return {"trades": [], "stats": {}}
     try:
         df = pd.read_sql("SELECT * FROM paper_trading ORDER BY entry_date DESC", engine)
-        return df.to_dict('records')
+        if df.empty:
+            return {"trades": [], "stats": {"total_trades": 0, "win_rate": 0, "total_pl_pct": 0, "avg_hold_days": 0}}
+        
+        # --- 获取最新价格 ---
+        codes = df['code'].unique().tolist()
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        # 方法1: 从 daily_k 表获取最新收盘价
+        price_map = {}
+        try:
+            placeholders = ','.join([f"'{c}'" for c in codes])
+            price_df = pd.read_sql(f"""
+                SELECT DISTINCT ON (code) code, "收盘" as latest_price, "日期" as latest_date
+                FROM daily_k 
+                WHERE code IN ({placeholders})
+                ORDER BY code, "日期" DESC
+            """, engine)
+            for _, row in price_df.iterrows():
+                price_map[row['code']] = float(row['latest_price'])
+        except Exception as e:
+            logger.warning(f"Paper trading: DB price fetch failed: {e}")
+        
+        # 方法2: 尝试从实时快照补充缺失的
+        if len(price_map) < len(codes):
+            try:
+                snapshot = get_market_snapshot()
+                if not snapshot.empty:
+                    for code in codes:
+                        if code not in price_map:
+                            match = snapshot[snapshot['code'] == code]
+                            if not match.empty:
+                                price_map[code] = float(match.iloc[0]['price'])
+            except:
+                pass
+        
+        # --- 计算每笔交易的盈亏 ---
+        trades = []
+        sector_map_data = {}
+        
+        # 获取行业映射
+        try:
+            sector_df = pd.read_sql("SELECT code, industry FROM stock_basic WHERE industry IS NOT NULL", engine)
+            sector_map_data = dict(zip(sector_df['code'], sector_df['industry']))
+        except:
+            pass
+        
+        for _, row in df.iterrows():
+            code = row['code']
+            entry_price = float(row['entry_price'])
+            current_price = price_map.get(code, entry_price)  # fallback to entry
+            
+            pl = current_price - entry_price
+            pl_pct = (pl / entry_price * 100) if entry_price > 0 else 0
+            
+            # 持仓天数
+            entry_date = pd.to_datetime(row['entry_date'])
+            hold_days = (datetime.now() - entry_date).days
+            
+            industry = sector_map_data.get(code, '未知')
+            
+            trades.append({
+                "id": int(row['id']),
+                "code": code,
+                "name": row['name'],
+                "entry_price": round(entry_price, 2),
+                "current_price": round(current_price, 2),
+                "entry_date": str(row['entry_date']),
+                "pl": round(pl, 2),
+                "pl_pct": round(pl_pct, 2),
+                "hold_days": hold_days,
+                "industry": industry,
+                "status": row.get('status', 'OPEN')
+            })
+            
+            # 同时更新数据库中的 current_price
+            if current_price != entry_price:
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(text("UPDATE paper_trading SET current_price = :price WHERE id = :id"),
+                                     {"price": current_price, "id": int(row['id'])})
+                        conn.commit()
+                except:
+                    pass
+        
+        # --- 汇总统计 ---
+        wins = sum(1 for t in trades if t['pl_pct'] > 0)
+        losses = sum(1 for t in trades if t['pl_pct'] < 0)
+        flat = sum(1 for t in trades if t['pl_pct'] == 0)
+        total = len(trades)
+        avg_pl = sum(t['pl_pct'] for t in trades) / total if total > 0 else 0
+        avg_hold = sum(t['hold_days'] for t in trades) / total if total > 0 else 0
+        
+        # 按板块汇总胜率
+        sector_stats = {}
+        for t in trades:
+            ind = t['industry']
+            if ind not in sector_stats:
+                sector_stats[ind] = {"wins": 0, "total": 0}
+            sector_stats[ind]["total"] += 1
+            if t['pl_pct'] > 0:
+                sector_stats[ind]["wins"] += 1
+        
+        sector_distribution = [
+            {"name": k, "value": round(v["wins"] / v["total"] * 100) if v["total"] > 0 else 0, "count": v["total"]}
+            for k, v in sector_stats.items()
+        ]
+        sector_distribution.sort(key=lambda x: x["value"], reverse=True)
+        
+        # 最大单笔盈利/亏损
+        best = max(trades, key=lambda t: t['pl_pct']) if trades else None
+        worst = min(trades, key=lambda t: t['pl_pct']) if trades else None
+        
+        stats = {
+            "total_trades": total,
+            "wins": wins,
+            "losses": losses,
+            "flat": flat,
+            "win_rate": round(wins / total * 100) if total > 0 else 0,
+            "avg_pl_pct": round(avg_pl, 2),
+            "total_pl_pct": round(sum(t['pl_pct'] for t in trades), 2),
+            "avg_hold_days": round(avg_hold, 1),
+            "best_trade": {"name": best['name'], "pl_pct": best['pl_pct']} if best else None,
+            "worst_trade": {"name": worst['name'], "pl_pct": worst['pl_pct']} if worst else None,
+            "sector_distribution": sector_distribution
+        }
+        
+        return {"trades": trades, "stats": stats}
     except Exception as e:
         logger.error(f"Error listing paper trades: {e}")
-        return []
+        import traceback
+        traceback.print_exc()
+        return {"trades": [], "stats": {}}
 
 
 @app.delete("/api/paper/remove/{id}")

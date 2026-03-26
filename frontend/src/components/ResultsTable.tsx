@@ -38,6 +38,8 @@ interface Result {
     共振?: string;
     影线比?: number;
     warnings?: string[];
+    结构?: string;
+    体质?: string;
 }
 
 export default function ResultsTable({
@@ -205,6 +207,11 @@ export default function ResultsTable({
 
                                     <td className="px-6 py-5">
                                         <div className="flex flex-col items-center gap-1">
+                                            {res.结构 && (
+                                                <div className="px-2 py-0.5 bg-blue-50 text-blue-600 rounded-lg text-[10px] font-black border border-blue-100 mb-0.5">
+                                                    {res.结构}
+                                                </div>
+                                            )}
                                             <div className="flex items-center gap-1">
                                                 <span className="text-[10px] font-bold text-slate-300">上影比</span>
                                                 <span className={cn(
@@ -215,7 +222,13 @@ export default function ResultsTable({
                                                     {(res.影线比 || 0).toFixed(2)}
                                                 </span>
                                             </div>
-                                            <span className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter">影线/实体</span>
+                                            {res.体质 && (
+                                                <div className="flex items-center gap-1 mt-0.5">
+                                                    <span className="text-[9px] font-bold text-slate-300">沉积</span>
+                                                    <span className="text-[10px] font-extrabold text-indigo-500">{res.体质}</span>
+                                                </div>
+                                            )}
+                                            {!res.体质 && <span className="text-[9px] text-slate-400 font-bold uppercase tracking-tighter">影线/实体</span>}
                                         </div>
                                     </td>
 

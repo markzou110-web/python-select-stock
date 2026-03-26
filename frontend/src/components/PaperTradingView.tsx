@@ -8,10 +8,13 @@ import {
     DollarSign,
     BarChart3,
     Clock,
-    ChevronRight,
     PieChart as PieIcon,
     AlertCircle,
-    Loader2
+    Loader2,
+    RefreshCw,
+    CalendarDays,
+    Trophy,
+    Skull
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
@@ -26,41 +29,58 @@ import {
     Cell
 } from 'recharts';
 
-export default function PaperTradingView() {
-    const [trades, setTrades] = useState<any[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [stats, setStats] = useState({ total_pl: 0, win_rate: 0, total_trades: 0 });
-    const [sectorData, setSectorData] = useState<any[]>([]);
+interface Trade {
+    id: number;
+    code: string;
+    name: string;
+    entry_price: number;
+    current_price: number;
+    entry_date: string;
+    pl: number;
+    pl_pct: number;
+    hold_days: number;
+    industry: string;
+    status: string;
+}
 
-    const fetchTrades = async () => {
-        setLoading(true);
+interface Stats {
+    total_trades: number;
+    wins: number;
+    losses: number;
+    flat: number;
+    win_rate: number;
+    avg_pl_pct: number;
+    total_pl_pct: number;
+    avg_hold_days: number;
+    best_trade: { name: string; pl_pct: number } | null;
+    worst_trade: { name: string; pl_pct: number } | null;
+    sector_distribution: { name: string; value: number; count: number }[];
+}
+
+export default function PaperTradingView() {
+    const [trades, setTrades] = useState<Trade[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [refreshing, setRefreshing] = useState(false);
+    const [stats, setStats] = useState<Stats>({
+        total_trades: 0, wins: 0, losses: 0, flat: 0,
+        win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0,
+        best_trade: null, worst_trade: null, sector_distribution: []
+    });
+
+    const fetchTrades = async (showRefresh = false) => {
+        if (showRefresh) setRefreshing(true); else setLoading(true);
         try {
             const res = await api.get('/api/paper/list');
             const data = res.data;
-            setTrades(data);
-
-            // Calculate stats
-            if (data.length > 0) {
-                const totalPL = data.reduce((acc: number, t: any) => acc + (t.current_price - t.entry_price), 0);
-                const wins = data.filter((t: any) => t.current_price >= t.entry_price).length;
-                setStats({
-                    total_pl: totalPL,
-                    win_rate: Math.round((wins / data.length) * 100),
-                    total_trades: data.length
-                });
-
-                // Mock Sector Distribution (In real app, we'd join with industry data)
-                setSectorData([
-                    { name: '有色金属', value: 80 },
-                    { name: '电子元件', value: 65 },
-                    { name: '酿酒行业', value: 45 },
-                    { name: '医药制造', value: 20 },
-                ].sort((a, b) => b.value - a.value));
+            setTrades(data.trades || []);
+            if (data.stats) {
+                setStats(data.stats);
             }
         } catch (err) {
             console.error("Fetch Trades Error:", err);
         } finally {
             setLoading(false);
+            setRefreshing(false);
         }
     };
 
@@ -89,29 +109,60 @@ export default function PaperTradingView() {
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
             {/* Header Stats */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-5">
                 <StatCard
-                    label="累计浮盈"
-                    value={`¥${stats.total_pl.toFixed(2)}`}
-                    sub={`${stats.total_pl >= 0 ? '+' : ''}${((stats.total_pl / 10000) * 100).toFixed(2)}%`}
-                    icon={<DollarSign size={20} />}
-                    color={stats.total_pl >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
+                    label="选股胜率"
+                    value={`${stats.win_rate}%`}
+                    sub={`${stats.wins}胜 / ${stats.losses}负 / ${stats.flat}平`}
+                    icon={<BarChart3 size={20} />}
+                    color={stats.win_rate >= 50 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
                 />
                 <StatCard
-                    label="实盘胜率"
-                    value={`${stats.win_rate}%`}
-                    sub={`总计 ${stats.total_trades} 笔交易`}
-                    icon={<BarChart3 size={20} />}
+                    label="平均收益"
+                    value={`${stats.avg_pl_pct >= 0 ? '+' : ''}${stats.avg_pl_pct}%`}
+                    sub={`累计 ${stats.total_pl_pct >= 0 ? '+' : ''}${stats.total_pl_pct}%`}
+                    icon={<DollarSign size={20} />}
+                    color={stats.avg_pl_pct >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
+                />
+                <StatCard
+                    label="平均持仓"
+                    value={`${stats.avg_hold_days}天`}
+                    sub={`共 ${stats.total_trades} 笔观察`}
+                    icon={<CalendarDays size={20} />}
                     color="text-indigo-600 bg-indigo-50"
                 />
                 <StatCard
                     label="核心强势板块"
-                    value={sectorData[0]?.name || "N/A"}
-                    sub={`胜率 ${sectorData[0]?.value}%`}
+                    value={stats.sector_distribution?.[0]?.name || "N/A"}
+                    sub={`胜率 ${stats.sector_distribution?.[0]?.value || 0}% (${stats.sector_distribution?.[0]?.count || 0}只)`}
                     icon={<PieIcon size={20} />}
                     color="text-amber-600 bg-amber-50"
                 />
             </div>
+
+            {/* Best / Worst highlight */}
+            {(stats.best_trade || stats.worst_trade) && (
+                <div className="grid grid-cols-2 gap-4">
+                    {stats.best_trade && (
+                        <div className="flex items-center gap-3 px-5 py-3 bg-rose-50 border border-rose-100 rounded-2xl">
+                            <Trophy size={18} className="text-rose-500" />
+                            <div>
+                                <p className="text-[10px] font-bold text-rose-400 uppercase tracking-widest">最佳单笔</p>
+                                <p className="text-sm font-black text-rose-700">{stats.best_trade.name} <span className="text-rose-500">+{stats.best_trade.pl_pct}%</span></p>
+                            </div>
+                        </div>
+                    )}
+                    {stats.worst_trade && stats.worst_trade.pl_pct < 0 && (
+                        <div className="flex items-center gap-3 px-5 py-3 bg-emerald-50 border border-emerald-100 rounded-2xl">
+                            <Skull size={18} className="text-emerald-500" />
+                            <div>
+                                <p className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest">最差单笔</p>
+                                <p className="text-sm font-black text-emerald-700">{stats.worst_trade.name} <span className="text-emerald-500">{stats.worst_trade.pl_pct}%</span></p>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                 {/* Trade List */}
@@ -121,6 +172,14 @@ export default function PaperTradingView() {
                             <Clock size={18} className="text-slate-400" />
                             持仓观察记录
                         </h3>
+                        <button
+                            onClick={() => fetchTrades(true)}
+                            disabled={refreshing}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-xl transition-all disabled:opacity-50"
+                        >
+                            <RefreshCw size={12} className={refreshing ? "animate-spin" : ""} />
+                            刷新价格
+                        </button>
                     </div>
 
                     <div className="glass-card overflow-hidden">
@@ -131,45 +190,64 @@ export default function PaperTradingView() {
                                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">入场价</th>
                                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">当前价</th>
                                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">盈亏</th>
+                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">持仓天数</th>
+                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">板块</th>
                                     <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">操作</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-50">
-                                {trades.length > 0 ? trades.map((t) => {
-                                    const pl = t.current_price - t.entry_price;
-                                    const plPct = (pl / t.entry_price) * 100;
-                                    return (
-                                        <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
-                                            <td className="px-6 py-5">
-                                                <div className="flex flex-col">
-                                                    <span className="font-bold text-slate-700">{t.name}</span>
+                                {trades.length > 0 ? trades.map((t) => (
+                                    <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
+                                        <td className="px-6 py-5">
+                                            <div className="flex flex-col">
+                                                <span className="font-bold text-slate-700">{t.name}</span>
+                                                <div className="flex items-center gap-2">
                                                     <span className="text-[10px] font-mono font-medium text-slate-400">{t.code}</span>
+                                                    <span className="text-[9px] font-bold text-slate-300">{t.entry_date}</span>
                                                 </div>
-                                            </td>
-                                            <td className="px-6 py-5 text-center font-mono font-bold text-slate-600">{t.entry_price.toFixed(2)}</td>
-                                            <td className="px-6 py-5 text-center font-mono font-bold text-slate-600">{t.current_price.toFixed(2)}</td>
-                                            <td className="px-6 py-5 text-center">
-                                                <div className={cn(
-                                                    "inline-flex items-center gap-1 font-black",
-                                                    pl >= 0 ? "text-rose-600" : "text-emerald-600"
-                                                )}>
-                                                    {pl >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
-                                                    {plPct.toFixed(2)}%
-                                                </div>
-                                            </td>
-                                            <td className="px-6 py-5 text-right">
-                                                <button
-                                                    onClick={() => removeTrade(t.id)}
-                                                    className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"
-                                                >
-                                                    <Trash2 size={16} />
-                                                </button>
-                                            </td>
-                                        </tr>
-                                    );
-                                }) : (
+                                            </div>
+                                        </td>
+                                        <td className="px-6 py-5 text-center font-mono font-bold text-slate-600">{t.entry_price.toFixed(2)}</td>
+                                        <td className="px-6 py-5 text-center">
+                                            <span className={cn(
+                                                "font-mono font-bold",
+                                                t.current_price > t.entry_price ? "text-rose-600" :
+                                                t.current_price < t.entry_price ? "text-emerald-600" : "text-slate-600"
+                                            )}>
+                                                {t.current_price.toFixed(2)}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-5 text-center">
+                                            <div className={cn(
+                                                "inline-flex items-center gap-1 font-black text-sm",
+                                                t.pl_pct > 0 ? "text-rose-600" :
+                                                t.pl_pct < 0 ? "text-emerald-600" : "text-slate-400"
+                                            )}>
+                                                {t.pl_pct > 0 ? <TrendingUp size={14} /> :
+                                                 t.pl_pct < 0 ? <TrendingDown size={14} /> : null}
+                                                {t.pl_pct > 0 ? '+' : ''}{t.pl_pct.toFixed(2)}%
+                                            </div>
+                                        </td>
+                                        <td className="px-6 py-5 text-center">
+                                            <span className="text-xs font-bold text-slate-500">{t.hold_days}天</span>
+                                        </td>
+                                        <td className="px-6 py-5 text-center">
+                                            <span className="px-2 py-0.5 bg-indigo-50 text-indigo-600 text-[10px] font-black rounded-lg border border-indigo-100">
+                                                {t.industry}
+                                            </span>
+                                        </td>
+                                        <td className="px-6 py-5 text-right">
+                                            <button
+                                                onClick={() => removeTrade(t.id)}
+                                                className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"
+                                            >
+                                                <Trash2 size={16} />
+                                            </button>
+                                        </td>
+                                    </tr>
+                                )) : (
                                     <tr>
-                                        <td colSpan={5} className="px-6 py-20 text-center text-slate-400 italic">
+                                        <td colSpan={7} className="px-6 py-20 text-center text-slate-400 italic">
                                             暂无观察记录，点击多因子共振池中的 "+" 加入。
                                         </td>
                                     </tr>
@@ -186,44 +264,55 @@ export default function PaperTradingView() {
                         板块胜率分布图
                     </h3>
                     <div className="glass-card p-6 h-[400px]">
-                        <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={sectorData} layout="vertical" margin={{ left: 20 }}>
-                                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(0,0,0,0.05)" />
-                                <XAxis type="number" hide />
-                                <YAxis
-                                    dataKey="name"
-                                    type="category"
-                                    axisLine={false}
-                                    tickLine={false}
-                                    tick={{ fill: '#64748b', fontSize: 11, fontWeight: 700 }}
-                                />
-                                <ReTooltip
-                                    cursor={{ fill: 'transparent' }}
-                                    content={({ active, payload }) => {
-                                        if (active && payload && payload.length) {
-                                            return (
-                                                <div className="bg-slate-900 text-white px-3 py-2 rounded-xl text-[10px] font-bold shadow-xl">
-                                                    胜率: {payload[0].value}%
-                                                </div>
-                                            );
-                                        }
-                                        return null;
-                                    }}
-                                />
-                                <Bar dataKey="value" radius={[0, 8, 8, 0]} barSize={20}>
-                                    {sectorData.map((entry, index) => (
-                                        <Cell key={`cell-${index}`} fill={entry.value > 50 ? '#6366f1' : '#94a3b8'} fillOpacity={entry.value / 100} />
-                                    ))}
-                                </Bar>
-                            </BarChart>
-                        </ResponsiveContainer>
+                        {stats.sector_distribution && stats.sector_distribution.length > 0 ? (
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={stats.sector_distribution} layout="vertical" margin={{ left: 20 }}>
+                                    <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(0,0,0,0.05)" />
+                                    <XAxis type="number" hide />
+                                    <YAxis
+                                        dataKey="name"
+                                        type="category"
+                                        axisLine={false}
+                                        tickLine={false}
+                                        tick={{ fill: '#64748b', fontSize: 11, fontWeight: 700 }}
+                                    />
+                                    <ReTooltip
+                                        cursor={{ fill: 'transparent' }}
+                                        content={({ active, payload }) => {
+                                            if (active && payload && payload.length) {
+                                                return (
+                                                    <div className="bg-slate-900 text-white px-3 py-2 rounded-xl text-[10px] font-bold shadow-xl">
+                                                        胜率: {payload[0].value}%
+                                                    </div>
+                                                );
+                                            }
+                                            return null;
+                                        }}
+                                    />
+                                    <Bar dataKey="value" radius={[0, 8, 8, 0]} barSize={20}>
+                                        {stats.sector_distribution.map((entry, index) => (
+                                            <Cell key={`cell-${index}`} fill={entry.value > 50 ? '#6366f1' : '#94a3b8'} fillOpacity={Math.max(entry.value / 100, 0.3)} />
+                                        ))}
+                                    </Bar>
+                                </BarChart>
+                            </ResponsiveContainer>
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-slate-400 text-sm">
+                                暂无板块数据
+                            </div>
+                        )}
 
-                        <div className="mt-6 p-4 bg-indigo-50 rounded-2xl border border-indigo-100 flex gap-3">
-                            <AlertCircle size={16} className="text-indigo-600 shrink-0" />
-                            <p className="text-[10px] text-indigo-700 font-medium leading-relaxed">
-                                决策建议：您的模拟盈亏显示 <span className="font-black">有色金属</span> 胜率显著高于其他板块。建议系统自动强化该板块个股权重。
-                            </p>
-                        </div>
+                        {stats.sector_distribution && stats.sector_distribution.length > 0 && (
+                            <div className="mt-6 p-4 bg-indigo-50 rounded-2xl border border-indigo-100 flex gap-3">
+                                <AlertCircle size={16} className="text-indigo-600 shrink-0" />
+                                <p className="text-[10px] text-indigo-700 font-medium leading-relaxed">
+                                    决策建议：您的模拟盈亏显示 <span className="font-black">{stats.sector_distribution[0]?.name}</span> 胜率
+                                    {stats.sector_distribution[0]?.value >= 50
+                                        ? "显著高于其他板块。建议系统自动强化该板块个股权重。"
+                                        : "尚未达到优势水平，建议持续跟踪积累样本。"}
+                                </p>
+                            </div>
+                        )}
                     </div>
                 </div>
             </div>

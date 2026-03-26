@@ -176,11 +176,15 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     </div>
                     <div className="bg-indigo-600 rounded-2xl p-5 text-white shadow-lg shadow-indigo-100 relative overflow-hidden">
                         <p className="text-sm font-medium leading-relaxed relative z-10">
-                            "{stock.名称} 今日展现极强强度，综合得分 <span className="font-black text-amber-300 font-mono">{stock.Score.toFixed(1)}</span>。
-                            所属 <span className="px-1.5 py-0.5 bg-white/20 rounded-lg text-xs font-bold">【{stock.行业}】</span>
+                            "{stock.名称} 今日展现极强强度，综合得分 <span className="font-black text-amber-300 font-mono">{stock.Score?.toFixed(1) || 'N/A'}</span>。
+                            所属 <span className="px-1.5 py-0.5 bg-white/20 rounded-lg text-xs font-bold">【{stock.行业 || '未知'}】</span>
                             {stock.共振 === "🔥 核心热点" ? "处于板块强势共振中。" : "个股独立活跃。"}
                             {stock.北向?.includes("流入") ? "北向资金近期持续加仓，资金面健康。" : "资金融入度一般，需关注量能持续性。"}
-                            均线粘合度 <span className="font-bold underline decoration-indigo-300 underline-offset-4">{stock.粘合度.toFixed(4)}</span>，
+                            {stock.粘合度 != null ? (
+                                <>均线粘合度 <span className="font-bold underline decoration-indigo-300 underline-offset-4">{stock.粘合度.toFixed(4)}</span>，</>
+                            ) : stock.体质 ? (
+                                <>沉积体质 <span className="font-bold underline decoration-indigo-300 underline-offset-4">{stock.体质}</span>，</>
+                            ) : null}
                             属于典型的高胜率共振突破模型。"
                         </p>
                         <div className="absolute -bottom-4 -right-4 w-24 h-24 bg-white/10 rounded-full blur-2xl" />
@@ -203,8 +207,8 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     />
                     <IndicatorCard
                         icon={<Target size={14} />}
-                        label="粘合位"
-                        value={stock.粘合度.toFixed(3)}
+                        label={stock.体质 ? "沉积体质" : "粘合位"}
+                        value={stock.粘合度 != null ? stock.粘合度.toFixed(3) : stock.体质 || "N/A"}
                         color="text-amber-500"
                     />
                     <IndicatorCard

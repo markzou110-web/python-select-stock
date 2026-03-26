@@ -41,6 +41,14 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     
     df['Vol_MA20'] = df['成交量'].rolling(window=20).mean()
     
+    # Azul's SMA system
+    df['MA20'] = df['收盘'].rolling(window=20).mean()
+    df['MA60'] = df['收盘'].rolling(window=60).mean()
+    
+    # 趋势体质：放量上涨，缩量下跌 (较过去5天)
+    up_vol = (df['收盘'] > df['开盘']) & (df['成交量'] > df['Vol_MA20'])
+    df['Trend_Quality'] = up_vol.rolling(window=5).sum()
+    
     # Squeeze Ratio Pre-calculation
     if all(col in df.columns for col in ['EMA5', 'EMA10', 'EMA20', 'EMA60']):
         ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
@@ -186,8 +194,12 @@ def calculate_pine_indicators(df):
     
     return df
 
-def get_weekly_indicators(code, df=None, local_only=False):
-    """获取周线趋势指标 (v5.1 - 支持本地重采样)"""
+def get_weekly_indicators(code, df=None, local_only=False, weekly_ma_period=20):
+    """获取周线趋势指标 (v5.2 - 支持可配置周线均线周期)
+    
+    Args:
+        weekly_ma_period: 周线均线周期 (默认20，可选10/20/30/60)
+    """
     try:
         if local_only and df is not None and not df.empty:
             # --- 核心优化：从本地日线重采样为周线 ---
@@ -206,11 +218,24 @@ def get_weekly_indicators(code, df=None, local_only=False):
         df_w['EMA10w'] = df_w['收盘'].ewm(span=10, adjust=False).mean()
         df_w['EMA30w'] = df_w['收盘'].ewm(span=30, adjust=False).mean()
         
+        # 动态计算用户选择的周线均线
+        ma_col = f'MA{weekly_ma_period}w'
+        df_w[ma_col] = df_w['收盘'].rolling(window=weekly_ma_period).mean()
+        
         curr = df_w.iloc[-1]
-        return curr['EMA10w'] > curr['EMA30w']
+        prev = df_w.iloc[-2]
+        
+        # 周线均线向上检查 (使用用户配置的周期)
+        ma_up = curr[ma_col] > prev[ma_col] if not np.isnan(prev[ma_col]) else True
+        
+        # 原有 EMA10 > EMA30 逻辑保留作为增强
+        ema_ok = curr['EMA10w'] > curr['EMA30w']
+        
+        return ma_up and ema_ok
     except Exception as e:
         logger.debug(f"Weekly indicator failed for {code}: {e}")
         return False
+
 def batch_calculate_indicators(df, snapshot_df=None, periods=[5, 10, 20, 60], bench_df=None):
     """
     全市场批量向量化指标计算 (v6.0 - 极致提速)
@@ -268,6 +293,15 @@ def batch_calculate_indicators(df, snapshot_df=None, periods=[5, 10, 20, 60], be
     
     # 量能均线
     df['Vol_MA20'] = group['成交量'].rolling(window=20).mean().reset_index(level=0, drop=True)
+    
+    # Azul 均线系统 (SMA)
+    df['MA20'] = group['收盘'].rolling(window=20).mean().reset_index(level=0, drop=True)
+    df['MA60'] = group['收盘'].rolling(window=60).mean().reset_index(level=0, drop=True)
+    
+    # 趋势体质向量化
+    is_up_day = (df['收盘'] > df['开盘'])
+    is_vol_high = (df['成交量'] > df['Vol_MA20'])
+    df['Trend_Quality'] = (is_up_day & is_vol_high).groupby(df['code']).rolling(window=5).sum().reset_index(level=0, drop=True)
     
     # --- 6. 均线粘合度 (Squeeze Ratio) ---
     # 这里不需要 groupby，因为是同一行不同列的操作

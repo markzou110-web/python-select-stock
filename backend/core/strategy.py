@@ -276,5 +276,126 @@ def calculate_pine_win_rate(df, min_signals=3):
     except Exception as e:
         return 0, 0
 
-    except Exception as e:
+
+def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8):
+    """
+    Azul "共识" 策略 (场景博弈与沉积验证法)
+    核心逻辑：周线向多 (MA60w), 日线 MA20 > MA60, HH (高点拾升), 放量突破大阳线, 趋势体质优
+    """
+    if len(df) < 60: return False, {"reason": "历史数据不足"}
+    
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # 1. 周线过滤 (由外部传入)
+    if not is_weekly_ok:
+        return False, {"reason": "月/周线大趋势未走强 (MA60w)"}
+    
+    # 2. 日线趋势状态：MA20 > MA60 (验证期/扩张期)
+    is_trend_up = curr.get('MA20', 0) > curr.get('MA60', 0)
+    
+    # 3. 高低点结构：突破近期 20 日高点 (HH)
+    recent_high = df['最高'].iloc[-21:-1].max()
+    is_hh = curr['收盘'] >= recent_high
+    
+    # 4. 放量突破大阳线
+    # 实体涨幅超过 2.5% 且是阳线
+    is_big_bull = (curr['收盘'] > curr['开盘'] * 1.025) and (curr['收盘'] > curr['开盘'])
+    vol_ratio = curr['成交量'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 0
+    is_vol_confirmed = vol_ratio >= vol_multiplier
+    
+    # 5. 趋势体质 (沉积截面)：过去 5 天中放量上涨的天数
+    trend_quality = curr.get('Trend_Quality', 0)
+    is_quality_ok = trend_quality >= 2
+    
+    # 6. 影线过滤
+    body = abs(curr['收盘'] - curr['开盘'])
+    upper_shadow = curr['最高'] - max(curr['收盘'], curr['开盘'])
+    shadow_ratio = upper_shadow / body if body > 0 else 0
+    is_shadow_ok = shadow_ratio < 0.4
+    
+    match = is_trend_up and is_hh and is_big_bull and is_vol_confirmed and is_quality_ok and is_shadow_ok
+    
+    debug_info = {
+        "MA20>MA60": "✅" if is_trend_up else "❌",
+        "HH突破": "✅" if is_hh else "❌",
+        "大阳线": "✅" if is_big_bull else "❌",
+        "量能确认": f"{vol_ratio:.1f}倍",
+        "沉积体质": f"{trend_quality}/5",
+        "shadow": f"{shadow_ratio:.2f}",
+        "weekly": "✅" if is_weekly_ok else "❌"
+    }
+    
+    if match:
+        score = (vol_ratio * 15) + (trend_quality * 5) + (25 if is_hh else 0) + (10 if curr['RSI'] > 60 else 0)
+        return True, {
+            "Score": round(float(score), 1),
+            "代码": curr.get('code', 'N/A'),
+            "名称": curr.get('name', 'N/A'),
+            "现价": curr['收盘'],
+            "涨幅%": round((curr['收盘'] - prev['收盘']) / prev['收盘'] * 100, 2),
+            "结构": "HH突破",
+            "体质": f"{trend_quality}/5",
+            "成交量": f"{vol_ratio:.1f}x",
+            "RSI": round(curr.get('RSI', 0), 1),
+            "DIF": round(curr.get('MACD_DIF', 0), 3),
+            "BB": round(curr.get('BB_Width', 0), 4),
+            "影线比": round(shadow_ratio, 2)
+        }
+    else:
+        reasons = []
+        if not is_trend_up: reasons.append("均线未多头")
+        if not is_hh: reasons.append("未越前高")
+        if not is_big_bull: reasons.append("实体不够")
+        if not is_vol_confirmed: reasons.append(f"量能欠缺({vol_ratio:.1f})")
+        if not is_quality_ok: reasons.append(f"体质欠佳({trend_quality}/5)")
+        if not is_shadow_ok: reasons.append("上影偏长")
+        debug_info["reason"] = ",".join(reasons)
+        return False, debug_info
+
+
+def calculate_consensus_win_rate(df):
+    """
+    计算 Azul 共识策略的历史胜率
+    """
+    if df.empty or len(df) < 80: return 0, 0
+    
+    try:
+        # 1. 预计算核心信号
+        is_trend_up = (df['MA20'] > df['MA60']).astype(int)
+        
+        # HH 判断 (简化：收盘价 > 过去 20 天最高)
+        high_20 = df['最高'].rolling(window=20).max().shift(1)
+        is_hh = (df['收盘'] >= high_20).astype(int)
+        
+        is_big_bull = ((df['收盘'] > df['开盘'] * 1.025) & (df['收盘'] > df['开盘'])).astype(int)
+        vol_ratio = df['成交量'] / df['Vol_MA20']
+        is_vol = (vol_ratio >= 1.8).astype(int)
+        is_quality = (df['Trend_Quality'] >= 2).astype(int)
+        
+        body = (df['收盘'] - df['开盘']).abs()
+        upper_shadow = df['最高'] - df[['收盘', '开盘']].max(axis=1)
+        is_shadow = (upper_shadow / body < 0.4).astype(int)
+        
+        # 信号掩码
+        signals = is_trend_up & is_hh & is_big_bull & is_vol & is_quality & is_shadow
+        # 限制范围：离当前最新日期至少留出 5 天用于计算盈亏
+        valid_range = df.index < len(df) - 5
+        signal_indices = df.index[signals == 1 & valid_range]
+        
+        if len(signal_indices) == 0: return 0, 0
+        
+        # 2. 统计胜率
+        success_count = 0
+        close_vals = df['收盘'].values
+        high_vals = df['最高'].values
+        
+        for idx in signal_indices:
+            entry_price = close_vals[idx]
+            future_max = np.max(high_vals[idx+1 : idx+6])
+            if (future_max - entry_price) / entry_price >= 0.03:
+                success_count += 1
+                
+        return round(success_count / len(signal_indices) * 100, 1), len(signal_indices)
+    except:
         return 0, 0

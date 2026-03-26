@@ -27,22 +27,23 @@ export default function Dashboard() {
     const [lastUpdated, setLastUpdated] = useState("");
 
     const [params, setParams] = useState({
-        strategy_type: "squeeze" as "squeeze" | "pine" | "both",  // 策略类型: squeeze=均线粘合, pine=Pine Script多指标, both=同时满足
-        pine_min_signals: 3,  // Pine策略: 最小共振信号数
-        min_data_days: 60,  // 最小数据天数
+        strategy_type: "squeeze" as "squeeze" | "pine" | "both" | "consensus",
+        pine_min_signals: 3,
+        min_data_days: 60,
         threshold: 0.12,
         vol_multiplier: 1.5,
         rsi_min: 55,
         use_macd_filter: true,
         use_bb_sqz: true,
         sqz_lookback: 10,
-        use_weekly: true,
+        use_weekly: false,
+        weekly_ma_period: 20,  // 周线均线周期 (10/20/30/60)
         market_range: "全市场(除科创)",
         turnover_min: 3.0,
         mkt_cap_min: 0,
         use_rs_filter: true,
         local_only: true,
-        data_date: "" as string  // 新增：选股使用的数据日期
+        data_date: "" as string
     });
 
     // 可用的数据日期列表
