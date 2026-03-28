@@ -375,13 +375,13 @@ def calculate_consensus_win_rate(df):
         
         body = (df['收盘'] - df['开盘']).abs()
         upper_shadow = df['最高'] - df[['收盘', '开盘']].max(axis=1)
-        is_shadow = (upper_shadow / body < 0.4).astype(int)
+        is_shadow = np.where(body > 0, (upper_shadow / body < 0.4).astype(int), 1).astype(int)
         
         # 信号掩码
         signals = is_trend_up & is_hh & is_big_bull & is_vol & is_quality & is_shadow
         # 限制范围：离当前最新日期至少留出 5 天用于计算盈亏
         valid_range = df.index < len(df) - 5
-        signal_indices = df.index[signals == 1 & valid_range]
+        signal_indices = df.index[(signals == 1) & valid_range]
         
         if len(signal_indices) == 0: return 0, 0
         

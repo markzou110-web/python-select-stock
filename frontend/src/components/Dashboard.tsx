@@ -10,6 +10,7 @@ import ResultsTable from '@/components/ResultsTable';
 import AIDeepDive from '@/components/AIDeepDive';
 import PaperTradingView from '@/components/PaperTradingView';
 import SettingsView from '@/components/SettingsView';
+import ErrorBoundary from '@/components/ErrorBoundary';
 import { marketApi } from '@/lib/api';
 import api from '@/lib/api';
 import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap } from 'lucide-react';
@@ -342,11 +343,13 @@ export default function Dashboard() {
                             <div className="flex gap-8 items-start">
                                 <div className={cn("transition-all duration-500", selectedStock ? "flex-1 min-w-0" : "w-full")}>
                                     {results.length > 0 ? (
-                                        <ResultsTable
-                                            results={results}
-                                            onSelectStock={setSelectedStock}
-                                            selectedCode={selectedStock?.代码}
-                                        />
+                                        <ErrorBoundary fallbackTitle="结果表格加载异常">
+                                            <ResultsTable
+                                                results={results}
+                                                onSelectStock={setSelectedStock}
+                                                selectedCode={selectedStock?.代码}
+                                            />
+                                        </ErrorBoundary>
                                     ) : (
                                         <div className="glass-card min-h-[400px] flex flex-col items-center justify-center text-slate-400 p-20 border-dashed border-2">
                                             {isScanning ? (
@@ -372,18 +375,24 @@ export default function Dashboard() {
 
                                 {selectedStock && (
                                     <div className="w-96 sticky top-0 animate-in slide-in-from-right-8 duration-500">
-                                        <AIDeepDive
-                                            stock={selectedStock}
-                                            onClose={() => setSelectedStock(null)}
-                                        />
+                                        <ErrorBoundary fallbackTitle="AI 深度分析加载异常">
+                                            <AIDeepDive
+                                                stock={selectedStock}
+                                                onClose={() => setSelectedStock(null)}
+                                            />
+                                        </ErrorBoundary>
                                     </div>
                                 )}
                             </div>
                         </>
                     ) : activeView === 'paper' ? (
-                        <PaperTradingView />
+                        <ErrorBoundary fallbackTitle="模拟盘加载异常">
+                            <PaperTradingView />
+                        </ErrorBoundary>
                     ) : (
-                        <SettingsView />
+                        <ErrorBoundary fallbackTitle="设置页加载异常">
+                            <SettingsView />
+                        </ErrorBoundary>
                     )}
                 </div>
 

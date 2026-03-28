@@ -14,7 +14,9 @@ import {
     RefreshCw,
     CalendarDays,
     Trophy,
-    Skull
+    Skull,
+    LogOut,
+    CheckCircle2
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
@@ -41,6 +43,8 @@ interface Trade {
     hold_days: number;
     industry: string;
     status: string;
+    close_price?: number;
+    close_date?: string;
 }
 
 interface Stats {
@@ -61,6 +65,9 @@ export default function PaperTradingView() {
     const [trades, setTrades] = useState<Trade[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
+    const [tab, setTab] = useState<'open' | 'closed'>('open');
+    const [closingId, setClosingId] = useState<number | null>(null);
+    const [closePrice, setClosePrice] = useState('');
     const [stats, setStats] = useState<Stats>({
         total_trades: 0, wins: 0, losses: 0, flat: 0,
         win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0,
@@ -73,9 +80,7 @@ export default function PaperTradingView() {
             const res = await api.get('/api/paper/list');
             const data = res.data;
             setTrades(data.trades || []);
-            if (data.stats) {
-                setStats(data.stats);
-            }
+            if (data.stats) setStats(data.stats);
         } catch (err) {
             console.error("Fetch Trades Error:", err);
         } finally {
@@ -84,19 +89,30 @@ export default function PaperTradingView() {
         }
     };
 
-    useEffect(() => {
-        fetchTrades();
-    }, []);
+    useEffect(() => { fetchTrades(); }, []);
 
     const removeTrade = async (id: number) => {
-        if (!confirm("确定移除该模拟记录吗？")) return;
+        if (!confirm("确定移除该记录吗？（数据将被删除）")) return;
         try {
             await api.delete(`/api/paper/remove/${id}`);
             fetchTrades();
-        } catch (err) {
-            console.error(err);
-        }
+        } catch (err) { console.error(err); }
     };
+
+    const closeTrade = async (id: number) => {
+        const price = parseFloat(closePrice);
+        if (isNaN(price) || price <= 0) { alert('请输入有效的卖出价格'); return; }
+        try {
+            await api.post(`/api/paper/close/${id}`, { close_price: price });
+            setClosingId(null);
+            setClosePrice('');
+            fetchTrades();
+        } catch (err) { console.error(err); }
+    };
+
+    const openTrades = trades.filter(t => t.status === 'OPEN');
+    const closedTrades = trades.filter(t => t.status === 'CLOSED');
+    const displayTrades = tab === 'open' ? openTrades : closedTrades;
 
     if (loading && trades.length === 0) {
         return (
@@ -168,10 +184,33 @@ export default function PaperTradingView() {
                 {/* Trade List */}
                 <div className="lg:col-span-2 space-y-4">
                     <div className="flex items-center justify-between px-2">
-                        <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                            <Clock size={18} className="text-slate-400" />
-                            持仓观察记录
-                        </h3>
+                        <div className="flex items-center gap-4">
+                            <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                                <Clock size={18} className="text-slate-400" />
+                                持仓观察记录
+                            </h3>
+                            {/* Tabs */}
+                            <div className="flex bg-slate-100 rounded-xl p-1 gap-0.5">
+                                <button
+                                    onClick={() => setTab('open')}
+                                    className={cn(
+                                        "px-3 py-1 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all",
+                                        tab === 'open' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
+                                    )}
+                                >
+                                    持仓中 ({openTrades.length})
+                                </button>
+                                <button
+                                    onClick={() => setTab('closed')}
+                                    className={cn(
+                                        "px-3 py-1 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all",
+                                        tab === 'closed' ? "bg-white text-emerald-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
+                                    )}
+                                >
+                                    已平仓 ({closedTrades.length})
+                                </button>
+                            </div>
+                        </div>
                         <button
                             onClick={() => fetchTrades(true)}
                             disabled={refreshing}
@@ -186,69 +225,129 @@ export default function PaperTradingView() {
                         <table className="w-full text-left">
                             <thead className="bg-slate-50/50 border-b border-slate-100">
                                 <tr>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">标的信息</th>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">入场价</th>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">当前价</th>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">盈亏</th>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">持仓天数</th>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">板块</th>
-                                    <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">操作</th>
+                                    <th className="px-5 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">标的信息</th>
+                                    <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">入场价</th>
+                                    <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">
+                                        {tab === 'closed' ? '卖出价' : '当前价'}
+                                    </th>
+                                    <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">盈亏</th>
+                                    <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">天数</th>
+                                    <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">板块</th>
+                                    <th className="px-4 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">操作</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-50">
-                                {trades.length > 0 ? trades.map((t) => (
-                                    <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
-                                        <td className="px-6 py-5">
-                                            <div className="flex flex-col">
-                                                <span className="font-bold text-slate-700">{t.name}</span>
-                                                <div className="flex items-center gap-2">
-                                                    <span className="text-[10px] font-mono font-medium text-slate-400">{t.code}</span>
-                                                    <span className="text-[9px] font-bold text-slate-300">{t.entry_date}</span>
+                                {displayTrades.length > 0 ? displayTrades.map((t) => {
+                                    const showPrice = tab === 'closed' && t.close_price ? t.close_price : t.current_price;
+                                    const pl_pct = tab === 'closed' && t.close_price
+                                        ? ((t.close_price - t.entry_price) / t.entry_price * 100)
+                                        : t.pl_pct;
+                                    return (
+                                        <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
+                                            <td className="px-5 py-4">
+                                                <div className="flex flex-col">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="font-bold text-slate-700">{t.name}</span>
+                                                        {t.status === 'CLOSED' && (
+                                                            <span className="px-1.5 py-0.5 bg-emerald-50 text-emerald-600 text-[9px] font-black rounded border border-emerald-100">
+                                                                已平仓
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-[10px] font-mono font-medium text-slate-400">{t.code}</span>
+                                                        <span className="text-[9px] font-bold text-slate-300">{t.entry_date}</span>
+                                                        {t.close_date && <span className="text-[9px] font-bold text-emerald-400">→ {t.close_date}</span>}
+                                                    </div>
                                                 </div>
-                                            </div>
-                                        </td>
-                                        <td className="px-6 py-5 text-center font-mono font-bold text-slate-600">{t.entry_price.toFixed(2)}</td>
-                                        <td className="px-6 py-5 text-center">
-                                            <span className={cn(
-                                                "font-mono font-bold",
-                                                t.current_price > t.entry_price ? "text-rose-600" :
-                                                t.current_price < t.entry_price ? "text-emerald-600" : "text-slate-600"
-                                            )}>
-                                                {t.current_price.toFixed(2)}
-                                            </span>
-                                        </td>
-                                        <td className="px-6 py-5 text-center">
-                                            <div className={cn(
-                                                "inline-flex items-center gap-1 font-black text-sm",
-                                                t.pl_pct > 0 ? "text-rose-600" :
-                                                t.pl_pct < 0 ? "text-emerald-600" : "text-slate-400"
-                                            )}>
-                                                {t.pl_pct > 0 ? <TrendingUp size={14} /> :
-                                                 t.pl_pct < 0 ? <TrendingDown size={14} /> : null}
-                                                {t.pl_pct > 0 ? '+' : ''}{t.pl_pct.toFixed(2)}%
-                                            </div>
-                                        </td>
-                                        <td className="px-6 py-5 text-center">
-                                            <span className="text-xs font-bold text-slate-500">{t.hold_days}天</span>
-                                        </td>
-                                        <td className="px-6 py-5 text-center">
-                                            <span className="px-2 py-0.5 bg-indigo-50 text-indigo-600 text-[10px] font-black rounded-lg border border-indigo-100">
-                                                {t.industry}
-                                            </span>
-                                        </td>
-                                        <td className="px-6 py-5 text-right">
-                                            <button
-                                                onClick={() => removeTrade(t.id)}
-                                                className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"
-                                            >
-                                                <Trash2 size={16} />
-                                            </button>
-                                        </td>
-                                    </tr>
-                                )) : (
+                                            </td>
+                                            <td className="px-4 py-4 text-center font-mono font-bold text-slate-600 text-sm">{t.entry_price.toFixed(2)}</td>
+                                            <td className="px-4 py-4 text-center">
+                                                <span className={cn(
+                                                    "font-mono font-bold text-sm",
+                                                    showPrice > t.entry_price ? "text-rose-600" :
+                                                    showPrice < t.entry_price ? "text-emerald-600" : "text-slate-600"
+                                                )}>
+                                                    {showPrice.toFixed(2)}
+                                                </span>
+                                            </td>
+                                            <td className="px-4 py-4 text-center">
+                                                <div className={cn(
+                                                    "inline-flex items-center gap-1 font-black text-sm",
+                                                    pl_pct > 0 ? "text-rose-600" :
+                                                    pl_pct < 0 ? "text-emerald-600" : "text-slate-400"
+                                                )}>
+                                                    {pl_pct > 0 ? <TrendingUp size={13} /> :
+                                                     pl_pct < 0 ? <TrendingDown size={13} /> : null}
+                                                    {pl_pct > 0 ? '+' : ''}{pl_pct.toFixed(2)}%
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-4 text-center">
+                                                <span className="text-xs font-bold text-slate-500">{t.hold_days}天</span>
+                                            </td>
+                                            <td className="px-4 py-4 text-center">
+                                                <span className="px-2 py-0.5 bg-indigo-50 text-indigo-600 text-[10px] font-black rounded-lg border border-indigo-100">
+                                                    {t.industry}
+                                                </span>
+                                            </td>
+                                            <td className="px-4 py-4 text-right">
+                                                {t.status === 'OPEN' ? (
+                                                    <div className="flex items-center justify-end gap-1">
+                                                        {closingId === t.id ? (
+                                                            <div className="flex items-center gap-1">
+                                                                <input
+                                                                    type="number"
+                                                                    step="0.01"
+                                                                    placeholder="卖出价"
+                                                                    value={closePrice}
+                                                                    onChange={e => setClosePrice(e.target.value)}
+                                                                    className="w-20 px-2 py-1 text-xs font-mono border border-indigo-200 rounded-lg outline-none focus:ring-2 focus:ring-indigo-400"
+                                                                    autoFocus
+                                                                    onKeyDown={e => { if (e.key === 'Enter') closeTrade(t.id); if (e.key === 'Escape') { setClosingId(null); setClosePrice(''); } }}
+                                                                />
+                                                                <button
+                                                                    onClick={() => closeTrade(t.id)}
+                                                                    className="p-1.5 text-emerald-500 hover:bg-emerald-50 rounded-lg transition-all"
+                                                                    title="确认平仓"
+                                                                >
+                                                                    <CheckCircle2 size={16} />
+                                                                </button>
+                                                            </div>
+                                                        ) : (
+                                                            <>
+                                                                <button
+                                                                    onClick={() => { setClosingId(t.id); setClosePrice(t.current_price.toFixed(2)); }}
+                                                                    className="p-1.5 text-indigo-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all"
+                                                                    title="平仓卖出"
+                                                                >
+                                                                    <LogOut size={15} />
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => removeTrade(t.id)}
+                                                                    className="p-1.5 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-all"
+                                                                    title="删除记录"
+                                                                >
+                                                                    <Trash2 size={15} />
+                                                                </button>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                ) : (
+                                                    <button
+                                                        onClick={() => removeTrade(t.id)}
+                                                        className="p-1.5 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-all"
+                                                        title="删除记录"
+                                                    >
+                                                        <Trash2 size={15} />
+                                                    </button>
+                                                )}
+                                            </td>
+                                        </tr>
+                                    );
+                                }) : (
                                     <tr>
                                         <td colSpan={7} className="px-6 py-20 text-center text-slate-400 italic">
-                                            暂无观察记录，点击多因子共振池中的 "+" 加入。
+                                            {tab === 'open' ? '暂无持仓中的记录' : '暂无已平仓记录'}
                                         </td>
                                     </tr>
                                 )}
@@ -308,8 +407,8 @@ export default function PaperTradingView() {
                                 <p className="text-[10px] text-indigo-700 font-medium leading-relaxed">
                                     决策建议：您的模拟盈亏显示 <span className="font-black">{stats.sector_distribution[0]?.name}</span> 胜率
                                     {stats.sector_distribution[0]?.value >= 50
-                                        ? "显著高于其他板块。建议系统自动强化该板块个股权重。"
-                                        : "尚未达到优势水平，建议持续跟踪积累样本。"}
+                                        ? "显著高于其他板块。建议强化该板块权重。"
+                                        : "尚未达优势水平，建议持续积累样本。"}
                                 </p>
                             </div>
                         )}

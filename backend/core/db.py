@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import uuid
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
@@ -130,10 +131,22 @@ def init_db(engine=None):
                     UNIQUE(code, entry_date)
                 );
             '''))
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    key VARCHAR(100) PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            '''))
             # 兼容性迁移：确保 resonance 和 shadow_ratio 列存在
             try:
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS shadow_ratio FLOAT;"))
+                conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(20);"))
+                # 纸上交易：增加平仓字段
+                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS close_price FLOAT;"))
+                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS close_date DATE;"))
+                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(20);"))
             except Exception as e:
                 logger.debug(f"Column migration skipped (may already exist): {e}")
             conn.commit()
@@ -250,9 +263,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
             for r in results:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio
+                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type
                     ) VALUES (
-                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio
+                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -266,7 +279,8 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         signal_count = EXCLUDED.signal_count,
                         north_money = EXCLUDED.north_money,
                         resonance = EXCLUDED.resonance,
-                        shadow_ratio = EXCLUDED.shadow_ratio
+                        shadow_ratio = EXCLUDED.shadow_ratio,
+                        strategy_type = EXCLUDED.strategy_type
                 '''), {
                     "code": r.get('代码'),
                     "name": r.get('名称'),
@@ -283,7 +297,8 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                     "signal_count": int(r.get('信号次数', 0)),
                     "north_money": r.get('北向', '---'),
                     "resonance": r.get('共振', '独苗'),
-                    "shadow_ratio": float(r.get('影线比', 0))
+                    "shadow_ratio": float(r.get('影线比', 0)),
+                    "strategy_type": r.get('strategy_type', 'squeeze')
                 })
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
@@ -333,7 +348,8 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
                 "信号次数": row['signal_count'],
                 "北向": row['north_money'],
                 "共振": row['resonance'],
-                "影线比": row['shadow_ratio']
+                "影线比": row['shadow_ratio'],
+                "strategy_type": row.get('strategy_type', 'squeeze')
             })
         return results
     except Exception as e:
@@ -412,23 +428,35 @@ def save_stock_basic(df: pd.DataFrame, engine=None) -> bool:
 
     try:
         data = df[['code', 'name', 'industry']].copy()
-        temp_table = "stock_basic_temp"
+        temp_table = f"stock_basic_temp_{uuid.uuid4().hex[:8]}"
+        if not validate_table_name(temp_table):
+            logger.error(f"Invalid temp table name: {temp_table}")
+            return False
         data.to_sql(temp_table, engine, if_exists='replace', index=False)
-        with engine.connect() as conn:
-            conn.execute(text(f'''
-                INSERT INTO stock_basic (code, name, industry)
-                SELECT code, name, industry FROM {temp_table}
-                ON CONFLICT (code) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    industry = CASE 
-                        WHEN EXCLUDED.industry = '未知' AND stock_basic.industry IS NOT NULL AND stock_basic.industry != '未知' 
-                        THEN stock_basic.industry 
-                        ELSE EXCLUDED.industry 
-                    END
-            '''))
-            conn.execute(text(f"DROP TABLE {temp_table}"))
-            conn.commit()
-        return True
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(f'''
+                    INSERT INTO stock_basic (code, name, industry)
+                    SELECT code, name, industry FROM {temp_table}
+                    ON CONFLICT (code) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        industry = CASE
+                            WHEN EXCLUDED.industry = '未知' AND stock_basic.industry IS NOT NULL AND stock_basic.industry != '未知'
+                            THEN stock_basic.industry
+                            ELSE EXCLUDED.industry
+                        END
+                '''))
+                conn.execute(text(f"DROP TABLE {temp_table}"))
+                conn.commit()
+            return True
+        except Exception:
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {temp_table}"))
+                    conn.commit()
+            except Exception:
+                pass
+            raise
     except Exception as e:
         logger.error(f"save_stock_basic Error: {e}")
         return False

@@ -92,6 +92,7 @@ class PaperTradeCreate(BaseModel):
     code: str
     name: str
     price: float
+    strategy_type: Optional[str] = None
 
 # 地雷数据缓存 (30分钟有效)
 _mine_sweeper_cache = {"data": None, "timestamp": 0}
@@ -489,7 +490,9 @@ def run_market_scan(
                     # 使用参数化查询防止 SQL 注入
                     query = text("""
                         SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol,
-                               2.0 as pct_chg, 10.0 as turnover, 10000000000.0 as mkt_cap
+                               CASE WHEN d.open > 0 THEN ROUND(((d.close - d.open) / d.open * 100)::numeric, 2) ELSE 0 END as pct_chg,
+                               NULL as turnover,
+                               NULL as mkt_cap
                         FROM daily_k d
                         LEFT JOIN stock_basic b ON d.code = b.code
                         WHERE d.date = :max_date
@@ -526,11 +529,15 @@ def run_market_scan(
         is_target_market = snapshot_df['code_str'].str.startswith(('60', '688', '00', '30'))
         is_not_st = ~snapshot_df['name_str'].str.contains('ST|退', case=False)
 
+        # fallback 模式下 turnover/mkt_cap 可能为 NULL（本地DB无此数据），需特殊处理
+        has_turnover = snapshot_df['turnover'].notna()
+        has_mkt_cap = snapshot_df['mkt_cap'].notna()
+
         candidates = snapshot_df[
             (snapshot_df['pct_chg'] > 0) &
             is_target_market & is_not_st &
-            (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000) &  # UI 传过来的是"亿"为单位
-            (snapshot_df['turnover'] >= turnover_min)
+            (~has_mkt_cap | (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)) &
+            (~has_turnover | (snapshot_df['turnover'] >= turnover_min))
         ].copy()
 
         logger.info(f"Snapshot: {total_snapshot} stocks")
@@ -900,6 +907,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             if match:
                 stats['代码'] = code
                 stats['名称'] = name
+                stats['strategy_type'] = "pine"
                 return stats
             else:
                 return stats
@@ -931,6 +939,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             combined_stats['Score'] = (stats_pine['Score'] + stats_sqz['Score']) / 2
             combined_stats['代码'] = code
             combined_stats['名称'] = name
+            combined_stats['strategy_type'] = "both"
             combined_stats['reason'] = "双重策略共振"
             return combined_stats
         elif strategy_type == "consensus":
@@ -943,6 +952,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             if match:
                 stats['代码'] = code
                 stats['名称'] = name
+                stats['strategy_type'] = "consensus"
                 return stats
             else:
                 return stats
@@ -967,6 +977,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
 
                 stats['代码'] = code
                 stats['名称'] = name
+                stats['strategy_type'] = "squeeze"
                 return stats
             else:
                 return stats
@@ -1213,14 +1224,15 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     try:
         with engine.connect() as conn:
             conn.execute(text('''
-                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status)
-                VALUES (:code, :name, :price, :date, :price, 'OPEN')
+                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status, strategy_type)
+                VALUES (:code, :name, :price, :date, :price, 'OPEN', :strategy_type)
                 ON CONFLICT (code, entry_date) DO NOTHING
             '''), {
                 "code": trade.code,
                 "name": trade.name,
                 "price": trade.price,
-                "date": datetime.now().strftime("%Y-%m-%d")
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "strategy_type": trade.strategy_type
             })
             conn.commit()
         return {"status": "success"}
@@ -1246,13 +1258,14 @@ def list_paper_trades() -> Dict[str, Any]:
         # 方法1: 从 daily_k 表获取最新收盘价
         price_map = {}
         try:
-            placeholders = ','.join([f"'{c}'" for c in codes])
-            price_df = pd.read_sql(f"""
+            placeholders = ','.join([f':code_{i}' for i in range(len(codes))])
+            params = {f"code_{i}": c for i, c in enumerate(codes)}
+            price_df = pd.read_sql(text(f"""
                 SELECT DISTINCT ON (code) code, "收盘" as latest_price, "日期" as latest_date
-                FROM daily_k 
+                FROM daily_k
                 WHERE code IN ({placeholders})
                 ORDER BY code, "日期" DESC
-            """, engine)
+            """), engine, params=params)
             for _, row in price_df.iterrows():
                 price_map[row['code']] = float(row['latest_price'])
         except Exception as e:
@@ -1284,19 +1297,25 @@ def list_paper_trades() -> Dict[str, Any]:
         
         for _, row in df.iterrows():
             code = row['code']
+            status = row.get('status', 'OPEN')
             entry_price = float(row['entry_price'])
-            current_price = price_map.get(code, entry_price)  # fallback to entry
+            entry_date = pd.to_datetime(row['entry_date'])
             
+            # --- 价格与日期处理 ---
+            if status == 'CLOSED':
+                current_price = float(row.get('close_price') or row.get('current_price') or entry_price)
+                close_date = pd.to_datetime(row.get('close_date') or datetime.now())
+                hold_days = (close_date - entry_date).days
+            else:
+                current_price = price_map.get(code, entry_price)  # fallback to entry
+                hold_days = (datetime.now() - entry_date).days
+                
             pl = current_price - entry_price
             pl_pct = (pl / entry_price * 100) if entry_price > 0 else 0
             
-            # 持仓天数
-            entry_date = pd.to_datetime(row['entry_date'])
-            hold_days = (datetime.now() - entry_date).days
-            
             industry = sector_map_data.get(code, '未知')
             
-            trades.append({
+            trade_data = {
                 "id": int(row['id']),
                 "code": code,
                 "name": row['name'],
@@ -1305,13 +1324,16 @@ def list_paper_trades() -> Dict[str, Any]:
                 "entry_date": str(row['entry_date']),
                 "pl": round(pl, 2),
                 "pl_pct": round(pl_pct, 2),
-                "hold_days": hold_days,
+                "hold_days": max(0, hold_days),
                 "industry": industry,
-                "status": row.get('status', 'OPEN')
-            })
+                "status": status,
+                "close_price": round(float(row['close_price']), 2) if row.get('close_price') is not None else None,
+                "close_date": str(row['close_date']) if row.get('close_date') is not None else None
+            }
+            trades.append(trade_data)
             
-            # 同时更新数据库中的 current_price
-            if current_price != entry_price:
+            # 仅更新 OPEN 状态的 current_price
+            if status == 'OPEN' and current_price != row.get('current_price'):
                 try:
                     with engine.connect() as conn:
                         conn.execute(text("UPDATE paper_trading SET current_price = :price WHERE id = :id"),
@@ -1384,6 +1406,42 @@ def remove_paper_trade(id: int) -> Dict[str, str]:
     except Exception as e:
         logger.error(f"Error removing paper trade: {e}")
         return {"status": "error"}
+
+
+@app.post("/api/paper/close/{id}")
+def close_paper_trade(id: int, data: dict) -> Dict[str, Any]:
+    """平仓: 记录卖出价格和日期，将交易标记为 CLOSED"""
+    close_price = data.get("close_price")
+    if close_price is None:
+        raise HTTPException(status_code=400, detail="必须提供 close_price")
+    
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error"}
+    try:
+        with engine.connect() as conn:
+            # 检查交易是否存在
+            result = conn.execute(text("SELECT * FROM paper_trading WHERE id = :id"), {"id": id})
+            trade = result.fetchone()
+            if not trade:
+                raise HTTPException(status_code=404, detail="交易记录不存在")
+            
+            conn.execute(text("""
+                UPDATE paper_trading 
+                SET close_price = :close_price, close_date = :close_date, status = 'CLOSED'
+                WHERE id = :id
+            """), {
+                "close_price": float(close_price),
+                "close_date": datetime.now().strftime("%Y-%m-%d"),
+                "id": id
+            })
+            conn.commit()
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error closing paper trade: {e}")
+        return {"status": "error", "detail": str(e)}
 
 
 @app.get("/api/test/push")

@@ -40,6 +40,7 @@ interface Result {
     warnings?: string[];
     结构?: string;
     体质?: string;
+    strategy_type?: string;
 }
 
 export default function ResultsTable({
@@ -66,7 +67,31 @@ export default function ResultsTable({
     };
 
     const handleExport = () => {
-        // ...Existing export logic
+        const headers = ['代码', '名称', '行业', '现价', '涨幅%', 'Score', 'RSI', 'DIF', 'BB', '粘合度', '历史胜率', '信号次数', '北向', '共振', '影线比', 'strategy_type'];
+        const rows = results.map(r => [
+            r.代码, r.名称, r.行业, r.现价, r['涨幅%'], r.Score, r.RSI, r.DIF, r.BB,
+            r.粘合度, r.历史胜率, r.信号次数, r.北向 || '', r.共振 || '',
+            r.影线比 || '', r.strategy_type || ''
+        ]);
+
+        // BOM for Excel UTF-8 compatibility
+        const csv = '\uFEFF' + [headers, ...rows].map(row =>
+            row.map(cell => {
+                const str = String(cell ?? '');
+                return str.includes(',') || str.includes('"') || str.includes('\n')
+                    ? `"${str.replace(/"/g, '""')}"`
+                    : str;
+            }).join(',')
+        ).join('\n');
+
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const date = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `AlphaVision_选股_${date}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
     };
 
     const addToWatchlist = async (stock: Result) => {
@@ -74,7 +99,8 @@ export default function ResultsTable({
             await api.post('/api/paper/add', {
                 code: stock.代码,
                 name: stock.名称,
-                price: stock.现价
+                price: stock.现价,
+                strategy_type: stock.strategy_type
             });
             alert(`${stock.名称} 已加入模拟池！`);
         } catch (err) {
@@ -311,7 +337,7 @@ export default function ResultsTable({
                                 </tr>
                                 {expandedRow === res.代码 && (
                                     <tr className="bg-slate-50/30 animate-in fade-in slide-in-from-top-2 duration-300">
-                                        <td colSpan={6} className="px-8 py-6">
+                                        <td colSpan={8} className="px-8 py-6">
                                             <div className="flex flex-col gap-4">
                                                 <div className="flex items-center justify-between">
                                                     <div className="flex items-center gap-3">
