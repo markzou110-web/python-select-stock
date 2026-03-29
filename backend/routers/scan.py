@@ -1,0 +1,660 @@
+"""
+Scan router - market scanning and strategy analysis endpoints.
+
+Extracted from api.py. Preserves all original logic exactly.
+"""
+from fastapi import APIRouter, HTTPException
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, date
+import time
+import re
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sqlalchemy import text
+
+import akshare as ak
+
+from core.logging_config import logger
+from core.db import (
+    get_db_engine, save_scan_results,
+    get_scan_history_by_date, get_scan_dates, get_available_dates,
+    load_from_db, get_sector_map
+)
+from core.data import (
+    get_market_snapshot, get_index_hist
+)
+from core.indicators import (
+    calculate_indicators, calculate_pine_indicators,
+    get_weekly_indicators, batch_calculate_indicators
+)
+from core.strategy import (
+    check_strategy, check_pine_strategy, check_consensus_strategy,
+    calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
+)
+
+router = APIRouter(prefix="/api", tags=["scan"])
+
+
+def run_market_scan(
+    threshold: float = 0.12,
+    vol_multiplier: float = 1.5,
+    rsi_min: int = 55,
+    use_macd_filter: bool = True,
+    use_bb_sqz: bool = True,
+    sqz_lookback: int = 10,
+    use_weekly: bool = True,
+    market_range: str = "全市场(除科创)",
+    turnover_min: float = 3.0,
+    mkt_cap_min: float = 0.0,
+    use_rs_filter: bool = True,
+    local_only: bool = True,
+    data_date: Optional[str] = None,
+    strategy_type: str = "squeeze",
+    pine_min_signals: int = 3,
+    min_data_days: Optional[int] = None,
+    weekly_ma_period: int = 20  # 周线均线周期 (10/20/30/60)
+):
+    # 调试日志：确认接收到的策略类型
+    logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
+
+    try:
+        snapshot_df = pd.DataFrame()
+        engine = get_db_engine()
+
+        # 1. 如果不是强制本地，尝试联网获取快照
+        if not local_only and data_date is None:
+            try:
+                snapshot_df = get_market_snapshot()
+            except:
+                logger.debug("Network snapshot failed.")
+
+        # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
+        if snapshot_df.empty:
+            logger.info(f"Switching to LOCAL DB mode (Local Only: {local_only}, Data Date: {data_date or 'Auto'})...")
+            try:
+                with engine.connect() as conn:
+                    # 如果指定了日期，使用指定日期；否则查找有足够数据的最近日期
+                    if data_date:
+                        # 验证日期格式和存在性
+                        date_check = conn.execute(
+                            text("SELECT date, COUNT(DISTINCT code) as stock_count FROM daily_k WHERE date = :date GROUP BY date"),
+                            {"date": data_date}
+                        ).fetchone()
+                        if not date_check:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"指定日期 {data_date} 没有数据或格式不正确。请使用 YYYY-MM-DD 格式。"
+                            )
+                        max_date = data_date
+                        stock_count = date_check[1]
+                        logger.info(f"Using specified date: {max_date} ({stock_count} stocks)")
+                    else:
+                        # 查找有足够数据的最近日期（至少 1000 只股票）
+                        logger.debug("Querying DB for best available date...")
+                        best_date_query = text("""
+                            SELECT date, COUNT(DISTINCT code) as stock_count
+                            FROM daily_k
+                            GROUP BY date
+                            HAVING COUNT(DISTINCT code) >= 1000
+                            ORDER BY date DESC
+                            LIMIT 1
+                        """)
+                        best_date_res = conn.execute(best_date_query).fetchone()
+                        if best_date_res and best_date_res[0]:
+                            max_date = best_date_res[0]
+                            stock_count = best_date_res[1]
+                            logger.info(f"Found best date in DB: {max_date} ({stock_count} stocks)")
+                        else:
+                            raise HTTPException(status_code=503, detail="数据库中没有足够的数据进行扫描")
+
+                    # 使用参数化查询防止 SQL 注入
+                    query = text("""
+                        SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol,
+                               CASE WHEN d.open > 0 THEN ROUND(((d.close - d.open) / d.open * 100)::numeric, 2) ELSE 0 END as pct_chg,
+                               NULL as turnover,
+                               NULL as mkt_cap
+                        FROM daily_k d
+                        LEFT JOIN stock_basic b ON d.code = b.code
+                        WHERE d.date = :max_date
+                    """)
+                    snapshot_df = pd.read_sql(query, engine, params={"max_date": max_date})
+                    logger.info(f"Loaded {len(snapshot_df)} rows from DB fallback.")
+                    # 保存数据日期信息用于返回
+                    if hasattr(snapshot_df, 'attrs'):
+                        snapshot_df.attrs['data_date'] = max_date
+                    # Fallback for name if join failed
+                    if not snapshot_df.empty:
+                        snapshot_df['name'] = snapshot_df['name'].fillna(snapshot_df['code'])
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Local fallback error: {e}")
+                raise HTTPException(status_code=500, detail=f"加载数据失败: {str(e)}")
+
+        if snapshot_df.empty:
+            detail_msg = "无法获取市场数据。"
+            if local_only:
+                detail_msg += "【离线模式】已开启，但本地数据库尚未同步今日数据。请先执行【数据管理 -> 同步当日数据】。"
+            else:
+                detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
+            raise HTTPException(status_code=503, detail=detail_msg)
+
+        # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
+        total_snapshot = len(snapshot_df)
+
+        # SOP: 仅保留 沪深主板(60, 00)、创业板(30)、科创板(688)；剔除 ST、退市整理
+        snapshot_df['code_str'] = snapshot_df['code'].astype(str)
+        snapshot_df['name_str'] = snapshot_df['name'].astype(str)
+
+        is_target_market = snapshot_df['code_str'].str.startswith(('60', '688', '00', '30'))
+        is_not_st = ~snapshot_df['name_str'].str.contains('ST|退', case=False)
+
+        # fallback 模式下 turnover/mkt_cap 可能为 NULL（本地DB无此数据），需特殊处理
+        has_turnover = snapshot_df['turnover'].notna()
+        has_mkt_cap = snapshot_df['mkt_cap'].notna()
+
+        candidates = snapshot_df[
+            (snapshot_df['pct_chg'] > 0) &
+            is_target_market & is_not_st &
+            (~has_mkt_cap | (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)) &
+            (~has_turnover | (snapshot_df['turnover'] >= turnover_min))
+        ].copy()
+
+        logger.info(f"Snapshot: {total_snapshot} stocks")
+        logger.info(f"After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
+
+        # 1. 处理科创板过滤
+        if "包含科创板" not in market_range:
+            candidates = candidates[~candidates['code'].astype(str).str.startswith('688')]
+
+        # 2. 处理成分股精确过滤
+        index_map = {
+            "沪深300": "000300",
+            "上证50": "000016",
+            "中证500": "000905",
+            "中证1000": "000852"
+        }
+
+        target_index = None
+        for key, val in index_map.items():
+            if key in market_range:
+                target_index = val
+                break
+
+        if target_index:
+            try:
+                import akshare as ak
+                cons_df = ak.index_stock_cons(symbol=target_index)
+                if not cons_df.empty:
+                    cons_codes = cons_df['品种代码'].tolist()
+                    candidates = candidates[candidates['code'].isin(cons_codes)]
+            except Exception as e:
+                logger.warning(f"{market_range} filter failed: {e}")
+
+        # 3. 安全检查：如果待扫描数量依然过多，提示用户缩小范围
+        # 已移除数量限制 - 用户可根据需要扫描任意数量的股票
+        # max_allowed = 4000 if local_only else 1200
+        # if len(candidates) > max_allowed:
+        #     mode_desc = "本地" if local_only else "在线"
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"{mode_desc}模式待扫描股票过多 ({len(candidates)}只/上限{max_allowed}), 请缩小市场范围或调高筛选条件。"
+        #     )
+        logger.info(f"准备扫描 {len(candidates)} 只股票...")
+
+        results = []
+        engine = get_db_engine()
+
+        # 核心优化：预拉取指数历史并过滤，避免在线程内重复查询和过滤
+        bench_df = get_index_hist("000001")
+        bench_slice = None
+        if not bench_df.empty:
+            # 预先过滤出需要的日期范围
+            hist_end = datetime.now() if not data_date else datetime.strptime(data_date, "%Y-%m-%d")
+            hist_start = hist_end - timedelta(days=365)
+            mask = (bench_df['日期'] >= hist_start.strftime("%Y-%m-%d")) & (bench_df['日期'] <= hist_end.strftime("%Y-%m-%d"))
+            bench_slice = bench_df.loc[mask, ['日期', '收盘']].copy()
+            logger.info(f"Pre-filtered benchmark data: {len(bench_slice)} points.")
+
+        # 核心优化：批量拉取所有候选标的的历史数据，并进行向量化指标计算
+        logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
+        start_time = time.time()
+        end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
+        start_date_hist = (datetime.strptime(end_date_hist, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+        candidate_codes = candidates['code'].tolist()
+
+        dfs = []
+        try:
+            chunk_size = 1000
+            for i in range(0, len(candidate_codes), chunk_size):
+                chunk = candidate_codes[i:i + chunk_size]
+                placeholders = ", ".join([f":code_{j}" for j in range(len(chunk))])
+                params = {f"code_{j}": c for j, c in enumerate(chunk)}
+                params["start_date"] = start_date_hist
+                params["end_date"] = end_date_hist
+
+                query = text(f"""
+                    SELECT d.code, d.date as "日期", d.open as "开盘", d.high as "最高",
+                           d.low as "最低", d.close as "收盘", d.vol as "成交量",
+                           b.name
+                    FROM daily_k d
+                    LEFT JOIN stock_basic b ON d.code = b.code
+                    WHERE d.code IN ({placeholders}) AND d.date >= :start_date AND d.date <= :end_date
+                    ORDER BY d.code, d.date ASC
+                """)
+                with engine.connect() as conn:
+                    chunk_df = pd.read_sql(query, conn, params=params)
+                    if not chunk_df.empty:
+                        dfs.append(chunk_df)
+
+            if not dfs:
+                logger.error("No historical data found for candidates.")
+                raise HTTPException(status_code=404, detail="本地历史数据缺失，请先同步数据。")
+
+            master_df = pd.concat(dfs).reset_index(drop=True)
+
+            # --- 注入实盘快照数据 ---
+            # snapshot_df 包含了我们要筛选的标的的实时数据
+            # 如果是本地历史回测 (local_only 且 snapshot 从 db fallback 加载)，master_df 已经包含该日数据，不可重复添加
+            # 我们通过判断 snapshot 的日期是否大于 master_df 中的最大日期来决定是否追加
+            snapshot_date = getattr(snapshot_df, 'attrs', {}).get('data_date', datetime.now().strftime("%Y-%m-%d"))
+            # 确保 snapshot_date 是字符串格式
+            if isinstance(snapshot_date, date):
+                snapshot_date = snapshot_date.strftime("%Y-%m-%d")
+            else:
+                snapshot_date = str(snapshot_date)[:10]
+
+            db_max_date = master_df['日期'].max()
+            if isinstance(db_max_date, pd.Timestamp):
+                db_max_date = db_max_date.strftime("%Y-%m-%d")
+            else:
+                db_max_date = str(db_max_date)[:10]
+
+            if snapshot_date > db_max_date and not candidates.empty:
+                logger.info(f"Appending real-time snapshot data ({snapshot_date}) to historical data...")
+                snap_to_append = candidates[['code', 'open', 'high', 'low', 'price', 'vol']].copy()
+                snap_to_append = snap_to_append.rename(columns={
+                    'open': '开盘',
+                    'high': '最高',
+                    'low': '最低',
+                    'price': '收盘',
+                    'vol': '成交量'
+                })
+                snap_to_append['日期'] = snapshot_date
+                master_df = pd.concat([master_df, snap_to_append], ignore_index=True)
+                # 重新排序并重置索引，确保 batch calculation 的索引对齐逻辑正常工作
+                master_df = master_df.sort_values(['code', '日期']).reset_index(drop=True)
+
+            logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
+
+            # --- 向量化指标计算 ---
+            master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
+
+            # Pine Script 策略或 同时启用 策略需要额外的指标计算
+            if strategy_type in ["pine", "both"]:
+                logger.info("Calculating Pine Script indicators in parallel...")
+                # 对每只股票单独计算 Pine 指标 (使用并行加速)
+                groups = [group.copy() for _, group in master_df.groupby('code')]
+
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    pine_results = list(executor.map(calculate_pine_indicators, groups))
+
+                if pine_results:
+                    master_df = pd.concat(pine_results, ignore_index=True)
+                logger.info(f"Parallel Pine Script indicators calculation completed.")
+
+            logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
+
+            # 按代码切分，供并发扫描使用
+            hist_map = {code: group for code, group in master_df.groupby('code')}
+
+        except Exception as e:
+            logger.error(f"Batch processing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"数据预处理失败: {str(e)}")
+
+        # 并发扫描逻辑 - 执行策略筛选和周线确认
+        workers = 24  # 向量化后主压力在周线重采样，可提高并发
+        logger.info(f"Starting strategy scan for {len(candidates)} stocks (workers={workers})...")
+
+        results = []
+        fail_reasons = {}
+        none_count = 0
+        processed_count = 0
+
+        # DEBUG: Check if name column exists in candidates
+        logger.info(f"DEBUG: candidates columns: {candidates.columns.tolist()}")
+        if 'name' in candidates.columns:
+            logger.info(f"DEBUG: Sample candidate names: {candidates['name'].head(10).tolist()}")
+        else:
+            logger.warning("DEBUG: 'name' column NOT found in candidates!")
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_stock = {
+                executor.submit(
+                    single_stock_task,
+                    row['code'], row['name'], row['price'], row['vol'], row['open'],
+                    threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
+                    local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
+                    bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days,
+                    weekly_ma_period=weekly_ma_period
+                ): row for _, row in candidates.iterrows()
+            }
+
+            for future in as_completed(future_to_stock):
+                processed_count += 1
+                if processed_count % 200 == 0:
+                    logger.info(f"Scan Progress: {processed_count}/{len(future_to_stock)} stocks processed...")
+
+                try:
+                    res = future.result(timeout=60)
+                    if isinstance(res, dict) and 'Score' in res:
+                        results.append(res)
+                    elif isinstance(res, dict):
+                        reason = res.get('reason', '未知')
+                        fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                    elif res is None:
+                        none_count += 1
+                except Exception as e:
+                    fail_reasons[f"异常: {str(e)[:30]}"] = fail_reasons.get(f"异常: {str(e)[:30]}", 0) + 1
+
+            logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
+            if fail_reasons:
+                logger.info(f"Rejection Summary: {fail_reasons}")
+
+            # Pine 策略或 同时启用 策略额外统计
+            if strategy_type in ["pine", "both"]:
+                pine_stats = {}
+                for reason, count in fail_reasons.items():
+                    if "信号不足" in reason:
+                        # 提取信号数，如 "信号不足 (2/3)"
+                        match = re.search(r'\((\d+)/(\d+)\)', reason)
+                        if match:
+                            signals = int(match.group(1))
+                            pine_stats[signals] = pine_stats.get(signals, 0) + count
+                if pine_stats:
+                    logger.info(f"Pine Strategy Signal Distribution: {pine_stats}")
+
+        logger.info(f"Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
+
+        # 排序并取 Top 100
+        results = sorted(results, key=lambda x: x['Score'], reverse=True)[:100]
+
+        # 补充增强数据 (行业, 胜率) - 并发处理 Top 100
+        logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
+        sector_map = get_sector_map()
+
+        def process_supplement(res):
+            try:
+                code = res['代码']
+                # 1. 计算胜率
+                df_hist = hist_map.get(code)
+                # 并发中重新计算指标 (Top 100 规模可控)
+                enable_pine = (strategy_type in ["pine", "both"])
+                df_labeled = calculate_indicators(df_hist, bench_df=bench_slice, enable_pine_indicators=enable_pine)
+                if strategy_type == "pine":
+                    wr, sig_count = calculate_pine_win_rate(df_labeled)
+                elif strategy_type == "both":
+                    wr, sig_count = calculate_pine_win_rate(df_labeled) # Both 优先使用 Pine 胜率显示，或者可以取平均
+                elif strategy_type == "consensus":
+                    wr, sig_count = calculate_consensus_win_rate(df_labeled)
+                else:
+                    wr, sig_count = calculate_historical_win_rate(df_labeled)
+                res['历史胜率'] = f"{wr}%"
+                res['信号次数'] = sig_count
+
+                # 2. 获取行业
+                industry = sector_map.get(code, "未知")
+                if industry == "未知":
+                    try:
+                        import akshare as ak
+                        info_df = ak.stock_individual_info_em(symbol=code)
+                        if not info_df.empty:
+                            industry_val = info_df[info_df['item'] == '行业分类']['value'].values
+                            if len(industry_val) > 0:
+                                industry = industry_val[0]
+                    except: pass
+                res['行业'] = industry
+            except Exception as e:
+                logger.error(f"Supplement error for {res.get('代码')}: {e}")
+            return res
+
+        # 使用线程池并发补充 100 只股票
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            list(executor.map(process_supplement, results))
+
+        # --- SOP: 板块共振 (Sector Resonance) 计算 ---
+        industry_counts = {}
+        for res in results:
+            ind = res.get('行业', '未知')
+            industry_counts[ind] = industry_counts.get(ind, 0) + 1
+
+        for res in results:
+            ind = res.get('行业', '未知')
+            if industry_counts.get(ind, 0) > 1 and ind != '未知':
+                res['共振'] = "🔥 核心热点"
+            else:
+                res['共振'] = "独苗"
+
+        # --- SOP: 地雷监测 (Mine Sweeper) ---
+        from routers.market import fetch_mine_sweeper_data
+        mine_data = fetch_mine_sweeper_data()
+        for res in results:
+            code = res['代码']
+            warnings = []
+            if code in mine_data["earnings"]: warnings.append("📅 财报")
+            if code in mine_data["unlocks"]: warnings.append("🔒 解禁")
+            if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
+            res['warnings'] = warnings
+
+        # Update Sentinel memory
+        from api import sentinel
+        sentinel.last_top_5 = results[:5]
+
+        # --- 持久化保存 ---
+        save_scan_results(results, engine)
+
+        return results
+    except HTTPException as he:
+        # 允许 HTTPException 直接通过，不再包装成 500
+        raise he
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20):
+    # DEBUG: Log name for first few stocks
+    if isinstance(code, str) and code in ['600000', '000001', '000002', '600519']:
+        logger.info(f"DEBUG single_stock_task[{code}]: name='{name}', strategy={strategy_type}")
+
+    # Use provided target_date or default to now
+    if target_date is None or target_date == "":
+        target_date = datetime.now()
+    elif isinstance(target_date, str):
+        target_date = datetime.strptime(target_date, "%Y-%m-%d")
+
+    # 优先使用预加载的数据
+    if preloaded_df is not None and not preloaded_df.empty:
+        df = preloaded_df.copy()
+    else:
+        df = load_from_db(code, (target_date - timedelta(days=360)).strftime("%Y-%m-%d"), engine)
+
+    if df.empty:
+        return {"reason": "数据库无此股票历史数据"}
+
+    # 统一日期格式为字符串，确保计算和合并的一致性
+    if pd.api.types.is_datetime64_any_dtype(df['日期']):
+        df['日期'] = df['日期'].dt.strftime('%Y-%m-%d')
+    else:
+        df['日期'] = df['日期'].astype(str).str[:10]
+
+    # 根据策略类型设置最小数据要求
+    if min_data_days is None:
+        if strategy_type == "pine":
+            min_days = 50
+        elif strategy_type == "consensus":
+            min_days = 130 # 需要 60 周或足够长的日线来模拟
+        else: # squeeze or both
+            min_days = 120
+    else:
+        min_days = min_data_days
+
+    if len(df) < min_days:
+        return {"reason": f"样本不足({len(df)})"}
+
+    try:
+        # 技术指标计算 - 如果预加载的数据已经包含指标，则跳过
+        if 'RSI' not in df.columns:
+            # Pine Script 策略或 同时启用 需要额外的指标
+            enable_pine = (strategy_type in ["pine", "both"])
+            df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df, enable_pine_indicators=enable_pine)
+
+            # 如果包含 Pine 策略且指标已计算但缺少 Pine 特定指标，需要补充计算
+            if enable_pine and 'RF_Upward' not in df.columns:
+                df = calculate_pine_indicators(df)
+
+        # 根据策略类型选择不同的筛选逻辑
+        if strategy_type == "pine":
+            # Pine Script 多指标共振策略
+            match, stats = check_pine_strategy(df, min_signals=pine_min_signals)
+            if match:
+                stats['代码'] = code
+                stats['名称'] = name
+                stats['strategy_type'] = "pine"
+                return stats
+            else:
+                return stats
+        elif strategy_type == "both":
+            # 同时满足：均线粘合 + Pine Script 共振
+            match_sqz, stats_sqz = check_strategy(
+                df, threshold=threshold, vol_multiplier=vol_multiplier, rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter, use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter
+            )
+            if not match_sqz:
+                return stats_sqz
+
+            match_pine, stats_pine = check_pine_strategy(df, min_signals=pine_min_signals)
+            if not match_pine:
+                return stats_pine
+
+            # 两者都满足，合并结果
+            # 周线趋势过滤
+            is_w_ok = True
+            if use_weekly:
+                is_w_ok = get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period)
+                if not is_w_ok:
+                    return {"reason": "周线波段未走强"}
+
+            combined_stats = stats_pine.copy()
+            combined_stats.update(stats_sqz)
+            # 分数取平均
+            combined_stats['Score'] = (stats_pine['Score'] + stats_sqz['Score']) / 2
+            combined_stats['代码'] = code
+            combined_stats['名称'] = name
+            combined_stats['strategy_type'] = "both"
+            combined_stats['reason'] = "双重策略共振"
+            return combined_stats
+        elif strategy_type == "consensus":
+            # Azul "共识" 策略
+            is_w_ok = True
+            if use_weekly:
+                is_w_ok = get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period)
+
+            match, stats = check_consensus_strategy(df, is_weekly_ok=is_w_ok, vol_multiplier=vol_multiplier)
+            if match:
+                stats['代码'] = code
+                stats['名称'] = name
+                stats['strategy_type'] = "consensus"
+                return stats
+            else:
+                return stats
+        else:
+            # 默认均线粘合策略
+            match, stats = check_strategy(
+                df,
+                threshold=threshold,
+                vol_multiplier=vol_multiplier,
+                rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter,
+                use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback,
+                use_rs_filter=use_rs_filter
+            )
+
+            if match:
+                # 周线趋势过滤
+                if use_weekly:
+                    if not get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period):
+                        return {"reason": "周线波段未走强"}
+
+                stats['代码'] = code
+                stats['名称'] = name
+                stats['strategy_type'] = "squeeze"
+                return stats
+            else:
+                return stats
+    except Exception as e:
+        logger.error(f"[{code}] 分析异常: {str(e)}")
+        return {"reason": "策略计算异常"}
+
+
+@router.get("/scan")
+def scan_market(
+    threshold: float = 0.12,
+    vol_multiplier: float = 1.5,
+    rsi_min: int = 55,
+    use_macd_filter: bool = True,
+    use_bb_sqz: bool = True,
+    sqz_lookback: int = 10,
+    use_weekly: bool = True,
+    market_range: str = "全市场(除科创)",
+    turnover_min: float = 3.0,
+    mkt_cap_min: float = 0.0,
+    use_rs_filter: bool = True,
+    local_only: bool = True,
+    data_date: Optional[str] = None,
+    strategy_type: str = "squeeze",
+    pine_min_signals: int = 3,
+    min_data_days: int = None,
+    weekly_ma_period: int = 20  # 周线均线周期
+):
+    """
+    API Endpoint for market scan
+
+    Args:
+        data_date: 指定使用的数据日期 (YYYY-MM-DD 格式)，为 None 时自动选择最新日期
+        strategy_type: 策略类型 (squeeze/pine/both/consensus)
+        pine_min_signals: Pine策略的最小共振信号数 (1-5)
+        min_data_days: 最小数据天数
+        weekly_ma_period: 周线大均线周期 (10/20/30/60)
+    """
+    logger.info(f"[SCAN] strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
+    return run_market_scan(
+        threshold, vol_multiplier, rsi_min, use_macd_filter,
+        use_bb_sqz, sqz_lookback, use_weekly, market_range,
+        turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days,
+        weekly_ma_period=weekly_ma_period
+    )
+
+
+@router.get("/scan/history")
+async def get_history_results(date: str):
+    """获取指定日期的历史选股结果"""
+    return get_scan_history_by_date(date)
+
+
+@router.get("/scan/dates")
+async def get_history_dates():
+    """获取历史扫描日期列表"""
+    return get_scan_dates()
+
+
+@router.get("/scan/available-dates")
+async def get_available_dates_api() -> Dict[str, Any]:
+    """获取可用于选股的数据日期列表"""
+    dates = get_available_dates()
+    return {"dates": dates}
