@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 venv/
 node_modules/
 .venv/
@@ -10,3 +11,12 @@ node_modules/
 .backend_pid
 .frontend_pid
 .DS_Store
+
+# Debug/utility scripts
+backend/debug_*
+backend/test_*
+backend/query_*.py
+backend/reset_*.py
+backend/check_*.py
+backend/repair_*.py
+backend/verify_schema.py
