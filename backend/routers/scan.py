@@ -18,10 +18,10 @@ from core.logging_config import logger
 from core.db import (
     get_db_engine, save_scan_results,
     get_scan_history_by_date, get_scan_dates, get_available_dates,
-    load_from_db, get_sector_map
+    load_from_db
 )
 from core.data import (
-    get_market_snapshot, get_index_hist
+    get_market_snapshot, get_index_hist, get_sector_map
 )
 from core.indicators import (
     calculate_indicators, calculate_pine_indicators,
