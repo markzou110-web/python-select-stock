@@ -1,4 +1,11 @@
-import axios from 'axios';
+import axios, { InternalAxiosRequestConfig } from 'axios';
+
+// Extend Axios config to include our custom metadata
+declare module 'axios' {
+    interface InternalAxiosRequestConfig {
+        metadata?: { startTime: number };
+    }
+}
 
 const api = axios.create({
     baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000',
@@ -14,7 +21,7 @@ api.interceptors.request.use((config) => {
 // 响应拦截器 - 记录耗时
 api.interceptors.response.use(
     (response) => {
-        const duration = Date.now() - response.config.metadata.startTime;
+        const duration = Date.now() - (response.config.metadata?.startTime || 0);
         console.log(`API ${response.config.url?.split('?')[0]} completed in ${duration}ms`);
         return response;
     },

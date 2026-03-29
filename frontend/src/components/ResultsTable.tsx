@@ -17,7 +17,8 @@ import {
     Calculator as CalcIcon
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import KLineChart from './KLineChart';
+import dynamic from 'next/dynamic';
+const KLineChart = dynamic(() => import('./KLineChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
 import PositionSizer from './PositionSizer';
 import api from '@/lib/api';
 
