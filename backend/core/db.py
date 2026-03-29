@@ -149,6 +149,18 @@ def init_db(engine=None):
                 conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(20);"))
             except Exception as e:
                 logger.debug(f"Column migration skipped (may already exist): {e}")
+
+            # 性能索引
+            try:
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date ON daily_k(date);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_code ON daily_k(code);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_date ON scan_history(date);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status ON paper_trading(status);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry);"))
+                logger.info("Performance indexes verified.")
+            except Exception as e:
+                logger.debug(f"Index creation skipped: {e}")
+
             conn.commit()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
