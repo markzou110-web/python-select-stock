@@ -66,10 +66,10 @@ def list_paper_trades() -> Dict[str, Any]:
             placeholders = ','.join([f':code_{i}' for i in range(len(codes))])
             params = {f"code_{i}": c for i, c in enumerate(codes)}
             price_df = pd.read_sql(text(f"""
-                SELECT DISTINCT ON (code) code, "收盘" as latest_price, "日期" as latest_date
+                SELECT DISTINCT ON (code) code, close as latest_price, date as latest_date
                 FROM daily_k
                 WHERE code IN ({placeholders})
-                ORDER BY code, "日期" DESC
+                ORDER BY code, date DESC
             """), engine, params=params)
             for _, row in price_df.iterrows():
                 price_map[row['code']] = float(row['latest_price'])
