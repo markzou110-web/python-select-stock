@@ -1,9 +1,9 @@
 "use client";
 
-import React, { useEffect, useState } from 'react';
-import { X, Check, Calendar } from 'lucide-react';
+import React, { useState } from 'react';
+import { X, Check, Zap, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import api from '@/lib/api';
+import { useMarketStore } from '@/stores/marketStore';
 
 interface FilterModalProps {
     isOpen: boolean;
@@ -15,11 +15,22 @@ interface FilterModalProps {
 }
 
 export default function FilterModal({ isOpen, onClose, params, setParams, onScan, availableDates = [] }: FilterModalProps) {
-    if (!isOpen) return null;
-
     const showSqueezeParams = params.strategy_type === "squeeze" || params.strategy_type === "both";
     const showPineParams = params.strategy_type === "pine" || params.strategy_type === "both";
     const showConsensusParams = params.strategy_type === "consensus";
+    const [recommending, setRecommending] = useState(false);
+    const fetchMarketRegime = useMarketStore(s => s.fetchMarketRegime);
+
+    const handleSmartRecommend = async () => {
+        setRecommending(true);
+        const recommended = await fetchMarketRegime(params.strategy_type || 'squeeze');
+        if (recommended) {
+            setParams({ ...params, ...recommended });
+        }
+        setRecommending(false);
+    };
+
+    if (!isOpen) return null;
 
     return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 text-slate-800">
@@ -29,9 +40,19 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         <h3 className="text-xl font-bold text-slate-800">🔬 高级策略筛选</h3>
                         <p className="text-xs text-slate-400 font-medium mt-0.5 uppercase tracking-wider">TradingView Pro Logic Configuration</p>
                     </div>
-                    <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-xl transition-colors">
-                        <X size={20} className="text-slate-500" />
-                    </button>
+                    <div className="flex items-center gap-3">
+                        <button 
+                            onClick={handleSmartRecommend} 
+                            disabled={recommending}
+                            className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-xl text-sm font-bold hover:bg-indigo-100 transition-colors disabled:opacity-50"
+                        >
+                            {recommending ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
+                            智能推荐
+                        </button>
+                        <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-xl transition-colors">
+                            <X size={20} className="text-slate-500" />
+                        </button>
+                    </div>
                 </div>
 
                 {/* 策略选择器 */}
@@ -342,6 +363,26 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                             </select>
                             <p className="text-[10px] text-slate-400 mt-1">
                                 选择使用哪一天的数据进行选股，留空则自动使用最新可用日期
+                            </p>
+                        </FilterItem>
+
+                        <FilterItem label="🛑 回测止损线 (%)">
+                            <div className="flex items-center gap-4">
+                                <input
+                                    type="range" min="-15" max="-3" step="1" value={params.stop_loss_pct || -8}
+                                    onChange={e => setParams({ ...params, stop_loss_pct: parseInt(e.target.value) })}
+                                    className="flex-1 accent-rose-600"
+                                />
+                                <div className="w-16 h-12 rounded-xl bg-rose-100 flex items-center justify-center">
+                                    <span className="text-sm font-bold text-rose-600">{params.stop_loss_pct || -8}%</span>
+                                </div>
+                            </div>
+                            <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
+                                <span>宽松 (-3%)</span>
+                                <span>严格 (-15%)</span>
+                            </div>
+                            <p className="text-[10px] text-rose-500 mt-1">
+                                回测中模拟止损退出的触发点，影响历史胜率和盈亏比计算
                             </p>
                         </FilterItem>
 

@@ -109,14 +109,26 @@ def run_market_scan(
                             raise HTTPException(status_code=503, detail="数据库中没有足够的数据进行扫描")
 
                     # 使用参数化查询防止 SQL 注入
+                    # pct_chg 使用与前一日收盘价对比 (日涨幅)，而非日内 open→close
+                    # 使用 LAG 窗口函数高效获取前日收盘价
                     query = text("""
-                        SELECT d.code, b.name, d.close as price, d.open, d.high, d.low, d.vol,
-                               CASE WHEN d.open > 0 THEN ROUND(((d.close - d.open) / d.open * 100)::numeric, 2) ELSE 0 END as pct_chg,
+                        WITH ranked AS (
+                            SELECT code, date, close, open, high, low, vol,
+                                   LAG(close) OVER (PARTITION BY code ORDER BY date) as prev_close
+                            FROM daily_k
+                            WHERE date <= :max_date
+                              AND date >= (:max_date::date - interval '7 days')::date
+                        )
+                        SELECT r.code, b.name, r.close as price, r.open, r.high, r.low, r.vol,
+                               CASE WHEN r.prev_close > 0
+                                   THEN ROUND(((r.close - r.prev_close) / r.prev_close * 100)::numeric, 2)
+                                   ELSE 0
+                               END as pct_chg,
                                NULL as turnover,
                                NULL as mkt_cap
-                        FROM daily_k d
-                        LEFT JOIN stock_basic b ON d.code = b.code
-                        WHERE d.date = :max_date
+                        FROM ranked r
+                        LEFT JOIN stock_basic b ON r.code = b.code
+                        WHERE r.date = :max_date
                     """)
                     snapshot_df = pd.read_sql(query, engine, params={"max_date": max_date})
                     logger.info(f"Loaded {len(snapshot_df)} rows from DB fallback.")
@@ -467,12 +479,17 @@ def run_market_scan(
 
         # --- 持久化保存 ---
         save_scan_results(results, engine)
-        
+
         ws_manager.broadcast_threadsafe({
             "type": "scan_end",
             "matches": len(results),
             "message": "扫描完成！"
         })
+
+        # 在结果中注入数据日期，方便前端展示涨幅对应哪一天
+        scan_data_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
+        for res in results:
+            res['data_date'] = scan_data_date
 
         return results
     except HTTPException as he:
