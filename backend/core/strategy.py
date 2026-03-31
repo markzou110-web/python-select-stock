@@ -1,5 +1,395 @@
 import pandas as pd
 import numpy as np
+from typing import Dict, Any, List, Optional
+
+
+def get_signal_details(
+    df: pd.DataFrame,
+    strategy_type: str = "squeeze",
+    stop_loss_pct: float = -8.0,
+    take_profit_pct: float = 5.0,
+    max_hold_days: int = 5,
+    threshold: float = 0.12,
+    vol_multiplier: float = 1.5,
+    rsi_min: int = 55,
+    min_signals: int = 3,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    逐日遍历历史数据，记录每次策略信号的买卖点明细。
+
+    Returns:
+        {"buy_signals": [...], "sell_signals": [...]}
+        每个 signal 包含 time, price, reason
+    """
+    buy_signals: List[Dict[str, Any]] = []
+    sell_signals: List[Dict[str, Any]] = []
+    if df.empty or len(df) < 120:
+        return {"buy_signals": buy_signals, "sell_signals": sell_signals}
+
+    close_vals = df['收盘'].values
+    high_vals = df['最高'].values
+    low_vals = df['最低'].values
+    max_idx = len(close_vals) - 1
+    stop_loss_ratio = stop_loss_pct / 100.0
+    take_profit_ratio = take_profit_pct / 100.0
+
+    # --- 找到所有买入信号日期 ---
+    signal_indices = _find_all_signal_indices(df, strategy_type, threshold, vol_multiplier, rsi_min, min_signals)
+
+    for idx in signal_indices:
+        entry_price = close_vals[idx]
+        if entry_price <= 0:
+            continue
+
+        date_str = str(df['日期'].iloc[idx])[:10]
+        buy_signals.append({
+            "time": date_str,
+            "price": round(float(entry_price), 2),
+            "reason": _get_signal_reason(df, idx, strategy_type),
+        })
+
+        # 模拟卖出
+        exit_price = entry_price
+        exit_reason = "超时平仓"
+        hold_days = max_hold_days
+        hit_stop = False
+
+        for day in range(1, max_hold_days + 1):
+            future_idx = idx + day
+            if future_idx > max_idx:
+                hold_days = day - 1
+                if hold_days > 0:
+                    exit_price = close_vals[min(idx + hold_days, max_idx)]
+                break
+
+            day_close = close_vals[future_idx]
+            day_low = low_vals[future_idx]
+            day_high = high_vals[future_idx]
+
+            day_low_return = (day_low - entry_price) / entry_price
+            if day_low_return <= stop_loss_ratio:
+                exit_price = entry_price * (1 + stop_loss_ratio)
+                hold_days = day
+                exit_reason = f"止损 {stop_loss_pct}%"
+                hit_stop = True
+                break
+
+            day_high_return = (day_high - entry_price) / entry_price
+            if day_high_return >= take_profit_ratio:
+                exit_price = entry_price * (1 + take_profit_ratio)
+                hold_days = day
+                exit_reason = f"止盈 +{take_profit_pct}%"
+                break
+
+            if day == max_hold_days:
+                exit_price = day_close
+                hold_days = day
+
+        pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
+        exit_date = str(df['日期'].iloc[min(idx + hold_days, max_idx)])[:10]
+
+        sell_signals.append({
+            "time": exit_date,
+            "price": round(float(exit_price), 2),
+            "reason": exit_reason,
+            "pnl_pct": pnl_pct,
+            "hold_days": hold_days,
+        })
+
+    return {"buy_signals": buy_signals, "sell_signals": sell_signals}
+
+
+def _find_all_signal_indices(
+    df: pd.DataFrame, strategy_type: str,
+    threshold: float, vol_multiplier: float, rsi_min: int, min_signals: int,
+) -> List[int]:
+    """找到历史中所有触发信号的索引（排除最后5天，留给回测）"""
+    try:
+        if strategy_type == "pine":
+            return _find_pine_signal_indices(df, min_signals)
+        elif strategy_type == "consensus":
+            return _find_consensus_signal_indices(df)
+        else:
+            return _find_squeeze_signal_indices(df, threshold, vol_multiplier, rsi_min)
+    except Exception:
+        return []
+
+
+def _find_squeeze_signal_indices(df: pd.DataFrame, threshold: float, vol_multiplier: float, rsi_min: int) -> List[int]:
+    """均线粘合策略的信号索引"""
+    ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
+    if not all(c in df.columns for c in ma_cols):
+        return []
+
+    ma_max = df[ma_cols].max(axis=1)
+    c_breakout = (df['收盘'] >= ma_max) & (df['收盘'] > df['开盘'])
+    c_volume = (df['成交量'] / df['Vol_MA20'].replace(0, np.nan)) >= vol_multiplier
+    c_rsi = df['RSI'] >= rsi_min
+    c_macd = df['MACD_DIF'] > df['MACD_DEA']
+    c_sqz = df['Sqz_Ratio'].rolling(10).min() < threshold if 'Sqz_Ratio' in df.columns else pd.Series(False, index=df.index)
+
+    mask = c_breakout & c_volume & c_rsi & c_macd & c_sqz
+    valid = df.index[mask & (df.index >= 120) & (df.index < len(df) - 5)]
+    return valid.tolist()
+
+
+def _find_pine_signal_indices(df: pd.DataFrame, min_signals: int) -> List[int]:
+    """Pine Script 共振策略的信号索引"""
+    rf_bullish = (df.get('RF_Upward', pd.Series(False, index=df.index)) & ~df.get('RF_Downward', pd.Series(False, index=df.index))).astype(int)
+    qqe_bullish = df.get('QQE_Long', pd.Series(False, index=df.index)).astype(int)
+    vol_bullish = (df['成交量'] > df.get('Vol_MA20', df['成交量'].rolling(20).mean()) * 1.2).astype(int)
+
+    bullish_count = rf_bullish + qqe_bullish + vol_bullish
+    is_bull_candle = df['收盘'] > df['开盘']
+
+    mask = (bullish_count >= min_signals) & is_bull_candle
+    valid = df.index[mask & (df.index >= 50) & (df.index < len(df) - 5)]
+    return valid.tolist()
+
+
+def _find_consensus_signal_indices(df: pd.DataFrame) -> List[int]:
+    """Azul 共识策略的信号索引"""
+    is_trend_up = df.get('MA20', 0) > df.get('MA60', 0)
+    if isinstance(is_trend_up, (bool, int)):
+        return []
+    is_trend_up = is_trend_up.astype(int)
+
+    high_20 = df['最高'].rolling(20).max().shift(1)
+    is_hh = (df['收盘'] >= high_20).astype(int)
+    is_big_bull = ((df['收盘'] > df['开盘'] * 1.025) & (df['收盘'] > df['开盘'])).astype(int)
+    vol_ratio = df['成交量'] / df['Vol_MA20'].replace(0, np.nan)
+    is_vol = (vol_ratio >= 1.8).astype(int)
+    is_quality = (df.get('Trend_Quality', 0) >= 2).astype(int)
+
+    body = (df['收盘'] - df['开盘']).abs()
+    upper_shadow = df['最高'] - df[['收盘', '开盘']].max(axis=1)
+    is_shadow = np.where(body > 0, (upper_shadow / body < 0.4).astype(int), 1).astype(int)
+
+    mask = is_trend_up & is_hh & is_big_bull & is_vol & is_quality & is_shadow
+    valid = df.index[(mask == 1) & (df.index >= 80) & (df.index < len(df) - 5)]
+    return valid.tolist()
+
+
+def _get_signal_reason(df: pd.DataFrame, idx: int, strategy_type: str) -> str:
+    """生成信号触发原因描述"""
+    row = df.iloc[idx]
+    if strategy_type == "pine":
+        parts = []
+        if row.get('RF_Upward', False): parts.append("RF看涨")
+        if row.get('QQE_Long', False): parts.append("QQE看涨")
+        vol_ma = row.get('Vol_MA20', 0)
+        if vol_ma > 0 and row['成交量'] > vol_ma * 1.2: parts.append("放量")
+        return "+".join(parts) if parts else "Pine共振"
+    elif strategy_type == "consensus":
+        return "HH突破+大阳线+放量"
+    else:
+        parts = ["均线粘合突破"]
+        vol_ma = row.get('Vol_MA20', 0)
+        if vol_ma > 0:
+            vr = row['成交量'] / vol_ma
+            parts.append(f"量比{vr:.1f}")
+        parts.append(f"RSI={row.get('RSI', 0):.0f}")
+        return "+".join(parts)
+
+
+def run_optimization_grid(
+    df: pd.DataFrame,
+    strategy_type: str = "squeeze",
+    param_x: str = "rsi_min",
+    param_x_values: Optional[List] = None,
+    param_y: str = "stop_loss_pct",
+    param_y_values: Optional[List] = None,
+) -> Dict[str, Any]:
+    """
+    参数寻优网格：对两个参数做笛卡尔积回测，返回胜率矩阵。
+
+    Returns:
+        {"x_labels": [...], "y_labels": [...], "values": [[win_rate, ...], ...], "metric": "win_rate"}
+    """
+    if param_x_values is None:
+        param_x_values = [50, 55, 60, 65]
+    if param_y_values is None:
+        param_y_values = [-5, -8, -10, -12]
+
+    x_labels = [str(v) for v in param_x_values]
+    y_labels = [str(v) for v in param_y_values]
+
+    values = []
+    for y_val in param_y_values:
+        row_results = []
+        for x_val in param_x_values:
+            signal_indices = _find_signal_indices_with_params(df, strategy_type, param_x, x_val)
+            if len(signal_indices) == 0:
+                row_results.append(0)
+                continue
+            bt = _simulate_backtest(
+                close_vals=df['收盘'].values,
+                high_vals=df['最高'].values,
+                low_vals=df['最低'].values,
+                signal_indices=signal_indices,
+                stop_loss_pct=float(y_val),
+            )
+            row_results.append(bt["win_rate"])
+        values.append(row_results)
+
+    # 找到最佳参数组合
+    best_wr = 0
+    best_x, best_y = param_x_values[0], param_y_values[0]
+    for i, y_val in enumerate(param_y_values):
+        for j, x_val in enumerate(param_x_values):
+            if values[i][j] > best_wr:
+                best_wr = values[i][j]
+                best_x, best_y = x_val, y_val
+
+    return {
+        "x_labels": x_labels,
+        "y_labels": y_labels,
+        "values": values,
+        "metric": "win_rate",
+        "best": {"param_x": best_x, "param_y": best_y, "win_rate": best_wr},
+    }
+
+
+def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param_name: str, param_value: Any) -> List[int]:
+    """根据指定参数值找信号索引"""
+    try:
+        if strategy_type == "pine":
+            min_signals = int(param_value) if param_name == "min_signals" else 3
+            return _find_pine_signal_indices(df, min_signals)
+        elif strategy_type == "consensus":
+            return _find_consensus_signal_indices(df)
+        else:
+            # squeeze 策略
+            threshold = 0.12
+            vol_multiplier = 1.5
+            rsi_min = 55
+            if param_name == "rsi_min":
+                rsi_min = int(param_value)
+            elif param_name == "vol_multiplier":
+                vol_multiplier = float(param_value)
+            elif param_name == "threshold":
+                threshold = float(param_value)
+            return _find_squeeze_signal_indices(df, threshold, vol_multiplier, rsi_min)
+    except Exception:
+        return []
+
+
+def _simulate_backtest(close_vals, high_vals, low_vals, signal_indices, stop_loss_pct=-8.0, take_profit_pct=5.0, max_hold_days=5) -> Dict[str, Any]:
+    """
+    通用回测模拟引擎
+    
+    对每个信号点模拟买入，按以下规则退出：
+    1. 止盈: 未来 N 天内最高价达到 +take_profit_pct%
+    2. 止损: 持仓期间某日收盘跌破入场价 stop_loss_pct%
+    3. 超时: 持有 max_hold_days 天后按收盘价结算
+    
+    Args:
+        close_vals: 收盘价 numpy array
+        high_vals: 最高价 numpy array  
+        low_vals: 最低价 numpy array
+        signal_indices: 信号点索引列表
+        stop_loss_pct: 止损百分比 (负数, 如 -8.0)
+        take_profit_pct: 止盈百分比 (正数, 如 5.0)
+        max_hold_days: 最大持有天数
+        
+    Returns:
+        回测统计字典
+    """
+    if len(signal_indices) == 0:
+        return {
+            "win_rate": 0, "signal_count": 0, "avg_hold_days": 0,
+            "avg_return": 0, "max_drawdown": 0, "profit_factor": 0,
+            "stop_loss_hits": 0
+        }
+    
+    wins = 0
+    losses = 0
+    total_profit = 0.0
+    total_loss = 0.0
+    stop_loss_hits = 0
+    max_drawdown = 0.0
+    returns = []
+    hold_days_list = []
+    
+    max_idx = len(close_vals) - 1
+    stop_loss_ratio = stop_loss_pct / 100.0   # e.g. -0.08
+    take_profit_ratio = take_profit_pct / 100.0  # e.g. 0.05
+    
+    for idx in signal_indices:
+        entry_price = close_vals[idx]
+        if entry_price <= 0:
+            continue
+            
+        exit_return = 0.0
+        hold_days = max_hold_days
+        hit_stop = False
+        
+        for day in range(1, max_hold_days + 1):
+            future_idx = idx + day
+            if future_idx > max_idx:
+                # 数据不足，按最后可用日结算
+                hold_days = day - 1
+                if hold_days > 0:
+                    exit_return = (close_vals[min(idx + hold_days, max_idx)] - entry_price) / entry_price
+                break
+            
+            day_close = close_vals[future_idx]
+            day_high = high_vals[future_idx]
+            day_low = low_vals[future_idx]
+            
+            # 当日最低价检查止损 (盘中触发)
+            day_low_return = (day_low - entry_price) / entry_price
+            if day_low_return <= stop_loss_ratio:
+                exit_return = stop_loss_ratio  # 按止损价计算
+                hold_days = day
+                hit_stop = True
+                break
+            
+            # 当日最高价检查止盈
+            day_high_return = (day_high - entry_price) / entry_price
+            if day_high_return >= take_profit_ratio:
+                exit_return = take_profit_ratio  # 按止盈价计算
+                hold_days = day
+                break
+            
+            # 最后一天按收盘价结算
+            if day == max_hold_days:
+                exit_return = (day_close - entry_price) / entry_price
+                hold_days = day
+        
+        # 统计
+        returns.append(exit_return * 100)  # 转为百分比
+        hold_days_list.append(hold_days)
+        
+        if hit_stop:
+            stop_loss_hits += 1
+        
+        if exit_return > 0:
+            wins += 1
+            total_profit += exit_return
+        elif exit_return < 0:
+            losses += 1
+            total_loss += abs(exit_return)
+        
+        # 最大回撤
+        if exit_return < max_drawdown:
+            max_drawdown = exit_return
+    
+    total_trades = len(returns)
+    win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
+    avg_return = round(sum(returns) / total_trades, 2) if total_trades > 0 else 0
+    avg_hold = round(sum(hold_days_list) / total_trades, 1) if total_trades > 0 else 0
+    profit_factor = round(total_profit / total_loss, 2) if total_loss > 0 else (999.0 if total_profit > 0 else 0)
+    
+    return {
+        "win_rate": win_rate,
+        "signal_count": total_trades,
+        "avg_hold_days": avg_hold,
+        "avg_return": avg_return,
+        "max_drawdown": round(max_drawdown * 100, 2),  # 百分比
+        "profit_factor": min(profit_factor, 99.0),  # cap for display
+        "stop_loss_hits": stop_loss_hits
+    }
 
 def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=True, sqz_lookback=10, use_rs_filter=True):
     """执行无门问禅：A股均线粘合战法 (Optimized)"""
@@ -92,9 +482,11 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     debug_info["reason"] = ",".join(reasons) if reasons else "多因子未共振"
     return False, debug_info
 
-def calculate_historical_win_rate(df):
-    """向量化计算回测胜率 (Optimized v5.1)"""
-    if df.empty or len(df) < 130: return 0, 0
+def calculate_historical_win_rate(df, stop_loss_pct=-8.0):
+    """向量化计算回测统计 (Enhanced v6.0 - 含止损/回撤/盈亏比)"""
+    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    if df.empty or len(df) < 130:
+        return empty_result
 
     try:
         # 1. 预计算所有行的共振信号 (向量化)
@@ -107,37 +499,32 @@ def calculate_historical_win_rate(df):
         c_macd = df['MACD_DIF'] > df['MACD_DEA']
         c_sqz = df['Sqz_Ratio'].rolling(10).min() < 0.12
 
-        # 核心优化：先用快速条件过滤出候选点，再对候选点进行昂贵的 BB Quantile 计算
         pre_signals = c_breakout & c_volume & c_rsi & c_macd & c_sqz
         valid_indices = df.index[120:-5]
         candidate_indices = df.index[pre_signals & (df.index.isin(valid_indices))]
 
         if len(candidate_indices) == 0:
-            return 0, 0
+            return empty_result
 
         final_signal_indices = []
         for idx in candidate_indices:
-            # 只有在候点才计算 120 天分位值
             bb_limit = df['BB_Width'].iloc[idx-119 : idx+1].quantile(0.2)
             if df.loc[idx, 'BB_Width'] <= bb_limit:
                 final_signal_indices.append(idx)
 
         if not final_signal_indices:
-            return 0, 0
+            return empty_result
 
-        success_count = 0
-        for idx in final_signal_indices:
-            entry_price = df.loc[idx, '收盘']
-            # 未来 5 天最高价
-            future_max = df.loc[idx+1 : idx+5, '最高'].max()
-            if (future_max - entry_price) / entry_price >= 0.03:
-                success_count += 1
-
-        win_rate = round(success_count / len(final_signal_indices) * 100, 1)
-        return win_rate, len(final_signal_indices)
+        return _simulate_backtest(
+            close_vals=df['收盘'].values,
+            high_vals=df['最高'].values,
+            low_vals=df['最低'].values,
+            signal_indices=final_signal_indices,
+            stop_loss_pct=stop_loss_pct
+        )
 
     except Exception as e:
-        return 0, 0
+        return empty_result
 
 
 def check_pine_strategy(df, min_signals=3):
@@ -234,47 +621,38 @@ def check_pine_strategy(df, min_signals=3):
         return False, debug_info
 
 
-def calculate_pine_win_rate(df, min_signals=3):
+def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
     """
-    计算 Pine Script 策略的历史胜率 (基于 3 指标模型)
+    计算 Pine Script 策略的回测统计 (Enhanced v6.0)
     """
+    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
     if df.empty or len(df) < 60:
-        return 0, 0
+        return empty_result
 
     try:
-        # 1. 核心共振点计算
         rf_bullish = (df['RF_Upward'] & ~df.get('RF_Downward', False)).astype(int)
         qqe_bullish = df.get('QQE_Long', False).astype(int)
         vol_bullish = (df['成交量'] > df.get('Vol_MA20', df['成交量'].rolling(20).mean())).astype(int)
 
         bullish_count = rf_bullish + qqe_bullish + vol_bullish
 
-        # 找出信号点 (至少满足 min_signals 个)
-        # 限制范围：离当前最新日期至少留出 5 天用于计算盈亏
         valid_range = df.index < len(df) - 5
         signal_mask = (bullish_count >= min_signals) & valid_range
-        signal_indices = df.index[signal_mask]
+        signal_indices = df.index[signal_mask].tolist()
 
         if len(signal_indices) == 0:
-            return 0, 0
+            return empty_result
 
-        # 2. 盈亏统计 (3% 目标价)
-        success_count = 0
-        close_vals = df['收盘'].values
-        high_vals = df['最高'].values
-        
-        for idx in signal_indices:
-            entry_price = close_vals[idx]
-            # 未来 5 天内是否存在最高价涨幅达到 3% 的点?
-            future_max = np.max(high_vals[idx+1 : idx+6])
-            if (future_max - entry_price) / entry_price >= 0.03:
-                success_count += 1
-
-        win_rate = round(success_count / len(signal_indices) * 100, 1)
-        return win_rate, len(signal_indices)
+        return _simulate_backtest(
+            close_vals=df['收盘'].values,
+            high_vals=df['最高'].values,
+            low_vals=df['最低'].values,
+            signal_indices=signal_indices,
+            stop_loss_pct=stop_loss_pct
+        )
 
     except Exception as e:
-        return 0, 0
+        return empty_result
 
 
 def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8):
@@ -354,17 +732,17 @@ def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8):
         return False, debug_info
 
 
-def calculate_consensus_win_rate(df):
+def calculate_consensus_win_rate(df, stop_loss_pct=-8.0):
     """
-    计算 Azul 共识策略的历史胜率
+    计算 Azul 共识策略的回测统计 (Enhanced v6.0)
     """
-    if df.empty or len(df) < 80: return 0, 0
+    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    if df.empty or len(df) < 80:
+        return empty_result
     
     try:
-        # 1. 预计算核心信号
         is_trend_up = (df['MA20'] > df['MA60']).astype(int)
         
-        # HH 判断 (简化：收盘价 > 过去 20 天最高)
         high_20 = df['最高'].rolling(window=20).max().shift(1)
         is_hh = (df['收盘'] >= high_20).astype(int)
         
@@ -377,25 +755,19 @@ def calculate_consensus_win_rate(df):
         upper_shadow = df['最高'] - df[['收盘', '开盘']].max(axis=1)
         is_shadow = np.where(body > 0, (upper_shadow / body < 0.4).astype(int), 1).astype(int)
         
-        # 信号掩码
         signals = is_trend_up & is_hh & is_big_bull & is_vol & is_quality & is_shadow
-        # 限制范围：离当前最新日期至少留出 5 天用于计算盈亏
         valid_range = df.index < len(df) - 5
-        signal_indices = df.index[(signals == 1) & valid_range]
+        signal_indices = df.index[(signals == 1) & valid_range].tolist()
         
-        if len(signal_indices) == 0: return 0, 0
+        if len(signal_indices) == 0:
+            return empty_result
         
-        # 2. 统计胜率
-        success_count = 0
-        close_vals = df['收盘'].values
-        high_vals = df['最高'].values
-        
-        for idx in signal_indices:
-            entry_price = close_vals[idx]
-            future_max = np.max(high_vals[idx+1 : idx+6])
-            if (future_max - entry_price) / entry_price >= 0.03:
-                success_count += 1
-                
-        return round(success_count / len(signal_indices) * 100, 1), len(signal_indices)
-    except:
-        return 0, 0
+        return _simulate_backtest(
+            close_vals=df['收盘'].values,
+            high_vals=df['最高'].values,
+            low_vals=df['最低'].values,
+            signal_indices=signal_indices,
+            stop_loss_pct=stop_loss_pct
+        )
+    except Exception:
+        return empty_result

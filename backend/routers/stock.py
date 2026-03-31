@@ -10,7 +10,8 @@ import akshare as ak
 
 from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code, load_from_db, save_to_db
-from core.indicators import calculate_indicators
+from core.indicators import calculate_indicators, calculate_pine_indicators
+from core.strategy import get_signal_details, run_optimization_grid
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -152,3 +153,41 @@ def get_stock_detail(code: str):
     except Exception as e:
         logger.error(f"Error fetching stock detail for {code}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{code}/signals")
+def get_stock_signals(
+    code: str,
+    strategy: str = "squeeze",
+    stop_loss_pct: float = -8.0,
+    take_profit_pct: float = 5.0,
+    max_hold_days: int = 5,
+):
+    """
+    获取个股历史买卖信号明细，回测可视化用
+
+    Args:
+        code: Stock code
+        strategy: Strategy type (squeeze/pine/consensus)
+        stop_loss_pct: Stop loss percentage (negative)
+        take_profit_pct: Take profit percentage
+        max_hold_days: Max holding days
+    """
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code format")
+
+    df = fetch_stock_data_with_indicators(code)
+    if df.empty:
+        return {"buy_signals": [], "sell_signals": []}
+
+    # Calculate additional Pine indicators if needed
+    if strategy in ["pine", "both"]:
+        df = calculate_pine_indicators(df)
+
+    return get_signal_details(
+        df,
+        strategy_type=strategy,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_hold_days=max_hold_days,
+    )

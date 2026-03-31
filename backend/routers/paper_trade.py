@@ -87,7 +87,7 @@ def list_paper_trades() -> Dict[str, Any]:
                             match = snapshot[snapshot['code'] == code]
                             if not match.empty:
                                 price_map[code] = float(match.iloc[0]['price'])
-            except:
+            except Exception:
                 pass
 
         # --- 计算每笔交易的盈亏 ---
@@ -98,7 +98,7 @@ def list_paper_trades() -> Dict[str, Any]:
         try:
             sector_df = pd.read_sql("SELECT code, industry FROM stock_basic WHERE industry IS NOT NULL", engine)
             sector_map_data = dict(zip(sector_df['code'], sector_df['industry']))
-        except:
+        except Exception:
             pass
 
         # 收集需要批量更新的记录
@@ -150,8 +150,10 @@ def list_paper_trades() -> Dict[str, Any]:
         if price_updates:
             try:
                 with engine.connect() as conn:
-                    for u in price_updates:
-                        conn.execute(text("UPDATE paper_trading SET current_price = :price WHERE id = :id"), u)
+                    conn.execute(
+                        text("UPDATE paper_trading SET current_price = :price WHERE id = :id"),
+                        price_updates,
+                    )
                     conn.commit()
             except Exception as e:
                 logger.warning(f"Batch price update failed: {e}")

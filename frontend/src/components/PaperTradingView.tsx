@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import {
     Trash2,
     TrendingUp,
@@ -69,6 +69,7 @@ export default function PaperTradingView() {
     const [tab, setTab] = useState<'open' | 'closed'>('open');
     const [closingId, setClosingId] = useState<number | null>(null);
     const [closePrice, setClosePrice] = useState('');
+    const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [stats, setStats] = useState<Stats>({
         total_trades: 0, wins: 0, losses: 0, flat: 0,
         win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0,
@@ -102,7 +103,11 @@ export default function PaperTradingView() {
 
     const closeTrade = async (id: number) => {
         const price = parseFloat(closePrice);
-        if (isNaN(price) || price <= 0) { alert('请输入有效的卖出价格'); return; }
+        if (isNaN(price) || price <= 0) {
+            setToast({ message: '请输入有效的卖出价格', type: 'error' });
+            setTimeout(() => setToast(null), 2500);
+            return;
+        }
         try {
             await api.post(`/api/paper/close/${id}`, { close_price: price });
             setClosingId(null);
@@ -111,8 +116,8 @@ export default function PaperTradingView() {
         } catch (err) { console.error(err); }
     };
 
-    const openTrades = trades.filter(t => t.status === 'OPEN');
-    const closedTrades = trades.filter(t => t.status === 'CLOSED');
+    const openTrades = useMemo(() => trades.filter(t => t.status === 'OPEN'), [trades]);
+    const closedTrades = useMemo(() => trades.filter(t => t.status === 'CLOSED'), [trades]);
     const displayTrades = tab === 'open' ? openTrades : closedTrades;
 
     if (loading && trades.length === 0) {
@@ -425,7 +430,7 @@ export default function PaperTradingView() {
     );
 }
 
-function StatCard({ label, value, sub, icon, color }: { label: string, value: string, sub: string, icon: any, color: string }) {
+function StatCard({ label, value, sub, icon, color }: { label: string, value: string, sub: string, icon: React.ReactNode, color: string }) {
     return (
         <div className="glass-card p-6 flex items-center gap-5">
             <div className={cn("w-14 h-14 rounded-2xl flex items-center justify-center shadow-sm", color)}>

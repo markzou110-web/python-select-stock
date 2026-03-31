@@ -138,6 +138,18 @@ def init_db(engine=None):
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             '''))
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS stock_fundamentals (
+                    code VARCHAR(20) PRIMARY KEY,
+                    roe FLOAT,
+                    pe_ttm FLOAT,
+                    pe_percentile FLOAT,
+                    net_profit_yoy FLOAT,
+                    revenue_yoy FLOAT,
+                    label VARCHAR(50),
+                    updated_at DATE
+                );
+            '''))
             # 兼容性迁移：确保 resonance 和 shadow_ratio 列存在
             try:
                 conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
@@ -155,6 +167,7 @@ def init_db(engine=None):
             try:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date ON daily_k(date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_code ON daily_k(code);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_code_date ON daily_k(code, date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_date ON scan_history(date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status ON paper_trading(status);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry);"))

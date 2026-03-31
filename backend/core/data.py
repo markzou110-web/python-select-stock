@@ -18,8 +18,18 @@ os.environ['HTTPS_PROXY'] = ''
 os.environ['http_proxy'] = ''
 os.environ['https_proxy'] = ''
 
-# --- Simple Time-based Cache ---
+# --- Bounded TTL Cache with auto-eviction ---
+_CACHE_MAX_SIZE = 128
 CACHE: Dict[str, Tuple[Any, float]] = {}
+
+
+def _evict_expired() -> None:
+    """Remove all expired entries from cache."""
+    now = time.time()
+    expired = [k for k, (_, ts) in CACHE.items() if now - ts > 86400]
+    for k in expired:
+        del CACHE[k]
+
 
 def get_cached_data(key: str, ttl_seconds: int) -> Optional[Any]:
     """
@@ -36,11 +46,17 @@ def get_cached_data(key: str, ttl_seconds: int) -> Optional[Any]:
         data, timestamp = CACHE[key]
         if time.time() - timestamp < ttl_seconds:
             return data
+        del CACHE[key]
     return None
 
 
 def set_cached_data(key: str, data: Any) -> None:
-    """Store data in cache with current timestamp."""
+    """Store data in cache with current timestamp. Evicts expired entries when full."""
+    if len(CACHE) >= _CACHE_MAX_SIZE:
+        _evict_expired()
+    if len(CACHE) >= _CACHE_MAX_SIZE:
+        oldest_key = min(CACHE, key=lambda k: CACHE[k][1])
+        del CACHE[oldest_key]
     CACHE[key] = (data, time.time())
 
 def get_market_snapshot() -> pd.DataFrame:

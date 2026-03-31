@@ -15,6 +15,7 @@ from sqlalchemy import text
 import akshare as ak
 
 from core.logging_config import logger
+from core.ws_manager import manager as ws_manager
 from core.db import (
     get_db_engine, save_scan_results,
     get_scan_history_by_date, get_scan_dates, get_available_dates,
@@ -65,7 +66,7 @@ def run_market_scan(
         if not local_only and data_date is None:
             try:
                 snapshot_df = get_market_snapshot()
-            except:
+            except Exception:
                 logger.debug("Network snapshot failed.")
 
         # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
@@ -191,16 +192,13 @@ def run_market_scan(
             except Exception as e:
                 logger.warning(f"{market_range} filter failed: {e}")
 
-        # 3. 安全检查：如果待扫描数量依然过多，提示用户缩小范围
-        # 已移除数量限制 - 用户可根据需要扫描任意数量的股票
-        # max_allowed = 4000 if local_only else 1200
-        # if len(candidates) > max_allowed:
-        #     mode_desc = "本地" if local_only else "在线"
-        #     raise HTTPException(
-        #         status_code=400,
-        #         detail=f"{mode_desc}模式待扫描股票过多 ({len(candidates)}只/上限{max_allowed}), 请缩小市场范围或调高筛选条件。"
-        #     )
+        # 无数量上限，用户可按需调整筛选条件
         logger.info(f"准备扫描 {len(candidates)} 只股票...")
+        
+        ws_manager.broadcast_threadsafe({
+            "type": "scan_start",
+            "message": f"准备扫描 {len(candidates)} 只股票..."
+        })
 
         results = []
         engine = get_db_engine()
@@ -323,13 +321,6 @@ def run_market_scan(
         none_count = 0
         processed_count = 0
 
-        # DEBUG: Check if name column exists in candidates
-        logger.info(f"DEBUG: candidates columns: {candidates.columns.tolist()}")
-        if 'name' in candidates.columns:
-            logger.info(f"DEBUG: Sample candidate names: {candidates['name'].head(10).tolist()}")
-        else:
-            logger.warning("DEBUG: 'name' column NOT found in candidates!")
-
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_stock = {
                 executor.submit(
@@ -344,8 +335,14 @@ def run_market_scan(
 
             for future in as_completed(future_to_stock):
                 processed_count += 1
-                if processed_count % 200 == 0:
+                if processed_count % 100 == 0 or processed_count == len(future_to_stock):
                     logger.info(f"Scan Progress: {processed_count}/{len(future_to_stock)} stocks processed...")
+                    ws_manager.broadcast_threadsafe({
+                        "type": "scan_progress",
+                        "current": processed_count,
+                        "total": len(future_to_stock),
+                        "message": f"扫描中... ({processed_count}/{len(future_to_stock)})"
+                    })
 
                 try:
                     res = future.result(timeout=60)
@@ -388,21 +385,37 @@ def run_market_scan(
         def process_supplement(res):
             try:
                 code = res['代码']
-                # 1. 计算胜率
+                # 1. 计算回测统计
                 df_hist = hist_map.get(code)
                 # 并发中重新计算指标 (Top 100 规模可控)
                 enable_pine = (strategy_type in ["pine", "both"])
                 df_labeled = calculate_indicators(df_hist, bench_df=bench_slice, enable_pine_indicators=enable_pine)
+                
+                # 获取止损参数 (前端可配置)
+                sl_pct = params.get("stop_loss_pct", -8.0)
+                try:
+                    sl_pct = float(sl_pct)
+                except (TypeError, ValueError):
+                    sl_pct = -8.0
+                
                 if strategy_type == "pine":
-                    wr, sig_count = calculate_pine_win_rate(df_labeled)
+                    bt = calculate_pine_win_rate(df_labeled, stop_loss_pct=sl_pct)
                 elif strategy_type == "both":
-                    wr, sig_count = calculate_pine_win_rate(df_labeled) # Both 优先使用 Pine 胜率显示，或者可以取平均
+                    bt = calculate_pine_win_rate(df_labeled, stop_loss_pct=sl_pct)
                 elif strategy_type == "consensus":
-                    wr, sig_count = calculate_consensus_win_rate(df_labeled)
+                    bt = calculate_consensus_win_rate(df_labeled, stop_loss_pct=sl_pct)
                 else:
-                    wr, sig_count = calculate_historical_win_rate(df_labeled)
-                res['历史胜率'] = f"{wr}%"
-                res['信号次数'] = sig_count
+                    bt = calculate_historical_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                
+                res['历史胜率'] = f"{bt['win_rate']}%"
+                res['信号次数'] = bt['signal_count']
+                res['回测统计'] = {
+                    "avg_return": bt['avg_return'],
+                    "max_drawdown": bt['max_drawdown'],
+                    "profit_factor": bt['profit_factor'],
+                    "avg_hold_days": bt['avg_hold_days'],
+                    "stop_loss_hits": bt['stop_loss_hits'],
+                }
 
                 # 2. 获取行业
                 industry = sector_map.get(code, "未知")
@@ -414,7 +427,7 @@ def run_market_scan(
                             industry_val = info_df[info_df['item'] == '行业分类']['value'].values
                             if len(industry_val) > 0:
                                 industry = industry_val[0]
-                    except: pass
+                    except Exception: pass
                 res['行业'] = industry
             except Exception as e:
                 logger.error(f"Supplement error for {res.get('代码')}: {e}")
@@ -454,6 +467,12 @@ def run_market_scan(
 
         # --- 持久化保存 ---
         save_scan_results(results, engine)
+        
+        ws_manager.broadcast_threadsafe({
+            "type": "scan_end",
+            "matches": len(results),
+            "message": "扫描完成！"
+        })
 
         return results
     except HTTPException as he:
@@ -466,10 +485,6 @@ def run_market_scan(
 
 
 def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20):
-    # DEBUG: Log name for first few stocks
-    if isinstance(code, str) and code in ['600000', '000001', '000002', '600519']:
-        logger.info(f"DEBUG single_stock_task[{code}]: name='{name}', strategy={strategy_type}")
-
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
@@ -658,3 +673,51 @@ async def get_available_dates_api() -> Dict[str, Any]:
     """获取可用于选股的数据日期列表"""
     dates = get_available_dates()
     return {"dates": dates}
+
+
+@router.post("/scan/optimize")
+def optimize_parameters(data: dict) -> Dict[str, Any]:
+    """
+    参数寻优：对指定股票和策略跑参数正交组合回测，返回胜率矩阵
+
+    Args:
+        data: {
+            "code": "000001",
+            "strategy": "squeeze",
+            "param_x": "rsi_min",
+            "param_x_values": [50, 55, 60, 65],
+            "param_y": "stop_loss_pct",
+            "param_y_values": [-5, -8, -10, -12]
+        }
+    """
+    from core.strategy import run_optimization_grid
+
+    code = data.get("code", "")
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code")
+
+    strategy = data.get("strategy", "squeeze")
+
+    engine = get_db_engine()
+    if not engine:
+        raise HTTPException(status_code=500, detail="Database unavailable")
+
+    # Load historical data
+    df = load_from_db(code, (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"), engine)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No historical data for this stock")
+
+    # Calculate indicators
+    enable_pine = strategy in ["pine", "both"]
+    df = calculate_indicators(df, enable_pine_indicators=enable_pine)
+    if enable_pine and 'RF_Upward' not in df.columns:
+        df = calculate_pine_indicators(df)
+
+    return run_optimization_grid(
+        df,
+        strategy_type=strategy,
+        param_x=data.get("param_x", "rsi_min"),
+        param_x_values=data.get("param_x_values"),
+        param_y=data.get("param_y", "stop_loss_pct"),
+        param_y_values=data.get("param_y_values"),
+    )

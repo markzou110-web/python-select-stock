@@ -7,7 +7,7 @@ from fastapi import APIRouter
 from typing import Dict, Any
 
 from core.config import config
-from core.db import save_setting
+from core.db import save_setting, get_setting
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -22,18 +22,57 @@ def get_settings_api() -> Dict[str, Any]:
 def save_settings_api(data: dict):
     if "sentinel_time" in data:
         save_setting("sentinel_time", data["sentinel_time"])
-        # Note: sentinel.trigger_time update is handled in api.py lifespan
+    if "sentinel_schedule_times" in data:
+        save_setting("sentinel_schedule_times", data["sentinel_schedule_times"])
     return {"status": "success"}
+
+
+@router.get("/settings/webhook")
+def get_webhook_settings() -> Dict[str, Any]:
+    """获取 WebHook 推送渠道配置"""
+    return {
+        "bark": {"configured": config.is_bark_configured()},
+        "feishu": {"url": get_setting("feishu_webhook_url", "")},
+        "dingtalk": {"url": get_setting("dingtalk_webhook_url", "")},
+        "wecom": {"url": get_setting("wecom_webhook_url", "")},
+    }
+
+
+@router.post("/settings/webhook")
+def save_webhook_settings(data: dict):
+    """保存 WebHook 推送渠道配置"""
+    channels = {
+        "feishu": "feishu_webhook_url",
+        "dingtalk": "dingtalk_webhook_url",
+        "wecom": "wecom_webhook_url",
+    }
+    saved = []
+    for channel, db_key in channels.items():
+        if channel in data:
+            save_setting(db_key, data[channel])
+            saved.append(channel)
+    return {"status": "success", "saved": saved}
+
+
+@router.post("/settings/webhook/test")
+def test_webhook(channel: str = "bark") -> Dict[str, Any]:
+    """测试推送渠道连通性"""
+    from core.notifier import notifier
+
+    title = "Alpha Vision 测试"
+    body = "这是一条测试消息，确认推送渠道已连通。"
+
+    try:
+        notifier.send(title, body, channels=[channel])
+        return {"status": "success", "message": f"Test message sent via {channel}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @router.get("/test/push")
 def test_push_notification() -> Dict[str, Any]:
     """测试 Bark 推送功能"""
-    import requests
-    from core.config import config
-    from core.logging_config import logger
-
-    BARK_KEY = config.BARK_KEY
+    from core.notifier import notifier
 
     mock_data = [
         {"code": "600519", "name": "测试茅台", "price": 1800.0},
@@ -46,12 +85,7 @@ def test_push_notification() -> Dict[str, Any]:
     body = f"【测试推送】\n发现 {len(names)} 只标的：\n" + "、".join([f"{n}({c})" for n, c in zip(names, codes)])
 
     try:
-        if config.is_bark_configured():
-            url = config.BARK_URL_TEMPLATE.format(key=BARK_KEY, title=title, body=body)
-            requests.get(url, timeout=5)
-            return {"status": "success", "message": f"Push sent: {body}"}
-        else:
-            return {"status": "success", "message": "Bark not configured. Push skipped."}
+        notifier.send(title, body)
+        return {"status": "success", "message": f"Push sent: {body}"}
     except Exception as e:
-        logger.error(f"Test push error: {e}")
         return {"status": "error", "message": "Internal server error"}

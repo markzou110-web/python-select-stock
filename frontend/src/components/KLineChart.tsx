@@ -10,12 +10,29 @@ import {
 } from 'lightweight-charts';
 import api from '@/lib/api';
 
+interface Signal {
+    time: string;
+    price: number;
+    reason: string;
+}
+
+interface SellSignal extends Signal {
+    pnl_pct?: number;
+    hold_days?: number;
+}
+
+interface Signals {
+    buy: Array<Signal>;
+    sell: Array<SellSignal>;
+}
+
 interface KLineChartProps {
     code: string;
     name: string;
+    signals?: Signals;
 }
 
-export default function KLineChart({ code, name }: KLineChartProps) {
+export default function KLineChart({ code, name, signals }: KLineChartProps) {
     const chartContainerRef = useRef<HTMLDivElement>(null);
     const chartRef = useRef<IChartApi | null>(null);
 
@@ -68,6 +85,33 @@ export default function KLineChart({ code, name }: KLineChartProps) {
                     ema120Series.setData(rawData.map((d: any) => ({ time: d.time, value: d.EMA120 })));
                     ema250Series.setData(rawData.map((d: any) => ({ time: d.time, value: d.EMA250 })));
 
+                    // Build buy/sell markers from signals prop
+                    if (signals) {
+                        const markers = [
+                            ...signals.buy.map((s) => ({
+                                time: s.time,
+                                position: 'belowBar' as const,
+                                color: '#22c55e',
+                                shape: 'arrowUp' as const,
+                                text: 'B',
+                                size: 1,
+                            })),
+                            ...signals.sell.map((s) => ({
+                                time: s.time,
+                                position: 'aboveBar' as const,
+                                color: '#ef4444',
+                                shape: 'arrowDown' as const,
+                                text: 'S',
+                                size: 1,
+                            })),
+                        ];
+
+                        // Sort markers by time (required by Lightweight Charts)
+                        markers.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+
+                        candlestickSeries.setMarkers(markers);
+                    }
+
                     chart.timeScale().fitContent();
                 }
             } catch (e) {
@@ -83,7 +127,7 @@ export default function KLineChart({ code, name }: KLineChartProps) {
             window.removeEventListener('resize', handleResize);
             chart.remove();
         };
-    }, [code]);
+    }, [code, signals]);
 
     return (
         <div className="w-full h-full relative">

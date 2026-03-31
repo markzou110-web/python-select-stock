@@ -46,6 +46,7 @@ class Config:
 
     # Sentinel
     SENTINEL_DEFAULT_TIME: str = os.getenv("SENTINEL_DEFAULT_TIME", "14:20")
+    SENTINEL_SCHEDULE_TIMES: str = os.getenv("SENTINEL_SCHEDULE_TIMES", "14:20")
 
     # Scanning defaults
     DEFAULT_THRESHOLD: float = float(os.getenv("DEFAULT_THRESHOLD", "0.12"))
