@@ -7,3 +7,4 @@ class PaperTradeCreate(BaseModel):
     name: str
     price: float
     strategy_type: Optional[str] = None
+    remark: Optional[str] = None

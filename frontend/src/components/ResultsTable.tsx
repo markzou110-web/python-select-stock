@@ -55,6 +55,8 @@ export default function ResultsTable({
 }) {
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
     const [sizingStock, setSizingStock] = useState<Result | null>(null);
+    const [remarkStock, setRemarkStock] = useState<Result | null>(null);
+    const [remarkText, setRemarkText] = useState('');
 
     if (results.length === 0) return null;
 
@@ -95,17 +97,26 @@ export default function ResultsTable({
         URL.revokeObjectURL(url);
     };
 
-    const addToWatchlist = async (stock: Result) => {
+    const addToWatchlist = async (stock: Result, remark?: string) => {
         try {
             await api.post('/api/paper/add', {
                 code: stock.代码,
                 name: stock.名称,
                 price: stock.现价,
-                strategy_type: stock.strategy_type
+                strategy_type: stock.strategy_type,
+                remark: remark || undefined
             });
             alert(`${stock.名称} 已加入模拟池！`);
         } catch (err) {
             console.error(err);
+        }
+    };
+
+    const confirmAddToWatchlist = () => {
+        if (remarkStock) {
+            addToWatchlist(remarkStock, remarkText);
+            setRemarkStock(null);
+            setRemarkText('');
         }
     };
 
@@ -310,7 +321,7 @@ export default function ResultsTable({
                                                 <CalcIcon size={18} />
                                             </button>
                                             <button
-                                                onClick={(e) => { e.stopPropagation(); addToWatchlist(res); }}
+                                                onClick={(e) => { e.stopPropagation(); setRemarkStock(res); setRemarkText(''); }}
                                                 className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-xl transition-all"
                                                 title="加入模拟池"
                                             >
@@ -385,6 +396,43 @@ export default function ResultsTable({
                     stock={sizingStock}
                     onClose={() => setSizingStock(null)}
                 />
+            )}
+
+            {remarkStock && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => { setRemarkStock(null); setRemarkText(''); }}>
+                    <div className="bg-white rounded-2xl shadow-2xl p-6 w-[400px] space-y-4 animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center justify-between">
+                            <h3 className="text-sm font-bold text-slate-800">加入模拟池</h3>
+                            <span className="text-xs text-slate-400 font-mono">{remarkStock.名称} {remarkStock.代码}</span>
+                        </div>
+                        <div>
+                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block mb-1.5">加入原因 / 备注</label>
+                            <textarea
+                                value={remarkText}
+                                onChange={e => setRemarkText(e.target.value)}
+                                placeholder="例如：均线粘合突破，放量突破前高..."
+                                rows={3}
+                                className="w-full px-3 py-2 text-sm text-slate-800 border border-slate-200 rounded-xl outline-none focus:ring-2 focus:ring-indigo-400 resize-none"
+                                autoFocus
+                                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); confirmAddToWatchlist(); } }}
+                            />
+                        </div>
+                        <div className="flex justify-end gap-2">
+                            <button
+                                onClick={() => { setRemarkStock(null); setRemarkText(''); }}
+                                className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-600 rounded-xl transition-all"
+                            >
+                                取消
+                            </button>
+                            <button
+                                onClick={confirmAddToWatchlist}
+                                className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition-all"
+                            >
+                                确认加入
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     );

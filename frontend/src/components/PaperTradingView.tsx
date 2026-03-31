@@ -45,6 +45,7 @@ interface Trade {
     status: string;
     close_price?: number;
     close_date?: string;
+    remark?: string;
 }
 
 interface Stats {
@@ -259,6 +260,11 @@ export default function PaperTradingView() {
                                                         <span className="text-[9px] font-bold text-slate-300">{t.entry_date}</span>
                                                         {t.close_date && <span className="text-[9px] font-bold text-emerald-400">→ {t.close_date}</span>}
                                                     </div>
+                                                    {t.remark && (
+                                                        <span className="text-[10px] text-slate-400 italic leading-relaxed line-clamp-1" title={t.remark}>
+                                                            💬 {t.remark}
+                                                        </span>
+                                                    )}
                                                 </div>
                                             </td>
                                             <td className="px-4 py-4 text-center font-mono font-bold text-slate-600 text-sm">{t.entry_price.toFixed(2)}</td>

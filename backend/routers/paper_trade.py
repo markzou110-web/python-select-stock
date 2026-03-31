@@ -29,15 +29,16 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     try:
         with engine.connect() as conn:
             conn.execute(text('''
-                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status, strategy_type)
-                VALUES (:code, :name, :price, :date, :price, 'OPEN', :strategy_type)
+                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status, strategy_type, remark)
+                VALUES (:code, :name, :price, :date, :price, 'OPEN', :strategy_type, :remark)
                 ON CONFLICT (code, entry_date) DO NOTHING
             '''), {
                 "code": trade.code,
                 "name": trade.name,
                 "price": trade.price,
                 "date": datetime.now().strftime("%Y-%m-%d"),
-                "strategy_type": trade.strategy_type
+                "strategy_type": trade.strategy_type,
+                "remark": trade.remark
             })
             conn.commit()
         return {"status": "success"}
@@ -136,7 +137,8 @@ def list_paper_trades() -> Dict[str, Any]:
                 "industry": industry,
                 "status": status,
                 "close_price": round(float(row['close_price']), 2) if row.get('close_price') is not None else None,
-                "close_date": str(row['close_date']) if row.get('close_date') is not None else None
+                "close_date": str(row['close_date']) if row.get('close_date') is not None else None,
+                "remark": row.get('remark') if row.get('remark') is not None else None
             }
             trades.append(trade_data)
 

@@ -147,6 +147,7 @@ def init_db(engine=None):
                 conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS close_price FLOAT;"))
                 conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS close_date DATE;"))
                 conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(20);"))
+                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS remark TEXT;"))
             except Exception as e:
                 logger.debug(f"Column migration skipped (may already exist): {e}")
 
