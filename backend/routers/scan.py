@@ -111,24 +111,25 @@ def run_market_scan(
                     # 使用参数化查询防止 SQL 注入
                     # pct_chg 使用与前一日收盘价对比 (日涨幅)，而非日内 open→close
                     # 使用 LAG 窗口函数高效获取前日收盘价
+                    # 注意: 避免 :: 类型转换语法，SQLAlchemy 会将 :: 误解析为命名参数
                     query = text("""
                         WITH ranked AS (
                             SELECT code, date, close, open, high, low, vol,
                                    LAG(close) OVER (PARTITION BY code ORDER BY date) as prev_close
                             FROM daily_k
-                            WHERE date <= :max_date
-                              AND date >= (:max_date::date - interval '7 days')::date
+                            WHERE date <= CAST(:max_date AS date)
+                              AND date >= CAST(CAST(:max_date AS date) - interval '7 days' AS date)
                         )
                         SELECT r.code, b.name, r.close as price, r.open, r.high, r.low, r.vol,
                                CASE WHEN r.prev_close > 0
-                                   THEN ROUND(((r.close - r.prev_close) / r.prev_close * 100)::numeric, 2)
+                                   THEN ROUND(CAST((r.close - r.prev_close) / r.prev_close * 100 AS numeric), 2)
                                    ELSE 0
                                END as pct_chg,
                                NULL as turnover,
                                NULL as mkt_cap
                         FROM ranked r
                         LEFT JOIN stock_basic b ON r.code = b.code
-                        WHERE r.date = :max_date
+                        WHERE r.date = CAST(:max_date AS date)
                     """)
                     snapshot_df = pd.read_sql(query, engine, params={"max_date": max_date})
                     logger.info(f"Loaded {len(snapshot_df)} rows from DB fallback.")
