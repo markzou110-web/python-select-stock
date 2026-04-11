@@ -219,6 +219,42 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     />
                 </div>
 
+                {/* 3.5 Backtest Stats */}
+                {stock.回测统计 && stock.回测统计.avg_return !== 0 && (
+                    <div className="space-y-3">
+                        <div className="flex items-center gap-2">
+                            <BarChart3 size={16} className="text-amber-500" />
+                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">回测概览</h4>
+                        </div>
+                        <div className="grid grid-cols-3 gap-3">
+                            <div className="p-3 bg-white border border-slate-100 rounded-xl text-center">
+                                <p className="text-[9px] font-bold text-slate-400 uppercase">平均收益</p>
+                                <p className={`text-lg font-black ${stock.回测统计.avg_return >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
+                                    {stock.回测统计.avg_return >= 0 ? '+' : ''}{stock.回测统计.avg_return}%
+                                </p>
+                            </div>
+                            <div className="p-3 bg-white border border-slate-100 rounded-xl text-center">
+                                <p className="text-[9px] font-bold text-slate-400 uppercase">最大回撤</p>
+                                <p className="text-lg font-black text-emerald-600">{stock.回测统计.max_drawdown}%</p>
+                            </div>
+                            <div className="p-3 bg-white border border-slate-100 rounded-xl text-center">
+                                <p className="text-[9px] font-bold text-slate-400 uppercase">盈亏比</p>
+                                <p className="text-lg font-black text-amber-600">{stock.回测统计.profit_factor}</p>
+                            </div>
+                        </div>
+                        <div className="flex justify-between px-2">
+                            <span className="text-[9px] font-bold text-slate-400">
+                                平均持仓 {stock.回测统计.avg_hold_days} 天
+                            </span>
+                            {stock.回测统计.stop_loss_hits > 0 && (
+                                <span className="text-[9px] font-bold text-rose-400">
+                                    触发止损 {stock.回测统计.stop_loss_hits} 次
+                                </span>
+                            )}
+                        </div>
+                    </div>
+                )}
+
                 {/* 4. Mini Chart */}
                 <div className="space-y-3">
                     <div className="flex items-center justify-between">

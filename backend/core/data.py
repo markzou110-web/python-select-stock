@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Dict, List, Any, Optional, Tuple
 from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map, validate_stock_code
+from sqlalchemy import text
 from .logging_config import logger
 
 # --- 禁用代理以避免连接问题 ---
@@ -188,10 +189,13 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
     except Exception:
         pass
 
-    # 如果获取失败但有过期缓存，返回过期缓存
-    if not res and 'index_data' in CACHE:
-        logger.debug("Using expired cache for index data")
-        return CACHE['index_data'][0]
+    # 兜底：用上次成功获取的缓存数据补全缺失项
+    if 'index_data' in CACHE:
+        old_data = CACHE['index_data'][0]
+        for name in indices:
+            if name not in res and name in old_data:
+                res[name] = old_data[name]
+                logger.debug(f"Index {name} using stale cache")
 
     if res:
         set_cached_data('index_data', res)

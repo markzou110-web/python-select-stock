@@ -21,42 +21,26 @@ import dynamic from 'next/dynamic';
 const KLineChart = dynamic(() => import('./KLineChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
 import PositionSizer from './PositionSizer';
 import api from '@/lib/api';
-
-interface Result {
-    代码: string;
-    名称: string;
-    行业: string;
-    现价: number;
-    "涨幅%": number;
-    Score: number;
-    RSI: number;
-    DIF: number;
-    BB: number;
-    粘合度: number;
-    历史胜率: string;
-    信号次数: number;
-    北向?: string;
-    共振?: string;
-    影线比?: number;
-    warnings?: string[];
-    结构?: string;
-    体质?: string;
-    strategy_type?: string;
-}
-
+import { ScanResult } from '@/stores/scanStore';
 export default function ResultsTable({
     results,
     onSelectStock,
     selectedCode
 }: {
-    results: Result[],
-    onSelectStock?: (stock: Result) => void,
+    results: ScanResult[],
+    onSelectStock?: (stock: ScanResult) => void,
     selectedCode?: string
 }) {
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
-    const [sizingStock, setSizingStock] = useState<Result | null>(null);
-    const [remarkStock, setRemarkStock] = useState<Result | null>(null);
+    const [sizingStock, setSizingStock] = useState<ScanResult | null>(null);
+    const [remarkStock, setRemarkStock] = useState<ScanResult | null>(null);
     const [remarkText, setRemarkText] = useState('');
+    const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+    const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 2500);
+    };
 
     if (results.length === 0) return null;
 
@@ -97,7 +81,7 @@ export default function ResultsTable({
         URL.revokeObjectURL(url);
     };
 
-    const addToWatchlist = async (stock: Result, remark?: string) => {
+    const addToWatchlist = async (stock: ScanResult, remark?: string) => {
         try {
             await api.post('/api/paper/add', {
                 code: stock.代码,
@@ -106,9 +90,10 @@ export default function ResultsTable({
                 strategy_type: stock.strategy_type,
                 remark: remark || undefined
             });
-            alert(`${stock.名称} 已加入模拟池！`);
+            showToast(`${stock.名称} 已加入模拟池`);
         } catch (err) {
             console.error(err);
+            showToast('加入失败，请重试', 'error');
         }
     };
 
@@ -308,6 +293,24 @@ export default function ResultsTable({
                                                 <span className="text-sm font-black italic">{res.历史胜率}</span>
                                             </div>
                                             <span className="text-[9px] font-bold text-slate-400 tracking-tighter">基于 {res.信号次数} 次历史共振信号</span>
+                                            {res.回测统计 && res.回测统计.avg_return !== 0 && (
+                                                <div className="flex flex-wrap justify-center gap-x-2 gap-y-0.5 mt-1">
+                                                    <span className={`text-[9px] font-bold ${res.回测统计.avg_return >= 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
+                                                        均收{res.回测统计.avg_return >= 0 ? '+' : ''}{res.回测统计.avg_return}%
+                                                    </span>
+                                                    <span className="text-[9px] font-bold text-emerald-500">
+                                                        回撤{res.回测统计.max_drawdown}%
+                                                    </span>
+                                                    <span className="text-[9px] font-bold text-amber-500">
+                                                        盈亏比{res.回测统计.profit_factor}
+                                                    </span>
+                                                    {res.回测统计.stop_loss_hits > 0 && (
+                                                        <span className="text-[9px] font-bold text-rose-400">
+                                                            止损{res.回测统计.stop_loss_hits}次
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                     </td>
 
@@ -375,7 +378,7 @@ export default function ResultsTable({
                                                     </div>
                                                 </div>
                                                 <div className="w-full h-[450px] bg-white rounded-2xl border border-slate-100 shadow-xl overflow-hidden relative group/chart">
-                                                    <KLineChart code={res.代码} name={res.名称} />
+                                                    <KLineChart code={res.代码} name={res.名称} strategyType={res.strategy_type || 'squeeze'} />
                                                     <div className="absolute inset-x-0 bottom-0 py-2 px-4 bg-white/90 backdrop-blur-sm border-t border-slate-50 flex justify-between items-center opacity-0 group-hover/chart:opacity-100 transition-opacity">
                                                         <span className="text-[10px] font-bold text-slate-400">数据源: 本地数据库 (极速渲染)</span>
                                                         <span className="text-[10px] font-bold text-indigo-400 italic">Alpha Vision 共振信号确认区</span>
@@ -432,6 +435,16 @@ export default function ResultsTable({
                             </button>
                         </div>
                     </div>
+                </div>
+            )}
+
+            {/* Toast notification */}
+            {toast && (
+                <div className={cn(
+                    "fixed top-6 right-6 z-50 px-5 py-3 rounded-2xl shadow-2xl text-sm font-bold animate-in fade-in slide-in-from-top-2 duration-300",
+                    toast.type === 'success' ? "bg-emerald-600 text-white" : "bg-rose-600 text-white"
+                )}>
+                    {toast.message}
                 </div>
             )}
         </div>

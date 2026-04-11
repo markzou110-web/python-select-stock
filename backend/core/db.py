@@ -286,6 +286,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
     try:
         current_date = datetime.now().strftime("%Y-%m-%d")
         with engine.connect() as conn:
+            # 先删除当天旧记录，避免上次扫描的残留股票仍然显示
+            conn.execute(text("DELETE FROM scan_history WHERE date = :date"), {"date": current_date})
+
             for r in results:
                 conn.execute(text('''
                     INSERT INTO scan_history (

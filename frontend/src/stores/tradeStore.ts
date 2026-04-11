@@ -15,6 +15,7 @@ export interface Trade {
     status: string;
     close_price?: number;
     close_date?: string;
+    remark?: string;
 }
 
 interface TradeStore {

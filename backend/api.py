@@ -4,7 +4,7 @@ Alpha Vision API - Main entry point.
 Routes are registered from the routers/ module.
 This file handles app initialization, middleware, lifespan events, and the Intraday Sentinel.
 """
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional, Dict, Any
@@ -18,6 +18,7 @@ import requests
 from core.config import config
 from core.logging_config import logger
 from core.db import get_db_engine, init_db, get_setting, save_setting
+from core.ws_manager import manager as ws_manager
 
 # Bark Key from config (not hardcoded)
 BARK_KEY = config.BARK_KEY
@@ -143,6 +144,7 @@ from routers.scan import router as scan_router
 from routers.paper_trade import router as paper_router
 from routers.stock import router as stock_router
 from routers.settings import router as settings_router
+from routers.alert import router as alert_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -150,7 +152,20 @@ app.include_router(scan_router)
 app.include_router(paper_router)
 app.include_router(stock_router)
 app.include_router(settings_router)
+app.include_router(alert_router)
 
+@app.websocket("/api/ws/scan-progress")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # We don't expect messages from client, just keep connection open
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        ws_manager.disconnect(websocket)
 
 if __name__ == "__main__":
     import uvicorn

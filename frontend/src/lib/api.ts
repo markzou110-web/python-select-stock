@@ -43,4 +43,19 @@ export const marketApi = {
     scanMarket: (params: any) => api.get('/api/scan', { params }),
 };
 
+export function connectScanWebSocket(onMessage: (msg: any) => void): WebSocket {
+    const wsUrl = (process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000')
+                    .replace(/^http/, 'ws') + '/api/ws/scan-progress';
+    const ws = new WebSocket(wsUrl);
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            onMessage(data);
+        } catch (e) {
+            console.error("WS Parse Error:", e);
+        }
+    };
+    return ws;
+}
+
 export default api;

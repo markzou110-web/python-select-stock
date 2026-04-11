@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useEffect } from 'react';
 import Header from '@/components/Header';
 import Sidebar from '@/components/Sidebar';
 import MarketCard from '@/components/MarketCard';
@@ -11,232 +11,71 @@ import AIDeepDive from '@/components/AIDeepDive';
 import PaperTradingView from '@/components/PaperTradingView';
 import SettingsView from '@/components/SettingsView';
 import ErrorBoundary from '@/components/ErrorBoundary';
-import { marketApi } from '@/lib/api';
-import api from '@/lib/api';
+import AlertsView from '@/components/AlertsView';
 import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useScanStore } from '@/stores/scanStore';
+import { useMarketStore } from '@/stores/marketStore';
 
 export default function Dashboard() {
-    const [indices, setIndices] = useState<any>({});
-    const [sectors, setSectors] = useState<any[]>([]);
-    const [results, setResults] = useState<any[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [isScanning, setIsScanning] = useState(false);
-    const [selectedStock, setSelectedStock] = useState<any>(null);
-    const [activeView, setActiveView] = useState('scanner');
-    const [isFilterOpen, setIsFilterOpen] = useState(false);
-    const [lastUpdated, setLastUpdated] = useState("");
+    // ── Market store ──
+    const indices = useMarketStore(s => s.indices);
+    const sectors = useMarketStore(s => s.sectors);
+    const syncProgress = useMarketStore(s => s.syncProgress);
+    const marketLoading = useMarketStore(s => s.loading);
+    const lastUpdated = useMarketStore(s => s.lastUpdated);
+    const fetchMarketData = useMarketStore(s => s.fetchMarketData);
+    const fetchSyncStatus = useMarketStore(s => s.fetchSyncStatus);
+    const fetchMarketRegime = useMarketStore(s => s.fetchMarketRegime);
+    const startSync = useMarketStore(s => s.startSync);
+    const stopSync = useMarketStore(s => s.stopSync);
+    const setLastUpdated = useMarketStore(s => s.setLastUpdated);
+    const marketRegime = useMarketStore(s => s.marketRegime);
 
-    const [params, setParams] = useState({
-        strategy_type: "squeeze" as "squeeze" | "pine" | "both" | "consensus",
-        pine_min_signals: 3,
-        min_data_days: 60,
-        threshold: 0.12,
-        vol_multiplier: 1.5,
-        rsi_min: 55,
-        use_macd_filter: true,
-        use_bb_sqz: true,
-        sqz_lookback: 10,
-        use_weekly: false,
-        weekly_ma_period: 20,  // 周线均线周期 (10/20/30/60)
-        market_range: "全市场(除科创)",
-        turnover_min: 3.0,
-        mkt_cap_min: 0,
-        use_rs_filter: true,
-        local_only: true,
-        data_date: "" as string
-    });
+    // ── Scan store ──
+    const results = useScanStore(s => s.results);
+    const isScanning = useScanStore(s => s.isScanning);
+    const scanProgress = useScanStore(s => s.scanProgress);
+    const selectedStock = useScanStore(s => s.selectedStock);
+    const params = useScanStore(s => s.params);
+    const historyDates = useScanStore(s => s.historyDates);
+    const selectedDate = useScanStore(s => s.selectedDate);
+    const availableDates = useScanStore(s => s.availableDates);
+    const viewMode = useScanStore(s => s.viewMode);
+    const isFilterOpen = useScanStore(s => s.isFilterOpen);
+    const setSelectedStock = useScanStore(s => s.setSelectedStock);
+    const setParams = useScanStore(s => s.setParams);
+    const setViewMode = useScanStore(s => s.setViewMode);
+    const setIsFilterOpen = useScanStore(s => s.setIsFilterOpen);
+    const startScan = useScanStore(s => s.startScan);
+    const loadHistory = useScanStore(s => s.loadHistory);
+    const fetchHistory = useScanStore(s => s.fetchHistory);
+    const fetchAvailableDates = useScanStore(s => s.fetchAvailableDates);
+    const handleExport = useScanStore(s => s.handleExport);
 
-    // 可用的数据日期列表
-    const [availableDates, setAvailableDates] = useState<Array<{date: string, stock_count: number}>>([]);
+    // ── Local UI state ──
+    const [activeView, setActiveView] = React.useState('scanner');
 
-    const [historyDates, setHistoryDates] = useState<string[]>([]);
-    const [selectedDate, setSelectedDate] = useState<string>("");
-
-    const [syncProgress, setSyncProgress] = useState<any>(null);
-
-    const fetchMarketData = useCallback(async () => {
-        // Try to load from localStorage first for instant rendering
-        try {
-            const cachedIndices = localStorage.getItem('av_indices_cache');
-            const cachedSectors = localStorage.getItem('av_sectors_cache');
-            if (cachedIndices) setIndices(JSON.parse(cachedIndices));
-            if (cachedSectors) setSectors(JSON.parse(cachedSectors));
-        } catch (e) {
-            console.error("Local cache error:", e);
-        }
-
-        try {
-            const [idxRes, secRes] = await Promise.all([
-                marketApi.getIndices(),
-                marketApi.getSectors()
-            ]);
-            setIndices(idxRes.data);
-            setSectors(secRes.data);
-
-            // Update cache
-            localStorage.setItem('av_indices_cache', JSON.stringify(idxRes.data));
-            localStorage.setItem('av_sectors_cache', JSON.stringify(secRes.data));
-        } catch (e) {
-            console.error("Failed to fetch market data:", e);
-        }
-    }, []);
-
-    const fetchSyncStatus = useCallback(async () => {
-        try {
-            const res = await api.get('/api/sync/status');
-            setSyncProgress(res.data);
-        } catch (e) {
-            console.error("Sync status fetch failed", e);
-        }
-    }, []);
-
-    const fetchHistory = useCallback(async () => {
-        try {
-            const dateRes = await api.get('/api/scan/dates');
-            const dates = dateRes.data;
-            setHistoryDates(dates);
-
-            // 如果有历史记录且当前没有选中，则默认加载最近一天的
-            if (dates.length > 0 && !results.length) {
-                const latestDate = dates[0];
-                setSelectedDate(latestDate);
-                const res = await api.get(`/api/scan/history?date=${latestDate}`);
-                setResults(res.data);
-            }
-        } catch (e) {
-            console.error("Failed to fetch history", e);
-        }
-    }, [results.length]);
-
-    const fetchAvailableDates = useCallback(async () => {
-        try {
-            const res = await api.get('/api/scan/available-dates');
-            setAvailableDates(res.data.dates || []);
-        } catch (e) {
-            console.error("Failed to fetch available dates", e);
-        }
-    }, []);
-
+    // ── Initialization ──
     useEffect(() => {
         const init = async () => {
-            setLoading(true);
+            useMarketStore.setState({ loading: true });
             setLastUpdated(new Date().toLocaleTimeString());
-            await Promise.all([fetchMarketData(), fetchSyncStatus(), fetchHistory(), fetchAvailableDates()]);
-            setLoading(false);
+            await Promise.all([
+                fetchMarketData(), 
+                fetchSyncStatus(), 
+                fetchHistory(), 
+                fetchAvailableDates(),
+                fetchMarketRegime(params.strategy_type || 'squeeze')
+            ]);
+            useMarketStore.setState({ loading: false });
         };
         init();
 
         const intervalId = setInterval(fetchSyncStatus, 5000);
         return () => clearInterval(intervalId);
-    }, [fetchMarketData, fetchSyncStatus, fetchHistory, fetchAvailableDates]);
-
-    const startSync = async () => {
-        try {
-            await api.post('/api/sync/daily');
-            fetchSyncStatus(); // Initial check
-        } catch (e) {
-            console.error("Sync start failed", e);
-        }
-    };
-
-    const stopSync = async () => {
-        try {
-            await api.post('/api/sync/stop');
-            fetchSyncStatus();
-        } catch (e) {
-            console.error("Sync stop failed", e);
-        }
-    };
-
-    const handleScan = async () => {
-        setIsScanning(true);
-        setResults([]);
-        const startTime = Date.now();
-
-        // 更新扫描状态的定时器
-        const statusInterval = setInterval(() => {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            console.log(`扫描进行中... 已耗时: ${elapsed}秒`);
-        }, 5000);
-
-        try {
-            // 清理 params，防止将 NaN 发向后端
-            const cleanParams = { ...params };
-            Object.keys(cleanParams).forEach(key => {
-                const val = (cleanParams as any)[key];
-                if (typeof val === 'number' && isNaN(val)) {
-                    delete (cleanParams as any)[key];
-                }
-            });
-
-            const res = await marketApi.scanMarket(cleanParams);
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            console.log(`扫描完成! 耗时: ${elapsed}秒, 找到 ${res.data.length} 只股票`);
-            setResults(res.data);
-            setSelectedDate(new Date().toISOString().split('T')[0]);
-            fetchHistory(); // 刷新日期列表
-        } catch (e: any) {
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            console.error("Scan Error Detail:", e);
-            const errorMsg = e.response?.data?.detail || e.message;
-
-            // 更详细的错误信息
-            let fullMessage = `扫描失败 (耗时: ${elapsed}秒)\n\n`;
-            if (e.code === 'ECONNABORTED' || e.message.includes('timeout')) {
-                fullMessage += `错误类型: 请求超时\n`;
-                fullMessage += `\n可能原因:\n`;
-                fullMessage += `1. 扫描股票数量过多，请缩小市场范围或调高筛选条件\n`;
-                fullMessage += `2. 网络连接不稳定，请检查网络设置\n`;
-                fullMessage += `3. 后端处理缓慢，请查看后端日志\n`;
-                fullMessage += `\n建议操作:\n`;
-                fullMessage += `- 勾选"仅本地数据"选项\n`;
-                fullMessage += `- 提高"最小换手率"阈值\n`;
-                fullMessage += `- 选择"沪深300"等较小市场范围`;
-            } else if (e.response?.status === 503) {
-                fullMessage += `错误类型: 服务不可用\n\n${errorMsg}`;
-            } else if (e.response?.status === 400) {
-                fullMessage += `错误类型: 参数错误\n\n${errorMsg}`;
-            } else {
-                fullMessage += `错误: ${errorMsg}`;
-            }
-
-            alert(fullMessage);
-        } finally {
-            clearInterval(statusInterval);
-            setIsScanning(false);
-        }
-    };
-    const handleDateChange = async (date: string) => {
-        setSelectedDate(date);
-        if (!date) return;
-        setIsScanning(true);
-        try {
-            const res = await api.get(`/api/scan/history?date=${date}`);
-            setResults(res.data);
-        } catch (e) {
-            console.error("Failed to load history", e);
-        } finally {
-            setIsScanning(false);
-        }
-    };
-
-    const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
-
-    const handleExport = () => {
-        if (results.length === 0) return;
-        const headers = ["代码", "名称", "行业", "现价", "涨幅%", "综合强度", "RSI", "DIF", "BB", "粘合度", "历史胜率"];
-        const rows = results.map(r => [
-            r.代码, r.名称, r.行业, r.现价, r["涨幅%"], r.Score, r.RSI, r.DIF, r.BB, r.粘合度, r.历史胜率
-        ]);
-        const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
-        const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.setAttribute("href", url);
-        link.setAttribute("download", `AlphaVision_Results_${new Date().toLocaleDateString()}.csv`);
-        link.click();
-    };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     return (
         <div className="flex h-screen overflow-hidden w-full">
@@ -249,7 +88,7 @@ export default function Dashboard() {
             />
             <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-slate-50">
                 <Header
-                    onScan={handleScan}
+                    onScan={startScan}
                     loading={isScanning}
                     lastUpdated={lastUpdated}
                     onOpenFilters={() => setIsFilterOpen(true)}
@@ -259,8 +98,29 @@ export default function Dashboard() {
                     {activeView === 'scanner' ? (
                         <>
                             {/* Market Overview */}
+                            <div className="flex items-center gap-4 mb-2">
+                                <h2 className="text-sm font-extrabold text-slate-800 uppercase tracking-widest flex items-center gap-2">
+                                    大盘风控指标
+                                    {marketRegime && (
+                                        <div className={cn(
+                                            "inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border shadow-sm ml-2",
+                                            marketRegime.color === "rose" && "bg-rose-50 border-rose-100 text-rose-700 shadow-rose-100/50",
+                                            marketRegime.color === "emerald" && "bg-emerald-50 border-emerald-100 text-emerald-700 shadow-emerald-100/50",
+                                            marketRegime.color === "amber" && "bg-amber-50 border-amber-100 text-amber-700 shadow-amber-100/50"
+                                        )}>
+                                            {marketRegime.label}
+                                        </div>
+                                    )}
+                                </h2>
+                                {marketRegime && (
+                                    <span className="text-[10px] text-slate-400 font-medium">
+                                        基于上证MA60研判: 现价 {marketRegime.details?.price} / MA60 {marketRegime.details?.ma60} 
+                                        ({marketRegime.details?.pct_above_ma60 > 0 ? '+' : ''}{marketRegime.details?.pct_above_ma60}%)
+                                    </span>
+                                )}
+                            </div>
                             <div className="flex gap-6 overflow-x-auto pb-2 scrollbar-none">
-                                {loading ? (
+                                {marketLoading ? (
                                     Array(5).fill(0).map((_, i) => <MarketCard key={i} name="" price={0} pct={0} loading />)
                                 ) : (
                                     Object.entries(indices).map(([name, data]: [string, any]) => (
@@ -276,7 +136,7 @@ export default function Dashboard() {
                             <div className="flex items-center justify-between pt-4 border-t border-slate-200">
                                 <div className="flex items-center gap-4">
                                     <button
-                                        onClick={handleScan}
+                                        onClick={startScan}
                                         disabled={isScanning}
                                         className={cn(
                                             "flex items-center gap-2 px-6 py-3 premium-gradient text-white rounded-2xl font-bold shadow-xl shadow-indigo-100 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 disabled:scale-100"
@@ -302,7 +162,7 @@ export default function Dashboard() {
                                             </span>
                                             <select
                                                 value={selectedDate}
-                                                onChange={(e) => handleDateChange(e.target.value)}
+                                                onChange={(e) => loadHistory(e.target.value)}
                                                 className="bg-white border border-slate-200 text-slate-600 text-sm font-bold rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500/20 transition-all cursor-pointer shadow-sm hover:border-slate-300"
                                             >
                                                 <option value="">-- 选择记录日期 --</option>
@@ -353,12 +213,30 @@ export default function Dashboard() {
                                     ) : (
                                         <div className="glass-card min-h-[400px] flex flex-col items-center justify-center text-slate-400 p-20 border-dashed border-2">
                                             {isScanning ? (
-                                                <div className="flex flex-col items-center animate-pulse">
-                                                    <div className="w-16 h-16 bg-indigo-50 text-indigo-500 rounded-full flex items-center justify-center mb-6">
+                                                <div className="flex flex-col items-center animate-pulse w-full max-w-md">
+                                                    <div className="w-16 h-16 bg-indigo-50 text-indigo-500 rounded-full flex items-center justify-center mb-6 shadow-indigo-100 shadow-xl">
                                                         <Zap size={32} />
                                                     </div>
-                                                    <p className="font-bold text-lg text-slate-600">正在分析全市场个股...</p>
-                                                    <p className="text-sm font-medium mt-1">多因子共振引擎正在进行深度过滤</p>
+                                                    <p className="font-bold text-lg text-slate-600 mb-2">正在分析全市场个股...</p>
+                                                    {scanProgress ? (
+                                                        <div className="w-full mt-4">
+                                                            <div className="flex justify-between text-xs font-bold text-slate-500 mb-2">
+                                                                <span>{scanProgress.message || '引擎连线中...'}</span>
+                                                                <span className="font-mono">{scanProgress.current}/{scanProgress.total}</span>
+                                                            </div>
+                                                            <div className="w-full bg-slate-100 rounded-full h-2 mb-2 overflow-hidden">
+                                                                <div 
+                                                                    className="premium-gradient h-2 rounded-full transition-all duration-300"
+                                                                    style={{ width: `${scanProgress.total > 0 ? (scanProgress.current / scanProgress.total) * 100 : 0}%` }}
+                                                                />
+                                                            </div>
+                                                            <div className="text-center text-[10px] text-slate-400 font-mono tracking-widest uppercase mt-4">
+                                                                已耗时: <span className="text-indigo-500 font-bold">{scanProgress.elapsed}s</span>
+                                                            </div>
+                                                        </div>
+                                                    ) : (
+                                                        <p className="text-sm font-medium mt-1">引擎启动中，准备建立通道...</p>
+                                                    )}
                                                 </div>
                                             ) : (
                                                 <>
@@ -389,6 +267,10 @@ export default function Dashboard() {
                         <ErrorBoundary fallbackTitle="模拟盘加载异常">
                             <PaperTradingView />
                         </ErrorBoundary>
+                    ) : activeView === 'alerts' ? (
+                        <ErrorBoundary fallbackTitle="预警页加载异常">
+                            <AlertsView />
+                        </ErrorBoundary>
                     ) : (
                         <ErrorBoundary fallbackTitle="设置页加载异常">
                             <SettingsView />
@@ -401,7 +283,7 @@ export default function Dashboard() {
                     onClose={() => setIsFilterOpen(false)}
                     params={params}
                     setParams={setParams}
-                    onScan={handleScan}
+                    onScan={startScan}
                     availableDates={availableDates}
                 />
             </div>

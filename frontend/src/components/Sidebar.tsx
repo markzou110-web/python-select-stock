@@ -15,6 +15,7 @@ import {
     Square
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useAlertStore } from '@/stores/alertStore';
 
 interface SidebarProps {
     syncProgress: any;
@@ -27,12 +28,7 @@ interface SidebarProps {
 export default function Sidebar({ syncProgress, onStartSync, onStopSync, activeView, onNavigate }: SidebarProps) {
     const isRunning = syncProgress?.is_running;
     const progress = syncProgress?.total > 0 ? (syncProgress.current / syncProgress.total) * 100 : 0;
-    const [alertMsg, setAlertMsg] = React.useState<string | null>(null);
-
-    const handleAlertClick = () => {
-        setAlertMsg("🔔 实时告警服务已激活 (后台运行中)");
-        setTimeout(() => setAlertMsg(null), 3000);
-    };
+    const unreadCount = useAlertStore(s => s.unreadCount);
 
     return (
         <div className="w-64 h-full bg-slate-50 border-r border-slate-200 flex flex-col z-20">
@@ -73,20 +69,12 @@ export default function Sidebar({ syncProgress, onStartSync, onStopSync, activeV
                     <NavItem
                         icon={<Bell size={20} />}
                         label="实时告警"
-                        onClick={handleAlertClick}
+                        active={activeView === 'alerts'}
+                        onClick={() => onNavigate('alerts')}
+                        badge={unreadCount}
                     />
                 </nav>
             </div>
-
-            {/* Alert Toast */}
-            {alertMsg && (
-                <div className="px-4 mb-2 animate-in slide-in-from-bottom-2 fade-in duration-300">
-                    <div className="bg-indigo-600 text-white text-xs font-bold px-4 py-3 rounded-xl shadow-lg flex items-center gap-2">
-                        <Bell size={14} className="animate-pulse" />
-                        {alertMsg}
-                    </div>
-                </div>
-            )}
 
             {/* Fixed Bottom Section */}
             <div className="flex-shrink-0 p-4 border-t border-slate-100 bg-slate-50">
@@ -153,17 +141,27 @@ export default function Sidebar({ syncProgress, onStartSync, onStopSync, activeV
     );
 }
 
-function NavItem({ icon, label, active = false, onClick }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void }) {
+function NavItem({ icon, label, active = false, badge = 0, onClick }: { icon: React.ReactNode, label: string, active?: boolean, badge?: number, onClick?: () => void }) {
     return (
         <div
             onClick={onClick}
             className={cn(
-                "nav-item cursor-pointer flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 text-slate-600 hover:bg-slate-100 hover:text-indigo-600",
+                "nav-item cursor-pointer flex items-center justify-between px-4 py-3 rounded-xl transition-all duration-200 text-slate-600 hover:bg-slate-100 hover:text-indigo-600",
                 active && "bg-indigo-600 text-white shadow-lg shadow-indigo-200 hover:bg-indigo-700 hover:text-white"
             )}
         >
-            {icon}
-            <span className="font-semibold text-sm">{label}</span>
+            <div className="flex items-center gap-3">
+                {icon}
+                <span className="font-semibold text-sm">{label}</span>
+            </div>
+            {badge > 0 && (
+                <span className={cn(
+                    "px-2 py-0.5 text-[10px] font-black rounded-lg ml-auto",
+                    active ? "bg-white text-indigo-600" : "bg-rose-500 text-white shadow-sm"
+                )}>
+                    {badge}
+                </span>
+            )}
         </div>
     );
 }

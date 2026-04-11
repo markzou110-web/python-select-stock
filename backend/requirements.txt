@@ -10,3 +10,4 @@ plotly==5.22.0
 python-multipart==0.0.9
 python-dotenv==1.0.1
 tushare==1.4.15
+websockets>=10.4

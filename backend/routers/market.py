@@ -99,3 +99,17 @@ def get_sectors():
     """获取热门行业板块"""
     logger.debug("Request: GET /api/market/sectors")
     return get_hot_sectors()
+
+
+@router.get("/market/regime")
+def get_market_regime(strategy_type: str = "squeeze"):
+    """获取当前市场状态和推荐参数"""
+    from core.market_regime import detect_market_regime, get_adaptive_params
+    
+    regime_info = detect_market_regime()
+    recommended = get_adaptive_params(regime_info["regime"], strategy_type)
+    
+    return {
+        "regime": regime_info,
+        "recommended_params": recommended
+    }
