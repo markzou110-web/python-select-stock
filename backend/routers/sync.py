@@ -145,3 +145,43 @@ def get_sync_status() -> Dict[str, Any]:
     """Get current synchronization progress."""
     with sync_progress_lock:
         return sync_progress.copy()
+
+
+@router.post("/fundamentals")
+def start_sync_fundamentals(background_tasks: BackgroundTasks):
+    """Start fundamental data synchronization in the background."""
+    def background_fund_task():
+        global sync_progress
+        with sync_progress_lock:
+            # We reuse the sync progress UI for fundamentals
+            sync_progress["is_running"] = True
+            sync_progress["stop_requested"] = False
+            sync_progress["start_time"] = datetime.now().isoformat()
+            sync_progress["status_text"] = "正在尝试拉取最新财报季度的大数据表，这可能需要10~30秒..."
+            sync_progress["total"] = 5000
+            sync_progress["current"] = 2500 # Just a visual cue that it is working
+            
+        try:
+            from core.fundamental import sync_all_fundamentals
+            engine = get_db_engine()
+            res = sync_all_fundamentals(engine)
+            with sync_progress_lock:
+                if res["status"] == "success":
+                    sync_progress["status_text"] = f"基本面数据更新完成！共入库 {res.get('count', 0)} 只标的。"
+                    sync_progress["current"] = 5000
+                else:
+                    sync_progress["status_text"] = f"基本面更新失败: {res.get('message', '')}"
+        except Exception as e:
+            logger.error(f"Fundamental sync error: {e}")
+            with sync_progress_lock:
+                sync_progress["status_text"] = f"同步基本面时出错: {e}"
+        finally:
+            with sync_progress_lock:
+                sync_progress["is_running"] = False
+                
+    with sync_progress_lock:
+        if sync_progress["is_running"]:
+            return {"status": "already_running", "progress": sync_progress}
+            
+    background_tasks.add_task(background_fund_task)
+    return {"status": "started", "message": "基本面同步已开始"}

@@ -32,11 +32,12 @@ from core.strategy import (
     check_strategy, check_pine_strategy, check_consensus_strategy,
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
 )
+from core.celery_app import celery_app
 
 router = APIRouter(prefix="/api", tags=["scan"])
 
-
-def run_market_scan(
+@celery_app.task(name="scan.run_market_scan_task")
+def run_market_scan_task(
     threshold: float = 0.12,
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
@@ -502,7 +503,7 @@ def run_market_scan(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20, fund_data=None):
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
@@ -552,7 +553,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         # 根据策略类型选择不同的筛选逻辑
         if strategy_type == "pine":
             # Pine Script 多指标共振策略
-            match, stats = check_pine_strategy(df, min_signals=pine_min_signals)
+            match, stats = check_pine_strategy(df, min_signals=pine_min_signals, fund_data=fund_data)
             if match:
                 stats['代码'] = code
                 stats['名称'] = name
@@ -565,12 +566,12 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             match_sqz, stats_sqz = check_strategy(
                 df, threshold=threshold, vol_multiplier=vol_multiplier, rsi_min=rsi_min,
                 use_macd_filter=use_macd_filter, use_bb_sqz=use_bb_sqz,
-                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter
+                sqz_lookback=sqz_lookback, use_rs_filter=use_rs_filter, fund_data=fund_data
             )
             if not match_sqz:
                 return stats_sqz
 
-            match_pine, stats_pine = check_pine_strategy(df, min_signals=pine_min_signals)
+            match_pine, stats_pine = check_pine_strategy(df, min_signals=pine_min_signals, fund_data=fund_data)
             if not match_pine:
                 return stats_pine
 
@@ -597,7 +598,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             if use_weekly:
                 is_w_ok = get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period)
 
-            match, stats = check_consensus_strategy(df, is_weekly_ok=is_w_ok, vol_multiplier=vol_multiplier)
+            match, stats = check_consensus_strategy(df, is_weekly_ok=is_w_ok, vol_multiplier=vol_multiplier, fund_data=fund_data)
             if match:
                 stats['代码'] = code
                 stats['名称'] = name
@@ -615,7 +616,8 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 use_macd_filter=use_macd_filter,
                 use_bb_sqz=use_bb_sqz,
                 sqz_lookback=sqz_lookback,
-                use_rs_filter=use_rs_filter
+                use_rs_filter=use_rs_filter,
+                fund_data=fund_data
             )
 
             if match:
@@ -652,26 +654,42 @@ def scan_market(
     data_date: Optional[str] = None,
     strategy_type: str = "squeeze",
     pine_min_signals: int = 3,
-    min_data_days: int = None,
+    min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20  # 周线均线周期
 ):
     """
-    API Endpoint for market scan
-
-    Args:
-        data_date: 指定使用的数据日期 (YYYY-MM-DD 格式)，为 None 时自动选择最新日期
-        strategy_type: 策略类型 (squeeze/pine/both/consensus)
-        pine_min_signals: Pine策略的最小共振信号数 (1-5)
-        min_data_days: 最小数据天数
-        weekly_ma_period: 周线大均线周期 (10/20/30/60)
+    API Endpoint for market scan (Asynchronous via Celery)
     """
-    logger.info(f"[SCAN] strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
-    return run_market_scan(
+    logger.info(f"[SCAN API] Submitting task: strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
+    
+    # 异步发送任务给 Celery Queue
+    task = run_market_scan_task.delay(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
         turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days,
-        weekly_ma_period=weekly_ma_period
+        weekly_ma_period
     )
+    
+    # 无 Redis 的兜底处理：任务已同步完成，直接把结果交给前端 (前端的 fallback 机制接收)
+    if celery_app.conf.task_always_eager and task.state == 'SUCCESS':
+        return {"status": "SUCCESS", "results": task.result, "message": "同步扫描完成"}
+
+    return {"task_id": task.id, "status": "PENDING", "message": "扫描任务已提交队列"}
+
+@router.get("/scan/status/{task_id}")
+def get_scan_status(task_id: str):
+    """查询扫描任务状态和结果"""
+    # get async result
+    task = celery_app.AsyncResult(task_id)
+    if task.state == 'SUCCESS':
+        # Result is either list of items or serialized JSON
+        result = task.result
+        return {"task_id": task_id, "status": task.state, "results": result, "message": "扫描完成"}
+    elif task.state == 'FAILURE':
+        return {"task_id": task_id, "status": task.state, "message": str(task.info)}
+    else:
+        return {"task_id": task_id, "status": task.state, "message": "任务正在执行中..."}
+
 
 
 @router.get("/scan/history")

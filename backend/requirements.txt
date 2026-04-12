@@ -11,3 +11,5 @@ python-multipart==0.0.9
 python-dotenv==1.0.1
 tushare==1.4.15
 websockets>=10.4
+celery==5.4.0
+redis==5.0.4

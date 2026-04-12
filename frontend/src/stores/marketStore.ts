@@ -37,6 +37,7 @@ interface MarketStore {
     fetchSyncStatus: () => Promise<void>;
     fetchMarketRegime: (strategy_type: string) => Promise<any>;
     startSync: () => Promise<void>;
+    startSyncFundamentals: () => Promise<void>;
     stopSync: () => Promise<void>;
     setLastUpdated: (t: string) => void;
 }
@@ -105,6 +106,15 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
             get().fetchSyncStatus();
         } catch (e) {
             console.error("Sync start failed", e);
+        }
+    },
+
+    startSyncFundamentals: async () => {
+        try {
+            await api.post('/api/sync/fundamentals');
+            get().fetchSyncStatus();
+        } catch (e) {
+            console.error("Fundamental sync start failed", e);
         }
     },
 

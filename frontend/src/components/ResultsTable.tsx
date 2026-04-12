@@ -54,10 +54,10 @@ export default function ResultsTable({
     };
 
     const handleExport = () => {
-        const headers = ['代码', '名称', '行业', '现价', '涨幅%', 'Score', 'RSI', 'DIF', 'BB', '粘合度', '历史胜率', '信号次数', '北向', '共振', '影线比', 'strategy_type'];
+        const headers = ['代码', '名称', '行业', '现价', '涨幅%', 'Score', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', '影线比', 'strategy_type'];
         const rows = results.map(r => [
             r.代码, r.名称, r.行业, r.现价, r['涨幅%'], r.Score, r.RSI, r.DIF, r.BB,
-            r.粘合度, r.历史胜率, r.信号次数, r.北向 || '', r.共振 || '',
+            r.粘合度, r.ROE || '', r.净利YOY || '', r.历史胜率, r.信号次数, r.北向 || '', r.共振 || '',
             r.影线比 || '', r.strategy_type || ''
         ]);
 
@@ -157,6 +157,7 @@ export default function ResultsTable({
                             </th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">价格形态</th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">所属板块</th>
+                            <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">基本面(最新季)</th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">资金动向</th>
                             <th className="px-6 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">历史表现</th>
                             <th className="px-8 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-right">操作</th>
@@ -273,6 +274,30 @@ export default function ResultsTable({
 
                                     <td className="px-6 py-5">
                                         <div className="flex flex-col items-center gap-1">
+                                            {res.ROE !== undefined && res.ROE !== null ? (
+                                                <div className="flex flex-col items-center gap-1">
+                                                    <div className="flex gap-2">
+                                                        <div className="flex flex-col items-center">
+                                                            <span className="text-[9px] font-bold text-slate-300">ROE</span>
+                                                            <span className={cn("text-[10px] font-extrabold", res.ROE >= 15 ? "text-rose-500" : res.ROE >= 8 ? "text-orange-500" : "text-slate-500")}>{res.ROE}%</span>
+                                                        </div>
+                                                        <div className="flex flex-col items-center">
+                                                            <span className="text-[9px] font-bold text-slate-300">净利YOY</span>
+                                                            <span className={cn("text-[10px] font-extrabold", res.净利YOY >= 30 ? "text-rose-500" : res.净利YOY >= 15 ? "text-orange-500" : "text-slate-500")}>{res.净利YOY}%</span>
+                                                        </div>
+                                                    </div>
+                                                    {(res.ROE >= 15 || res.净利YOY >= 30) && (
+                                                        <span className="text-[9px] px-1.5 py-0.5 bg-rose-50 border border-rose-100 text-rose-500 rounded font-black mt-1">戴维斯双击💎</span>
+                                                    )}
+                                                </div>
+                                            ) : (
+                                                <span className="text-[10px] text-slate-300 font-bold">---</span>
+                                            )}
+                                        </div>
+                                    </td>
+
+                                    <td className="px-6 py-5">
+                                        <div className="flex flex-col items-center gap-1">
                                             <div className="flex items-center gap-1">
                                                 <span className="text-[10px] font-bold text-slate-300">北向</span>
                                                 <span className={cn(
@@ -352,7 +377,7 @@ export default function ResultsTable({
                                 </tr>
                                 {expandedRow === res.代码 && (
                                     <tr className="bg-slate-50/30 animate-in fade-in slide-in-from-top-2 duration-300">
-                                        <td colSpan={8} className="px-8 py-6">
+                                        <td colSpan={9} className="px-8 py-6">
                                             <div className="flex flex-col gap-4">
                                                 <div className="flex items-center justify-between">
                                                     <div className="flex items-center gap-3">

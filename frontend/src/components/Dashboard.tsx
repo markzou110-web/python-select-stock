@@ -28,6 +28,7 @@ export default function Dashboard() {
     const fetchSyncStatus = useMarketStore(s => s.fetchSyncStatus);
     const fetchMarketRegime = useMarketStore(s => s.fetchMarketRegime);
     const startSync = useMarketStore(s => s.startSync);
+    const startSyncFundamentals = useMarketStore(s => s.startSyncFundamentals);
     const stopSync = useMarketStore(s => s.stopSync);
     const setLastUpdated = useMarketStore(s => s.setLastUpdated);
     const marketRegime = useMarketStore(s => s.marketRegime);
@@ -82,6 +83,7 @@ export default function Dashboard() {
             <Sidebar
                 syncProgress={syncProgress}
                 onStartSync={startSync}
+                onStartSyncFundamentals={startSyncFundamentals}
                 onStopSync={stopSync}
                 activeView={activeView}
                 onNavigate={setActiveView}

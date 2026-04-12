@@ -1,0 +1,30 @@
+
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: alphavision_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+    command: redis-server --appendonly yes
+
+  # 预留 PostgreSQL 配置，若本地已安装可注释掉本段
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: alphavision_db
+  #   environment:
+  #     POSTGRES_USER: alphavision
+  #     POSTGRES_PASSWORD: password
+  #     POSTGRES_DB: alphavision
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+  #   restart: always
+
+volumes:
+  redis_data:
+  pg_data:

@@ -391,7 +391,35 @@ def _simulate_backtest(close_vals, high_vals, low_vals, signal_indices, stop_los
         "stop_loss_hits": stop_loss_hits
     }
 
-def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=True, sqz_lookback=10, use_rs_filter=True):
+def _calculate_fundamental_score(fund_data: Optional[Dict[str, Any]]) -> tuple[float, dict]:
+    """计算基本面加权分数并返回 UI 展示所需的数据"""
+    fund_score = 0.0
+    roe = 0.0
+    net_profit_yoy = 0.0
+    
+    if fund_data:
+        roe = float(fund_data.get('roe', 0))
+        net_profit_yoy = float(fund_data.get('net_profit_yoy', 0))
+        
+        # 规则 1: 稳定高 ROE (戴维斯双击潜质)
+        if roe >= 15:
+            fund_score += 15
+        elif roe >= 8:
+            fund_score += 5
+            
+        # 规则 2: 净利润高增 (成长极速/断层潜质)
+        if net_profit_yoy >= 30:
+            fund_score += 20
+        elif net_profit_yoy >= 15:
+            fund_score += 10
+            
+    return fund_score, {
+        "ROE": round(roe, 2) if roe else None,
+        "净利YOY": round(net_profit_yoy, 2) if net_profit_yoy else None
+    }
+
+
+def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=True, sqz_lookback=10, use_rs_filter=True, fund_data: dict = None):
     """执行无门问禅：A股均线粘合战法 (Optimized)"""
     if len(df) < 120: return False, {"reason": f"历史数据不足 ({len(df)}天)"}
 
@@ -456,10 +484,15 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         upper_shadow = curr['最高'] - max(curr['收盘'], curr['开盘'])
         shadow_ratio = round(upper_shadow / body, 2) if body > 0 else 0
         
-        # 评分
-        score = (vol_ratio * 25) + ((threshold - df['Sqz_Ratio'].iloc[-1]) * 100 * 50) + (curr['RSI'] * 0.4)
-        return True, {
-            "Score": round(score, 2),
+        # 技术评分
+        tech_score = (vol_ratio * 25) + ((threshold - df['Sqz_Ratio'].iloc[-1]) * 100 * 50) + (curr['RSI'] * 0.4)
+        
+        # 基本面加权
+        fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
+        total_score = tech_score + fund_score
+        
+        res = {
+            "Score": round(total_score, 2),
             "涨幅%": round(pct_change, 2),
             "现价": curr['收盘'],
             "代码": curr.get('code', 'N/A'),
@@ -470,6 +503,8 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
             "BB": round(curr['BB_Width'], 4),
             "影线比": shadow_ratio
         }
+        res.update(fund_ui_data)
+        return True, res
     
     reasons = []
     if not is_breakout: reasons.append("未突破均线簇")
@@ -527,7 +562,7 @@ def calculate_historical_win_rate(df, stop_loss_pct=-8.0):
         return empty_result
 
 
-def check_pine_strategy(df, min_signals=3):
+def check_pine_strategy(df, min_signals=3, fund_data: dict = None):
     """
     Pine Script 多指标共振策略 (基于用户截图优化的 3 指标核心版)
     核心指标：Range Filter, Volume, QQE Mod
@@ -585,7 +620,11 @@ def check_pine_strategy(df, min_signals=3):
 
     if is_match:
         # 计算评分 (基于信号数量和一致性)
-        score = core_signals * 30 + (10 if st_bullish else 0) + (10 if rqk_bullish else 0)
+        tech_score = core_signals * 30 + (10 if st_bullish else 0) + (10 if rqk_bullish else 0)
+        
+        # 基本面加分与高管背书
+        fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
+        total_score = tech_score + fund_score
         
         # 计算辅助显示数据 (用于前端表格)
         prev = df.iloc[-2]
@@ -595,8 +634,8 @@ def check_pine_strategy(df, min_signals=3):
         pct_change_3d = (curr['收盘'] - df['收盘'].iloc[-4]) / df['收盘'].iloc[-4] * 100 if len(df) >= 4 else 0
         
         # 影线统计 (重复计算以便返回)
-        return True, {
-            "Score": round(float(score), 1),
+        res = {
+            "Score": round(float(total_score), 1),
             "现价": curr['收盘'],
             "代码": curr.get('code', 'N/A'),
             "名称": curr.get('name', 'N/A'),
@@ -612,6 +651,8 @@ def check_pine_strategy(df, min_signals=3):
             "QQE": "看涨" if qqe_bullish else "看跌",
             "成交量": "放量" if vol_bullish else "缩量"
         }
+        res.update(fund_ui_data)
+        return True, res
     else:
         reasons = []
         if core_signals < min_signals: reasons.append(f"信号不足({core_signals}/3)")
@@ -655,7 +696,7 @@ def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
         return empty_result
 
 
-def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8):
+def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8, fund_data: dict = None):
     """
     Azul "共识" 策略 (场景博弈与沉积验证法)
     核心逻辑：周线向多 (MA60w), 日线 MA20 > MA60, HH (高点拾升), 放量突破大阳线, 趋势体质优
@@ -705,9 +746,13 @@ def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8):
     }
     
     if match:
-        score = (vol_ratio * 15) + (trend_quality * 5) + (25 if is_hh else 0) + (10 if curr['RSI'] > 60 else 0)
-        return True, {
-            "Score": round(float(score), 1),
+        tech_score = (vol_ratio * 15) + (trend_quality * 5) + (25 if is_hh else 0) + (10 if curr['RSI'] > 60 else 0)
+        
+        fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
+        total_score = tech_score + fund_score
+        
+        res = {
+            "Score": round(float(total_score), 1),
             "代码": curr.get('code', 'N/A'),
             "名称": curr.get('name', 'N/A'),
             "现价": curr['收盘'],
@@ -720,6 +765,8 @@ def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8):
             "BB": round(curr.get('BB_Width', 0), 4),
             "影线比": round(shadow_ratio, 2)
         }
+        res.update(fund_ui_data)
+        return True, res
     else:
         reasons = []
         if not is_trend_up: reasons.append("均线未多头")

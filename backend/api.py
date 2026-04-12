@@ -14,6 +14,10 @@ import socket
 import threading
 import asyncio
 import requests
+import warnings
+
+# Suppress pandas FutureWarnings caused by akshare
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 from core.config import config
 from core.logging_config import logger

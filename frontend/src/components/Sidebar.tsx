@@ -20,12 +20,13 @@ import { useAlertStore } from '@/stores/alertStore';
 interface SidebarProps {
     syncProgress: any;
     onStartSync: () => void;
+    onStartSyncFundamentals?: () => void;
     onStopSync: () => void;
     activeView: string;
     onNavigate: (view: string) => void;
 }
 
-export default function Sidebar({ syncProgress, onStartSync, onStopSync, activeView, onNavigate }: SidebarProps) {
+export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamentals, onStopSync, activeView, onNavigate }: SidebarProps) {
     const isRunning = syncProgress?.is_running;
     const progress = syncProgress?.total > 0 ? (syncProgress.current / syncProgress.total) * 100 : 0;
     const unreadCount = useAlertStore(s => s.unreadCount);
@@ -81,19 +82,35 @@ export default function Sidebar({ syncProgress, onStartSync, onStopSync, activeV
                 <div className="mb-4">
                     <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">数据管理</h3>
 
-                    <button
-                        onClick={onStartSync}
-                        disabled={isRunning}
-                        className={cn(
-                            "w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border-2 font-bold text-sm transition-all",
-                            isRunning
-                                ? "bg-slate-100 border-slate-100 text-slate-400 cursor-not-allowed"
-                                : "bg-white border-slate-100 text-slate-600 hover:border-indigo-100 hover:bg-indigo-50/50 hover:text-indigo-600"
-                        )}
-                    >
-                        <RefreshCw size={16} className={cn(isRunning && "animate-spin")} />
-                        {isRunning ? "正在同步..." : "同步当日数据"}
-                    </button>
+                    <div className="space-y-2">
+                        <button
+                            onClick={onStartSync}
+                            disabled={isRunning}
+                            className={cn(
+                                "w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border-2 font-bold text-sm transition-all",
+                                isRunning
+                                    ? "bg-slate-100 border-slate-100 text-slate-400 cursor-not-allowed"
+                                    : "bg-white border-slate-100 text-slate-600 hover:border-indigo-100 hover:bg-indigo-50/50 hover:text-indigo-600"
+                            )}
+                        >
+                            <RefreshCw size={16} className={cn(isRunning && "animate-spin")} />
+                            {isRunning ? "正在同步..." : "同步行情快照"}
+                        </button>
+                        
+                        <button
+                            onClick={onStartSyncFundamentals}
+                            disabled={isRunning}
+                            className={cn(
+                                "w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border-2 font-bold text-sm transition-all",
+                                isRunning
+                                    ? "bg-slate-100 border-slate-100 text-slate-400 cursor-not-allowed"
+                                    : "bg-white border-slate-100 text-slate-600 hover:border-emerald-100 hover:bg-emerald-50/50 hover:text-emerald-600"
+                            )}
+                        >
+                            <Database size={16} className={cn(isRunning && "animate-pulse")} />
+                            同步最新基本面
+                        </button>
+                    </div>
 
                     {isRunning && (
                         <div className="mt-4 p-3 bg-white rounded-xl border border-slate-100 shadow-sm">

@@ -19,6 +19,8 @@ export interface ScanResult {
     影线比?: number;
     strategy_type?: string;
     warnings?: string[];
+    ROE?: number;
+    净利YOY?: number;
     结构?: string;
     体质?: string;
     回测统计?: BacktestStats;
@@ -133,7 +135,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
 
     startScan: async () => {
         let ws: WebSocket | null = null;
-        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在初始化后台扫描引擎..." } });
+        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在向后台提交扫描任务..." } });
         const startTime = Date.now();
 
         try {
@@ -157,30 +159,67 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 }
             });
 
-            const res = await marketApi.scanMarket(cleanParams);
+            const submitRes = await marketApi.scanMarket(cleanParams);
             
-            // Allow progress animation to complete
-            setTimeout(() => {
-                set({
-                    results: res.data.results || [],
-                    selectedDate: new Date().toISOString().split('T')[0],
-                    isScanning: false,
-                    scanProgress: null,
+            if (submitRes.data.task_id) {
+                const taskId = submitRes.data.task_id;
+                
+                // Poll for status
+                return new Promise<void>((resolve) => {
+                    const pollInterval = setInterval(async () => {
+                        try {
+                            const statusRes = await api.get(`/api/scan/status/${taskId}`);
+                            const state = statusRes.data.status;
+                            
+                            if (state === 'SUCCESS') {
+                                clearInterval(pollInterval);
+                                // Allow progress animation to complete
+                                setTimeout(() => {
+                                    set({
+                                        results: statusRes.data.results || [],
+                                        selectedDate: new Date().toISOString().split('T')[0],
+                                        isScanning: false,
+                                        scanProgress: null,
+                                    });
+                                    get().fetchHistory(); // Refresh date list
+                                    if (ws) { try { ws.close(); } catch (e) {} }
+                                    resolve();
+                                }, 1000);
+                            } else if (state === 'FAILURE') {
+                                clearInterval(pollInterval);
+                                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                                alert(`扫描失败 (耗时: ${elapsed}秒)\n\n${statusRes.data.message}`);
+                                set({ isScanning: false, scanProgress: null });
+                                if (ws) { try { ws.close(); } catch (e) {} }
+                                resolve();
+                            }
+                            // PENDING or STARTED: just wait
+                        } catch (err) {
+                            console.error("Error polling task status", err);
+                        }
+                    }, 1000);
                 });
-                get().fetchHistory(); // Refresh date list
-            }, 1000);
+            } else {
+                // Fallback for sync return if celery was disabled temporarily
+                setTimeout(() => {
+                    set({
+                        results: submitRes.data.results || submitRes.data || [],
+                        selectedDate: new Date().toISOString().split('T')[0],
+                        isScanning: false,
+                        scanProgress: null,
+                    });
+                    get().fetchHistory();
+                    if (ws) { try { ws.close(); } catch (e) {} }
+                }, 1000);
+            }
         } catch (e: any) {
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             console.error("Scan Error Detail:", e);
             const errorMsg = e.response?.data?.detail || e.message;
 
-            let fullMessage = `扫描失败 (耗时: ${elapsed}秒)\n\n`;
+            let fullMessage = `请求失败 (耗时: ${elapsed}秒)\n\n`;
             if (e.code === 'ECONNABORTED' || e.message?.includes('timeout')) {
-                fullMessage += `错误类型: 请求超时\n\n可能原因:\n`;
-                fullMessage += `1. 扫描股票数量过多，请缩小市场范围或调高筛选条件\n`;
-                fullMessage += `2. 网络连接不稳定，请检查网络设置\n`;
-                fullMessage += `3. 后端处理缓慢，请查看后端日志\n\n`;
-                fullMessage += `建议操作:\n- 勾选"仅本地数据"选项\n- 提高"最小换手率"阈值\n- 选择"沪深300"等较小市场范围`;
+                fullMessage += `错误类型: 请求超时\n\n请检查网络并重试`;
             } else if (e.response?.status === 503) {
                 fullMessage += `错误类型: 服务不可用\n\n${errorMsg}`;
             } else if (e.response?.status === 400) {
@@ -190,10 +229,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
             }
             alert(fullMessage);
             set({ isScanning: false, scanProgress: null });
-        } finally {
-            if (ws) {
-                try { ws.close(); } catch (e) {}
-            }
+            if (ws) { try { ws.close(); } catch (e) {} }
         }
     },
 

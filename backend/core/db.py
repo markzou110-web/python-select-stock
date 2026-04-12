@@ -4,9 +4,11 @@ import re
 import uuid
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from .logging_config import logger
+from .models import Base, StockBasic, DailyK, ScanHistory, PaperTrading, SystemSetting, StockFundamental
 
 # 获取项目根目录下的配置文件路径
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +55,8 @@ def save_db_config(config: Dict[str, Any]) -> bool:
         logger.error(f"Failed to save db config: {e}")
         return False
 
+SessionLocal = None
+
 def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
     """根据配置获取数据库引擎"""
     if not db_config:
@@ -64,6 +68,10 @@ def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
     try:
         url = f"postgresql://{db_config['user']}:{db_config['pwd']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
         engine = create_engine(url, pool_size=10, max_overflow=20)
+        
+        global SessionLocal
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        
         return engine
     except (KeyError, ValueError) as e:
         logger.error(f"Invalid db config: {e}")
@@ -78,91 +86,10 @@ def init_db(engine=None):
         engine = get_db_engine()
     if not engine: return
     try:
+        # 使用 ORM 创建所有表 (如果不存在则创建)
+        Base.metadata.create_all(bind=engine)
+        
         with engine.connect() as conn:
-            conn.execute(text('''
-                CREATE TABLE IF NOT EXISTS stock_basic (
-                    code VARCHAR(20) PRIMARY KEY,
-                    name VARCHAR(50),
-                    industry VARCHAR(100)
-                );
-            '''))
-            conn.execute(text('''
-                CREATE TABLE IF NOT EXISTS daily_k (
-                    code VARCHAR(20),
-                    date DATE,
-                    open FLOAT,
-                    high FLOAT,
-                    low FLOAT,
-                    close FLOAT,
-                    vol FLOAT,
-                    PRIMARY KEY (code, date)
-                );
-            '''))
-            conn.execute(text('''
-                CREATE TABLE IF NOT EXISTS scan_history (
-                    code VARCHAR(20),
-                    name VARCHAR(50),
-                    date DATE,
-                    price FLOAT,
-                    pct FLOAT,
-                    score FLOAT,
-                    rsi FLOAT,
-                    dif FLOAT,
-                    bb FLOAT,
-                    glue FLOAT,
-                    industry VARCHAR(100),
-                    win_rate VARCHAR(20),
-                    signal_count INTEGER,
-                    north_money VARCHAR(100),
-                    resonance VARCHAR(50),
-                    shadow_ratio FLOAT,
-                    PRIMARY KEY (code, date)
-                );
-            '''))
-            conn.execute(text('''
-                CREATE TABLE IF NOT EXISTS paper_trading (
-                    id SERIAL PRIMARY KEY,
-                    code VARCHAR(20),
-                    name VARCHAR(50),
-                    entry_price FLOAT,
-                    entry_date DATE,
-                    current_price FLOAT,
-                    status VARCHAR(20) DEFAULT 'OPEN',
-                    UNIQUE(code, entry_date)
-                );
-            '''))
-            conn.execute(text('''
-                CREATE TABLE IF NOT EXISTS system_settings (
-                    key VARCHAR(100) PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            '''))
-            conn.execute(text('''
-                CREATE TABLE IF NOT EXISTS stock_fundamentals (
-                    code VARCHAR(20) PRIMARY KEY,
-                    roe FLOAT,
-                    pe_ttm FLOAT,
-                    pe_percentile FLOAT,
-                    net_profit_yoy FLOAT,
-                    revenue_yoy FLOAT,
-                    label VARCHAR(50),
-                    updated_at DATE
-                );
-            '''))
-            # 兼容性迁移：确保 resonance 和 shadow_ratio 列存在
-            try:
-                conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS resonance VARCHAR(50);"))
-                conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS shadow_ratio FLOAT;"))
-                conn.execute(text("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(20);"))
-                # 纸上交易：增加平仓字段
-                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS close_price FLOAT;"))
-                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS close_date DATE;"))
-                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(20);"))
-                conn.execute(text("ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS remark TEXT;"))
-            except Exception as e:
-                logger.debug(f"Column migration skipped (may already exist): {e}")
-
             # 性能索引
             try:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date ON daily_k(date);"))
@@ -171,7 +98,7 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_date ON scan_history(date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status ON paper_trading(status);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry);"))
-                logger.info("Performance indexes verified.")
+                logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
 
@@ -525,18 +452,16 @@ def get_setting(key: str, default: Any = None, engine=None) -> Any:
     Returns:
         Setting value or default
     """
-    if engine is None:
-        engine = get_db_engine()
-    if not engine:
-        return default
+    if SessionLocal is None:
+        if engine is None:
+            engine = get_db_engine()
+        if not engine:
+            return default
 
     try:
-        with engine.connect() as conn:
-            res = conn.execute(
-                text("SELECT value FROM system_settings WHERE key = :key"),
-                {"key": key}
-            ).fetchone()
-            return res[0] if res else default
+        with SessionLocal() as session:
+            setting = session.get(SystemSetting, key)
+            return setting.value if setting else default
     except Exception as e:
         logger.debug(f"Error getting setting {key}: {e}")
         return default
@@ -553,18 +478,21 @@ def save_setting(key: str, value: Any, engine=None) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    if engine is None:
-        engine = get_db_engine()
-    if not engine:
-        return False
+    if SessionLocal is None:
+        if engine is None:
+            engine = get_db_engine()
+        if not engine:
+            return False
 
     try:
-        with engine.connect() as conn:
-            conn.execute(text('''
-                INSERT INTO system_settings (key, value) VALUES (:key, :value)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            '''), {"key": key, "value": str(value)})
-            conn.commit()
+        with SessionLocal() as session:
+            setting = session.get(SystemSetting, key)
+            if setting:
+                setting.value = str(value)
+            else:
+                setting = SystemSetting(key=key, value=str(value))
+                session.add(setting)
+            session.commit()
         return True
     except Exception as e:
         logger.error(f"Error saving setting {key}: {e}")

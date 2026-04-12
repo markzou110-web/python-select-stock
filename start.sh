@@ -22,6 +22,17 @@ if ! command -v npm &> /dev/null; then
     echo "请安装 Node.js: brew install node"
 fi
 
+# 尝试启动基础设施 (Redis)
+echo ""
+echo "🐳 初始化基础设施 (Redis)..."
+if command -v docker-compose &> /dev/null; then
+    docker-compose up -d redis || echo "⚠️ 提示: Docker 可能未运行，Redis 启动失败。系统将自动切入单机免依赖模式！"
+elif command -v docker &> /dev/null && docker compose version &> /dev/null; then
+    docker compose up -d redis || echo "⚠️ 提示: Docker 可能未运行，Redis 启动失败。系统将自动切入单机免依赖模式！"
+else
+    echo "未找到 Docker 环境，跳过启动 Redis。系统将自动切入单机同步免依赖模式！"
+fi
+
 # 启动后端
 echo ""
 echo "🚀 启动后端 (FastAPI)..."
@@ -56,6 +67,17 @@ elif [ ! -f ".env" ]; then
     echo "   然后编辑 .env 填写数据库配置"
 fi
 
+# 检查 Redis 状态
+echo "检查 Redis 连接状态..."
+if nc -z localhost 6379 2>/dev/null || ping -c 1 localhost &> /dev/null; then
+    echo "启动 Celery Worker (任务队列)..."
+    python3 -m celery -A core.celery_app.celery_app worker --loglevel=info > celery.log 2>&1 &
+    CELERY_PID=$!
+    echo "Celery PID: $CELERY_PID"
+else
+    echo "⚠️ 警告: Redis 可能未运行或无法连接。请运行 docker-compose up -d redis 否则扫描功能可能卡住！"
+fi
+
 # 启动后端
 echo "后端启动中... (http://localhost:8000)"
 python3 api.py &
@@ -87,6 +109,9 @@ cd "$PROJECT_DIR"
 # 保存PID
 echo "$BACKEND_PID" > .backend_pid
 echo "$FRONTEND_PID" > .frontend_pid
+if [ ! -z "$CELERY_PID" ]; then
+    echo "$CELERY_PID" > .celery_pid
+fi
 
 echo ""
 echo "============================================================"
