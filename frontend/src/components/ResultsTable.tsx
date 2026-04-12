@@ -3,7 +3,7 @@
 import React, { useState, useMemo } from 'react';
 import {
     Target,
-    Map,
+    Map as MapIcon,
     BarChart3,
     History,
     Layers,
@@ -240,7 +240,7 @@ export default function ResultsTable({
                 <td className="px-6 py-5">
                     <div className="flex flex-col items-center gap-2">
                         <div className="flex items-center gap-1.5 px-3 py-1 bg-indigo-50 text-indigo-600 border border-indigo-100 rounded-full min-w-[60px] justify-center">
-                            <Map size={10} className="text-indigo-400" />
+                            <MapIcon size={10} className="text-indigo-400" />
                             <span className="text-[10px] font-black break-keep whitespace-nowrap">
                                 {(res.行业 && res.行业.trim()) ? res.行业 : "未知"}
                             </span>
