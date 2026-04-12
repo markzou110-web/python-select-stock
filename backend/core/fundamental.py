@@ -2,6 +2,7 @@ import akshare as ak
 import pandas as pd
 from datetime import datetime
 import time
+import socket
 from sqlalchemy import text
 from .logging_config import logger
 from .models import StockFundamental
@@ -31,20 +32,28 @@ def fetch_latest_fundamentals() -> pd.DataFrame:
     
     best_df = pd.DataFrame()
     
-    for date_str in valid_dates:
-        logger.info(f"正在尝试拉取 {date_str} 财报数据...")
-        try:
-            df = ak.stock_yjbb_em(date=date_str)
-            if df is not None and not df.empty and len(df) > 1000:
-                logger.info(f"成功获取 {date_str} 的全市场业绩报表，共 {len(df)} 条记录。")
-                best_df = df
-                break
-            else:
-                logger.info(f"{date_str} 的数据条目数不足 ({len(df) if df is not None else 0})，尝试更早的季度...")
-        except Exception as e:
-            logger.warning(f"获取 {date_str} 业绩报表失败: {e}")
-        
-        time.sleep(1) # 请求间隔
+    # Save the original default timeout and set a 15-second timeout
+    # This prevents the underlying requests from hanging indefinitely
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(15)
+    
+    try:
+        for date_str in valid_dates:
+            logger.info(f"正在尝试拉取 {date_str} 财报数据...")
+            try:
+                df = ak.stock_yjbb_em(date=date_str)
+                if df is not None and not df.empty and len(df) > 1000:
+                    logger.info(f"成功获取 {date_str} 的全市场业绩报表，共 {len(df)} 条记录。")
+                    best_df = df
+                    break
+                else:
+                    logger.info(f"{date_str} 的数据条目数不足 ({len(df) if df is not None else 0})，尝试更早的季度...")
+            except Exception as e:
+                logger.warning(f"获取 {date_str} 业绩报表失败: {e}")
+            
+            time.sleep(1) # 请求间隔
+    finally:
+        socket.setdefaulttimeout(old_timeout)
         
     if best_df.empty:
         logger.error("无法获取任何历史季度的基本面数据。")
@@ -115,14 +124,12 @@ def sync_all_fundamentals(engine) -> dict:
     logger.info(f"准备写入 {len(df)} 条基本面记录到 stock_fundamentals 表...")
     
     try:
-        from sqlalchemy.orm import Session
-        with Session(engine) as session:
+        with engine.begin() as conn:
             # 清空旧数据
-            session.execute(text("DELETE FROM stock_fundamentals"))
+            conn.execute(text("DELETE FROM stock_fundamentals"))
             
             # 使用 pandas 的 to_sql 快速批量写入
-            df.to_sql('stock_fundamentals', engine, if_exists='append', index=False)
-            session.commit()
+            df.to_sql('stock_fundamentals', conn, if_exists='append', index=False)
             
         logger.info("全市场基本面数据入库完成！")
         return {"status": "success", "count": len(df)}
