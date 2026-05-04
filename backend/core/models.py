@@ -48,6 +48,7 @@ class PaperTrading(Base):
     entry_price = Column(Float)
     entry_date = Column(Date)
     current_price = Column(Float)
+    high_since_entry = Column(Float, nullable=True) # 用于移动止损追踪
     status = Column(String(20), default='OPEN')
     close_price = Column(Float, nullable=True)
     close_date = Column(Date, nullable=True)

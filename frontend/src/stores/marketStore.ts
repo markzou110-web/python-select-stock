@@ -18,11 +18,10 @@ export interface SyncProgress {
 }
 
 export interface MarketRegimeData {
-    regime: string;
-    label: string;
-    color: string;
-    description: string;
-    details: any;
+    status: string;
+    desc: string;
+    indices: Record<string, any>;
+    updated_at: string;
 }
 
 interface MarketStore {
@@ -35,7 +34,7 @@ interface MarketStore {
 
     fetchMarketData: () => Promise<void>;
     fetchSyncStatus: () => Promise<void>;
-    fetchMarketRegime: (strategy_type: string) => Promise<any>;
+    fetchMarketRegime: () => Promise<any>;
     startSync: () => Promise<void>;
     startSyncFundamentals: () => Promise<void>;
     stopSync: () => Promise<void>;
@@ -87,13 +86,13 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
         }
     },
 
-    fetchMarketRegime: async (strategy_type: string) => {
+    fetchMarketRegime: async () => {
         try {
-            const res = await api.get(`/api/market/regime?strategy_type=${strategy_type}`);
-            if (res.data && res.data.regime) {
-                set({ marketRegime: res.data.regime });
+            const res = await api.get('/api/market/regime');
+            if (res.data && res.data.status) {
+                set({ marketRegime: res.data });
             }
-            return res.data.recommended_params;
+            return null;
         } catch (e) {
             console.error("Market regime fetch failed", e);
             return null;

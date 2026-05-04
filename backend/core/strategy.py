@@ -53,6 +53,9 @@ def get_signal_details(
         exit_reason = "超时平仓"
         hold_days = max_hold_days
         hit_stop = False
+        max_close_reached = entry_price
+        atr = df['ATR'].iloc[idx] if 'ATR' in df.columns else entry_price * 0.03
+        trailing_multiplier = 2.2 # 这里的倍数与后台设定的对齐
 
         for day in range(1, max_hold_days + 1):
             future_idx = idx + day
@@ -66,6 +69,7 @@ def get_signal_details(
             day_low = low_vals[future_idx]
             day_high = high_vals[future_idx]
 
+            # 1. 止损检查
             day_low_return = (day_low - entry_price) / entry_price
             if day_low_return <= stop_loss_ratio:
                 exit_price = entry_price * (1 + stop_loss_ratio)
@@ -73,19 +77,22 @@ def get_signal_details(
                 exit_reason = f"止损 {stop_loss_pct}%"
                 hit_stop = True
                 break
-
-            day_high_return = (day_high - entry_price) / entry_price
-            if day_high_return >= take_profit_ratio:
-                exit_price = entry_price * (1 + take_profit_ratio)
+            
+            # 2. 移动止盈检查
+            max_close_reached = max(max_close_reached, day_close)
+            if day_close < (max_close_reached - atr * trailing_multiplier):
+                exit_price = day_close
                 hold_days = day
-                exit_reason = f"止盈 +{take_profit_pct}%"
+                exit_reason = "移动止盈"
                 break
 
             if day == max_hold_days:
                 exit_price = day_close
                 hold_days = day
 
-        pnl_pct = round((exit_price - entry_price) / entry_price * 100, 2)
+        # 3. 计入摩擦力 (用于显示真实的 PnL)
+        pnl_pct_raw = (exit_price - entry_price) / entry_price * 100
+        pnl_pct = round(pnl_pct_raw - 0.26, 2) # 固定扣除约 0.26% 的滑点与佣金
         exit_date = str(df['日期'].iloc[min(idx + hold_days, max_idx)])[:10]
 
         sell_signals.append({
@@ -96,7 +103,41 @@ def get_signal_details(
             "hold_days": hold_days,
         })
 
-    return {"buy_signals": buy_signals, "sell_signals": sell_signals}
+    # --- 阶段 1 优化: 全局追踪移动止盈线 ---
+    # 我们只追踪信号发生期间的止盈线轨迹
+    trailing_stops = []
+    
+    for idx in signal_indices:
+        atr = df['ATR'].iloc[idx] if 'ATR' in df.columns else df['收盘'].iloc[idx] * 0.03
+        max_close = df['收盘'].iloc[idx]
+        multiplier = 2.2
+        
+        # 记录从买入日后第 1 天开始到平仓日
+        # 注意：这里需要再次模拟以提取轨迹
+        for day in range(1, max_hold_days + 1):
+            f_idx = idx + day
+            if f_idx >= len(df): break
+            
+            day_close = df['收盘'].iloc[f_idx]
+            max_close = max(max_close, day_close)
+            stop_level = max_close - (atr * multiplier)
+            
+            trailing_stops.append({
+                "time": str(df['日期'].iloc[f_idx])[:10],
+                "value": round(float(stop_level), 2)
+            })
+            
+            # 如果跌破，停止该段轨迹
+            if day_close < stop_level or (df['最低'].iloc[f_idx] - df['收盘'].iloc[idx])/df['收盘'].iloc[idx] <= stop_loss_ratio:
+                break
+            if day == max_hold_days:
+                break
+
+    return {
+        "buy_signals": buy_signals, 
+        "sell_signals": sell_signals,
+        "trailing_stops": trailing_stops
+    }
 
 
 def _find_all_signal_indices(
@@ -228,6 +269,7 @@ def run_optimization_grid(
                 low_vals=df['最低'].values,
                 signal_indices=signal_indices,
                 stop_loss_pct=float(y_val),
+                atr_vals=df['ATR'].values if 'ATR' in df.columns else None
             )
             row_results.append(bt["win_rate"])
         values.append(row_results)
@@ -274,14 +316,21 @@ def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param
         return []
 
 
-def _simulate_backtest(close_vals, high_vals, low_vals, signal_indices, stop_loss_pct=-8.0, take_profit_pct=5.0, max_hold_days=5) -> Dict[str, Any]:
+def _simulate_backtest(
+    close_vals, high_vals, low_vals, signal_indices, 
+    stop_loss_pct=-8.0, take_profit_pct=5.0, max_hold_days=5,
+    atr_vals=None, vol_vals=None,
+    use_trailing_stop=True, trailing_multiplier=2.2, capital=100000,
+    vol_cap_pct=0.05, time_stop_days=None,
+) -> Dict[str, Any]:
     """
-    通用回测模拟引擎
+    通用回测模拟引擎 (v7.0 - 真实摩擦模型)
     
     对每个信号点模拟买入，按以下规则退出：
-    1. 止盈: 未来 N 天内最高价达到 +take_profit_pct%
-    2. 止损: 持仓期间某日收盘跌破入场价 stop_loss_pct%
-    3. 超时: 持有 max_hold_days 天后按收盘价结算
+    1. 止损: 持仓期间某日最低价跌破入场价 stop_loss_pct%
+    2. 移动止盈: 收盘价跌破 (持仓期最高收盘 - N*ATR)
+    3. 时间止损: 持有 time_stop_days 天且未盈利 → 强制平仓
+    4. 超时: 持有 max_hold_days 天后按收盘价结算
     
     Args:
         close_vals: 收盘价 numpy array
@@ -291,6 +340,13 @@ def _simulate_backtest(close_vals, high_vals, low_vals, signal_indices, stop_los
         stop_loss_pct: 止损百分比 (负数, 如 -8.0)
         take_profit_pct: 止盈百分比 (正数, 如 5.0)
         max_hold_days: 最大持有天数
+        atr_vals: ATR 序列 (用于移动止损和头寸计算)
+        vol_vals: 成交量序列 (用于流动性约束)
+        use_trailing_stop: 是否启用移动止盈
+        trailing_multiplier: 移动止盈 ATR 倍数
+        capital: 初始模拟资金 (用于头寸计算)
+        vol_cap_pct: 成交额占比上限 (默认 5%)
+        time_stop_days: 时间止损天数 (None=不启用; 如设为 5 则持仓 5 天未盈利自动平仓)
         
     Returns:
         回测统计字典
@@ -299,63 +355,117 @@ def _simulate_backtest(close_vals, high_vals, low_vals, signal_indices, stop_los
         return {
             "win_rate": 0, "signal_count": 0, "avg_hold_days": 0,
             "avg_return": 0, "max_drawdown": 0, "profit_factor": 0,
-            "stop_loss_hits": 0
+            "stop_loss_hits": 0, "vol_skipped": 0, "time_stopped": 0
         }
+    
+    # --- A 股真实费率常量 ---
+    STAMP_TAX_RATE = 0.0005    # 印花税 0.05% (仅卖出, 2023年减半)
+    COMMISSION_RATE = 0.00025  # 券商佣金 万2.5 (买卖双向)
+    COMMISSION_MIN = 5.0       # 最低佣金 5 元
     
     wins = 0
     losses = 0
     total_profit = 0.0
     total_loss = 0.0
     stop_loss_hits = 0
+    vol_skipped = 0
+    time_stopped = 0
     max_drawdown = 0.0
     returns = []
     hold_days_list = []
     
     max_idx = len(close_vals) - 1
     stop_loss_ratio = stop_loss_pct / 100.0   # e.g. -0.08
-    take_profit_ratio = take_profit_pct / 100.0  # e.g. 0.05
     
     for idx in signal_indices:
         entry_price = close_vals[idx]
         if entry_price <= 0:
             continue
             
+        # --- 头寸计算 (2% 风险模型) ---
+        atr = atr_vals[idx] if atr_vals is not None and not np.isnan(atr_vals[idx]) else entry_price * 0.03
+        risk_per_share = max(atr * 2, entry_price * 0.05) 
+        ideal_shares = int((capital * 0.02) / risk_per_share) if risk_per_share > 0 else 0
+        
+        # --- 成交量约束 (Volume Constraint) ---
+        if vol_vals is not None and idx < len(vol_vals):
+            day_vol = vol_vals[idx]
+            if day_vol > 0:
+                day_turnover = day_vol * entry_price  # 近似日成交额
+                max_invest = day_turnover * vol_cap_pct
+                max_shares = int(max_invest / entry_price)
+                actual_shares = min(ideal_shares, max_shares)
+                # 不满一手 (100 股) 则跳过
+                if actual_shares < 100:
+                    vol_skipped += 1
+                    continue
+                ideal_shares = actual_shares
+        
+        # 确保至少一手
+        shares = max(ideal_shares, 100)
+        
         exit_return = 0.0
         hold_days = max_hold_days
         hit_stop = False
+        max_close_since_entry = entry_price
+        exit_price = entry_price
         
         for day in range(1, max_hold_days + 1):
             future_idx = idx + day
             if future_idx > max_idx:
-                # 数据不足，按最后可用日结算
                 hold_days = day - 1
                 if hold_days > 0:
-                    exit_return = (close_vals[min(idx + hold_days, max_idx)] - entry_price) / entry_price
+                    exit_price = close_vals[min(idx + hold_days, max_idx)]
+                    exit_return = (exit_price - entry_price) / entry_price
                 break
             
             day_close = close_vals[future_idx]
             day_high = high_vals[future_idx]
             day_low = low_vals[future_idx]
             
-            # 当日最低价检查止损 (盘中触发)
+            # 1. 固定止损检查 (盘中触发)
             day_low_return = (day_low - entry_price) / entry_price
             if day_low_return <= stop_loss_ratio:
-                exit_return = stop_loss_ratio  # 按止损价计算
+                exit_price = entry_price * (1 + stop_loss_ratio)
+                exit_return = stop_loss_ratio
                 hold_days = day
                 hit_stop = True
                 break
             
-            # 当日最高价检查止盈
-            day_high_return = (day_high - entry_price) / entry_price
-            if day_high_return >= take_profit_ratio:
-                exit_return = take_profit_ratio  # 按止盈价计算
-                hold_days = day
-                break
+            # 2. 移动止盈逻辑
+            if use_trailing_stop:
+                max_close_since_entry = max(max_close_since_entry, day_close)
+                current_stop_level = max_close_since_entry - (atr * trailing_multiplier)
+                if day_close < current_stop_level:
+                    exit_price = day_close
+                    exit_return = (day_close - entry_price) / entry_price
+                    hold_days = day
+                    break
             
+            # 3. 时间止损: 持仓 N 天未盈利 → 强制平仓
+            if time_stop_days and day >= time_stop_days:
+                current_return = (day_close - entry_price) / entry_price
+                if current_return <= 0:
+                    exit_price = day_close
+                    exit_return = current_return
+                    hold_days = day
+                    time_stopped += 1
+                    break
+
             # 最后一天按收盘价结算
             if day == max_hold_days:
+                exit_price = day_close
                 exit_return = (day_close - entry_price) / entry_price
                 hold_days = day
+        
+        # --- A 股动态税费模型 ---
+        buy_cost = entry_price * shares
+        sell_cost = exit_price * shares
+        buy_commission = max(buy_cost * COMMISSION_RATE, COMMISSION_MIN)
+        sell_commission = max(sell_cost * COMMISSION_RATE, COMMISSION_MIN)
+        stamp_tax = sell_cost * STAMP_TAX_RATE
+        total_friction = (buy_commission + sell_commission + stamp_tax) / buy_cost if buy_cost > 0 else 0
+        exit_return -= total_friction
         
         # 统计
         returns.append(exit_return * 100)  # 转为百分比
@@ -388,7 +498,9 @@ def _simulate_backtest(close_vals, high_vals, low_vals, signal_indices, stop_los
         "avg_return": avg_return,
         "max_drawdown": round(max_drawdown * 100, 2),  # 百分比
         "profit_factor": min(profit_factor, 99.0),  # cap for display
-        "stop_loss_hits": stop_loss_hits
+        "stop_loss_hits": stop_loss_hits,
+        "vol_skipped": vol_skipped,
+        "time_stopped": time_stopped
     }
 
 def _calculate_fundamental_score(fund_data: Optional[Dict[str, Any]]) -> tuple[float, dict]:
@@ -555,7 +667,9 @@ def calculate_historical_win_rate(df, stop_loss_pct=-8.0):
             high_vals=df['最高'].values,
             low_vals=df['最低'].values,
             signal_indices=final_signal_indices,
-            stop_loss_pct=stop_loss_pct
+            stop_loss_pct=stop_loss_pct,
+            atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None
         )
 
     except Exception as e:
@@ -689,7 +803,9 @@ def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
             high_vals=df['最高'].values,
             low_vals=df['最低'].values,
             signal_indices=signal_indices,
-            stop_loss_pct=stop_loss_pct
+            stop_loss_pct=stop_loss_pct,
+            atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None
         )
 
     except Exception as e:
@@ -814,7 +930,9 @@ def calculate_consensus_win_rate(df, stop_loss_pct=-8.0):
             high_vals=df['最高'].values,
             low_vals=df['最低'].values,
             signal_indices=signal_indices,
-            stop_loss_pct=stop_loss_pct
+            stop_loss_pct=stop_loss_pct,
+            atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None
         )
     except Exception:
         return empty_result

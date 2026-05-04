@@ -60,6 +60,20 @@ def run_market_scan_task(
     logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
 
     try:
+        # 获取大盘环境以动态调整参数
+        from core.data import get_market_regime
+        regime = get_market_regime()
+        reg_status = regime.get("status", "UNKNOWN")
+        
+        # 动态调优：在大跌 (CRITICAL) 时收紧筛选，在进攻 (OFFENSIVE) 时适度放宽换手
+        if reg_status == "CRITICAL":
+            rsi_min = min(rsi_min + 5, 80)
+            threshold = max(0.08, threshold - 0.04)
+            logger.info(f"[SCAN] Market is {reg_status}. Tightening RSI to {rsi_min} and Threshold to {threshold}.")
+        elif reg_status == "OFFENSIVE":
+            turnover_min = max(2.5, turnover_min - 0.5)
+            logger.info(f"[SCAN] Market is {reg_status}. Adjusting turnover requirement to {turnover_min}.")
+
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
 

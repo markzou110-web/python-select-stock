@@ -4,7 +4,8 @@ Alpha Vision API - Main entry point.
 Routes are registered from the routers/ module.
 This file handles app initialization, middleware, lifespan events, and the Intraday Sentinel.
 """
-from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional, Dict, Any
@@ -23,6 +24,7 @@ from core.config import config
 from core.logging_config import logger
 from core.db import get_db_engine, init_db, get_setting, save_setting
 from core.ws_manager import manager as ws_manager
+from core.errors import AlphaVisionError, error_response
 
 # Bark Key from config (not hardcoded)
 BARK_KEY = config.BARK_KEY
@@ -91,6 +93,13 @@ class IntradaySentinel:
                     if results:
                         self.last_top_5 = results[:5]
                         send_intraday_notification(self.last_top_5)
+
+                    # --- 新增: 拟合实盘风控检查 ---
+                    logger.info("Sentinel: Running Paper Trading Wind Control...")
+                    from routers.paper_trade import run_wind_control
+                    wc_res = run_wind_control()
+                    if wc_res.get("closed_count", 0) > 0:
+                        logger.info(f"Wind Control: Closed {wc_res['closed_count']} positions.")
                 except Exception as e:
                     logger.error(f"Sentinel Scan Error: {e}")
 
@@ -141,6 +150,48 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# --- Rate Limiting Middleware ---
+if config.RATE_LIMIT_ENABLED:
+    from core.rate_limiter import RateLimiter
+
+    _rate_limiter = RateLimiter()
+    _rate_limiter.register("/api/scan", config.RATE_LIMIT_SCAN)       # e.g. 10/minute
+    _rate_limiter.register("/api/sync", config.RATE_LIMIT_SYNC)       # e.g. 1/hour
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        path = request.url.path
+        # Exempt WebSocket, health checks, and static assets
+        if path.startswith("/api/ws") or path == "/docs" or path == "/openapi.json":
+            return await call_next(request)
+
+        if not _rate_limiter.check(path):
+            rule = _rate_limiter.get_matching_rule(path)
+            logger.warning(f"Rate limited: {path} (rule: {rule})")
+            return JSONResponse(
+                status_code=429,
+                content=error_response("RATE_LIMITED", f"请求过于频繁，限制为 {rule}"),
+            )
+        return await call_next(request)
+
+# --- Global Exception Handler ---
+_ERROR_STATUS_MAP = {
+    "DB_ERROR": 503,
+    "SCAN_ERROR": 500,
+    "DATA_SOURCE_ERROR": 502,
+    "VALIDATION_ERROR": 400,
+}
+
+@app.exception_handler(AlphaVisionError)
+async def alpha_vision_error_handler(request: Request, exc: AlphaVisionError):
+    """Catch all AlphaVisionError subclasses and return structured JSON."""
+    status_code = _ERROR_STATUS_MAP.get(exc.code, 500)
+    logger.warning(f"AlphaVisionError [{exc.code}]: {exc.message}")
+    return JSONResponse(
+        status_code=status_code,
+        content=error_response(exc.code, exc.message),
+    )
+
 # --- Register Routers ---
 from routers.market import router as market_router
 from routers.sync import router as sync_router
@@ -157,6 +208,12 @@ app.include_router(paper_router)
 app.include_router(stock_router)
 app.include_router(settings_router)
 app.include_router(alert_router)
+
+@app.get("/api/market/regime")
+async def get_market_pulse():
+    """获取大盘多指数综合判准"""
+    from core.data import get_market_regime
+    return get_market_regime()
 
 @app.websocket("/api/ws/scan-progress")
 async def websocket_endpoint(websocket: WebSocket):

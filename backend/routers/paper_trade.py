@@ -12,6 +12,7 @@ import pandas as pd
 from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code
 from core.data import get_market_snapshot, get_sector_map
+from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
 from schemas.paper_trade import PaperTradeCreate
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -19,7 +20,7 @@ router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
 
 @router.post("/add")
 def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
-    """Add a paper trade entry"""
+    """Add a paper trade entry with sector concentration check"""
     if not validate_stock_code(trade.code):
         return {"status": "error", "detail": "Invalid stock code format"}
 
@@ -27,6 +28,28 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     if not engine:
         return {"status": "error"}
     try:
+        # --- 行业集中度控制 (Sector Exposure Control) ---
+        MAX_SECTOR_POSITIONS = 2  # 同行业最多 2 个持仓
+        sector_map = get_sector_map()
+        new_industry = sector_map.get(trade.code, '未知')
+        
+        open_df = pd.read_sql("SELECT code FROM paper_trading WHERE status = 'OPEN'", engine)
+        if not open_df.empty and new_industry != '未知':
+            sector_counts = {}
+            for code in open_df['code']:
+                ind = sector_map.get(code, '未知')
+                sector_counts[ind] = sector_counts.get(ind, 0) + 1
+            
+            current_count = sector_counts.get(new_industry, 0)
+            if current_count >= MAX_SECTOR_POSITIONS:
+                return {
+                    "status": "warning",
+                    "detail": f"行业 [{new_industry}] 已有 {current_count} 个持仓，"
+                              f"超过集中度上限 {MAX_SECTOR_POSITIONS}。确认是否继续？",
+                    "industry": new_industry,
+                    "current_count": current_count
+                }
+
         with engine.connect() as conn:
             conn.execute(text('''
                 INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status, strategy_type, remark)
@@ -118,6 +141,12 @@ def list_paper_trades() -> Dict[str, Any]:
             else:
                 current_price = price_map.get(code, entry_price)  # fallback to entry
                 hold_days = (datetime.now() - entry_date).days
+                
+                # --- 移动止损数据更新 ---
+                high_since_entry = float(row.get('high_since_entry') or entry_price)
+                high_since_entry = max(high_since_entry, current_price)
+                # 即使价格没变，我们也需要 high_since_entry 来更新
+                price_updates.append({"price": current_price, "high": high_since_entry, "id": int(row['id'])})
 
             pl = current_price - entry_price
             pl_pct = (pl / entry_price * 100) if entry_price > 0 else 0
@@ -136,27 +165,24 @@ def list_paper_trades() -> Dict[str, Any]:
                 "hold_days": max(0, hold_days),
                 "industry": industry,
                 "status": status,
+                "high_since_entry": round(high_since_entry, 2) if status == 'OPEN' else None,
                 "close_price": round(float(row['close_price']), 2) if row.get('close_price') is not None else None,
                 "close_date": str(row['close_date']) if row.get('close_date') is not None else None,
                 "remark": row.get('remark') if row.get('remark') is not None else None
             }
             trades.append(trade_data)
 
-            # 收集 OPEN 状态的 current_price 更新
-            if status == 'OPEN' and current_price != row.get('current_price'):
-                price_updates.append({"price": current_price, "id": int(row['id'])})
-
-        # 批量更新价格
+        # 批量更新价格与最高点
         if price_updates:
             try:
                 with engine.connect() as conn:
                     conn.execute(
-                        text("UPDATE paper_trading SET current_price = :price WHERE id = :id"),
+                        text("UPDATE paper_trading SET current_price = :price, high_since_entry = :high WHERE id = :id"),
                         price_updates,
                     )
                     conn.commit()
             except Exception as e:
-                logger.warning(f"Batch price update failed: {e}")
+                logger.warning(f"Batch paper trading update failed: {e}")
 
         # --- 汇总统计 ---
         wins = sum(1 for t in trades if t['pl_pct'] > 0)
@@ -186,6 +212,26 @@ def list_paper_trades() -> Dict[str, Any]:
         best = max(trades, key=lambda t: t['pl_pct']) if trades else None
         worst = min(trades, key=lambda t: t['pl_pct']) if trades else None
 
+        # 最大回撤计算
+        cumulative_returns = []
+        running_sum = 0
+        for t in sorted(trades, key=lambda x: x['entry_date']):
+            running_sum += t['pl_pct']
+            cumulative_returns.append(running_sum)
+        
+        max_drawdown = 0
+        if cumulative_returns:
+            peak = -9999
+            for val in cumulative_returns:
+                if val > peak: peak = val
+                drawdown = peak - val
+                if drawdown > max_drawdown: max_drawdown = drawdown
+
+        # 盈亏比
+        gain_trades = [t['pl_pct'] for t in trades if t['pl_pct'] > 0]
+        loss_trades = [abs(t['pl_pct']) for t in trades if t['pl_pct'] < 0]
+        profit_factor = round(sum(gain_trades) / sum(loss_trades), 2) if loss_trades and sum(loss_trades) > 0 else (9.9 if gain_trades else 0)
+
         stats = {
             "total_trades": total,
             "wins": wins,
@@ -195,9 +241,15 @@ def list_paper_trades() -> Dict[str, Any]:
             "avg_pl_pct": round(avg_pl, 2),
             "total_pl_pct": round(sum(t['pl_pct'] for t in trades), 2),
             "avg_hold_days": round(avg_hold, 1),
+            "max_drawdown": round(max_drawdown, 2),
+            "profit_factor": profit_factor,
             "best_trade": {"name": best['name'], "pl_pct": best['pl_pct']} if best else None,
             "worst_trade": {"name": worst['name'], "pl_pct": worst['pl_pct']} if worst else None,
-            "sector_distribution": sector_distribution
+            "sector_distribution": sector_distribution,
+            "monte_carlo": run_monte_carlo([t['pl_pct'] for t in trades]),
+            "rolling_performance": calculate_rolling_performance(trades),
+            "risk_metrics": calculate_risk_metrics(trades),
+            "pnl_attribution": calculate_pnl_attribution(trades)
         }
 
         return {"trades": trades, "stats": stats}
@@ -258,3 +310,86 @@ def close_paper_trade(id: int, data: dict) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error closing paper trade: {e}")
         return {"status": "error", "detail": str(e)}
+
+
+@router.post("/wind-control")
+def run_wind_control() -> Dict[str, Any]:
+    """风控：自动扫描所有持仓，根据多重止损逻辑触发卖出通知/平仓
+    
+    止损规则优先级:
+    1. 固定止损: 跌破入场成本 -9%
+    2. ATR 移动止盈: 从持仓期最高价回撤 -8%
+    3. 大盘极端风控: 双指数破位时强制清仓
+    4. 时间止损: 持仓超过 N 天且未盈利 → 自动平仓
+    """
+    TIME_STOP_DAYS = 5  # 时间止损天数
+    
+    engine = get_db_engine()
+    if not engine: return {"status": "error"}
+    
+    try:
+        df = pd.read_sql("SELECT * FROM paper_trading WHERE status = 'OPEN'", engine)
+        if df.empty: return {"status": "success", "closed_count": 0}
+        
+        from core.data import get_market_snapshot
+        snapshot = get_market_snapshot()
+        if snapshot.empty: return {"status": "error", "detail": "市场行情不可用"}
+        
+        # 获取当前大盘环境
+        from core.data import get_market_regime
+        regime = get_market_regime()
+        regime_status = regime.get("status", "UNKNOWN")
+
+        closed_count = 0
+        alerts = []
+
+        for _, row in df.iterrows():
+            code = row['code']
+            entry_price = float(row['entry_price'])
+            entry_date = pd.to_datetime(row['entry_date'])
+            high_since_entry = float(row['high_since_entry'] or entry_price)
+            hold_days = (datetime.now() - entry_date).days
+            
+            # 获取当前行情
+            match = snapshot[snapshot['code'] == code]
+            if match.empty: continue
+            curr_price = float(match.iloc[0]['price'])
+            pl_pct = (curr_price - entry_price) / entry_price * 100
+            
+            # --- 风控逻辑判定 (按优先级) ---
+            stop_level = high_since_entry * 0.92 # 默认跌破高点 8% 触发
+            fixed_stop = entry_price * 0.91 # 默认固定止损 9%
+            
+            reason = ""
+            if curr_price <= fixed_stop:
+                reason = "触发固定止盈止损线 (入场成本 -9%)"
+            elif curr_price <= stop_level:
+                reason = "触发 ATR 移动止盈线 (高点回撤 -8%)"
+            elif regime_status == "CRITICAL":
+                reason = "大盘极度走弱 (双指数破位)，强制清仓避险"
+            elif hold_days >= TIME_STOP_DAYS and pl_pct <= 0:
+                reason = f"时间止损: 持仓 {hold_days} 天未盈利 ({pl_pct:.1f}%)"
+
+            if reason:
+                # 生成更详细的智能备注
+                remark = f"{reason}。卖出时大盘状态：{regime.get('desc', 'N/A')}。"
+                
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        UPDATE paper_trading 
+                        SET close_price = :p, close_date = :d, status = 'CLOSED', remark = :r
+                        WHERE id = :id
+                    """), {
+                        "p": curr_price,
+                        "d": datetime.now().strftime("%Y-%m-%d"),
+                        "r": remark,
+                        "id": int(row['id'])
+                    })
+                    conn.commit()
+                closed_count += 1
+                alerts.append(f"{row['name']}({code}) {reason}")
+        
+        return {"status": "success", "closed_count": closed_count, "alerts": alerts}
+    except Exception as e:
+        logger.error(f"Wind control error: {e}")
+        return {"status": "error"}

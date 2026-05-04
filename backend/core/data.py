@@ -9,7 +9,63 @@ from functools import lru_cache
 from typing import Dict, List, Any, Optional, Tuple
 from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map, validate_stock_code
 from sqlalchemy import text
+from .indicators import calculate_ema
 from .logging_config import logger
+
+def get_market_regime() -> Dict[str, Any]:
+    """
+    获取大盘环境：结合上证指数 (000001) 和 创业板指 (399006)
+    """
+    indices = {"000001": "上证", "399006": "创业"}
+    states = {}
+    
+    try:
+        now = datetime.now()
+        start_date = (now - timedelta(days=60)).strftime('%Y%m%d')
+        end_date = now.strftime('%Y%m%d')
+        
+        for code, name in indices.items():
+            # 使用更可靠的 index_zh_a_hist
+            df = ak.index_zh_a_hist(symbol=code, period="daily", 
+                                   start_date=(now - timedelta(days=60)).strftime('%Y%m%d'),
+                                   end_date=now.strftime('%Y%m%d'))
+            
+            if df.empty: continue
+            
+            # index_zh_a_hist 返回的列名为: 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
+            # 无需重命名，直接计算 EMA20
+            df = calculate_ema(df, 20)
+            
+            latest = df.iloc[-1]
+            close = float(latest['收盘'])
+            ema20 = float(latest['EMA20'])
+            
+            states[name] = {
+                "close": round(close, 2),
+                "ema20": round(ema20, 2),
+                "trend": "BULL" if close > ema20 else "BEAR"
+            }
+            
+        # 综合评判
+        if states["上证"]["trend"] == "BULL" and states["创业"]["trend"] == "BULL":
+            status = "OFFENSIVE"
+            desc = "进攻模式：双指数均站上 20 日线"
+        elif states["上证"]["trend"] == "BEAR" and states["创业"]["trend"] == "BEAR":
+            status = "CRITICAL"
+            desc = "空仓防守：双指数均跌破 20 日线"
+        else:
+            status = "DEFENSIVE"
+            desc = "减仓观望：市场进入震荡/分化期"
+            
+        return {
+            "status": status,
+            "desc": desc,
+            "indices": states,
+            "updated_at": datetime.now().strftime('%H:%M:%S')
+        }
+    except Exception as e:
+        logger.error(f"Error getting market regime: {e}")
+        return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": {}, "updated_at": ""}
 
 # --- 禁用代理以避免连接问题 ---
 # 禁用 requests 和 urllib 的代理

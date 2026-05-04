@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 from .logging_config import logger
 from .models import Base, StockBasic, DailyK, ScanHistory, PaperTrading, SystemSetting, StockFundamental
+from .errors import DatabaseError, ValidationError
 
 # 获取项目根目录下的配置文件路径
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

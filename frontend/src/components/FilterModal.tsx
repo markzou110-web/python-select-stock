@@ -23,7 +23,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
 
     const handleSmartRecommend = async () => {
         setRecommending(true);
-        const recommended = await fetchMarketRegime(params.strategy_type || 'squeeze');
+        const recommended = await fetchMarketRegime();
         if (recommended) {
             setParams({ ...params, ...recommended });
         }

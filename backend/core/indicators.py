@@ -3,6 +3,11 @@ import numpy as np
 import akshare as ak
 from core.logging_config import logger
 
+def calculate_ema(df: pd.DataFrame, period: int, col: str = '收盘') -> pd.DataFrame:
+    """计算指定周期的 EMA"""
+    df[f'EMA{period}'] = df[col].ewm(span=period, adjust=False).mean()
+    return df
+
 def calculate_indicators(df, current_price=None, current_vol=None, current_open=None, periods=[5, 10, 20, 60], bench_df=None, enable_pine_indicators=False):
     """计算 EMA, MACD, BB, RSI 和 RS (Optimized)"""
     if df.empty: return df
@@ -40,6 +45,14 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid'].replace(0, np.nan)
     
     df['Vol_MA20'] = df['成交量'].rolling(window=20).mean()
+
+    # --- ATR (Average True Range) 14 ---
+    high_low = df['最高'] - df['最低']
+    high_close = np.abs(df['最高'] - df['收盘'].shift(1))
+    low_close = np.abs(df['最低'] - df['收盘'].shift(1))
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    df['ATR'] = true_range.rolling(window=14).mean()
     
     # Azul's SMA system
     df['MA20'] = df['收盘'].rolling(window=20).mean()

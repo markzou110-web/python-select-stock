@@ -30,6 +30,10 @@ interface SignalData {
         pnl_pct: number;
         hold_days: number;
     }>;
+    trailing_stops?: Array<{
+        time: string;
+        value: number;
+    }>;
 }
 
 export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLineChartProps) {
@@ -72,6 +76,15 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
         const ema20Series = chart.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 1, title: 'EMA20' });
         const ema120Series = chart.addSeries(LineSeries, { color: '#3b82f6', lineWidth: 1, title: 'EMA120' });
         const ema250Series = chart.addSeries(LineSeries, { color: '#8b5cf6', lineWidth: 1, title: 'EMA250' });
+        
+        const trailingStopSeries = chart.addSeries(LineSeries, { 
+            color: '#f97316', 
+            lineWidth: 2, 
+            lineStyle: 2, // Dashed
+            title: 'Trailing Stop',
+            lastValueVisible: false,
+            priceLineVisible: false
+        });
 
         chartRef.current = chart;
 
@@ -128,7 +141,11 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                     markers.sort((a, b) => a.time.localeCompare(b.time));
 
                     if (markers.length > 0) {
-                        candlestickSeries.setMarkers(markers);
+                        (candlestickSeries as any).setMarkers(markers);
+                    }
+
+                    if (signals.trailing_stops) {
+                        trailingStopSeries.setData(signals.trailing_stops);
                     }
                 } catch (e) {
                     console.warn("Signal fetch failed (non-critical):", e);
@@ -177,6 +194,10 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                 <div className="flex items-center gap-1.5">
                     <div className="w-2.5 h-2.5 rounded-full bg-purple-500" />
                     <span className="text-[10px] font-bold text-slate-500">EMA 250</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                    <div className="w-3 h-0.5 bg-orange-500 border-t border-dashed border-orange-500" />
+                    <span className="text-[10px] font-bold text-orange-500">移动止损</span>
                 </div>
                 {totalBuys > 0 && (
                     <>

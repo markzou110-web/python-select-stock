@@ -264,10 +264,10 @@ export default function ResultsTable({
                                     </div>
                                     <div className="flex flex-col items-center">
                                         <span className="text-[9px] font-bold text-slate-300">净利YOY</span>
-                                        <span className={cn("text-[10px] font-extrabold", res.净利YOY >= 30 ? "text-rose-500" : res.净利YOY >= 15 ? "text-orange-500" : "text-slate-500")}>{res.净利YOY}%</span>
+                                        <span className={cn("text-[10px] font-extrabold", (res.净利YOY ?? 0) >= 30 ? "text-rose-500" : (res.净利YOY ?? 0) >= 15 ? "text-orange-500" : "text-slate-500")}>{res.净利YOY}%</span>
                                     </div>
                                 </div>
-                                {(res.ROE >= 15 || res.净利YOY >= 30) && (
+                                {((res.ROE ?? 0) >= 15 || (res.净利YOY ?? 0) >= 30) && (
                                     <span className="text-[9px] px-1.5 py-0.5 bg-rose-50 border border-rose-100 text-rose-500 rounded font-black mt-1">戴维斯双击💎</span>
                                 )}
                             </div>
