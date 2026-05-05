@@ -42,7 +42,7 @@ class Config:
     # Rate Limiting
     RATE_LIMIT_ENABLED: bool = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
     RATE_LIMIT_SCAN: str = os.getenv("RATE_LIMIT_SCAN", "10/minute")
-    RATE_LIMIT_SYNC: str = os.getenv("RATE_LIMIT_SYNC", "1/hour")
+    RATE_LIMIT_SYNC: str = os.getenv("RATE_LIMIT_SYNC", "30/minute")
 
     # Sentinel
     SENTINEL_DEFAULT_TIME: str = os.getenv("SENTINEL_DEFAULT_TIME", "14:20")

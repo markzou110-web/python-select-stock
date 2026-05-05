@@ -161,8 +161,9 @@ if config.RATE_LIMIT_ENABLED:
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
         path = request.url.path
-        # Exempt WebSocket, health checks, and static assets
-        if path.startswith("/api/ws") or path == "/docs" or path == "/openapi.json":
+        # Exempt WebSocket, health checks, and status polling
+        if (path.startswith("/api/ws") or 
+            path in ("/docs", "/openapi.json", "/api/health", "/api/sync/status")):
             return await call_next(request)
 
         if not _rate_limiter.check(path):
