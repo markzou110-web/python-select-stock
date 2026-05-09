@@ -17,7 +17,7 @@ import api from '@/lib/api';
 
 export default function SettingsView() {
     const [settings, setSettings] = useState({
-        sentinel_time: "14:20",
+        sentinel_schedule_times: "14:20",
         bark_key: ""
     });
     const [loading, setLoading] = useState(true);
@@ -101,16 +101,17 @@ export default function SettingsView() {
                         <div className="space-y-3">
                             <label className="flex items-center gap-2 text-sm font-bold text-slate-700">
                                 <Clock size={16} className="text-indigo-500" />
-                                哨兵自动执行时间 (14:20)
+                                哨兵自动巡检时间点
                             </label>
                             <input
-                                type="time"
-                                value={settings.sentinel_time}
-                                onChange={(e) => setSettings({ ...settings, sentinel_time: e.target.value })}
+                                type="text"
+                                value={settings.sentinel_schedule_times || ""}
+                                onChange={(e) => setSettings({ ...settings, sentinel_schedule_times: e.target.value })}
+                                placeholder="例如: 10:30, 14:20, 14:50"
                                 className="w-full bg-slate-50 border border-slate-100 text-slate-600 font-mono font-bold rounded-xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 focus:bg-white transition-all"
                             />
                             <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
-                                💡 系统将在每日该时刻自动获取最新行情、分析全市场共振标的，并触发推送通知。
+                                💡 支持配置多个时间点（用英文逗号分隔，如 <code className="bg-slate-100 px-1 py-0.5 rounded">14:20, 14:50</code>）。系统将在每日配置时刻自动获取最新行情、分析全市场标的，并触发推送通知。
                             </p>
                         </div>
 

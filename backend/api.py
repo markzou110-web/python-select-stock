@@ -32,16 +32,9 @@ BARK_KEY = config.BARK_KEY
 socket.setdefaulttimeout(config.AKSHARE_TIMEOUT)  # 防止网络请求无限挂起
 
 
-# --- Intraday Sentinel ---
 def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str]:
     """
-    Sends a push notification via Bark for the 14:30 Sentinel.
-
-    Args:
-        stock_list: List of stock dictionaries with '名称'/'name' and '代码'/'code' keys
-
-    Returns:
-        Message body if sent, None otherwise
+    Sends a push notification via the Notifier for the Sentinel.
     """
     if not stock_list:
         return None
@@ -50,19 +43,16 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     codes = [s.get('代码', s.get('code', '')) for s in stock_list]
 
     title = "Alpha Vision 哨兵提醒"
-    body = f"【14:30 尾盘确认】\n发现 {len(names)} 只标的走势稳健：\n" + "、".join([f"{n}({c})" for n, c in zip(names, codes)])
+    body = f"【自动巡检确认】\n发现 {len(names)} 只标的走势稳健：\n" + "、".join([f"{n}({c})" for n, c in zip(names, codes)])
 
     logger.info(f"Notification: {body}")
 
-    if config.is_bark_configured():
-        try:
-            url = config.BARK_URL_TEMPLATE.format(key=BARK_KEY, title=title, body=body)
-            requests.get(url, timeout=5)
-            logger.info("Bark push sent successfully.")
-        except Exception as e:
-            logger.error(f"Bark push failed: {e}")
-    else:
-        logger.debug("Bark Key not configured. Skipping push.")
+    from core.notifier import notifier
+    try:
+        # 运行异步的 notifier.send
+        asyncio.run(notifier.send(title, body, channels=["bark"]))
+    except Exception as e:
+        logger.error(f"Push notification failed: {e}")
 
     return body
 
@@ -72,10 +62,16 @@ class IntradaySentinel:
         self.last_top_5 = []
         self.thread = None
         self._stop = False
-        self.trigger_time = "14:20"
+        self.schedule_times = ["14:20"]
+        self.triggered_today = set()
+
+    def _load_schedule(self):
+        times_str = get_setting("sentinel_schedule_times", "14:20")
+        self.schedule_times = [t.strip() for t in times_str.split(",") if t.strip()]
 
     def start(self):
-        self.trigger_time = get_setting("sentinel_time", "14:20")
+        self._load_schedule()
+        self.triggered_today.clear()
         self._stop = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -85,8 +81,13 @@ class IntradaySentinel:
             now = datetime.now()
             current_time = now.strftime("%H:%M")
 
-            if current_time == self.trigger_time:
-                logger.info(f"Sentinel Triggered at {self.trigger_time}: Automated check...")
+            # Reset tracking every day
+            if current_time == "00:00":
+                self.triggered_today.clear()
+
+            if current_time in self.schedule_times and current_time not in self.triggered_today:
+                logger.info(f"Sentinel Triggered at {current_time}: Automated check...")
+                self.triggered_today.add(current_time)
                 try:
                     from routers.scan import run_market_scan
                     results = run_market_scan(local_only=True)
@@ -103,10 +104,8 @@ class IntradaySentinel:
                 except Exception as e:
                     logger.error(f"Sentinel Scan Error: {e}")
 
-                time.sleep(60)  # Skip this minute
-
             if now.minute % 10 == 0 and now.second < 30:
-                self.trigger_time = get_setting("sentinel_time", "14:20")
+                self._load_schedule()
 
             time.sleep(30)
 

@@ -148,13 +148,16 @@ def calculate_risk_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     avg_loss = round(np.mean(losses), 2) if losses else 0
     
     # --- 期望值 (Expectancy) ---
-    win_rate = len(wins) / len(returns) if returns else 0
-    loss_rate = 1 - win_rate
-    expectancy = round(win_rate * avg_win + loss_rate * avg_loss, 2)
+    win_count = len(wins)
+    total_count = len(returns)
+    win_rate = round(win_count / total_count * 100, 1) if total_count > 0 else 0
+    loss_rate = 1 - (win_rate / 100)
+    expectancy = round((win_rate / 100) * avg_win + loss_rate * avg_loss, 2)
     
     return {
         "sharpe_ratio": sharpe,
         "calmar_ratio": calmar,
+        "win_rate": win_rate,
         "equity_curve": equity_curve,
         "max_consecutive_losses": max_consecutive_losses,
         "avg_win": avg_win,

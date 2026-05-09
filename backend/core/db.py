@@ -220,9 +220,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
             for r in results:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type
+                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy
                     ) VALUES (
-                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type
+                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -237,7 +237,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         north_money = EXCLUDED.north_money,
                         resonance = EXCLUDED.resonance,
                         shadow_ratio = EXCLUDED.shadow_ratio,
-                        strategy_type = EXCLUDED.strategy_type
+                        strategy_type = EXCLUDED.strategy_type,
+                        roe = EXCLUDED.roe,
+                        net_profit_yoy = EXCLUDED.net_profit_yoy
                 '''), {
                     "code": r.get('代码'),
                     "name": r.get('名称'),
@@ -255,7 +257,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                     "north_money": r.get('北向', '---'),
                     "resonance": r.get('共振', '独苗'),
                     "shadow_ratio": float(r.get('影线比', 0)),
-                    "strategy_type": r.get('strategy_type', 'squeeze')
+                    "strategy_type": r.get('strategy_type', 'squeeze'),
+                    "roe": float(r.get('ROE', 0)) if r.get('ROE') is not None else None,
+                    "net_profit_yoy": float(r.get('净利YOY', 0)) if r.get('净利YOY') is not None else None
                 })
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
@@ -306,7 +310,9 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
                 "北向": row['north_money'],
                 "共振": row['resonance'],
                 "影线比": row['shadow_ratio'],
-                "strategy_type": row.get('strategy_type', 'squeeze')
+                "strategy_type": row.get('strategy_type', 'squeeze'),
+                "ROE": row.get('roe'),
+                "净利YOY": row.get('net_profit_yoy')
             })
         return results
     except Exception as e:

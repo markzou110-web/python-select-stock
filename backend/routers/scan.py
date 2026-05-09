@@ -340,6 +340,25 @@ def run_market_scan_task(
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"数据预处理失败: {str(e)}")
 
+        # 加载基本面数据
+        fund_map = {}
+        try:
+            with engine.connect() as conn:
+                from sqlalchemy import text
+                fund_res = conn.execute(text("SELECT code, roe, net_profit_yoy, revenue_yoy, label FROM stock_fundamentals")).fetchall()
+                for r in fund_res:
+                    # 强制使用字符串作为 Key，防止 pandas 类型推断导致 int/str 匹配失败
+                    code_key = str(r[0])
+                    fund_map[code_key] = {
+                        "roe": float(r[1]) if r[1] is not None else 0.0,
+                        "net_profit_yoy": float(r[2]) if r[2] is not None else 0.0,
+                        "revenue_yoy": float(r[3]) if r[3] is not None else 0.0,
+                        "label": str(r[4]) if r[4] is not None else ""
+                    }
+                logger.info(f"Loaded fundamentals for {len(fund_map)} stocks from database.")
+        except Exception as e:
+            logger.error(f"Failed to load fundamentals: {e}")
+
         # 并发扫描逻辑 - 执行策略筛选和周线确认
         workers = 24  # 向量化后主压力在周线重采样，可提高并发
         logger.info(f"Starting strategy scan for {len(candidates)} stocks (workers={workers})...")
@@ -357,7 +376,7 @@ def run_market_scan_task(
                     threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
                     local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
                     bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days,
-                    weekly_ma_period=weekly_ma_period
+                    weekly_ma_period=weekly_ma_period, fund_data=fund_map.get(str(row['code']))
                 ): row for _, row in candidates.iterrows()
             }
 

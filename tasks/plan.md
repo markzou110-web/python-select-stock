@@ -7,11 +7,9 @@
 
 ## 模块 A: 回测可视化 (Visual Backtesting) — 最高优先级
 
-### A1: K线图买卖点标注 (Chart Overlays)
+### A1: K线图买卖点标注 (Chart Overlays) - **✅ 已完成**
 
-**现状**: KLineChart.tsx 使用 Lightweight Charts，只显示价格+EMA，无标记功能。
-
-**方案**:
+**现状**: 已在 `KLineChart.tsx` 中使用 Lightweight Charts 实现了买卖点标记（Buy/Sell Arrows）和移动止损轨迹线，并在后端 `strategy.py` 提供了对应的数据接口。
 
 #### 后端改动
 - **文件**: `backend/routers/stock.py`
@@ -45,7 +43,7 @@
   - 展开行加载K线图时，同时请求 signals 数据
   - 将 signals 传递给 KLineChart 组件
 
-### A2: 参数寻优热力图 (Optimization Grid)
+### A2: 参数寻优热力图 (Optimization Grid) - **✅ 已完成**
 
 **方案**:
 
@@ -88,7 +86,7 @@
 
 ## 模块 B: 全自动追踪与推送 (Automation & Notification)
 
-### B1: 定时扫描雷达
+### B1: 定时扫描雷达 - **✅ 已完成**
 
 **现状**: `IntradaySentinel` 用 `threading.Thread` + `time.sleep(30)` 轮询，仅支持单次触发。
 
@@ -106,7 +104,8 @@
 - **文件**: `backend/core/config.py`
   - 新增配置: `SENTINEL_SCHEDULE_TIMES` (逗号分隔的时间点列表)
 
-### B2: 多渠道 WebHook 推送
+### B2: 多渠道 WebHook 推送 - **⚠️ 部分完成/暂停**
+*(注: 核心代码 `notifier.py` 已具备多渠道能力，但根据用户要求，前端配置暂时仅保留 Bark 手机推送，其余渠道暂缓配置 UI 接入)*
 
 **方案**:
 
@@ -138,7 +137,7 @@
 
 ---
 
-## 模块 C: 基本面因子融合 (Fundamental Alpha)
+## 模块 C: 基本面因子融合 (Fundamental Alpha) - **✅ 已完成**
 
 ### C1: 财务指标接入
 

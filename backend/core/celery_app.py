@@ -11,7 +11,7 @@ celery_app = Celery(
     "alphavision_tasks",
     broker=redis_url,
     backend=redis_url,
-    include=["routers.scan"] # 注册 task 所在的模块
+    include=["routers.scan", "core.tasks"] # 注册 task 所在的模块
 )
 
 # 检查 Redis 连通性，如果不通则退化为单机同步模式
@@ -35,6 +35,13 @@ celery_app.conf.update(
     task_time_limit=3600, # 一次任务最长1小时
     task_always_eager=not redis_available, # 如果没有 Redis，就在当前线程同步执行！
     task_eager_propagates=True,
+    # 定时任务配置 (Beat)
+    beat_schedule={
+        'check-alerts-every-5-minutes': {
+            'task': 'tasks.check_realtime_alerts',
+            'schedule': 300.0, # 每 5 分钟检查一次
+        },
+    },
 )
 
 if __name__ == "__main__":

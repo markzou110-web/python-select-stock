@@ -525,9 +525,11 @@ def _calculate_fundamental_score(fund_data: Optional[Dict[str, Any]]) -> tuple[f
         elif net_profit_yoy >= 15:
             fund_score += 10
             
+    # 只有当 fund_data 确实存在时，才返回具体数值（允许 0.0 和负数显示）
+    # 如果 fund_data 为 None，则返回 None 供前端渲染 '---'
     return fund_score, {
-        "ROE": round(roe, 2) if roe else None,
-        "净利YOY": round(net_profit_yoy, 2) if net_profit_yoy else None
+        "ROE": round(roe, 2) if fund_data is not None else None,
+        "净利YOY": round(net_profit_yoy, 2) if fund_data is not None else None
     }
 
 
@@ -936,3 +938,96 @@ def calculate_consensus_win_rate(df, stop_loss_pct=-8.0):
         )
     except Exception:
         return empty_result
+
+def evaluate_exit_signals(
+    df: pd.DataFrame, 
+    entry_price: float, 
+    high_since_entry: float,
+    stop_loss_pct: float = -8.0
+) -> List[Dict[str, str]]:
+    """
+    高度优化的卖出/预警评估引擎。
+    支持：保本逻辑、阶梯移动止损、趋势破位、量能见顶。
+    
+    Returns:
+        List of {"level": "warning"|"critical", "reason": "...", "suggestion": "..."}
+    """
+    if df.empty or entry_price <= 0:
+        return []
+
+    latest = df.iloc[-1]
+    curr_price = float(latest['收盘'])
+    high_price = max(high_since_entry, float(latest['最高']))
+    
+    pl_pct = (curr_price - entry_price) / entry_price * 100
+    max_pl_pct = (high_price - entry_price) / entry_price * 100
+    
+    alerts = []
+
+    # --- 1. 绝对止损 (Survival First) ---
+    if pl_pct <= stop_loss_pct:
+        alerts.append({
+            "level": "critical",
+            "reason": f"触及硬性止损位 ({stop_loss_pct}%)",
+            "suggestion": "触发风控底线，建议无条件平仓"
+        })
+        return alerts # 止损优先级最高，直接返回
+
+    # --- 2. 保本逻辑 (Protect Capital) ---
+    # 如果曾经盈利超过 5%，但现在跌回 +1% 以内
+    if max_pl_pct >= 5.0 and pl_pct <= 1.0:
+        alerts.append({
+            "level": "critical",
+            "reason": "触发保本机制（盈利后回撤至成本线）",
+            "suggestion": "防止盈利转亏损，建议止损出局"
+        })
+
+    # --- 3. 阶梯移动止损 (Trailing Stop) ---
+    # 盈利 > 30%: 允许从最高点回落 5%
+    if max_pl_pct >= 30.0:
+        if curr_price < high_price * 0.95:
+            alerts.append({
+                "level": "critical",
+                "reason": f"高位大幅回撤 ({round(high_price/curr_price*100-100, 1)}%)",
+                "suggestion": "触发 30% 档位移动止损，建议落袋为安"
+            })
+    # 盈利 > 15%: 允许从最高点回落 8%
+    elif max_pl_pct >= 15.0:
+        if curr_price < high_price * 0.92:
+            alerts.append({
+                "level": "warning",
+                "reason": "触及 15% 档位移动止盈线",
+                "suggestion": "建议减仓 50% 或收紧止损"
+            })
+
+    # --- 4. 技术趋势破位 (Trend Break) ---
+    ema5 = latest.get('EMA5', 0)
+    ema20 = latest.get('EMA20', 0)
+    
+    if curr_price < ema20 and ema20 > 0:
+        if curr_price < ema5:
+            alerts.append({
+                "level": "warning",
+                "reason": "双均线破位 (EMA5+EMA20)",
+                "suggestion": "短期趋势走坏，建议观察是否有反抽卖点"
+            })
+        else:
+            alerts.append({
+                "level": "none", # 仅提醒
+                "reason": "跌破 20 日波段线",
+                "suggestion": "关注支撑强度"
+            })
+
+    # --- 5. 情绪/量能见顶 (Climax) ---
+    vol = float(latest['成交量'])
+    vol_ma = latest.get('Vol_MA20', 0)
+    is_red = curr_price < float(latest['开盘'])
+    
+    if vol > vol_ma * 3.0 and is_red:
+        alerts.append({
+            "level": "warning",
+            "reason": "放量滞涨/阴线 (3倍巨量)",
+            "suggestion": "疑似主力高位出货，建议先行了结"
+        })
+
+    return alerts

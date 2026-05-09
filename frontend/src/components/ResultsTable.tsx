@@ -16,12 +16,14 @@ import {
     Lock,
     Calendar,
     Plus,
-    Calculator as CalcIcon
+    Calculator as CalcIcon,
+    Settings2
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import dynamic from 'next/dynamic';
 const KLineChart = dynamic(() => import('./KLineChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
 import PositionSizer from './PositionSizer';
+import HeatmapOptimizer from './HeatmapOptimizer';
 import api from '@/lib/api';
 import { ScanResult } from '@/stores/scanStore';
 export default function ResultsTable({
@@ -35,6 +37,7 @@ export default function ResultsTable({
 }) {
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
     const [sizingStock, setSizingStock] = useState<ScanResult | null>(null);
+    const [optimizingStock, setOptimizingStock] = useState<ScanResult | null>(null);
     const [remarkStock, setRemarkStock] = useState<ScanResult | null>(null);
     const [remarkText, setRemarkText] = useState('');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
@@ -323,6 +326,13 @@ export default function ResultsTable({
                 <td className="px-8 py-5 text-right">
                     <div className="flex items-center justify-end gap-2">
                         <button
+                            onClick={(e) => { e.stopPropagation(); setOptimizingStock(res); }}
+                            className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
+                            title="参数寻优"
+                        >
+                            <Settings2 size={18} />
+                        </button>
+                        <button
                             onClick={(e) => { e.stopPropagation(); setSizingStock(res); }}
                             className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
                             title="仓位计算"
@@ -573,6 +583,15 @@ export default function ResultsTable({
                 <PositionSizer
                     stock={sizingStock}
                     onClose={() => setSizingStock(null)}
+                />
+            )}
+
+            {optimizingStock && (
+                <HeatmapOptimizer
+                    code={optimizingStock.代码}
+                    name={optimizingStock.名称}
+                    strategy={optimizingStock.strategy_type || 'squeeze'}
+                    onClose={() => setOptimizingStock(null)}
                 />
             )}
 

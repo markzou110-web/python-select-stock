@@ -43,6 +43,8 @@ def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
         
         df_hist = pd.read_sql(query, engine, params=params)
         
+        from core.strategy import evaluate_exit_signals
+        
         alerts = []
         
         for idx, row in df_paper.iterrows():
@@ -50,74 +52,64 @@ def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
             entry_price = float(row['entry_price'])
             name = row['name']
             trade_id = row['id']
+            high_since_entry = float(row.get('high_since_entry') or entry_price)
             
             stock_hist = df_hist[df_hist['code'] == code].copy()
-            if len(stock_hist) == 0:
+            if len(stock_hist) < 20:
                 continue
                 
             # 计算指标
             try:
+                # 传入 current_price 以便包含今日实时涨跌
                 stock_labeled = calculate_indicators(stock_hist)
                 if stock_labeled.empty:
                     continue
+                
                 latest_data = stock_labeled.iloc[-1]
+                current_price = float(latest_data['收盘'])
+                pl_pct = (current_price - entry_price) / entry_price * 100
+                
+                # 调用新的核心评估引擎
+                exit_signals = evaluate_exit_signals(
+                    stock_labeled, 
+                    entry_price, 
+                    high_since_entry, 
+                    stop_loss_pct=stop_loss_pct
+                )
+                
+                if exit_signals:
+                    # 汇总信号
+                    reasons = [s['reason'] for s in exit_signals if s['level'] != 'none']
+                    if not reasons: # 如果只有 none 级别的信号
+                        reasons = [exit_signals[0]['reason']]
+                        
+                    # 取最高风险等级
+                    levels = [s['level'] for s in exit_signals]
+                    top_level = "critical" if "critical" in levels else ("warning" if "warning" in levels else "none")
+                    
+                    # 取第一个建议
+                    suggestion = next((s['suggestion'] for s in exit_signals if s['level'] == top_level), exit_signals[0]['suggestion'])
+
+                    alerts.append({
+                        "id": trade_id,
+                        "code": code,
+                        "name": name,
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "pl_pct": round(pl_pct, 2),
+                        "level": top_level,
+                        "reasons": reasons,
+                        "suggestion": suggestion,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    
             except Exception as e:
-                logger.error(f"Error calculating indicators for {code}: {e}")
+                logger.error(f"Error processing alert for {code}: {e}")
                 continue
                 
-            current_price = float(latest_data['收盘'])
-            pl_pct = (current_price - entry_price) / entry_price * 100
-            ema20 = float(latest_data.get('EMA20', 0))
-            
-            reasons = []
-            level = "none"
-            suggestion = ""
-            
-            # 告警规则 1: 触及止损
-            if pl_pct <= stop_loss_pct:
-                reasons.append(f"跌破止损阈值 ({stop_loss_pct}%)")
-                level = "critical"
-                suggestion = "建议无条件平仓"
-            
-            # 告警规则 2: 跌破 20 日均线 (波段支撑)
-            if current_price < ema20 and ema20 > 0:
-                reasons.append(f"跌破波段支撑线 (MA20: {ema20:.2f})")
-                if level != "critical":
-                    level = "warning"
-                    suggestion = "建议减仓或开启保护止损"
-            
-            # 告警规则 3: 高位大幅回落 (如果当前盈利较高但今日大跌)
-            # 例如: 收盘距离最高价跌幅超过 5% 且带有长上影线
-            try:
-                body = abs(float(latest_data['收盘']) - float(latest_data['开盘']))
-                upper_shadow = float(latest_data['最高']) - max(float(latest_data['收盘']), float(latest_data['开盘']))
-                shadow_ratio = upper_shadow / body if body > 0 else 0
-                day_drop = (float(latest_data['最高']) - current_price) / float(latest_data['最高']) * 100
-                if shadow_ratio > 1.5 and day_drop > 4:
-                    reasons.append("出现长上影线且高位回落，抛压较重")
-                    if level != "critical":
-                        level = "warning"
-                        suggestion = "关注趋势反转风险，建议锁定部分利润"
-            except Exception:
-                pass
-            
-            if len(reasons) > 0:
-                alerts.append({
-                    "id": trade_id,
-                    "code": code,
-                    "name": name,
-                    "entry_price": entry_price,
-                    "current_price": current_price,
-                    "pl_pct": round(pl_pct, 2),
-                    "ema20": round(ema20, 2),
-                    "level": level,  # 'warning' or 'critical'
-                    "reasons": reasons,
-                    "suggestion": suggestion,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
         # 按风险等级排序 (critical 优先于 warning)
-        alerts.sort(key=lambda x: 0 if x['level'] == 'critical' else 1)
+        level_map = {"critical": 0, "warning": 1, "none": 2}
+        alerts.sort(key=lambda x: level_map.get(x['level'], 9))
                 
         return {"alerts": alerts}
         

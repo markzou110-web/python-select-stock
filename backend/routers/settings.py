@@ -15,7 +15,11 @@ router = APIRouter(prefix="/api", tags=["settings"])
 @router.get("/settings")
 def get_settings_api() -> Dict[str, Any]:
     """获取系统设置（不暴露敏感信息）"""
-    return config.get_bark_safe_status()
+    return {
+        "configured": config.is_bark_configured(),
+        "sentinel_time": get_setting("sentinel_time", config.SENTINEL_DEFAULT_TIME),
+        "sentinel_schedule_times": get_setting("sentinel_schedule_times", "14:20")
+    }
 
 
 @router.post("/settings")

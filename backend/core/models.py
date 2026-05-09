@@ -39,6 +39,8 @@ class ScanHistory(Base):
     resonance = Column(String(50))
     shadow_ratio = Column(Float)
     strategy_type = Column(String(20))
+    roe = Column(Float, nullable=True)
+    net_profit_yoy = Column(Float, nullable=True)
 
 class PaperTrading(Base):
     __tablename__ = "paper_trading"

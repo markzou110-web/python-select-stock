@@ -37,7 +37,11 @@ _ALL_CHANNELS: list[str] = ["bark", "feishu", "dingtalk", "wecom"]
 # ---------------------------------------------------------------------------
 
 def _bark_key() -> str:
-    """Return the Bark key from the environment, or an empty string."""
+    """Return the Bark key from DB settings (priority) or environment."""
+    from core.db import get_setting
+    db_key = get_setting("bark_key")
+    if db_key:
+        return str(db_key).strip()
     return os.getenv("BARK_KEY", "")
 
 
