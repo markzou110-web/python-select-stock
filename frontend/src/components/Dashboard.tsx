@@ -61,7 +61,10 @@ export default function Dashboard() {
     useEffect(() => {
         const init = async () => {
             useMarketStore.setState({ loading: true });
-            setLastUpdated(new Date().toLocaleTimeString());
+            const now = new Date();
+            const dateStr = now.toISOString().split('T')[0];
+            const timeStr = now.toLocaleTimeString();
+            setLastUpdated(`${dateStr} ${timeStr}`);
             await Promise.all([
                 fetchMarketData(), 
                 fetchSyncStatus(), 

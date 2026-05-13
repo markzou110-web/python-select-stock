@@ -65,9 +65,16 @@ class IntradaySentinel:
         self.schedule_times = ["14:20"]
         self.triggered_today = set()
 
-    def _load_schedule(self):
-        times_str = get_setting("sentinel_schedule_times", "14:20")
+    def update_schedule(self, times_str: Optional[str] = None):
+        """实时更新调度时间点"""
+        if times_str is None:
+            times_str = get_setting("sentinel_schedule_times", "14:20")
         self.schedule_times = [t.strip() for t in times_str.split(",") if t.strip()]
+        logger.info(f"Sentinel schedule updated to: {self.schedule_times}")
+
+    def _load_schedule(self):
+        # 保持兼容性调用 update_schedule
+        self.update_schedule()
 
     def start(self):
         self._load_schedule()
@@ -89,8 +96,8 @@ class IntradaySentinel:
                 logger.info(f"Sentinel Triggered at {current_time}: Automated check...")
                 self.triggered_today.add(current_time)
                 try:
-                    from routers.scan import run_market_scan
-                    results = run_market_scan(local_only=True)
+                    from routers.scan import run_market_scan_task
+                    results = run_market_scan_task(local_only=False)
                     if results:
                         self.last_top_5 = results[:5]
                         send_intraday_notification(self.last_top_5)
@@ -162,6 +169,7 @@ if config.RATE_LIMIT_ENABLED:
         path = request.url.path
         # Exempt WebSocket, health checks, and status polling
         if (path.startswith("/api/ws") or 
+            path.startswith("/api/scan/status") or
             path in ("/docs", "/openapi.json", "/api/health", "/api/sync/status")):
             return await call_next(request)
 

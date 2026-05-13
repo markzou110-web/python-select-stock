@@ -17,17 +17,25 @@ def get_settings_api() -> Dict[str, Any]:
     """获取系统设置（不暴露敏感信息）"""
     return {
         "configured": config.is_bark_configured(),
-        "sentinel_time": get_setting("sentinel_time", config.SENTINEL_DEFAULT_TIME),
+        "bark_key": get_setting("bark_key", ""),
         "sentinel_schedule_times": get_setting("sentinel_schedule_times", "14:20")
     }
 
 
 @router.post("/settings")
 def save_settings_api(data: dict):
-    if "sentinel_time" in data:
-        save_setting("sentinel_time", data["sentinel_time"])
+    if "bark_key" in data:
+        save_setting("bark_key", data["bark_key"])
     if "sentinel_schedule_times" in data:
+        # 保存设置
         save_setting("sentinel_schedule_times", data["sentinel_schedule_times"])
+        
+        # 实时通知后台哨兵更新调度时间
+        try:
+            from api import sentinel
+            sentinel.update_schedule(data["sentinel_schedule_times"])
+        except Exception:
+            pass
     return {"status": "success"}
 
 

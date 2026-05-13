@@ -344,7 +344,6 @@ def run_market_scan_task(
         fund_map = {}
         try:
             with engine.connect() as conn:
-                from sqlalchemy import text
                 fund_res = conn.execute(text("SELECT code, roe, net_profit_yoy, revenue_yoy, label FROM stock_fundamentals")).fetchall()
                 for r in fund_res:
                     # 强制使用字符串作为 Key，防止 pandas 类型推断导致 int/str 匹配失败

@@ -10,8 +10,14 @@ from dotenv import load_dotenv
 # Load .env file if exists
 load_dotenv()
 
+import platform
+
 # Base directory
 BASE_DIR = Path(__file__).parent.parent
+
+# macOS Fork Safety Fix
+if platform.system() == "Darwin":
+    os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
 
 class Config:
@@ -114,6 +120,10 @@ class Config:
             os.environ['HTTPS_PROXY'] = ''
             os.environ['http_proxy'] = ''
             os.environ['https_proxy'] = ''
+        
+        # Ensure fork safety on macOS is set during setup as well
+        if platform.system() == "Darwin":
+            os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
 
 # Global config instance

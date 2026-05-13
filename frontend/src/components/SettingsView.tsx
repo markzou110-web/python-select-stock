@@ -138,13 +138,14 @@ export default function SettingsView() {
                                 Bark 推送 Key (当前库)
                             </label>
                             <input
-                                type="password"
-                                value={settings.bark_key}
-                                disabled
-                                className="w-full bg-slate-100 border border-slate-100 text-slate-400 font-mono font-bold rounded-xl px-4 py-3 cursor-not-allowed"
+                                type="text"
+                                value={settings.bark_key || ""}
+                                onChange={(e) => setSettings({ ...settings, bark_key: e.target.value })}
+                                placeholder="输入您的 Bark Key"
+                                className="w-full bg-slate-50 border border-slate-100 text-slate-600 font-mono font-bold rounded-xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 focus:bg-white transition-all"
                             />
                             <p className="text-[10px] text-slate-400 font-medium">
-                                🔒 已通过后台环境配置文件加载。如需修改，请直接编辑 `backend/api.py` 中的 BARK_KEY。
+                                🔒 保存后将优先使用此 Key。如果为空，则使用 .env 文件中的默认配置。
                             </p>
                         </div>
                     </div>

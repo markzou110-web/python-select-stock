@@ -4,6 +4,9 @@
 # 设置 PATH（确保 Homebrew 和用户路径可用）
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+# macOS Fork Safety Fix (防止 Celery Worker 在并行扫描时崩溃)
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
+
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
