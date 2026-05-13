@@ -104,20 +104,25 @@ def calculate_pine_indicators(df):
     low = df['最低'].values
     open_p = df['开盘'].values
     
-    # --- 1. Range Filter (DonovanWall 精确实现) ---
+    # --- 1. Range Filter (DonovanWall 精确实现 - TV Pine Script 对齐) ---
     # TV 参数: Sampling Period = 50, Range Multiplier = 3.0
+    # 关键修正: TV 原版使用 EMA 而非 SMA 来平滑波动量
     wper = 50
     avgt = 3.0
     
     abs_diff = np.abs(close - np.roll(close, 1))
     abs_diff[0] = 0
-    # 使用 SMA 计算平均波动量
-    rng = pd.Series(abs_diff).rolling(window=wper).mean().values * avgt
+    
+    # TV Pine Script 原版: smoothrng = ema(abs(close - close[1]), per) * mult
+    # 第一次 EMA 平滑
+    smooth1 = pd.Series(abs_diff).ewm(span=wper, adjust=False).mean().values
+    # TV 原版对结果再做一次 EMA 平滑: smrng = ema(smoothrng, per)
+    rng = pd.Series(smooth1).ewm(span=wper, adjust=False).mean().values * avgt
     
     rf_filter = np.zeros(len(close))
     rf_filter[0] = close[0]
     
-    # 递归过滤算法 (创建步进效果)
+    # 递归过滤算法 (TV 原版: Type 1 filter)
     for i in range(1, len(close)):
         curr_rng = rng[i] if not np.isnan(rng[i]) else 0
         if close[i] > rf_filter[i-1]:
@@ -127,10 +132,10 @@ def calculate_pine_indicators(df):
             # 价格下跌时，过滤线跟随下跌 (取最小值)
             rf_filter[i] = min(rf_filter[i-1], close[i] + curr_rng)
 
-    # 状态判断 (TV 逻辑: 价格穿透过滤器)
-    # 本次更新重点：只有价格在过滤线上方 且 过滤线不再下降时才算 Up
+    # 状态判断 (TV 逻辑: 价格穿透过滤器且过滤线方向一致)
     rf_up = (close > rf_filter) & (rf_filter >= np.roll(rf_filter, 1))
     rf_down = (close < rf_filter) & (rf_filter <= np.roll(rf_filter, 1))
+
     
     # --- 2. QQE Mod (3-9-21-55 灵敏版本) ---
     # 对齐截图参数: RSI=3, Smoothing=5, Factor=3
