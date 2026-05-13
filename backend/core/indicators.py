@@ -132,9 +132,10 @@ def calculate_pine_indicators(df):
             # 价格下跌时，过滤线跟随下跌 (取最小值)
             rf_filter[i] = min(rf_filter[i-1], close[i] + curr_rng)
 
-    # 状态判断 (TV 逻辑: 价格穿透过滤器且过滤线方向一致)
-    rf_up = (close > rf_filter) & (rf_filter >= np.roll(rf_filter, 1))
-    rf_down = (close < rf_filter) & (rf_filter <= np.roll(rf_filter, 1))
+    # 状态判断 (TV 逻辑: 价格在过滤线上方 且 过滤线严格上升才算看涨)
+    # 关键: 过滤线持平时为中性状态，不算看涨也不算看跌
+    rf_up = (close > rf_filter) & (rf_filter > np.roll(rf_filter, 1))
+    rf_down = (close < rf_filter) & (rf_filter < np.roll(rf_filter, 1))
 
     
     # --- 2. QQE Mod (3-9-21-55 灵敏版本) ---
