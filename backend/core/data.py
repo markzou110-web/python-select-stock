@@ -289,6 +289,45 @@ def get_hot_sectors() -> List[Dict[str, Any]]:
 
     return []
 
+def get_sector_trends() -> Dict[str, Dict[str, Any]]:
+    """获取全行业板块涨跌趋势，用于 SOP 大盘-板块-个股联动（缓存 10 分钟）
+    
+    Returns:
+        Dict: { '半导体': {'pct': 3.2, 'trend': 'LEAD', 'lead_stock': 'xxx'}, ... }
+        trend 分类: LEAD(领涨≥2%), FOLLOW(跟涨0~2%), FLAT(横盘-1~0%), DOWN(下跌<-1%)
+    """
+    cached = get_cached_data('sector_trends', 600)
+    if cached:
+        return cached
+
+    trends = {}
+    try:
+        df = ak.stock_board_industry_name_em()
+        if not df.empty:
+            for _, row in df.iterrows():
+                pct = float(row['涨跌幅'])
+                if pct >= 2.0:
+                    trend = 'LEAD'
+                elif pct >= 0:
+                    trend = 'FOLLOW'
+                elif pct >= -1.0:
+                    trend = 'FLAT'
+                else:
+                    trend = 'DOWN'
+
+                trends[row['板块名称']] = {
+                    'pct': round(pct, 2),
+                    'trend': trend,
+                    'lead_stock': row.get('领涨股票', '')
+                }
+            set_cached_data('sector_trends', trends)
+            logger.info(f"Sector trends loaded: {len(trends)} sectors, "
+                        f"LEAD={sum(1 for v in trends.values() if v['trend']=='LEAD')}, "
+                        f"DOWN={sum(1 for v in trends.values() if v['trend']=='DOWN')}")
+    except Exception as e:
+        logger.warning(f"Sector trends fetch error: {e}")
+    return trends
+
 def get_sector_map() -> Dict[str, str]:
     """获取全市场个股行业映射 (重量级操作，优先读取数据库)"""
     # 1. 内存缓存

@@ -475,6 +475,23 @@ def run_market_scan_task(
                                 industry = industry_val[0]
                     except Exception: pass
                 res['行业'] = industry
+
+                # 3. SOP 新增字段
+                if df_hist is not None and len(df_hist) >= 6:
+                    close_now = float(df_hist['收盘'].iloc[-1])
+                    close_5d_ago = float(df_hist['收盘'].iloc[-6])
+                    res['pct_5d'] = round((close_now - close_5d_ago) / close_5d_ago * 100, 2)
+                else:
+                    res['pct_5d'] = 0.0
+
+                # 入场价 (当日最高价作为突破确认位) 和 止损价 (-8%)
+                if df_hist is not None and not df_hist.empty:
+                    res['entry_price'] = round(float(df_hist['最高'].iloc[-1]), 2)
+                    res['stop_price'] = round(float(res['entry_price']) * 0.92, 2)
+                else:
+                    res['entry_price'] = res.get('现价', 0)
+                    res['stop_price'] = round(float(res.get('现价', 0)) * 0.92, 2)
+
             except Exception as e:
                 logger.error(f"Supplement error for {res.get('代码')}: {e}")
             return res
@@ -507,9 +524,42 @@ def run_market_scan_task(
             if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
             res['warnings'] = warnings
 
-        # Update Sentinel memory
+        # --- SOP: 注入流通市值 (从快照数据) ---
+        snap_mkt_map = {}
+        if not snapshot_df.empty and 'mkt_cap' in snapshot_df.columns:
+            for _, row in snapshot_df.iterrows():
+                snap_mkt_map[str(row['code'])] = row.get('mkt_cap', 0)
+        for res in results:
+            mkt_raw = snap_mkt_map.get(res['代码'], 0)
+            res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
+
+        # --- SOP: 大盘-板块-个股联动过滤 ---
+        from core.data import get_sector_trends, get_market_regime
+        sector_trends = get_sector_trends()
+        market_regime = get_market_regime()
+
+        # 注入板块走势到每个结果
+        for res in results:
+            sector = res.get('行业', '')
+            s_info = sector_trends.get(sector, {})
+            res['sector_trend'] = s_info.get('trend', 'UNKNOWN')
+            res['sector_pct'] = s_info.get('pct', 0)
+
+        # 应用 SOP 等级评定
+        _apply_sop_filter(results, market_regime, sector_trends)
+        logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
+                    f"B={sum(1 for r in results if r.get('sop_grade')=='B')}, "
+                    f"C={sum(1 for r in results if r.get('sop_grade')=='C')}, "
+                    f"D={sum(1 for r in results if r.get('sop_grade')=='D')}")
+
+        # 按 SOP 等级排序: A > B > C > D, 同等级内按 Score 排序
+        grade_order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+        results = sorted(results, key=lambda x: (grade_order.get(x.get('sop_grade', 'D'), 3), -x.get('Score', 0)))
+
+        # Update Sentinel memory (仅 A/B 级)
         from api import sentinel
-        sentinel.last_top_5 = results[:5]
+        ab_results = [r for r in results if r.get('sop_grade') in ('A', 'B')]
+        sentinel.last_top_5 = ab_results[:5] if ab_results else results[:5]
 
         # --- 持久化保存 ---
         save_scan_results(results, engine)
@@ -517,10 +567,10 @@ def run_market_scan_task(
         ws_manager.broadcast_threadsafe({
             "type": "scan_end",
             "matches": len(results),
-            "message": "扫描完成！"
+            "message": f"扫描完成！A级{sum(1 for r in results if r.get('sop_grade')=='A')}只 B级{sum(1 for r in results if r.get('sop_grade')=='B')}只"
         })
 
-        # 在结果中注入数据日期，方便前端展示涨幅对应哪一天
+        # 在结果中注入数据日期
         scan_data_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
         for res in results:
             res['data_date'] = scan_data_date
@@ -533,6 +583,80 @@ def run_market_scan_task(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _apply_sop_filter(results, market_regime, sector_trends):
+    """SOP 过滤引擎：对扫描结果应用硬性条件、一票否决、加分项，生成 A/B/C/D 等级"""
+    regime_status = market_regime.get('status', 'UNKNOWN')
+
+    for res in results:
+        vetoes = []
+        checks = []
+        bonuses = []
+
+        # ── 一票否决 ──
+        if res.get('涨幅%', 0) > 7:
+            vetoes.append("涨幅>7%")
+        if res.get('影线比', 0) > 0.5:
+            vetoes.append("上影线过长")
+        if res.get('pct_5d', 0) > 15:
+            vetoes.append("5日涨>15%")
+        if res.get('warnings') and len(res['warnings']) > 0:
+            vetoes.append("地雷预警")
+        if 0 < res.get('mkt_cap_yi', 0) < 30:
+            vetoes.append("市值<30亿")
+
+        # 板块下跌否决
+        sector = res.get('行业', '')
+        sector_info = sector_trends.get(sector, {})
+        if sector_info.get('trend') == 'DOWN':
+            vetoes.append("板块下跌")
+
+        # ── 硬性条件 ──
+        win_rate_str = res.get('历史胜率', '0%')
+        try:
+            win_rate = float(str(win_rate_str).replace('%', ''))
+        except (ValueError, TypeError):
+            win_rate = 0
+        pf = res.get('回测统计', {}).get('profit_factor', 0)
+        try:
+            pf = float(pf)
+        except (ValueError, TypeError):
+            pf = 0
+
+        if win_rate >= 50:
+            checks.append("胜率≥50%")
+        if pf >= 1.5:
+            checks.append("盈亏比≥1.5")
+        if regime_status != "CRITICAL":
+            checks.append("大盘安全")
+
+        # ── 加分项 ──
+        if res.get('共振') == "🔥 核心热点":
+            bonuses.append("板块共振")
+        if (res.get('ROE') or 0) >= 8:
+            bonuses.append("ROE≥8%")
+        if (res.get('净利YOY') or 0) >= 15:
+            bonuses.append("业绩增长")
+        if sector_info.get('trend') == 'LEAD':
+            bonuses.append("板块领涨")
+        if regime_status == "OFFENSIVE":
+            bonuses.append("大盘进攻")
+
+        # ── 综合评级 ──
+        if vetoes:
+            grade = "D"
+        elif len(checks) >= 3 and len(bonuses) >= 2:
+            grade = "A"
+        elif len(checks) >= 2:
+            grade = "B"
+        else:
+            grade = "C"
+
+        res['sop_grade'] = grade
+        res['sop_vetoes'] = vetoes
+        res['sop_checks'] = checks
+        res['sop_bonuses'] = bonuses
 
 
 def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20, fund_data=None):

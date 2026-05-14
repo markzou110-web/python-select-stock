@@ -35,26 +35,68 @@ socket.setdefaulttimeout(config.AKSHARE_TIMEOUT)  # 防止网络请求无限挂�
 def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str]:
     """
     Sends a push notification via the Notifier for the Sentinel.
+    Only sends A/B grade stocks with actionable information.
     """
     if not stock_list:
         return None
 
-    names = [s.get('名称', s.get('name', '')) for s in stock_list]
-    codes = [s.get('代码', s.get('code', '')) for s in stock_list]
+    # 仅推送 A 和 B 级标的
+    ab_stocks = [s for s in stock_list if s.get('sop_grade') in ('A', 'B')]
+    if not ab_stocks:
+        logger.info("Sentinel: No A/B grade stocks to push.")
+        return None
 
-    title = "Alpha Vision 哨兵提醒"
-    body = f"【自动巡检确认】\n发现 {len(names)} 只标的走势稳健：\n" + "、".join([f"{n}({c})" for n, c in zip(names, codes)])
+    # 获取大盘状态
+    regime_emoji = {"OFFENSIVE": "🚀 进攻模式", "DEFENSIVE": "⚠️ 防守模式", "CRITICAL": "🛡️ 严格防守"}
+    from core.data import get_market_regime
+    regime = get_market_regime()
+    regime_str = regime_emoji.get(regime.get('status', ''), '❓ 未知')
 
+    now_str = datetime.now().strftime("%H:%M")
+    title = f"Alpha Vision 哨兵 {now_str}"
+
+    lines = [f"大盘：{regime_str}", ""]
+    sector_emoji = {'LEAD': '🚀领涨', 'FOLLOW': '📈跟涨', 'FLAT': '➖横盘', 'DOWN': '📉下跌'}
+
+    for s in ab_stocks[:5]:
+        grade = s.get('sop_grade', '?')
+        grade_icon = "🟢" if grade == "A" else "🔵"
+        name = s.get('名称', s.get('name', ''))
+        code = s.get('代码', s.get('code', ''))
+        sector = s.get('行业', '')
+        s_trend = sector_emoji.get(s.get('sector_trend', ''), '')
+        s_pct = s.get('sector_pct', 0)
+        entry = s.get('entry_price', 0)
+        stop = s.get('stop_price', 0)
+        win_rate = s.get('历史胜率', 'N/A')
+        pf = s.get('回测统计', {}).get('profit_factor', 'N/A')
+
+        lines.append(f"{grade_icon} {grade}级 {name} ({code})")
+        if sector:
+            lines.append(f"  板块: {sector} {s_trend}{'+' if s_pct >= 0 else ''}{s_pct}%")
+        lines.append(f"  入场: {entry} | 止损: {stop}")
+        lines.append(f"  胜率: {win_rate} | 盈亏比: {pf}")
+        # 加分项
+        bonuses = s.get('sop_bonuses', [])
+        if bonuses:
+            lines.append(f"  ⭐ {'、'.join(bonuses)}")
+        lines.append("")
+
+    total_a = sum(1 for s in stock_list if s.get('sop_grade') == 'A')
+    total_b = sum(1 for s in stock_list if s.get('sop_grade') == 'B')
+    lines.append(f"A级{total_a}只 | B级{total_b}只")
+
+    body = "\n".join(lines)
     logger.info(f"Notification: {body}")
 
     from core.notifier import notifier
     try:
-        # 运行异步的 notifier.send
         asyncio.run(notifier.send(title, body, channels=["bark"]))
     except Exception as e:
         logger.error(f"Push notification failed: {e}")
 
     return body
+
 
 
 class IntradaySentinel:

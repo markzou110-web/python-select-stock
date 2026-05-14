@@ -24,6 +24,17 @@ export interface ScanResult {
     结构?: string;
     体质?: string;
     回测统计?: BacktestStats;
+    // SOP 等级系统
+    sop_grade?: 'A' | 'B' | 'C' | 'D';
+    sop_vetoes?: string[];
+    sop_checks?: string[];
+    sop_bonuses?: string[];
+    entry_price?: number;
+    stop_price?: number;
+    pct_5d?: number;
+    mkt_cap_yi?: number;
+    sector_trend?: string;
+    sector_pct?: number;
 }
 
 export interface BacktestStats {
