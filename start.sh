@@ -74,7 +74,7 @@ fi
 echo "检查 Redis 连接状态..."
 if nc -z localhost 6379 2>/dev/null || ping -c 1 localhost &> /dev/null; then
     echo "启动 Celery Worker (任务队列)..."
-    python3 -m celery -A core.celery_app.celery_app worker --loglevel=info > celery.log 2>&1 &
+    python3 -m celery -A core.celery_app.celery_app worker -B --loglevel=info > celery.log 2>&1 &
     CELERY_PID=$!
     echo "Celery PID: $CELERY_PID"
 else

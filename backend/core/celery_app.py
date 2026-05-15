@@ -2,6 +2,7 @@ from celery import Celery
 import os
 from .logging_config import logger
 from .config import config
+from celery.schedules import crontab
 
 import redis
 
@@ -40,6 +41,10 @@ celery_app.conf.update(
         'check-alerts-every-5-minutes': {
             'task': 'tasks.check_realtime_alerts',
             'schedule': 300.0, # 每 5 分钟检查一次
+        },
+        'daily-sync-at-1800': {
+            'task': 'tasks.daily_sync',
+            'schedule': crontab(hour=18, minute=0), # 每天下午 18:00 执行同步
         },
     },
 )

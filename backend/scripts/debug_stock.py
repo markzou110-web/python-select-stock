@@ -8,14 +8,14 @@ from core.strategy import check_pine_strategy, check_strategy
 from datetime import datetime, timedelta
 import pandas as pd
 
-code = "300598"  # 诚迈科技
+code = "002727"  # 一心堂
 print(f"\n{'='*60}")
-print(f"  诊断股票: {code} (诚迈科技)")
+print(f"  诊断股票: {code} (一心堂)")
 print(f"{'='*60}")
 
 # 1. 加载数据
 engine = get_db_engine()
-df = load_from_db(code, (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d"), engine)
+df = load_from_db(code, (datetime.now() - timedelta(days=1000)).strftime("%Y-%m-%d"), engine)
 print(f"\n[1] 数据加载: {len(df)} 条记录")
 print(f"    日期范围: {df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}")
 

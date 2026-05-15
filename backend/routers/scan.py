@@ -246,7 +246,8 @@ def run_market_scan_task(
         logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
         start_time = time.time()
         end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
-        start_date_hist = (datetime.strptime(end_date_hist, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+        # 深度修复：延长历史数据预热期至 1000 天（约 4 年），以确保 100/200 周期的长效 EMA 完全收敛，精确对齐 TradingView
+        start_date_hist = (datetime.strptime(end_date_hist, "%Y-%m-%d") - timedelta(days=1000)).strftime("%Y-%m-%d")
         candidate_codes = candidates['code'].tolist()
 
         dfs = []

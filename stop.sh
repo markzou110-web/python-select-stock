@@ -21,6 +21,17 @@ fi
 echo "清理所有残留的后端进程 (api.py)..."
 pkill -9 -f "api.py" && echo "  已清理" || echo "  未发现残留进程"
 
+# 2. 停止 Celery (任务队列和定时调度)
+if [ -f ".celery_pid" ]; then
+    CELERY_PID=$(cat .celery_pid)
+    echo "停止记录的 Celery (PID: $CELERY_PID)..."
+    kill $CELERY_PID 2>/dev/null
+    rm -f .celery_pid
+fi
+
+echo "清理所有残留的 Celery 进程..."
+pkill -9 -f "celery" && echo "  已清理" || echo "  未发现残留进程"
+
 # 2. 停止前端
 if [ -f ".frontend_pid" ]; then
     FRONTEND_PID=$(cat .frontend_pid)

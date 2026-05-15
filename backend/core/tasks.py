@@ -99,3 +99,19 @@ def check_realtime_alerts():
     except Exception as e:
         logger.error(f"Error in check_realtime_alerts task: {e}")
         return str(e)
+
+
+@celery_app.task(name="tasks.daily_sync")
+def daily_sync():
+    """
+    每天下午 18:00 自动执行全市场数据同步
+    """
+    logger.info("Starting scheduled daily data sync...")
+    try:
+        from routers.sync import background_sync_task
+        # background_sync_task 会处理多源同步、重试和错误处理
+        background_sync_task()
+        return "Daily sync completed successfully"
+    except Exception as e:
+        logger.error(f"Error in scheduled daily_sync task: {e}")
+        return str(e)

@@ -688,7 +688,9 @@ class MultiSourceSync:
             today = datetime.now().date()
 
             # 确保至少有 120 天的数据（用于 Pine Script 策略）
-            min_required_days = 120
+            # 深度修复：由于 Range Filter 等长线 EMA 需要充分的历史数据预热（长达 199 天的周期，需 3 倍即约 600 天以上才完全收敛）
+            # 将基础同步天数从 120 天上调至 1000 天，确保所有技术指标计算与 TradingView 绝对对齐
+            min_required_days = 1000
 
             if last_date:
                 # 检查数据天数是否足够

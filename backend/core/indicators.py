@@ -105,19 +105,19 @@ def calculate_pine_indicators(df):
     open_p = df['开盘'].values
     
     # --- 1. Range Filter (DonovanWall 精确实现 - TV Pine Script 对齐) ---
-    # TV 参数: Sampling Period = 50, Range Multiplier = 3.0
-    # 关键修正: TV 原版使用 EMA 而非 SMA 来平滑波动量
-    wper = 50
+    # TV 参数: 截图显示为默认。DonovanWall 默认 Sampling Period = 100, Range Multiplier = 3.0
+    wper = 100
+    wper2 = (wper * 2) - 1  # TV 原版: 199
     avgt = 3.0
     
     abs_diff = np.abs(close - np.roll(close, 1))
     abs_diff[0] = 0
     
-    # TV Pine Script 原版: smoothrng = ema(abs(close - close[1]), per) * mult
-    # 第一次 EMA 平滑
-    smooth1 = pd.Series(abs_diff).ewm(span=wper, adjust=False).mean().values
-    # TV 原版对结果再做一次 EMA 平滑: smrng = ema(smoothrng, per)
-    rng = pd.Series(smooth1).ewm(span=wper, adjust=False).mean().values * avgt
+    # 第一次 EMA 平滑: ema(abs(close - close[1]), period)
+    # 核心修复：使用 adjust=True 让 EMA 加速预热，补偿本地数据库只有 280 天历史数据的问题
+    smooth1 = pd.Series(abs_diff).ewm(span=wper, adjust=True).mean().values
+    # 第二次 EMA 平滑: ema(avrng, (period*2)-1) * mult
+    rng = pd.Series(smooth1).ewm(span=wper2, adjust=True).mean().values * avgt
     
     rf_filter = np.zeros(len(close))
     rf_filter[0] = close[0]
@@ -138,9 +138,9 @@ def calculate_pine_indicators(df):
     rf_down = (close < rf_filter) & (rf_filter < np.roll(rf_filter, 1))
 
     
-    # --- 2. QQE Mod (3-9-21-55 灵敏版本) ---
-    # 对齐截图参数: RSI=3, Smoothing=5, Factor=3
-    rsi_period = 3
+    # --- 2. QQE Mod (根据截图参数精确对齐) ---
+    # 截图参数: RSI 天数=6, Smoothing=5, Fast Factor=3
+    rsi_period = 6
     smoothing = 5
     qqe_factor = 3
 
