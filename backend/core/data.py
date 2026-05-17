@@ -521,6 +521,52 @@ def get_index_hist(code: str) -> pd.DataFrame:
         logger.debug(f"Error fetching index hist for {code}: {e}")
         return pd.DataFrame()
 
+def get_tool_trade_date_hist() -> pd.DataFrame:
+    """
+    用不触发 V8/py_mini_racer 崩溃的容灾方式获取 A 股交易日历列表
+    """
+    # 1. 优先使用数据库中已有的历史日期作为交易日历，极速且 100% 安全
+    try:
+        from core.db import get_db_engine
+        engine = get_db_engine()
+        if engine:
+            with engine.connect() as conn:
+                res = conn.execute(text("SELECT DISTINCT date FROM daily_k ORDER BY date ASC")).fetchall()
+                if res:
+                    dates = [row[0] for row in res]
+                    dates = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in dates]
+                    return pd.DataFrame({"trade_date": dates})
+    except Exception as e:
+        logger.warning(f"Failed to fetch trade dates from local db: {e}")
+
+    # 2. 次优先：获取上证指数 (000001) 的历史日期列表，使用 Eastmoney 接口而不使用 mini_racer/V8 引擎
+    try:
+        df_index = ak.index_zh_a_hist(symbol="000001", period="daily")
+        if not df_index.empty and "日期" in df_index.columns:
+            dates = pd.to_datetime(df_index["日期"]).dt.strftime("%Y-%m-%d").tolist()
+            return pd.DataFrame({"trade_date": dates})
+    except Exception as e:
+        logger.warning(f"Failed to fetch trade dates via SSE Index daily hist: {e}")
+
+    # 3. 最后兜底 (注意: 这在多线程下可能因 V8 isolate 冲突导致崩溃，作为最末端手段并加入异常保护)
+    try:
+        df_sina = ak.tool_trade_date_hist_sina()
+        if not df_sina.empty:
+            dates = pd.to_datetime(df_sina["trade_date"]).dt.strftime("%Y-%m-%d").tolist()
+            return pd.DataFrame({"trade_date": dates})
+    except Exception as e:
+        logger.error(f"Ultimate fallback tool_trade_date_hist_sina also failed: {e}")
+        
+    # 4. 如果真的都没有，返回最近365天的日期（剔除周末）
+    dates = []
+    curr = datetime.now() - timedelta(days=365)
+    end = datetime.now() + timedelta(days=1)
+    while curr < end:
+        if curr.weekday() < 5:
+            dates.append(curr.strftime("%Y-%m-%d"))
+        curr += timedelta(days=1)
+    return pd.DataFrame({"trade_date": dates})
+
 def get_sentiment_history(days: int = 10) -> List[Dict[str, Any]]:
     """
     获取过去 N 个交易日的市场情绪历史（涨跌停家数）
@@ -532,7 +578,7 @@ def get_sentiment_history(days: int = 10) -> List[Dict[str, Any]]:
 
     try:
         # 获取交易日历
-        trade_dates_df = ak.tool_trade_date_hist_sina()
+        trade_dates_df = get_tool_trade_date_hist()
         trade_dates_df['trade_date'] = pd.to_datetime(trade_dates_df['trade_date'])
         
         # 获取最近的交易日

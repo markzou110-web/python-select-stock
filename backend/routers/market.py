@@ -120,7 +120,8 @@ def get_market_regime(strategy_type: str = "squeeze"):
 def get_market_sentiment():
     """获取市场情绪数据：涨跌停家数，连板高度"""
     try:
-        trade_dates = ak.tool_trade_date_hist_sina()
+        from core.data import get_tool_trade_date_hist
+        trade_dates = get_tool_trade_date_hist()
         trade_dates['trade_date'] = pd.to_datetime(trade_dates['trade_date'])
         today = datetime.now()
         # Find the latest trade date <= today
