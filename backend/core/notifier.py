@@ -59,6 +59,9 @@ class Notifier:
         title: str,
         body: str,
         channels: Optional[List[str]] = None,
+        url: Optional[str] = None,
+        group: Optional[str] = "AlphaVision",
+        is_archive: int = 1,
     ) -> dict[str, bool]:
         """
         Dispatch *title* / *body* to the requested *channels*.
@@ -85,16 +88,16 @@ class Notifier:
 
             try:
                 if name == "bark":
-                    results["bark"] = self._send_bark(title, body)
+                    results["bark"] = self._send_bark(title, body, url=url, group=group, is_archive=is_archive)
                 elif name == "feishu":
-                    url = get_setting(_CHANNEL_SETTING_KEYS["feishu"])
-                    results["feishu"] = self._send_feishu(title, body, url)
+                    url_webhook = get_setting(_CHANNEL_SETTING_KEYS["feishu"])
+                    results["feishu"] = self._send_feishu(title, body, url_webhook)
                 elif name == "dingtalk":
-                    url = get_setting(_CHANNEL_SETTING_KEYS["dingtalk"])
-                    results["dingtalk"] = self._send_dingtalk(title, body, url)
+                    url_webhook = get_setting(_CHANNEL_SETTING_KEYS["dingtalk"])
+                    results["dingtalk"] = self._send_dingtalk(title, body, url_webhook)
                 elif name == "wecom":
-                    url = get_setting(_CHANNEL_SETTING_KEYS["wecom"])
-                    results["wecom"] = self._send_wecom(title, body, url)
+                    url_webhook = get_setting(_CHANNEL_SETTING_KEYS["wecom"])
+                    results["wecom"] = self._send_wecom(title, body, url_webhook)
             except Exception as exc:
                 logger.error(f"Notification error on {name}: {exc}")
                 results[name] = False
@@ -120,23 +123,34 @@ class Notifier:
     # -- channel implementations ---------------------------------------------
 
     @staticmethod
-    def _send_bark(title: str, body: str) -> bool:
+    def _send_bark(
+        title: str, 
+        body: str, 
+        url: Optional[str] = None,
+        group: Optional[str] = None,
+        is_archive: int = 1
+    ) -> bool:
         """
         Push via Bark (HTTP GET).
-
-        The Bark key is read from the ``BARK_KEY`` environment variable.
         """
         key = _bark_key()
         if not key:
             logger.debug("Bark key not configured. Skipping Bark push.")
             return False
 
-        url = (
-            f"https://api.day.app/{key}/{title}/{body}"
-            f"?icon={_BARK_ICON_URL}"
-        )
+        import urllib.parse
+        safe_title = urllib.parse.quote(title)
+        safe_body = urllib.parse.quote(body)
+        
+        bark_url = f"https://api.day.app/{key}/{safe_title}/{safe_body}?icon={_BARK_ICON_URL}&isArchive={is_archive}"
+        
+        if url:
+            bark_url += f"&url={urllib.parse.quote(url)}"
+        if group:
+            bark_url += f"&group={urllib.parse.quote(group)}"
+
         try:
-            resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+            resp = requests.get(bark_url, timeout=_REQUEST_TIMEOUT)
             if resp.ok:
                 logger.info("Bark push sent successfully.")
                 return True

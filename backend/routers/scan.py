@@ -851,8 +851,31 @@ def get_scan_status(task_id: str):
 
 @router.get("/scan/history")
 async def get_history_results(date: str):
-    """获取指定日期的历史选股结果"""
-    return get_scan_history_by_date(date)
+    """获取指定日期的历史选股结果并计算至今表现"""
+    results = get_scan_history_by_date(date)
+    if not results:
+        return []
+    
+    # 获取实时快照，计算后续表现
+    try:
+        snapshot = get_market_snapshot()
+        if not snapshot.empty:
+            for r in results:
+                code = r["代码"]
+                hist_price = float(r["现价"])
+                match = snapshot[snapshot['code'] == code]
+                if not match.empty:
+                    curr_price = float(match.iloc[0]['price'])
+                    pl_pct = (curr_price - hist_price) / hist_price * 100 if hist_price > 0 else 0
+                    r["最新价"] = curr_price
+                    r["表现%"] = round(pl_pct, 2)
+                else:
+                    r["最新价"] = hist_price
+                    r["表现%"] = 0.0
+    except Exception as e:
+        logger.warning(f"Failed to fetch performance for history: {e}")
+        
+    return results
 
 
 @router.get("/scan/dates")

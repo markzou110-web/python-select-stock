@@ -393,3 +393,48 @@ def run_wind_control() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Wind control error: {e}")
         return {"status": "error"}
+
+@router.get("/portfolio/stats")
+def get_portfolio_stats() -> Dict[str, Any]:
+    """获取组合分析统计数据"""
+    engine = get_db_engine()
+    if not engine: return {"error": "Database error"}
+    
+    try:
+        # 1. 获取所有交易记录
+        df = pd.read_sql("SELECT * FROM paper_trading ORDER BY entry_date ASC", engine)
+        if df.empty:
+            return {
+                "risk_metrics": {},
+                "attribution": {"by_industry": [], "by_strategy": []},
+                "rolling_performance": []
+            }
+        
+        trades = df.to_dict('records')
+        
+        # 2. 计算指标
+        risk_metrics = calculate_risk_metrics(trades)
+        attribution = calculate_pnl_attribution(trades)
+        rolling_performance = calculate_rolling_performance(trades)
+        
+        # 3. 补充持仓热力图数据 (按行业)
+        # 获取行业分布 (OPEN 持仓)
+        open_df = df[df['status'] == 'OPEN'].copy()
+        sector_dist = []
+        if not open_df.empty:
+            sector_counts = open_df['industry'].value_counts()
+            for sector, count in sector_counts.items():
+                sector_dist.append({
+                    "name": sector,
+                    "value": int(count)
+                })
+        
+        return {
+            "risk_metrics": risk_metrics,
+            "attribution": attribution,
+            "rolling_performance": rolling_performance,
+            "sector_distribution": sector_dist
+        }
+    except Exception as e:
+        logger.error(f"Error calculating portfolio stats: {e}")
+        return {"error": str(e)}

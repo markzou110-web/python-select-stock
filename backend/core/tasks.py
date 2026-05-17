@@ -81,7 +81,7 @@ def check_realtime_alerts():
 
         # 5. 发送推送
         if alerts_triggered:
-            title = "Alpha Vision 实时风险预警"
+            title = f"⚠️ 风险预警 ({len(alerts_triggered)}个信号)"
             body = "\n".join(alerts_triggered)
             # 这是一个异步操作，但不等待结果
             import asyncio
@@ -91,7 +91,12 @@ def check_realtime_alerts():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            loop.run_until_complete(notifier.send(title, body))
+            loop.run_until_complete(notifier.send(
+                title, 
+                body, 
+                group="AlphaVision_Alert",
+                url="http://localhost:3000"  # 默认跳转到仪表板
+            ))
             logger.info(f"Sent {len(alerts_triggered)} alerts via push channels.")
 
         return f"Processed {len(df_paper)} positions, triggered {len(alerts_triggered)} alerts"
@@ -110,7 +115,29 @@ def daily_sync():
     try:
         from routers.sync import background_sync_task
         # background_sync_task 会处理多源同步、重试和错误处理
-        background_sync_task()
+        result = background_sync_task()
+        
+        # 同步完成后发送摘要推送
+        try:
+            import asyncio
+            title = "📊 Alpha Vision 数据同步完成"
+            body = "今日全市场行情及财务数据已同步。系统已进入收盘扫描状态。"
+            
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            loop.run_until_complete(notifier.send(
+                title, 
+                body, 
+                group="AlphaVision_Sync",
+                url="http://localhost:3000"
+            ))
+        except Exception as push_err:
+            logger.error(f"Failed to send sync summary push: {push_err}")
+            
         return "Daily sync completed successfully"
     except Exception as e:
         logger.error(f"Error in scheduled daily_sync task: {e}")

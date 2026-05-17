@@ -85,14 +85,14 @@ interface ScanStore {
     selectedDate: string;
     availableDates: Array<{ date: string; stock_count: number }>;
     scanProgress: ScanProgress | null;
-    viewMode: 'list' | 'grid';
+    viewMode: 'list' | 'grid' | 'history';
     isFilterOpen: boolean;
 
     setResults: (results: ScanResult[]) => void;
     setIsScanning: (v: boolean) => void;
     setSelectedStock: (stock: ScanResult | null) => void;
     setParams: (params: ScanParams) => void;
-    setViewMode: (mode: 'list' | 'grid') => void;
+    setViewMode: (mode: 'list' | 'grid' | 'history') => void;
     setIsFilterOpen: (v: boolean) => void;
     setSelectedDate: (date: string) => void;
 

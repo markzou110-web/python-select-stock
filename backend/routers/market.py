@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 import time
 import akshare as ak
+import pandas as pd
 
 from core.logging_config import logger
 from core.data import get_index_data, get_hot_sectors
@@ -113,3 +114,61 @@ def get_market_regime(strategy_type: str = "squeeze"):
         "regime": regime_info,
         "recommended_params": recommended
     }
+
+
+@router.get("/market/sentiment")
+def get_market_sentiment():
+    """获取市场情绪数据：涨跌停家数，连板高度"""
+    try:
+        trade_dates = ak.tool_trade_date_hist_sina()
+        trade_dates['trade_date'] = pd.to_datetime(trade_dates['trade_date'])
+        today = datetime.now()
+        # Find the latest trade date <= today
+        past_dates = trade_dates[trade_dates['trade_date'] <= today]
+        if past_dates.empty:
+            return {"error": "No trade dates found"}
+        
+        latest_date = past_dates.iloc[-1]['trade_date']
+        date_str = latest_date.strftime("%Y%m%d")
+
+        # 涨停池
+        try:
+            df_up = ak.stock_zt_pool_em(date=date_str)
+            up_count = len(df_up) if df_up is not None and not df_up.empty else 0
+            # 计算最高连板
+            max_streak = 0
+            if up_count > 0 and '连板数' in df_up.columns:
+                max_streak = int(df_up['连板数'].max())
+        except:
+            up_count = 0
+            max_streak = 0
+            
+        # 跌停池
+        try:
+            df_down = ak.stock_zt_pool_dtgc_em(date=date_str)
+            down_count = len(df_down) if df_down is not None and not df_down.empty else 0
+        except:
+            down_count = 0
+            
+        # 简单情绪评分 (0-100)
+        score = 50
+        if up_count + down_count > 0:
+            ratio = up_count / (up_count + down_count)
+            score = int(ratio * 100)
+            
+        return {
+            "date": latest_date.strftime("%Y-%m-%d"),
+            "limit_up_count": up_count,
+            "limit_down_count": down_count,
+            "max_streak": max_streak,
+            "sentiment_score": score
+        }
+    except Exception as e:
+        logger.error(f"Error fetching market sentiment: {e}")
+        return {"error": str(e)}
+
+@router.get("/market/sentiment/history")
+def get_sentiment_history_api(days: int = 10):
+    """获取市场情绪历史数据（涨跌停家数趋势）"""
+    from core.data import get_sentiment_history
+    return get_sentiment_history(days=days)

@@ -27,13 +27,17 @@ fi
 
 # 尝试启动基础设施 (Redis)
 echo ""
-echo "🐳 初始化基础设施 (Redis)..."
-if command -v docker-compose &> /dev/null; then
-    docker-compose up -d redis || echo "⚠️ 提示: Docker 可能未运行，Redis 启动失败。系统将自动切入单机免依赖模式！"
-elif command -v docker &> /dev/null && docker compose version &> /dev/null; then
-    docker compose up -d redis || echo "⚠️ 提示: Docker 可能未运行，Redis 启动失败。系统将自动切入单机免依赖模式！"
+echo "🗄️ 初始化基础设施 (Redis)..."
+if command -v redis-cli &> /dev/null && redis-cli ping &> /dev/null; then
+    echo "✅ Redis 已在运行"
+elif command -v brew &> /dev/null && brew services list | grep -q redis; then
+    echo "启动本地 Redis 服务 (Homebrew)..."
+    brew services start redis
+elif command -v redis-server &> /dev/null; then
+    echo "启动本地 Redis 服务 (后台运行)..."
+    redis-server --daemonize yes
 else
-    echo "未找到 Docker 环境，跳过启动 Redis。系统将自动切入单机同步免依赖模式！"
+    echo "⚠️ 提示: 未找到本地 Redis 服务，系统将自动切入单机免依赖模式！"
 fi
 
 # 启动后端

@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import dynamic from 'next/dynamic';
-const KLineChart = dynamic(() => import('./KLineChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
+const StockChart = dynamic(() => import('./StockChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
 import PositionSizer from './PositionSizer';
 import HeatmapOptimizer from './HeatmapOptimizer';
 import api from '@/lib/api';
@@ -445,7 +445,7 @@ export default function ResultsTable({
                                 </div>
                             </div>
                             <div className="w-full h-[450px] bg-white rounded-2xl border border-slate-100 shadow-xl overflow-hidden relative group/chart">
-                                <KLineChart code={res.代码} name={res.名称} strategyType={res.strategy_type || 'squeeze'} />
+                                <StockChart code={res.代码} name={res.名称} />
                                 <div className="absolute inset-x-0 bottom-0 py-2 px-4 bg-white/90 backdrop-blur-sm border-t border-slate-50 flex justify-between items-center opacity-0 group-hover/chart:opacity-100 transition-opacity">
                                     <span className="text-[10px] font-bold text-slate-400">数据源: 本地数据库 (极速渲染)</span>
                                     <span className="text-[10px] font-bold text-indigo-400 italic">Alpha Vision 共振信号确认区</span>

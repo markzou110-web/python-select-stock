@@ -3,40 +3,81 @@ import pandas as pd
 import time
 import random
 import os
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Callable
 from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map, validate_stock_code
 from sqlalchemy import text
 from .indicators import calculate_ema
 from .logging_config import logger
 
+
+# ═══════════════════════════════════════════════════════
+# Feature 1: 数据源容灾智能切换 — resilient_fetch 工厂
+# ═══════════════════════════════════════════════════════
+
+def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = "data"):
+    """
+    按优先级依次尝试多个数据源函数，任何一个成功即返回结果。
+    所有调用强制 timeout 秒超时，防止 akshare 底层挂起。
+    
+    Args:
+        fetch_funcs: 一组 callable，按优先级排列
+        timeout: 每个源的最大等待秒数
+        label: 日志标签
+    Returns:
+        第一个成功函数的返回值，或 None
+    """
+    for i, func in enumerate(fetch_funcs):
+        source_name = getattr(func, '__name__', f'source_{i}')
+        # 每个源内部尝试 2 次
+        for attempt in range(2):
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(func)
+                    result = future.result(timeout=timeout)
+                    if result is not None and not (isinstance(result, pd.DataFrame) and result.empty):
+                        return result
+            except FuturesTimeoutError:
+                logger.warning(f"[{label}] {source_name} timed out after {timeout}s (attempt {attempt+1})")
+            except Exception as e:
+                logger.debug(f"[{label}] {source_name} failed (attempt {attempt+1}): {str(e)[:80]}")
+            
+            if attempt == 0:
+                time.sleep(1) # 重试间隔
+                
+    logger.warning(f"[{label}] All {len(fetch_funcs)} sources failed after multiple attempts.")
+    return None
+
 def get_market_regime() -> Dict[str, Any]:
     """
     获取大盘环境：结合上证指数 (000001) 和 创业板指 (399006)
     """
-    indices = {"000001": "上证", "399006": "创业"}
+    indices_tx = {"sh000001": "上证", "sz399006": "创业"}
     states = {}
     
     try:
-        now = datetime.now()
-        start_date = (now - timedelta(days=60)).strftime('%Y%m%d')
-        end_date = now.strftime('%Y%m%d')
-        
-        for code, name in indices.items():
-            # 使用更可靠的 index_zh_a_hist
-            df = ak.index_zh_a_hist(symbol=code, period="daily", 
-                                   start_date=(now - timedelta(days=60)).strftime('%Y%m%d'),
-                                   end_date=now.strftime('%Y%m%d'))
+        for code, name in indices_tx.items():
+            def _fetch_tx(c=code):
+                return ak.stock_zh_index_daily_tx(symbol=c)
+            def _fetch_em(c=code.replace('sh','').replace('sz','')):
+                now = datetime.now()
+                return ak.index_zh_a_hist(symbol=c, period="daily",
+                    start_date=(now - timedelta(days=60)).strftime('%Y%m%d'),
+                    end_date=now.strftime('%Y%m%d'))
             
-            if df.empty: continue
+            df = resilient_fetch([_fetch_tx, _fetch_em], timeout=15, label=f"regime_{name}")
+            if df is None or df.empty:
+                continue
             
-            # index_zh_a_hist 返回的列名为: 日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
-            # 无需重命名，直接计算 EMA20
-            df = calculate_ema(df, 20)
+            # 统一列名：腾讯源列名是 close，东财源是 收盘
+            close_col = 'close' if 'close' in df.columns else '收盘'
+            df_regime = pd.DataFrame({'收盘': df[close_col].values})
+            df_regime = calculate_ema(df_regime, 20)
             
-            latest = df.iloc[-1]
+            latest = df_regime.iloc[-1]
             close = float(latest['收盘'])
             ema20 = float(latest['EMA20'])
             
@@ -45,6 +86,9 @@ def get_market_regime() -> Dict[str, Any]:
                 "ema20": round(ema20, 2),
                 "trend": "BULL" if close > ema20 else "BEAR"
             }
+        
+        if "上证" not in states or "创业" not in states:
+            return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": states, "updated_at": ""}
             
         # 综合评判
         if states["上证"]["trend"] == "BULL" and states["创业"]["trend"] == "BULL":
@@ -117,13 +161,19 @@ def set_cached_data(key: str, data: Any) -> None:
     CACHE[key] = (data, time.time())
 
 def get_market_snapshot() -> pd.DataFrame:
-    """获取全市场实时快照 (v5.1 - 强化防封与缓存)"""
-    max_retries = 3
+    """获取全市场实时快照 (v5.2 - 增强网络异常容忍)"""
+    max_retries = 5
     for attempt in range(max_retries):
         try:
-            # 增加微小随机延迟以打散并发请求
-            time.sleep(random.uniform(0.1, 0.5))
+            # 增加随机延迟以避开频率限制
+            time.sleep(random.uniform(0.5, 1.5) * (attempt + 1))
+            
+            # 使用更稳定的接口，或添加超时控制
             df = ak.stock_zh_a_spot_em()
+            
+            if df is None or df.empty:
+                raise ValueError("Returned empty snapshot")
+                
             # 重命名常用列以便处理
             df = df.rename(columns={
                 '代码': 'code',
@@ -138,14 +188,13 @@ def get_market_snapshot() -> pd.DataFrame:
             })
             return df
         except Exception as e:
+            wait_time = (attempt + 1) * 5
             if attempt < max_retries - 1:
-                # 增强退避等待
-                wait_time = (attempt + 1) * 4
-                logger.warning(f"Snapshot fetch failed (attempt {attempt+1}), retrying in {wait_time}s... Error: {e}")
+                logger.warning(f"Snapshot fetch failed ({e}), retry {attempt+1}/{max_retries} in {wait_time}s...")
                 time.sleep(wait_time)
-                continue
-            logger.error(f"Error fetching snapshot after {max_retries} attempts: {e}")
-            return pd.DataFrame()
+            else:
+                logger.error(f"Snapshot fetch failed after {max_retries} attempts: {e}")
+                return pd.DataFrame()
 
 def sync_stock(code: str, name: str, engine=None) -> bool:
     """
@@ -198,46 +247,57 @@ def sync_stock(code: str, name: str, engine=None) -> bool:
         return False
 
 def get_index_data() -> Dict[str, Dict[str, float]]:
-    """获取主要指数实时行情 (并发拉取 + 缓存)"""
+    """获取主要指数实时行情 (容灾多源 + 缓存)"""
     cached = get_cached_data('index_data', 60)
     if cached:
         return cached
 
     indices = {
-        "上证": "000001",
-        "创业板": "399006",
-        "沪深300": "000300",
-        "科创50": "000688",
-        "中证1000": "000852"
+        "上证": "sh000001",
+        "创业板": "sz399006",
+        "沪深300": "sh000300",
+        "科创50": "sh000688",
+        "中证1000": "sh000852"
     }
 
-    def fetch_one_with_retry(name: str, code: str, retries: int = 2) -> Tuple[str, Optional[Dict[str, float]]]:
-        for i in range(retries):
-            try:
-                # 增加随机延迟避免并发请求被限流
-                time.sleep(random.uniform(0.3, 0.8))
-                df = ak.index_zh_a_hist(symbol=code, period="daily",
-                                       start_date=(datetime.now() - timedelta(days=10)).strftime("%Y%m%d"))
-                if not df.empty:
-                    curr = df.iloc[-1]
-                    prev = df.iloc[-2] if len(df) > 1 else curr
-                    pct = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100
-                    return name, {'price': float(curr['收盘']), 'pct': round(pct, 2)}
-            except Exception as e:
-                if i < retries - 1:
-                    time.sleep(random.uniform(0.5, 1.5))
-                else:
-                    logger.debug(f"Index fetch failed for {name}: {str(e)[:50]}")
-        return name, None
+    # 提前获取东财全指数快照作为备选 (EM 备选源)
+    em_snapshot = pd.DataFrame()
+    try:
+        em_snapshot = ak.stock_zh_index_spot_em()
+    except Exception as e:
+        logger.debug(f"Failed to fetch EM index snapshot: {e}")
+
+    def fetch_one(name: str, code: str) -> Tuple[str, Optional[Dict[str, float]]]:
+        # 提取数字代码用于 EM 匹配
+        numeric_code = "".join(filter(str.isdigit, code))
+
+        def _tx():
+            time.sleep(random.uniform(0.1, 0.3))
+            df = ak.stock_zh_index_daily_tx(symbol=code)
+            if df is not None and not df.empty:
+                curr, prev = df.iloc[-1], df.iloc[-2] if len(df) > 1 else df.iloc[-1]
+                pct = (curr['close'] - prev['close']) / prev['close'] * 100
+                return {'price': float(curr['close']), 'pct': round(pct, 2)}
+            return None
+        
+        def _em():
+            if em_snapshot.empty: return None
+            match = em_snapshot[em_snapshot['代码'] == numeric_code]
+            if not match.empty:
+                row = match.iloc[0]
+                return {'price': float(row['最新价']), 'pct': float(row['涨跌幅'])}
+            return None
+        
+        result = resilient_fetch([_tx, _em], timeout=15, label=f"index_{name}")
+        return name, result
 
     res = {}
-    # 降低并发度，减少 EastMoney 连通重置风险
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(fetch_one_with_retry, name, code) for name, code in indices.items()]
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(fetch_one, n, c) for n, c in indices.items()]
             for future in futures:
                 try:
-                    name, data = future.result(timeout=20)
+                    name, data = future.result(timeout=15)
                     if data:
                         res[name] = data
                 except Exception:
@@ -251,42 +311,39 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
         for name in indices:
             if name not in res and name in old_data:
                 res[name] = old_data[name]
-                logger.debug(f"Index {name} using stale cache")
 
     if res:
         set_cached_data('index_data', res)
     return res
 
 def get_hot_sectors() -> List[Dict[str, Any]]:
-    """获取热门行业板块指数 (缓存 10 分钟)"""
+    """获取热门行业板块指数 (容灾多源 + 缓存 10 分钟)"""
     cached = get_cached_data('hot_sectors', 600)
     if cached:
         return cached
 
-    for i in range(3):
-        try:
-            df = ak.stock_board_industry_name_em()
-            if not df.empty:
-                df_sorted = df.sort_values('涨跌幅', ascending=False).head(5)
-                hot_sectors = []
-                for _, row in df_sorted.iterrows():
-                    hot_sectors.append({
-                        'name': row['板块名称'],
-                        'pct': row['涨跌幅'],
-                        'lead': row['领涨股票']
-                    })
-                set_cached_data('hot_sectors', hot_sectors)
-                return hot_sectors
-        except Exception as e:
-            if i < 2:
-                time.sleep(1)
-            logger.debug(f"Hot sectors fetch attempt {i+1} failed: {e}")
+    def _sina():
+        df = ak.stock_sector_spot()
+        if df is not None and not df.empty:
+            df_sorted = df.sort_values('涨跌幅', ascending=False).head(5)
+            return [{'name': str(r['板块']), 'pct': float(r['涨跌幅']), 'lead': str(r['股票名称'])} for _, r in df_sorted.iterrows()]
+        return None
 
-    # 如果获取失败但有过期缓存，返回过期缓存
+    def _em():
+        df = ak.stock_board_industry_name_em()
+        if df is not None and not df.empty:
+            df_sorted = df.sort_values('涨跌幅', ascending=False).head(5)
+            return [{'name': str(r['板块名称']), 'pct': float(r['涨跌幅']), 'lead': str(r['领涨股票'])} for _, r in df_sorted.iterrows()]
+        return None
+
+    result = resilient_fetch([_sina, _em], timeout=8, label="hot_sectors")
+    if result:
+        set_cached_data('hot_sectors', result)
+        return result
+
+    # 兜底过期缓存
     if 'hot_sectors' in CACHE:
-        logger.debug("Using expired cache for hot sectors")
         return CACHE['hot_sectors'][0]
-
     return []
 
 def get_sector_trends() -> Dict[str, Dict[str, Any]]:
@@ -300,33 +357,52 @@ def get_sector_trends() -> Dict[str, Dict[str, Any]]:
     if cached:
         return cached
 
-    trends = {}
-    try:
-        df = ak.stock_board_industry_name_em()
-        if not df.empty:
+    def _classify(pct: float) -> str:
+        if pct >= 2.0: return 'LEAD'
+        if pct >= 0: return 'FOLLOW'
+        if pct >= -1.0: return 'FLAT'
+        return 'DOWN'
+
+    def _sina():
+        df = ak.stock_sector_spot()
+        if df is not None and not df.empty:
+            trends = {}
             for _, row in df.iterrows():
                 pct = float(row['涨跌幅'])
-                if pct >= 2.0:
-                    trend = 'LEAD'
-                elif pct >= 0:
-                    trend = 'FOLLOW'
-                elif pct >= -1.0:
-                    trend = 'FLAT'
-                else:
-                    trend = 'DOWN'
-
-                trends[row['板块名称']] = {
+                trends[str(row['板块'])] = {
                     'pct': round(pct, 2),
-                    'trend': trend,
-                    'lead_stock': row.get('领涨股票', '')
+                    'trend': _classify(pct),
+                    'lead_stock': str(row.get('股票名称', ''))
                 }
-            set_cached_data('sector_trends', trends)
-            logger.info(f"Sector trends loaded: {len(trends)} sectors, "
-                        f"LEAD={sum(1 for v in trends.values() if v['trend']=='LEAD')}, "
-                        f"DOWN={sum(1 for v in trends.values() if v['trend']=='DOWN')}")
-    except Exception as e:
-        logger.warning(f"Sector trends fetch error: {e}")
-    return trends
+            return trends
+        return None
+
+    def _em():
+        df = ak.stock_board_industry_name_em()
+        if df is not None and not df.empty:
+            trends = {}
+            for _, row in df.iterrows():
+                pct = float(row['涨跌幅'])
+                trends[str(row['板块名称'])] = {
+                    'pct': round(pct, 2),
+                    'trend': _classify(pct),
+                    'lead_stock': str(row.get('领涨股票', ''))
+                }
+            return trends
+        return None
+
+    result = resilient_fetch([_sina, _em], timeout=10, label="sector_trends")
+    if result:
+        set_cached_data('sector_trends', result)
+        logger.info(f"Sector trends loaded: {len(result)} sectors, "
+                    f"LEAD={sum(1 for v in result.values() if v['trend']=='LEAD')}, "
+                    f"DOWN={sum(1 for v in result.values() if v['trend']=='DOWN')}")
+        return result
+    
+    # 兜底过期缓存
+    if 'sector_trends' in CACHE:
+        return CACHE['sector_trends'][0]
+    return {}
 
 def get_sector_map() -> Dict[str, str]:
     """获取全市场个股行业映射 (重量级操作，优先读取数据库)"""
@@ -444,3 +520,68 @@ def get_index_hist(code: str) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"Error fetching index hist for {code}: {e}")
         return pd.DataFrame()
+
+def get_sentiment_history(days: int = 10) -> List[Dict[str, Any]]:
+    """
+    获取过去 N 个交易日的市场情绪历史（涨跌停家数）
+    """
+    cache_key = f'sentiment_history_{days}'
+    cached = get_cached_data(cache_key, 3600)  # 缓存 1 小时
+    if cached is not None:
+        return cached
+
+    try:
+        # 获取交易日历
+        trade_dates_df = ak.tool_trade_date_hist_sina()
+        trade_dates_df['trade_date'] = pd.to_datetime(trade_dates_df['trade_date'])
+        
+        # 获取最近的交易日
+        today = datetime.now()
+        past_dates = trade_dates_df[trade_dates_df['trade_date'] <= today]['trade_date'].tolist()
+        target_dates = [d.strftime("%Y%m%d") for d in past_dates[-days:]]
+        
+        results = []
+        
+        def fetch_day_sentiment(date_str):
+            for attempt in range(3):
+                try:
+                    # 增加随机延迟，避免并发撞击
+                    time.sleep(random.uniform(0.2, 0.8) * (attempt + 1))
+                    
+                    # 涨停 (EM 接口)
+                    zt_df = ak.stock_zt_pool_em(date=date_str)
+                    up_count = len(zt_df) if zt_df is not None and not zt_df.empty else 0
+                    
+                    # 跌停 (EM 接口)
+                    dt_df = ak.stock_dt_pool_em(date=date_str)
+                    down_count = len(dt_df) if dt_df is not None and not dt_df.empty else 0
+                    
+                    return {
+                        "date": f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}",
+                        "up": up_count,
+                        "down": down_count
+                    }
+                except Exception as e:
+                    if attempt < 2:
+                        logger.debug(f"Retry {attempt+1} for sentiment date {date_str} due to: {e}")
+                        continue
+                    logger.debug(f"Final failure fetching sentiment for {date_str}: {e}")
+                    return None
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_date = {executor.submit(fetch_day_sentiment, d): d for d in target_dates}
+            for future in as_completed(future_to_date):
+                res = future.result()
+                if res:
+                    results.append(res)
+        
+        # 按日期排序
+        results.sort(key=lambda x: x['date'])
+        
+        if results:
+            set_cached_data(cache_key, results)
+            
+        return results
+    except Exception as e:
+        logger.error(f"Error in get_sentiment_history: {e}")
+        return []

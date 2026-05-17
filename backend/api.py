@@ -250,6 +250,7 @@ from routers.paper_trade import router as paper_router
 from routers.stock import router as stock_router
 from routers.settings import router as settings_router
 from routers.alert import router as alert_router
+from routers.kline import router as kline_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -258,6 +259,7 @@ app.include_router(paper_router)
 app.include_router(stock_router)
 app.include_router(settings_router)
 app.include_router(alert_router)
+app.include_router(kline_router)
 
 @app.get("/api/market/regime")
 async def get_market_pulse():

@@ -4,15 +4,17 @@ import React, { useEffect } from 'react';
 import Header from '@/components/Header';
 import Sidebar from '@/components/Sidebar';
 import MarketCard from '@/components/MarketCard';
+import MarketSentiment from '@/components/MarketSentiment';
 import SectorGrid from '@/components/SectorGrid';
 import FilterModal from '@/components/FilterModal';
 import ResultsTable from '@/components/ResultsTable';
+import ScanHistoryView from '@/components/ScanHistoryView';
 import AIDeepDive from '@/components/AIDeepDive';
 import PaperTradingView from '@/components/PaperTradingView';
 import SettingsView from '@/components/SettingsView';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import AlertsView from '@/components/AlertsView';
-import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap } from 'lucide-react';
+import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
 import { useMarketStore } from '@/stores/marketStore';
@@ -137,6 +139,10 @@ export default function Dashboard() {
                                             ))
                                         )}
                                     </div>
+                                    
+                                    <div className="my-6">
+                                        <MarketSentiment />
+                                    </div>
 
                                     {/* Hot Sectors */}
                                     <SectorGrid sectors={sectors} />
@@ -198,6 +204,13 @@ export default function Dashboard() {
                                             >
                                                 <LayoutGrid size={20} />
                                             </button>
+                                            <button
+                                                onClick={() => setViewMode('history')}
+                                                className={cn("p-2 rounded-xl transition-all flex items-center gap-1.5", viewMode === 'history' ? "bg-indigo-50 text-indigo-600" : "text-slate-400 hover:text-slate-600")}
+                                                title="历史回溯"
+                                            >
+                                                <Calendar size={20} />
+                                            </button>
                                             <div className="mx-1 h-6 w-[1px] bg-slate-200" />
                                             <button
                                                 onClick={handleExport}
@@ -210,7 +223,11 @@ export default function Dashboard() {
 
                                     {/* Results Section */}
                                     <div className="flex flex-col gap-8">
-                                        {results.length > 0 ? (
+                                        {viewMode === 'history' ? (
+                                            <ErrorBoundary fallbackTitle="历史回溯加载异常">
+                                                <ScanHistoryView availableDates={availableDates.map(d => d.date)} />
+                                            </ErrorBoundary>
+                                        ) : results.length > 0 ? (
                                             <ErrorBoundary fallbackTitle="结果表格加载异常">
                                                 <ResultsTable
                                                     results={results}
