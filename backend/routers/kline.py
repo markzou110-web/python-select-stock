@@ -39,6 +39,11 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         # Calculate all indicators including Pine Script indicators (Range Filter, QQE)
         df = calculate_indicators(df, enable_pine_indicators=True)
         
+        # 核心防崩保障：对计算后的 DataFrame 按日期强制去重并按日期严格升序排列，规避任何指标合并导致的时序紊乱或重复
+        df['日期'] = pd.to_datetime(df['日期'])
+        df = df.drop_duplicates(subset=['日期']).sort_values('日期').reset_index(drop=True)
+        df['日期'] = df['日期'].dt.strftime("%Y-%m-%d")
+        
         # Prepare data for lightweight-charts
         candlestick_data = []
         rf_filter_data = []
