@@ -5,9 +5,10 @@ import api from '@/lib/api';
 interface StockChartProps {
     code: string;
     name: string;
+    strategyType?: string;
 }
 
-const StockChart: React.FC<StockChartProps> = ({ code, name }) => {
+const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => {
     const chartContainerRef = useRef<HTMLDivElement>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -16,11 +17,12 @@ const StockChart: React.FC<StockChartProps> = ({ code, name }) => {
         let chart: IChartApi | null = null;
         let candlestickSeries: ISeriesApi<"Candlestick"> | null = null;
         let rfSeries: ISeriesApi<"Line"> | null = null;
+        let trailingSeries: ISeriesApi<"Line"> | null = null;
 
         const fetchDataAndRender = async () => {
             try {
                 setLoading(true);
-                const response = await api.get(`/api/kline/${code}`);
+                const response = await api.get(`/api/kline/${code}?strategy_type=${strategyType || 'squeeze'}`);
                 const data = response.data;
 
                 if (!chartContainerRef.current) return;
@@ -72,6 +74,27 @@ const StockChart: React.FC<StockChartProps> = ({ code, name }) => {
                     rfSeries!.setData(validRf);
                 }
 
+                // Add Trailing Stop Line (红色虚线：跟踪止损止盈轨迹)
+                if (data.trailing_stops && data.trailing_stops.length > 0) {
+                    trailingSeries = chart.addSeries(LineSeries, {
+                        color: '#f44336',
+                        lineWidth: 2,
+                        lineStyle: 2, // 2 = Dotted line style in lightweight-charts
+                        crosshairMarkerVisible: false,
+                        lastValueVisible: false,
+                        priceLineVisible: false,
+                    });
+
+                    const validTrailing = data.trailing_stops
+                        .map((t: any) => ({
+                            time: t.time,
+                            value: parseFloat(t.value)
+                        }))
+                        .filter((t: any) => !isNaN(t.value));
+
+                    trailingSeries!.setData(validTrailing);
+                }
+
                 if (data.markers && data.markers.length > 0) {
                     const markersPlugin = createSeriesMarkers(candlestickSeries!);
                     markersPlugin.setMarkers(data.markers);
@@ -102,7 +125,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name }) => {
                 chart.remove();
             }
         };
-    }, [code]);
+    }, [code, strategyType]);
 
     if (loading) {
         return (
@@ -127,8 +150,27 @@ const StockChart: React.FC<StockChartProps> = ({ code, name }) => {
                     {name} <span className="text-slate-500 text-sm ml-2">{code}</span>
                 </div>
                 <div className="text-xs text-slate-500 flex items-center gap-3">
-                    <span className="flex items-center gap-1"><div className="w-2 h-2 rounded-full bg-[#ff9800]"></div> Range Filter</span>
-                    <span className="flex items-center gap-1">🚀 Buy Signal</span>
+                    <span className="flex items-center gap-1">
+                        <div className="w-2 h-2 rounded-full bg-[#ff9800]"></div> Range Filter
+                    </span>
+                    {strategyType === 'squeeze' && (
+                        <span className="flex items-center gap-1 font-medium text-blue-600">
+                            🔵 均线粘合突破
+                        </span>
+                    )}
+                    {strategyType === 'consensus' && (
+                        <span className="flex items-center gap-1 font-medium text-purple-600">
+                            🟣 Azul共识突破
+                        </span>
+                    )}
+                    {strategyType === 'pine' && (
+                        <span className="flex items-center gap-1 font-medium text-indigo-600">
+                            🚀 多指标共振
+                        </span>
+                    )}
+                    <span className="flex items-center gap-1 text-red-500 font-medium">
+                        --- 移动风控线
+                    </span>
                 </div>
             </div>
             <div ref={chartContainerRef} className="w-full h-[400px]" />

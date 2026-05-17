@@ -10,11 +10,11 @@ from sqlalchemy import text
 router = APIRouter(prefix="/api", tags=["kline"])
 
 @router.get("/kline/{code}")
-def get_kline_data(code: str, days: int = 400):
+def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
     """
-    获取单只股票的 K 线数据，并计算前端图表所需的指标（如 Range Filter 和买卖点）。
+    获取单只股票的 K 线数据，并根据当前选股策略计算前端图表所需的指标与买卖点标记。
     """
-    logger.info(f"Fetching kline data for {code} over {days} days")
+    logger.info(f"Fetching kline data for {code} over {days} days with strategy: {strategy_type}")
     try:
         engine = get_db_engine()
         
@@ -62,37 +62,46 @@ def get_kline_data(code: str, days: int = 400):
                     "time": date_str,
                     "value": float(row['RF_Filter'])
                 })
+
+        # 3. 动态加载策略特有的买卖点明细 (均线粘合、多指标共振或Azul共识突破)
+        from core.strategy import get_signal_details
+        signals = get_signal_details(df, strategy_type=strategy_type)
+        
+        # 记录已添加标记的日期，避免多线程重叠
+        added_dates = set()
+
+        for b in signals.get("buy_signals", []):
+            time_str = b["time"]
+            if time_str not in added_dates:
+                markers_data.append({
+                    "time": time_str,
+                    "position": "belowBar",
+                    "color": "#2196F3", # Blue for Buy
+                    "shape": "arrowUp",
+                    "text": "Buy"
+                })
+                added_dates.add(time_str)
                 
-            # 3. Buy/Sell Markers (from Pine Strategy logic or core_signals)
-            # Find crossover points for buy signals (simplification based on RF_Upward)
-            if 'RF_Upward' in df.columns and row.get('RF_Upward', False):
-                # Check if it's the exact crossover point (previous day was not upward)
-                prev_upward = df['RF_Upward'].iloc[index - 1] if index > 0 else False
-                if not prev_upward:
-                    markers_data.append({
-                        "time": date_str,
-                        "position": "belowBar",
-                        "color": "#2196F3", # Blue for Buy
-                        "shape": "arrowUp",
-                        "text": "Buy"
-                    })
-                    
-            if 'RF_Downward' in df.columns and row.get('RF_Downward', False):
-                prev_downward = df['RF_Downward'].iloc[index - 1] if index > 0 else False
-                if not prev_downward:
-                    markers_data.append({
-                        "time": date_str,
-                        "position": "aboveBar",
-                        "color": "#e91e63", # Red for Sell
-                        "shape": "arrowDown",
-                        "text": "Sell"
-                    })
+        for s in signals.get("sell_signals", []):
+            time_str = s["time"]
+            if time_str not in added_dates:
+                # 止损标记红色，止盈/超时标记绿色
+                color = "#e91e63" if "止损" in s["reason"] else "#4caf50"
+                markers_data.append({
+                    "time": time_str,
+                    "position": "aboveBar",
+                    "color": color,
+                    "shape": "arrowDown",
+                    "text": s["reason"]
+                })
+                added_dates.add(time_str)
 
         return {
             "code": code,
             "candlestick": candlestick_data,
             "rf_filter": rf_filter_data,
-            "markers": markers_data
+            "markers": markers_data,
+            "trailing_stops": signals.get("trailing_stops", [])
         }
         
     except Exception as e:
