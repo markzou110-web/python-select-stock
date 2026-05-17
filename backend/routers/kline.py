@@ -96,12 +96,25 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                 })
                 added_dates.add(time_str)
 
+        # 确保 markers 严格按照时间升序排列，解决 lightweight-charts 的 Assertion failed 崩溃问题
+        markers_data.sort(key=lambda x: x["time"])
+
+        # 确保 移动风控线 严格按时间升序且日期唯一（若同一天有多条重叠轨迹，取最低保底止损价）
+        trailing_stops_dict = {}
+        for ts in signals.get("trailing_stops", []):
+            t = ts["time"]
+            val = ts["value"]
+            if t not in trailing_stops_dict or val < trailing_stops_dict[t]:
+                trailing_stops_dict[t] = val
+        
+        trailing_stops_data = [{"time": t, "value": v} for t, v in sorted(trailing_stops_dict.items())]
+
         return {
             "code": code,
             "candlestick": candlestick_data,
             "rf_filter": rf_filter_data,
             "markers": markers_data,
-            "trailing_stops": signals.get("trailing_stops", [])
+            "trailing_stops": trailing_stops_data
         }
         
     except Exception as e:
