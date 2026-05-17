@@ -17,7 +17,7 @@ export default function ScanHistoryView({ availableDates }: ScanHistoryViewProps
         const fetchHistory = async () => {
             setIsLoading(true);
             try {
-                const res = await api.get(`/scan/history?date=${selectedDate}`);
+                const res = await api.get(`/api/scan/history?date=${selectedDate}`);
                 setHistoryData(res.data);
             } catch (e) {
                 console.error("Failed to fetch history:", e);
