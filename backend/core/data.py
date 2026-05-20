@@ -60,6 +60,9 @@ def get_market_regime() -> Dict[str, Any]:
     
     try:
         for code, name in indices_tx.items():
+            def _fetch_sina(c=code):
+                # 新浪指数日线在海外IP仅需 0.1~0.3 秒，极其稳定且数据完整
+                return ak.stock_zh_index_daily(symbol=c)
             def _fetch_tx(c=code):
                 return ak.stock_zh_index_daily_tx(symbol=c)
             def _fetch_em(c=code.replace('sh','').replace('sz','')):
@@ -68,11 +71,12 @@ def get_market_regime() -> Dict[str, Any]:
                     start_date=(now - timedelta(days=60)).strftime('%Y%m%d'),
                     end_date=now.strftime('%Y%m%d'))
             
-            df = resilient_fetch([_fetch_tx, _fetch_em], timeout=15, label=f"regime_{name}")
+            # 优先使用极其快速稳定的新浪源
+            df = resilient_fetch([_fetch_sina, _fetch_tx, _fetch_em], timeout=15, label=f"regime_{name}")
             if df is None or df.empty:
                 continue
             
-            # 统一列名：腾讯源列名是 close，东财源是 收盘
+            # 统一列名：新浪源和腾讯源列名是 close，东财源是 收盘
             close_col = 'close' if 'close' in df.columns else '收盘'
             df_regime = pd.DataFrame({'收盘': df[close_col].values})
             df_regime = calculate_ema(df_regime, 20)
@@ -385,7 +389,39 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
         "中证1000": "sh000852"
     }
 
-    # 提前获取东财全指数快照作为备选 (EM 备选源)
+    res = {}
+
+    # 1. 优先尝试腾讯极速合并实时源 (海外IP畅通无阻，毫秒级返回，彻底避免多线程并发超时)
+    try:
+        symbols = list(indices.values())
+        url = f"http://qt.gtimg.cn/q={','.join(symbols)}"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            r.encoding = 'gbk'
+            lines = r.text.strip().split('\n')
+            code_to_name = {v: k for k, v in indices.items()}
+            for line in lines:
+                if not line or '=' not in line or '"' not in line:
+                    continue
+                line_prefix = line.split('=')[0].replace('v_', '').strip()
+                if line_prefix in code_to_name:
+                    content = line.split('"')[1]
+                    parts = content.split('~')
+                    if len(parts) >= 33:
+                        name = code_to_name[line_prefix]
+                        res[name] = {
+                            'price': float(parts[3]) if parts[3] else 0.0,
+                            'pct': float(parts[32]) if parts[32] else 0.0
+                        }
+            if len(res) == len(indices):
+                set_cached_data('index_data', res)
+                return res
+            elif res:
+                logger.warning(f"[index_data] Partial fetch success from Tencent batch: {list(res.keys())}")
+    except Exception as e:
+        logger.debug(f"Tencent index batch fetch failed: {e}")
+
+    # 2. 备选源：提前获取东财全指数快照 (EM 备选源)
     em_snapshot = pd.DataFrame()
     try:
         em_snapshot = ak.stock_zh_index_spot_em()
@@ -416,21 +452,23 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
         result = resilient_fetch([_tx, _em], timeout=15, label=f"index_{name}")
         return name, result
 
-    res = {}
-    try:
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(fetch_one, n, c) for n, c in indices.items()]
-            for future in futures:
-                try:
-                    name, data = future.result(timeout=15)
-                    if data:
-                        res[name] = data
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    # 针对未成功获取的指数，启动并发兜底
+    missing_indices = {k: v for k, v in indices.items() if k not in res}
+    if missing_indices:
+        try:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(fetch_one, n, c) for n, c in missing_indices.items()]
+                for future in futures:
+                    try:
+                        name, data = future.result(timeout=15)
+                        if data:
+                            res[name] = data
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
-    # 兜底：用上次成功获取的缓存数据补全缺失项
+    # 3. 兜底：用上次成功获取的缓存数据补全缺失项
     if 'index_data' in CACHE:
         old_data = CACHE['index_data'][0]
         for name in indices:
