@@ -223,8 +223,95 @@ def get_market_snapshot() -> pd.DataFrame:
         df = df[cols]
         return df
 
-    # 通过 resilient_fetch 容灾调用，给新浪源充足的超时空间（35秒）
-    df = resilient_fetch([_fetch_snapshot_em, _fetch_snapshot_sina], timeout=35, label="market_snapshot")
+    def _fetch_snapshot_tencent():
+        """使用腾讯行情API，并发分批抓取全市场快照"""
+        basic_map = get_stock_basic_map()
+        codes = list(basic_map.keys())
+        if not codes:
+            raise ValueError("Tencent fetch aborted: Local database stock_basic table has no codes.")
+        
+        logger.info(f"Tencent snapshot fetch triggered for {len(codes)} stocks.")
+        
+        def format_tencent_code(code: str) -> str:
+            if code.startswith('6') or code.startswith('900'):
+                return f'sh{code}'
+            elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
+                return f'sz{code}'
+            elif code.startswith('8') or code.startswith('4') or code.startswith('920'):
+                return f'bj{code}'
+            return code
+
+        def fetch_tencent_chunk(chunk_codes):
+            symbols = [format_tencent_code(c) for c in chunk_codes]
+            url = f"http://qt.gtimg.cn/q={','.join(symbols)}"
+            try:
+                r = requests.get(url, timeout=8)
+                if r.status_code != 200:
+                    return []
+                r.encoding = 'gbk'
+                lines = r.text.strip().split('\n')
+                results = []
+                for line in lines:
+                    if not line or '"' not in line:
+                        continue
+                    try:
+                        content = line.split('"')[1]
+                        parts = content.split('~')
+                        if len(parts) < 46:
+                            continue
+                        
+                        # 提取核心字段
+                        code = parts[2]
+                        name = parts[1]
+                        price = float(parts[3]) if parts[3] else None
+                        open_val = float(parts[5]) if parts[5] else None
+                        pct_chg = float(parts[32]) if parts[32] else 0.0
+                        vol = float(parts[6]) if parts[6] else 0.0 # 已经是手
+                        turnover = float(parts[38]) if parts[38] else None
+                        mkt_cap = float(parts[45]) * 100000000.0 if parts[45] else None # 换算为元
+                        pe = float(parts[39]) if parts[39] else None
+                        
+                        results.append({
+                            'code': code,
+                            'name': name,
+                            'price': price,
+                            'open': open_val,
+                            'pct_chg': pct_chg,
+                            'vol': vol,
+                            'turnover': turnover,
+                            'mkt_cap': mkt_cap,
+                            'pe': pe
+                        })
+                    except Exception:
+                        continue
+                return results
+            except Exception as e:
+                logger.debug(f"Tencent chunk fetch failed: {e}")
+                return []
+
+        chunk_size = 200
+        chunks = [codes[i:i + chunk_size] for i in range(0, len(codes), chunk_size)]
+        
+        all_results = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_chunk = {executor.submit(fetch_tencent_chunk, chunk): chunk for chunk in chunks}
+            for future in as_completed(future_to_chunk):
+                try:
+                    res = future.result()
+                    if res:
+                        all_results.extend(res)
+                except Exception:
+                    continue
+                    
+        if not all_results:
+            raise ValueError("Tencent fetch returned empty result")
+            
+        df = pd.DataFrame(all_results)
+        logger.info(f"Tencent snapshot fetched successfully: {len(df)} rows.")
+        return df
+
+    # 通过 resilient_fetch 容灾调用，给新浪源/腾讯源充足的超时空间（35秒）
+    df = resilient_fetch([_fetch_snapshot_em, _fetch_snapshot_sina, _fetch_snapshot_tencent], timeout=35, label="market_snapshot")
     
     if df is not None and not df.empty:
         # 存入缓存
