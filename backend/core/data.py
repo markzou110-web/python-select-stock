@@ -161,49 +161,78 @@ def set_cached_data(key: str, data: Any) -> None:
     CACHE[key] = (data, time.time())
 
 def get_market_snapshot() -> pd.DataFrame:
-    """获取全市场实时快照 (v5.2 - 增强网络异常容忍，加入缓存机制)"""
-    # 增加 60 秒的高速缓存，防止双策略或并发扫描时频繁高负荷请求东财
+    """获取全市场实时快照 (v6.0 - 引入 resilient_fetch 多源容灾弹性重构)"""
+    # 增加 60 秒的高速缓存，防止双策略或并发扫描时频繁高负荷请求
     cached = get_cached_data('market_snapshot', 60)
     if cached is not None:
         logger.info("Using cached market snapshot data.")
         return cached
 
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            # 增加随机延迟以避开频率限制
-            time.sleep(random.uniform(0.5, 1.5) * (attempt + 1))
+    def _fetch_snapshot_em():
+        # 增加随机延迟以避开频率限制
+        time.sleep(random.uniform(0.1, 0.5))
+        df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            raise ValueError("Eastmoney returned empty snapshot")
             
-            # 使用更稳定的接口，或添加超时控制
-            df = ak.stock_zh_a_spot_em()
+        # 重命名常用列以便处理
+        df = df.rename(columns={
+            '代码': 'code',
+            '名称': 'name',
+            '最新价': 'price',
+            '今开': 'open',
+            '涨跌幅': 'pct_chg',
+            '成交量': 'vol',
+            '换手率': 'turnover',
+            '总市值': 'mkt_cap',
+            '市盈率-动态': 'pe'
+        })
+        return df
+
+    def _fetch_snapshot_sina():
+        # 增加随机延迟
+        time.sleep(random.uniform(0.1, 0.5))
+        df = ak.stock_zh_a_spot()
+        if df is None or df.empty:
+            raise ValueError("Sina returned empty snapshot")
+        
+        # 统一列名映射
+        df = df.rename(columns={
+            '代码': 'code',
+            '名称': 'name',
+            '最新价': 'price',
+            '今开': 'open',
+            '涨跌幅': 'pct_chg',
+            '成交量': 'vol'
+        })
+        
+        # 提取 6 位纯数字代码
+        df['code'] = df['code'].str.extract(r'(\d{6})')
+        
+        # 新浪成交量单位是股，东财是手。统一转换为手 (1手 = 100股)
+        if 'vol' in df.columns:
+            df['vol'] = pd.to_numeric(df['vol'], errors='coerce') / 100.0
             
-            if df is None or df.empty:
-                raise ValueError("Returned empty snapshot")
-                
-            # 重命名常用列以便处理
-            df = df.rename(columns={
-                '代码': 'code',
-                '名称': 'name',
-                '最新价': 'price',
-                '今开': 'open',
-                '涨跌幅': 'pct_chg',
-                '成交量': 'vol',
-                '换手率': 'turnover',
-                '总市值': 'mkt_cap',
-                '市盈率-动态': 'pe'
-            })
-            
-            # 存入缓存
-            set_cached_data('market_snapshot', df)
-            return df
-        except Exception as e:
-            wait_time = (attempt + 1) * 5
-            if attempt < max_retries - 1:
-                logger.warning(f"Snapshot fetch failed ({e}), retry {attempt+1}/{max_retries} in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Snapshot fetch failed after {max_retries} attempts: {e}")
-                return pd.DataFrame()
+        # 补全东财快照特有的字段
+        df['turnover'] = None
+        df['mkt_cap'] = None
+        df['pe'] = None
+        
+        # 只保留标准快照列
+        cols = ['code', 'name', 'price', 'open', 'pct_chg', 'vol', 'turnover', 'mkt_cap', 'pe']
+        df = df[cols]
+        return df
+
+    # 通过 resilient_fetch 容灾调用，给新浪源充足的超时空间（35秒）
+    df = resilient_fetch([_fetch_snapshot_em, _fetch_snapshot_sina], timeout=35, label="market_snapshot")
+    
+    if df is not None and not df.empty:
+        # 存入缓存
+        set_cached_data('market_snapshot', df)
+        return df
+    
+    logger.error("All real-time snapshot sources failed.")
+    return pd.DataFrame()
 
 def sync_stock(code: str, name: str, engine=None) -> bool:
     """
