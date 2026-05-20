@@ -139,7 +139,46 @@ class IntradaySentinel:
                 self.triggered_today.add(current_time)
                 try:
                     from routers.scan import run_market_scan_task
-                    results = run_market_scan_task(local_only=False)
+                    
+                    # 1. 执行均线收敛策略 (Squeeze) 扫描
+                    logger.info("Sentinel: Running Squeeze strategy scan...")
+                    squeeze_results = run_market_scan_task(local_only=False, strategy_type="squeeze") or []
+                    
+                    # 2. 执行多指标共振策略 (Pine) 扫描
+                    logger.info("Sentinel: Running Pine strategy scan...")
+                    pine_results = run_market_scan_task(local_only=False, strategy_type="pine") or []
+                    
+                    # 3. 双策略合并去重逻辑
+                    combined_dict = {}
+                    
+                    # 先放入 Squeeze 结果
+                    for s in squeeze_results:
+                        code = s.get('代码', s.get('code', ''))
+                        if code:
+                            s['strategy_type'] = 'squeeze'
+                            combined_dict[code] = s
+                            
+                    # 再放入 Pine 结果，如存在，进行策略升级合并
+                    for s in pine_results:
+                        code = s.get('代码', s.get('code', ''))
+                        if code:
+                            if code in combined_dict:
+                                existing = combined_dict[code]
+                                existing['strategy_type'] = 'both'
+                                existing['reason'] = "双策略共振(Squeeze+Pine)"
+                                if 'sop_bonuses' in existing and 'sop_bonuses' in s:
+                                    existing['sop_bonuses'] = list(set(existing['sop_bonuses'] + s['sop_bonuses']))
+                                if s.get('Score', 0) > existing.get('Score', 0):
+                                    existing['Score'] = s['Score']
+                            else:
+                                s['strategy_type'] = 'pine'
+                                combined_dict[code] = s
+                    
+                    results = list(combined_dict.values())
+                    # 按评级排序（A级优先，B级次之，C级再次），其次按 Score 降序
+                    grade_order = {'A': 0, 'B': 1, 'C': 2, 'D': 3, '?': 4}
+                    results = sorted(results, key=lambda x: (grade_order.get(x.get('sop_grade', '?'), 4), -x.get('Score', 0)))
+                    
                     if results:
                         self.last_top_5 = results[:5]
                         send_intraday_notification(self.last_top_5)

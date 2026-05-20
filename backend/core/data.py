@@ -161,7 +161,13 @@ def set_cached_data(key: str, data: Any) -> None:
     CACHE[key] = (data, time.time())
 
 def get_market_snapshot() -> pd.DataFrame:
-    """获取全市场实时快照 (v5.2 - 增强网络异常容忍)"""
+    """获取全市场实时快照 (v5.2 - 增强网络异常容忍，加入缓存机制)"""
+    # 增加 60 秒的高速缓存，防止双策略或并发扫描时频繁高负荷请求东财
+    cached = get_cached_data('market_snapshot', 60)
+    if cached is not None:
+        logger.info("Using cached market snapshot data.")
+        return cached
+
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -186,6 +192,9 @@ def get_market_snapshot() -> pd.DataFrame:
                 '总市值': 'mkt_cap',
                 '市盈率-动态': 'pe'
             })
+            
+            # 存入缓存
+            set_cached_data('market_snapshot', df)
             return df
         except Exception as e:
             wait_time = (attempt + 1) * 5

@@ -95,13 +95,15 @@ def get_signal_details(
         pnl_pct = round(pnl_pct_raw - 0.26, 2) # 固定扣除约 0.26% 的滑点与佣金
         exit_date = str(df['日期'].iloc[min(idx + hold_days, max_idx)])[:10]
 
-        sell_signals.append({
-            "time": exit_date,
-            "price": round(float(exit_price), 2),
-            "reason": exit_reason,
-            "pnl_pct": pnl_pct,
-            "hold_days": hold_days,
-        })
+        is_open = (idx + max_hold_days > max_idx) and (not hit_stop) and (exit_reason == "超时平仓")
+        if not is_open:
+            sell_signals.append({
+                "time": exit_date,
+                "price": round(float(exit_price), 2),
+                "reason": exit_reason,
+                "pnl_pct": pnl_pct,
+                "hold_days": hold_days,
+            })
 
     # --- 阶段 1 优化: 全局追踪移动止盈线 ---
     # 我们只追踪信号发生期间的止盈线轨迹
@@ -170,7 +172,7 @@ def _find_squeeze_signal_indices(df: pd.DataFrame, threshold: float, vol_multipl
     c_sqz = df['Sqz_Ratio'].rolling(10).min() < threshold if 'Sqz_Ratio' in df.columns else pd.Series(False, index=df.index)
 
     mask = c_breakout & c_volume & c_rsi & c_macd & c_sqz
-    valid = df.index[mask & (df.index >= 120) & (df.index < len(df) - 5)]
+    valid = df.index[mask & (df.index >= 120)]
     return valid.tolist()
 
 
@@ -184,7 +186,7 @@ def _find_pine_signal_indices(df: pd.DataFrame, min_signals: int) -> List[int]:
     is_bull_candle = df['收盘'] > df['开盘']
 
     mask = (bullish_count >= min_signals) & is_bull_candle
-    valid = df.index[mask & (df.index >= 50) & (df.index < len(df) - 5)]
+    valid = df.index[mask & (df.index >= 50)]
     return valid.tolist()
 
 
@@ -207,7 +209,7 @@ def _find_consensus_signal_indices(df: pd.DataFrame) -> List[int]:
     is_shadow = np.where(body > 0, (upper_shadow / body < 0.4).astype(int), 1).astype(int)
 
     mask = is_trend_up & is_hh & is_big_bull & is_vol & is_quality & is_shadow
-    valid = df.index[(mask == 1) & (df.index >= 80) & (df.index < len(df) - 5)]
+    valid = df.index[(mask == 1) & (df.index >= 80)]
     return valid.tolist()
 
 

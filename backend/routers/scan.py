@@ -434,6 +434,8 @@ def run_market_scan_task(
                 code = res['代码']
                 # 1. 计算回测统计
                 df_hist = hist_map.get(code)
+                if df_hist is not None:
+                    df_hist = df_hist.copy().reset_index(drop=True)
                 # 并发中重新计算指标 (Top 100 规模可控)
                 enable_pine = (strategy_type in ["pine", "both"])
                 df_labeled = calculate_indicators(df_hist, bench_df=bench_slice, enable_pine_indicators=enable_pine)
@@ -669,7 +671,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
 
     # 优先使用预加载的数据
     if preloaded_df is not None and not preloaded_df.empty:
-        df = preloaded_df.copy()
+        df = preloaded_df.copy().reset_index(drop=True)
     else:
         df = load_from_db(code, (target_date - timedelta(days=360)).strftime("%Y-%m-%d"), engine)
 
