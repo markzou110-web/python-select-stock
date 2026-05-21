@@ -2,6 +2,7 @@ from celery import Celery
 import os
 from .logging_config import logger
 from .config import config
+config.setup_no_proxy()
 from celery.schedules import crontab
 
 import redis
