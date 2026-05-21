@@ -150,7 +150,8 @@ class Notifier:
             bark_url += f"&group={urllib.parse.quote(group)}"
 
         try:
-            resp = requests.get(bark_url, timeout=_REQUEST_TIMEOUT)
+            # Force bypass system proxies to avoid SSL handshake issues (like UNEXPECTED_EOF_WHILE_READING)
+            resp = requests.get(bark_url, timeout=_REQUEST_TIMEOUT, proxies={"http": None, "https": None})
             if resp.ok:
                 logger.info("Bark push sent successfully.")
                 return True
@@ -189,10 +190,12 @@ class Notifier:
         }
 
         try:
+            # Force bypass system proxies to avoid SSL handshake issues
             resp = requests.post(
                 url,
                 json=payload,
                 timeout=_REQUEST_TIMEOUT,
+                proxies={"http": None, "https": None},
             )
             if resp.ok:
                 logger.info("Feishu push sent successfully.")
@@ -226,10 +229,12 @@ class Notifier:
         }
 
         try:
+            # Force bypass system proxies to avoid SSL handshake issues
             resp = requests.post(
                 url,
                 json=payload,
                 timeout=_REQUEST_TIMEOUT,
+                proxies={"http": None, "https": None},
             )
             if resp.ok:
                 logger.info("DingTalk push sent successfully.")
@@ -262,10 +267,12 @@ class Notifier:
         }
 
         try:
+            # Force bypass system proxies to avoid SSL handshake issues
             resp = requests.post(
                 url,
                 json=payload,
                 timeout=_REQUEST_TIMEOUT,
+                proxies={"http": None, "https": None},
             )
             if resp.ok:
                 logger.info("WeCom push sent successfully.")
