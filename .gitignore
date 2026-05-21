@@ -10,6 +10,7 @@ node_modules/
 .env
 .backend_pid
 .frontend_pid
+.celery_pid
 .DS_Store
 
 # Debug/utility scripts
