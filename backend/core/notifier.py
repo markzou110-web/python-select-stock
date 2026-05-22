@@ -131,29 +131,32 @@ class Notifier:
         is_archive: int = 1
     ) -> bool:
         """
-        Push via Bark (HTTP GET).
+        Push via Bark (HTTP POST).
         """
         key = _bark_key()
         if not key:
             logger.debug("Bark key not configured. Skipping Bark push.")
             return False
 
-        import urllib.parse
-        safe_title = urllib.parse.quote(title)
-        safe_body = urllib.parse.quote(body)
-        
-        bark_url = f"https://api.day.app/{key}/{safe_title}/{safe_body}?icon={_BARK_ICON_URL}&isArchive={is_archive}"
+        bark_url = "https://api.day.app/push"
+        payload = {
+            "title": title,
+            "body": body,
+            "device_key": key,
+            "icon": _BARK_ICON_URL,
+            "isArchive": is_archive
+        }
         
         if url:
-            bark_url += f"&url={urllib.parse.quote(url)}"
+            payload["url"] = url
         if group:
-            bark_url += f"&group={urllib.parse.quote(group)}"
+            payload["group"] = group
 
         try:
             # Force bypass system proxies to avoid SSL handshake issues (like UNEXPECTED_EOF_WHILE_READING)
-            resp = requests.get(bark_url, timeout=_REQUEST_TIMEOUT, proxies={"http": None, "https": None})
+            resp = requests.post(bark_url, json=payload, timeout=_REQUEST_TIMEOUT, proxies={"http": None, "https": None})
             if resp.ok:
-                logger.info("Bark push sent successfully.")
+                logger.info("Bark POST push sent successfully.")
                 return True
             logger.warning(
                 f"Bark push returned HTTP {resp.status_code}: {resp.text}"

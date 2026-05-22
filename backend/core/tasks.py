@@ -39,6 +39,10 @@ def check_realtime_alerts():
             
         snapshot_map = snapshot.set_index('code')['price'].to_dict()
 
+        # 在循环外部，仅抓取一次大盘基准指数历史 K 线（用于 RS 计算），彻底消除循环内 24 次冗余的网络请求
+        from core.data import get_index_hist
+        bench_df = get_index_hist("000001")
+
         codes = df_paper['code'].unique().tolist()
         alerts_triggered = []
 
@@ -66,8 +70,8 @@ def check_realtime_alerts():
             
             if len(df_hist) < 20: continue
 
-            # 注入实时价
-            df_labeled = calculate_indicators(df_hist, current_price=curr_price)
+            # 注入实时价并传入大盘基准，避免内部隐式重复抓取
+            df_labeled = calculate_indicators(df_hist, current_price=curr_price, bench_df=bench_df)
             
             # 4. 评估信号
             signals = evaluate_exit_signals(df_labeled, entry_price, high_since_entry)
@@ -82,7 +86,12 @@ def check_realtime_alerts():
         # 5. 发送推送
         if alerts_triggered:
             title = f"⚠️ 风险预警 ({len(alerts_triggered)}个信号)"
-            body = "\n".join(alerts_triggered)
+            # 为保证移动端通知显示美观，若多于 5 个预警，仅展示前 5 个并做优雅截断，避免消息堆叠
+            if len(alerts_triggered) > 5:
+                body = "\n".join(alerts_triggered[:5]) + f"\n... 等共 {len(alerts_triggered)} 个风控预警信号，请点击查看仪表板。"
+            else:
+                body = "\n".join(alerts_triggered)
+                
             # 这是一个异步操作，但不等待结果
             import asyncio
             try:
