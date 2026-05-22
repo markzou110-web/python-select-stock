@@ -185,6 +185,8 @@ def get_market_snapshot() -> pd.DataFrame:
             '名称': 'name',
             '最新价': 'price',
             '今开': 'open',
+            '最高': 'high',
+            '最低': 'low',
             '涨跌幅': 'pct_chg',
             '成交量': 'vol',
             '换手率': 'turnover',
@@ -206,6 +208,8 @@ def get_market_snapshot() -> pd.DataFrame:
             '名称': 'name',
             '最新价': 'price',
             '今开': 'open',
+            '最高': 'high',
+            '最低': 'low',
             '涨跌幅': 'pct_chg',
             '成交量': 'vol'
         })
@@ -223,7 +227,7 @@ def get_market_snapshot() -> pd.DataFrame:
         df['pe'] = None
         
         # 只保留标准快照列
-        cols = ['code', 'name', 'price', 'open', 'pct_chg', 'vol', 'turnover', 'mkt_cap', 'pe']
+        cols = ['code', 'name', 'price', 'open', 'high', 'low', 'pct_chg', 'vol', 'turnover', 'mkt_cap', 'pe']
         df = df[cols]
         return df
 
@@ -269,6 +273,8 @@ def get_market_snapshot() -> pd.DataFrame:
                         name = parts[1]
                         price = float(parts[3]) if parts[3] else None
                         open_val = float(parts[5]) if parts[5] else None
+                        high_val = float(parts[33]) if (len(parts) > 33 and parts[33]) else price
+                        low_val = float(parts[34]) if (len(parts) > 34 and parts[34]) else price
                         pct_chg = float(parts[32]) if parts[32] else 0.0
                         vol = float(parts[6]) if parts[6] else 0.0 # 已经是手
                         turnover = float(parts[38]) if parts[38] else None
@@ -280,6 +286,8 @@ def get_market_snapshot() -> pd.DataFrame:
                             'name': name,
                             'price': price,
                             'open': open_val,
+                            'high': high_val,
+                            'low': low_val,
                             'pct_chg': pct_chg,
                             'vol': vol,
                             'turnover': turnover,
@@ -318,6 +326,12 @@ def get_market_snapshot() -> pd.DataFrame:
     df = resilient_fetch([_fetch_snapshot_em, _fetch_snapshot_sina, _fetch_snapshot_tencent], timeout=35, label="market_snapshot")
     
     if df is not None and not df.empty:
+        # 双重防御：确保 high 和 low 列始终存在，若不存在以最新价/今开填充
+        if 'high' not in df.columns:
+            df['high'] = df['price'] if 'price' in df.columns else df['open']
+        if 'low' not in df.columns:
+            df['low'] = df['price'] if 'price' in df.columns else df['open']
+            
         # 存入缓存
         set_cached_data('market_snapshot', df)
         return df

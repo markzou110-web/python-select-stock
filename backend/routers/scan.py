@@ -299,6 +299,11 @@ def run_market_scan_task(
 
             if snapshot_date > db_max_date and not candidates.empty:
                 logger.info(f"Appending real-time snapshot data ({snapshot_date}) to historical data...")
+                # 容错双重防御：防止因行情接口偶发缺陷导致缺失 high 或 low 字段
+                for col in ['high', 'low']:
+                    if col not in candidates.columns:
+                        candidates[col] = candidates['price'] if 'price' in candidates.columns else candidates['open']
+                
                 snap_to_append = candidates[['code', 'open', 'high', 'low', 'price', 'vol']].copy()
                 snap_to_append = snap_to_append.rename(columns={
                     'open': '开盘',
