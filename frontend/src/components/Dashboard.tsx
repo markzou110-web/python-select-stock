@@ -28,7 +28,7 @@ export default function Dashboard() {
     const lastUpdated = useMarketStore(s => s.lastUpdated);
     const fetchMarketData = useMarketStore(s => s.fetchMarketData);
     const fetchSyncStatus = useMarketStore(s => s.fetchSyncStatus);
-    const fetchMarketRegime = useMarketStore(s => s.fetchMarketRegime);
+    const fetchMarketPulse = useMarketStore(s => s.fetchMarketPulse);
     const startSync = useMarketStore(s => s.startSync);
     const startSyncFundamentals = useMarketStore(s => s.startSyncFundamentals);
     const stopSync = useMarketStore(s => s.stopSync);
@@ -72,7 +72,7 @@ export default function Dashboard() {
                 fetchSyncStatus(), 
                 fetchHistory(), 
                 fetchAvailableDates(),
-                fetchMarketRegime()
+                fetchMarketPulse()
             ]);
             useMarketStore.setState({ loading: false });
         };

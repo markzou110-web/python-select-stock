@@ -83,7 +83,8 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
                 df = df.merge(b_slice, on='日期', suffixes=('', '_bench'), how='left')
                 df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
                 df['RS_MA50'] = df['RS'].rolling(window=50).mean()
-    except: pass
+    except Exception as e:
+        logger.warning(f"Error calculating RS indicator: {e}")
 
     # Pine Script 策略指标 (可选启用)
     if enable_pine_indicators:

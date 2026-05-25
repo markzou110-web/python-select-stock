@@ -13,6 +13,7 @@ class ConnectionManager:
         self.active_connections: List[WebSocket] = []
         self.loop = None
         self._listen_thread = None
+        self._stop_flag = False
         try:
             self.redis_client = redis.Redis.from_url(redis_url)
             self.pubsub = self.redis_client.pubsub()
@@ -35,17 +36,28 @@ class ConnectionManager:
             asyncio.create_task(self._listen_to_redis())
 
     async def _listen_to_redis(self):
-        # We need an async reader for redis to not block the event loop
-        # For simplicity with sync redis client, we poll with asyncio.sleep
-        while True:
+        """Listen to Redis pubsub for cross-process messages. Stops when flagged or no connections."""
+        while not self._stop_flag:
             try:
-                message = self.redis_client.pubsub().get_message(ignore_subscribe_messages=True)
+                # 无活跃连接时降低轮询频率
+                if not self.active_connections:
+                    await asyncio.sleep(1.0)
+                    continue
+
+                message = self.pubsub.get_message(ignore_subscribe_messages=True)
                 if message and message.get('type') == 'message':
                     data = json.loads(message['data'])
                     await self.broadcast(data)
+            except redis.ConnectionError:
+                # Redis 断开连接，等待重连
+                await asyncio.sleep(5.0)
             except Exception:
                 pass
             await asyncio.sleep(0.05)
+
+    def stop(self):
+        """Graceful shutdown: stop the Redis listener."""
+        self._stop_flag = True
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
@@ -79,3 +91,4 @@ class ConnectionManager:
                     pass
 
 manager = ConnectionManager()
+

@@ -19,13 +19,71 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
     const showPineParams = params.strategy_type === "pine" || params.strategy_type === "both";
     const showConsensusParams = params.strategy_type === "consensus";
     const [recommending, setRecommending] = useState(false);
+    const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+    const [highlightedFields, setHighlightedFields] = useState<string[]>([]);
     const fetchMarketRegime = useMarketStore(s => s.fetchMarketRegime);
+
+    const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 4500);
+    };
 
     const handleSmartRecommend = async () => {
         setRecommending(true);
-        const recommended = await fetchMarketRegime();
-        if (recommended) {
-            setParams({ ...params, ...recommended });
+        const data = await fetchMarketRegime(params.strategy_type);
+        if (data && data.recommended_params) {
+            const recommendedParams = data.recommended_params;
+            
+            // Find which keys are actually changed
+            const changes: string[] = [];
+            const changedKeys: string[] = [];
+            const newParams = { ...params, ...recommendedParams };
+            
+            // Map parameter keys to friendly Chinese names
+            const paramNames: Record<string, string> = {
+                threshold: '粘合度阈值',
+                vol_multiplier: '量比倍数',
+                rsi_min: 'RSI最小强度',
+                use_bb_sqz: '极致波动率(BB)',
+                sqz_lookback: '粘合回溯天数',
+                stop_loss_pct: '回测止损线',
+                pine_min_signals: '最小共振信号数'
+            };
+            
+            Object.keys(recommendedParams).forEach(key => {
+                if (key !== 'description' && params[key] !== recommendedParams[key]) {
+                    const name = paramNames[key] || key;
+                    const oldVal = params[key];
+                    const newVal = recommendedParams[key];
+                    changedKeys.push(key);
+                    if (oldVal !== undefined) {
+                        changes.push(`${name}(${oldVal} ➡️ ${newVal})`);
+                    } else {
+                        changes.push(`${name}(${newVal})`);
+                    }
+                }
+            });
+
+            setParams(newParams);
+            
+            if (changedKeys.length > 0) {
+                setHighlightedFields(changedKeys);
+                setTimeout(() => setHighlightedFields([]), 3000);
+            }
+            
+            const regime = data.regime;
+            const desc = recommendedParams.description || regime.description;
+            
+            let msg = `检测到当前大盘为【${regime.label}】。${desc}`;
+            if (changes.length > 0) {
+                msg += `，已自适应调整参数：${changes.join('、')}`;
+            } else {
+                msg += `。（当前参数已处于该市场环境下的推荐配置，无需调整）`;
+            }
+            
+            showToast(msg, 'success');
+        } else {
+            showToast("智能推荐参数获取失败，请重试", 'error');
         }
         setRecommending(false);
     };
@@ -97,7 +155,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         {/* 均线粘合策略专用参数 */}
                         {showSqueezeParams && (
                             <>
-                                <FilterItem label="粘合度阈值 (0.01~0.30)">
+                                <FilterItem label="粘合度阈值 (0.01~0.30)" highlighted={highlightedFields.includes('threshold')}>
                                     <input
                                         type="range" min="0.01" max="0.30" step="0.01" value={params.threshold || 0}
                                         onChange={e => setParams({ ...params, threshold: parseFloat(e.target.value) })}
@@ -110,7 +168,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     </div>
                                 </FilterItem>
 
-                                <FilterItem label="量比倍数 (1.0~5.0)">
+                                <FilterItem label="量比倍数 (1.0~5.0)" highlighted={highlightedFields.includes('vol_multiplier')}>
                                     <input
                                         type="number" step="0.1" value={isNaN(params.vol_multiplier) ? '' : params.vol_multiplier}
                                         onChange={e => setParams({ ...params, vol_multiplier: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
@@ -156,7 +214,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         {/* Pine Script 策略专用参数 */}
                         {showPineParams && (
                             <>
-                                <FilterItem label="🎯 最小共振信号数">
+                                <FilterItem label="🎯 最小共振信号数" highlighted={highlightedFields.includes('pine_min_signals')}>
                                     <div className="flex items-center gap-4">
                                         <input
                                             type="range" min="1" max="5" step="1" value={params.pine_min_signals || 3}
@@ -221,11 +279,11 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     </ul>
                                 </div>
                                 
-                                <FilterItem label="量比倍数 (建议 &gt; 1.8)">
+                                <FilterItem label="量比倍数 (建议 &gt; 1.8)" highlighted={highlightedFields.includes('vol_multiplier')}>
                                     <input
                                         type="number" step="0.5" value={isNaN(params.vol_multiplier) ? '' : params.vol_multiplier}
                                         onChange={e => setParams({ ...params, vol_multiplier: e.target.value === '' ? NaN : parseFloat(e.target.value) })}
-                                        className="w-full px-4 py-2 bg-blue-50/50 border-none rounded-xl text-sm font-bold text-blue-900 outline-none focus:ring-2 focus:ring-blue-500"
+                                        className="w-full px-4 py-2 bg-blue-50/50 border-none rounded-xl text-sm font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500"
                                     />
                                 </FilterItem>
 
@@ -240,7 +298,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         <select
                                             value={params.weekly_ma_period}
                                             onChange={e => setParams({ ...params, weekly_ma_period: parseInt(e.target.value) })}
-                                            className="w-full px-4 py-2 bg-blue-50/50 border-none rounded-xl text-sm font-bold text-blue-900 outline-none focus:ring-2 focus:ring-blue-500"
+                                            className="w-full px-4 py-2 bg-blue-50/50 border-none rounded-xl text-sm font-bold text-slate-900 outline-none focus:ring-2 focus:ring-blue-500"
                                         >
                                             <option value={10}>MA10w (10周 ≈ 2.5个月) — 灵敏</option>
                                             <option value={20}>MA20w (20周 ≈ 5个月) — 推荐</option>
@@ -277,7 +335,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         {/* 均线粘合策略专用参数 */}
                         {showSqueezeParams && (
                             <>
-                                <FilterItem label="RSI 最小强度 (30~80)">
+                                <FilterItem label="RSI 最小强度 (30~80)" highlighted={highlightedFields.includes('rsi_min')}>
                                     <input
                                         type="number" value={isNaN(params.rsi_min) ? '' : params.rsi_min}
                                         onChange={e => setParams({ ...params, rsi_min: e.target.value === '' ? NaN : parseInt(e.target.value) })}
@@ -285,7 +343,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     />
                                 </FilterItem>
 
-                                <FilterItem label="粘合回溯天数 (1~30)">
+                                <FilterItem label="粘合回溯天数 (1~30)" highlighted={highlightedFields.includes('sqz_lookback')}>
                                     <input
                                         type="number" value={isNaN(params.sqz_lookback) ? '' : params.sqz_lookback}
                                         onChange={e => setParams({ ...params, sqz_lookback: e.target.value === '' ? NaN : parseInt(e.target.value) })}
@@ -297,6 +355,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     label="极致波动率收缩 (BB)"
                                     active={params.use_bb_sqz}
                                     onClick={() => setParams({ ...params, use_bb_sqz: !params.use_bb_sqz })}
+                                    highlighted={highlightedFields.includes('use_bb_sqz')}
                                 />
 
                                 <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-slate-100 cursor-pointer transition-all hover:bg-slate-50">
@@ -366,7 +425,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                             </p>
                         </FilterItem>
 
-                        <FilterItem label="🛑 回测止损线 (%)">
+                        <FilterItem label="🛑 回测止损线 (%)" highlighted={highlightedFields.includes('stop_loss_pct')}>
                             <div className="flex items-center gap-4">
                                 <input
                                     type="range" min="-15" max="-3" step="1" value={params.stop_loss_pct || -8}
@@ -382,7 +441,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                 <span>严格 (-15%)</span>
                             </div>
                             <p className="text-[10px] text-rose-500 mt-1">
-                                回测中模拟止损退出的触发点，影响历史胜率和盈亏比计算
+                                回测中模拟止损退出的触发点，影响历史胜率 and 盈亏比计算
                             </p>
                         </FilterItem>
 
@@ -419,32 +478,59 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     </button>
                 </div>
             </div>
+            
+            {/* Toast notification */}
+            {toast && (
+                <div className={cn(
+                    "fixed top-6 right-6 z-[60] max-w-md px-5 py-4 rounded-2xl shadow-2xl text-sm font-bold animate-in fade-in slide-in-from-top-4 duration-300 bg-indigo-600 text-white"
+                )}>
+                    <div className="flex items-start gap-3">
+                        <div className="mt-0.5 p-1 bg-white/10 rounded-lg">
+                            <Zap size={16} className="text-amber-300 fill-amber-300 animate-bounce" />
+                        </div>
+                        <div className="space-y-1">
+                            <p className="font-extrabold tracking-wide">💡 智能推荐反馈</p>
+                            <p className="text-xs text-white/95 font-medium leading-relaxed">{toast.message}</p>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
 
-function FilterItem({ label, children }: { label: string, children: React.ReactNode }) {
+function FilterItem({ label, children, highlighted = false }: { label: string, children: React.ReactNode, highlighted?: boolean }) {
     return (
-        <div className="space-y-2">
-            <label className="text-xs font-extrabold text-slate-500 uppercase tracking-wider">{label}</label>
+        <div className={cn(
+            "space-y-2 p-2 rounded-2xl transition-all duration-500",
+            highlighted ? "bg-amber-50 ring-2 ring-amber-400/50 shadow-md shadow-amber-100 scale-[1.02]" : "border border-transparent"
+        )}>
+            <label className="text-xs font-extrabold text-slate-500 uppercase tracking-wider flex items-center gap-1">
+                {label}
+                {highlighted && <span className="text-[10px] bg-amber-500 text-white px-1.5 py-0.5 rounded-full font-black animate-pulse">推荐更新</span>}
+            </label>
             {children}
         </div>
     );
 }
 
-function ToggleItem({ label, active, onClick }: { label: string, active: boolean, onClick: () => void }) {
+function ToggleItem({ label, active, onClick, highlighted = false }: { label: string, active: boolean, onClick: () => void, highlighted?: boolean }) {
     return (
         <div
             onClick={onClick}
             className={cn(
-                "flex items-center justify-between p-3 rounded-xl border-2 cursor-pointer transition-all",
+                "flex items-center justify-between p-3 rounded-xl border-2 cursor-pointer transition-all duration-500",
+                highlighted ? "border-amber-400 bg-amber-50/50 scale-[1.02] ring-2 ring-amber-400/30" : 
                 active ? "border-indigo-600 bg-indigo-50/50" : "border-slate-100 bg-slate-50/30 hover:border-slate-200"
             )}
         >
-            <span className={cn("text-xs font-bold", active ? "text-indigo-600" : "text-slate-400")}>{label}</span>
+            <span className={cn("text-xs font-bold flex items-center gap-1", highlighted ? "text-amber-700" : active ? "text-indigo-600" : "text-slate-400")}>
+                {label}
+                {highlighted && <span className="text-[9px] bg-amber-500 text-white px-1 py-0.5 rounded-full font-black">更新</span>}
+            </span>
             <div className={cn(
                 "w-5 h-5 rounded-md flex items-center justify-center transition-all",
-                active ? "bg-indigo-600 text-white" : "bg-slate-200 text-transparent"
+                highlighted ? "bg-amber-500 text-white" : active ? "bg-indigo-600 text-white" : "bg-slate-200 text-transparent"
             )}>
                 <Check size={14} strokeWidth={3} />
             </div>

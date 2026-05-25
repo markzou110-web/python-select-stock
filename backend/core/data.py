@@ -15,8 +15,7 @@ from .logging_config import logger
 
 
 # ═══════════════════════════════════════════════════════
-# Feature 1: 数据源容灾智能切换 — resilient_fetch 工厂
-# ═══════════════════════════════════════════════════════
+_resilient_executor = ThreadPoolExecutor(max_workers=10)
 
 def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = "data"):
     """
@@ -35,11 +34,10 @@ def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = 
         # 每个源内部尝试 2 次
         for attempt in range(2):
             try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(func)
-                    result = future.result(timeout=timeout)
-                    if result is not None and not (isinstance(result, pd.DataFrame) and result.empty):
-                        return result
+                future = _resilient_executor.submit(func)
+                result = future.result(timeout=timeout)
+                if result is not None and not (isinstance(result, pd.DataFrame) and result.empty):
+                    return result
             except FuturesTimeoutError:
                 logger.warning(f"[{label}] {source_name} timed out after {timeout}s (attempt {attempt+1})")
             except Exception as e:
@@ -115,17 +113,16 @@ def get_market_regime() -> Dict[str, Any]:
         logger.error(f"Error getting market regime: {e}")
         return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": {}, "updated_at": ""}
 
-# --- 禁用代理以避免连接问题 ---
-# 禁用 requests 和 urllib 的代理
-os.environ['NO_PROXY'] = '*'
-os.environ['HTTP_PROXY'] = ''
-os.environ['HTTPS_PROXY'] = ''
-os.environ['http_proxy'] = ''
-os.environ['https_proxy'] = ''
+# --- 统一根据配置禁用代理 ---
+from core.config import config
+config.setup_no_proxy()
 
 # --- Bounded TTL Cache with auto-eviction ---
+import threading
+
 _CACHE_MAX_SIZE = 128
 CACHE: Dict[str, Tuple[Any, float]] = {}
+_cache_lock = threading.Lock()
 
 
 def _evict_expired() -> None:
@@ -147,22 +144,32 @@ def get_cached_data(key: str, ttl_seconds: int) -> Optional[Any]:
     Returns:
         Cached data or None if expired/not found
     """
-    if key in CACHE:
-        data, timestamp = CACHE[key]
-        if time.time() - timestamp < ttl_seconds:
-            return data
-        del CACHE[key]
-    return None
+    with _cache_lock:
+        if key in CACHE:
+            data, timestamp = CACHE[key]
+            if time.time() - timestamp < ttl_seconds:
+                return data
+            del CACHE[key]
+        return None
 
 
 def set_cached_data(key: str, data: Any) -> None:
     """Store data in cache with current timestamp. Evicts expired entries when full."""
-    if len(CACHE) >= _CACHE_MAX_SIZE:
-        _evict_expired()
-    if len(CACHE) >= _CACHE_MAX_SIZE:
-        oldest_key = min(CACHE, key=lambda k: CACHE[k][1])
-        del CACHE[oldest_key]
-    CACHE[key] = (data, time.time())
+    with _cache_lock:
+        if len(CACHE) >= _CACHE_MAX_SIZE:
+            _evict_expired()
+        if len(CACHE) >= _CACHE_MAX_SIZE:
+            oldest_key = min(CACHE, key=lambda k: CACHE[k][1])
+            del CACHE[oldest_key]
+        CACHE[key] = (data, time.time())
+
+
+def get_stale_cache(key: str) -> Optional[Any]:
+    """Get cached data regardless of TTL (for fallback use when fresh fetch fails)."""
+    with _cache_lock:
+        if key in CACHE:
+            return CACHE[key][0]
+        return None
 
 def get_market_snapshot() -> pd.DataFrame:
     """获取全市场实时快照 (v6.0 - 引入 resilient_fetch 多源容灾弹性重构)"""
@@ -483,11 +490,11 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
             pass
 
     # 3. 兜底：用上次成功获取的缓存数据补全缺失项
-    if 'index_data' in CACHE:
-        old_data = CACHE['index_data'][0]
+    stale_index = get_stale_cache('index_data')
+    if stale_index:
         for name in indices:
-            if name not in res and name in old_data:
-                res[name] = old_data[name]
+            if name not in res and name in stale_index:
+                res[name] = stale_index[name]
 
     if res:
         set_cached_data('index_data', res)
@@ -519,8 +526,9 @@ def get_hot_sectors() -> List[Dict[str, Any]]:
         return result
 
     # 兜底过期缓存
-    if 'hot_sectors' in CACHE:
-        return CACHE['hot_sectors'][0]
+    stale = get_stale_cache('hot_sectors')
+    if stale:
+        return stale
     return []
 
 def get_sector_trends() -> Dict[str, Dict[str, Any]]:
@@ -577,8 +585,9 @@ def get_sector_trends() -> Dict[str, Dict[str, Any]]:
         return result
     
     # 兜底过期缓存
-    if 'sector_trends' in CACHE:
-        return CACHE['sector_trends'][0]
+    stale = get_stale_cache('sector_trends')
+    if stale:
+        return stale
     return {}
 
 def get_sector_map() -> Dict[str, str]:
@@ -767,17 +776,8 @@ def get_index_hist(code: str) -> pd.DataFrame:
         res_container = []
         def target_func():
             try:
-                # 临时清理代理，以防万一
-                old_proxies = {k: os.environ.get(k) for k in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']}
-                for k in old_proxies:
-                    if k in os.environ: del os.environ[k]
-                
                 df_ak = ak.index_zh_a_hist(symbol=code, period="daily")
                 res_container.append(df_ak)
-                
-                # 还原代理
-                for k, v in old_proxies.items():
-                    if v is not None: os.environ[k] = v
             except Exception as ex:
                 logger.warning(f"ak.index_zh_a_hist exception: {ex}")
                 

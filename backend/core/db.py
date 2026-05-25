@@ -56,24 +56,38 @@ def save_db_config(config: Dict[str, Any]) -> bool:
         logger.error(f"Failed to save db config: {e}")
         return False
 
+_engine = None
 SessionLocal = None
 
 def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
     """根据配置获取数据库引擎"""
+    global _engine, SessionLocal
+    if _engine is not None:
+        return _engine
+
     if not db_config:
         db_config = load_db_config()
 
     if not db_config:
-        return None
+        # 兜底：使用环境变量配置 (config.py)
+        try:
+            from .config import config as app_config
+            url = app_config.get_database_url()
+            _engine = create_engine(url, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600)
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+            logger.info("Database engine created from environment config.")
+            return _engine
+        except Exception as e:
+            logger.error(f"Failed to create engine from env config: {e}")
+            return None
 
     try:
         url = f"postgresql://{db_config['user']}:{db_config['pwd']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
-        engine = create_engine(url, pool_size=10, max_overflow=20)
+        _engine = create_engine(url, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600)
         
-        global SessionLocal
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
         
-        return engine
+        return _engine
     except (KeyError, ValueError) as e:
         logger.error(f"Invalid db config: {e}")
         return None
@@ -99,6 +113,8 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_date ON scan_history(date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status ON paper_trading(status);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date_code ON daily_k(date, code);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status_date ON paper_trading(status, entry_date DESC);"))
                 logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
@@ -134,22 +150,18 @@ def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
         data['code'] = code
         data = data.rename(columns={'日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'vol'})
 
-        # 使用唯一的临时表名，防止多线程冲突
-        # 验证临时表名格式
-        temp_table_name = f"daily_k_temp_{code}"
-        if not validate_table_name(temp_table_name):
-            logger.error(f"Invalid temp table name: {temp_table_name}")
-            return False
+        # 统一将 date 列转为字符串，确保数据库能够一致解析
+        data['date'] = data['date'].astype(str)
 
-        data.to_sql(temp_table_name, engine, if_exists='replace', index=False)
+        # 转换为记录字典列表，使用批量参数化 INSERT 替代临时表以确保线程/事务安全
+        rows = data.to_dict('records')
+
         with engine.connect() as conn:
-            # 使用参数化查询避免 SQL 注入 (临时表名已验证)
-            conn.execute(text(f'''
+            conn.execute(text('''
                 INSERT INTO daily_k (code, date, open, high, low, close, vol)
-                SELECT code, CAST(date AS DATE), open, high, low, close, vol FROM {temp_table_name}
+                VALUES (:code, CAST(:date AS DATE), :open, :high, :low, :close, :vol)
                 ON CONFLICT (code, date) DO NOTHING
-            '''))
-            conn.execute(text(f"DROP TABLE {temp_table_name}"))
+            '''), rows)
             conn.commit()
         return True
     except Exception as e:
@@ -217,7 +229,33 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
             # 先删除当天旧记录，避免上次扫描的残留股票仍然显示
             conn.execute(text("DELETE FROM scan_history WHERE date = :date"), {"date": current_date})
 
+            # 批量构建参数列表
+            rows = []
             for r in results:
+                rows.append({
+                    "code": r.get('代码'),
+                    "name": r.get('名称'),
+                    "date": current_date,
+                    "price": float(r.get('现价', 0)),
+                    "pct": float(r.get('涨幅%', 0)),
+                    "score": float(r.get('Score', 0)),
+                    "rsi": float(r.get('RSI', 0)),
+                    "dif": float(r.get('DIF', 0)),
+                    "bb": float(r.get('BB', 0)),
+                    "glue": float(r.get('粘合度', 0)),
+                    "industry": r.get('行业', '未知'),
+                    "win_rate": r.get('历史胜率', '0%'),
+                    "signal_count": int(r.get('信号次数', 0)),
+                    "north_money": r.get('北向', '---'),
+                    "resonance": r.get('共振', '独苗'),
+                    "shadow_ratio": float(r.get('影线比', 0)),
+                    "strategy_type": r.get('strategy_type', 'squeeze'),
+                    "roe": float(r.get('ROE', 0)) if r.get('ROE') is not None else None,
+                    "net_profit_yoy": float(r.get('净利YOY', 0)) if r.get('净利YOY') is not None else None
+                })
+
+            # 一次性批量插入 (executemany)
+            if rows:
                 conn.execute(text('''
                     INSERT INTO scan_history (
                         code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy
@@ -240,27 +278,7 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         strategy_type = EXCLUDED.strategy_type,
                         roe = EXCLUDED.roe,
                         net_profit_yoy = EXCLUDED.net_profit_yoy
-                '''), {
-                    "code": r.get('代码'),
-                    "name": r.get('名称'),
-                    "date": current_date,
-                    "price": float(r.get('现价', 0)),
-                    "pct": float(r.get('涨幅%', 0)),
-                    "score": float(r.get('Score', 0)),
-                    "rsi": float(r.get('RSI', 0)),
-                    "dif": float(r.get('DIF', 0)),
-                    "bb": float(r.get('BB', 0)),
-                    "glue": float(r.get('粘合度', 0)),
-                    "industry": r.get('行业', '未知'),
-                    "win_rate": r.get('历史胜率', '0%'),
-                    "signal_count": int(r.get('信号次数', 0)),
-                    "north_money": r.get('北向', '---'),
-                    "resonance": r.get('共振', '独苗'),
-                    "shadow_ratio": float(r.get('影线比', 0)),
-                    "strategy_type": r.get('strategy_type', 'squeeze'),
-                    "roe": float(r.get('ROE', 0)) if r.get('ROE') is not None else None,
-                    "net_profit_yoy": float(r.get('净利YOY', 0)) if r.get('净利YOY') is not None else None
-                })
+                '''), rows)
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
         return True
@@ -291,30 +309,37 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
         if df.empty:
             return []
         
-        # 转换回前端需要的格式
-        results = []
-        for _, row in df.iterrows():
-            results.append({
-                "代码": row['code'],
-                "名称": row['name'],
-                "行业": row['industry'],
-                "现价": row['price'],
-                "涨幅%": row['pct'],
-                "Score": row['score'],
-                "RSI": row['rsi'],
-                "DIF": row['dif'],
-                "BB": row['bb'],
-                "粘合度": row['glue'],
-                "历史胜率": row['win_rate'],
-                "信号次数": row['signal_count'],
-                "北向": row['north_money'],
-                "共振": row['resonance'],
-                "影线比": row['shadow_ratio'],
-                "strategy_type": row.get('strategy_type', 'squeeze'),
-                "ROE": row.get('roe'),
-                "净利YOY": row.get('net_profit_yoy')
-            })
-        return results
+        # Define a column mapping
+        col_mapping = {
+            "code": "代码",
+            "name": "名称",
+            "industry": "行业",
+            "price": "现价",
+            "pct": "涨幅%",
+            "score": "Score",
+            "rsi": "RSI",
+            "dif": "DIF",
+            "bb": "BB",
+            "glue": "粘合度",
+            "win_rate": "历史胜率",
+            "signal_count": "信号次数",
+            "north_money": "北向",
+            "resonance": "共振",
+            "shadow_ratio": "影线比",
+            "strategy_type": "strategy_type",
+            "roe": "ROE",
+            "net_profit_yoy": "净利YOY"
+        }
+        
+        # 仅过滤并重命名 DataFrame 中存在的列，以防结构字段缺失
+        existing_mapping = {k: v for k, v in col_mapping.items() if k in df.columns}
+        df_mapped = df[list(existing_mapping.keys())].rename(columns=existing_mapping)
+        
+        # 兜底确保策略类型列存在
+        if "strategy_type" not in df_mapped.columns:
+            df_mapped["strategy_type"] = "squeeze"
+            
+        return df_mapped.to_dict('records')
     except Exception as e:
         logger.error(f"Error loading scan history for {date_str}: {e}")
         return []

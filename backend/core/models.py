@@ -1,8 +1,9 @@
 from sqlalchemy import Column, String, Float, Integer, Date, DateTime, Text
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    pass
 
 class StockBasic(Base):
     __tablename__ = "stock_basic"

@@ -13,7 +13,7 @@ from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code
 from core.data import get_market_snapshot, get_sector_map
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
-from schemas.paper_trade import PaperTradeCreate
+from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
 
@@ -33,7 +33,7 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
         sector_map = get_sector_map()
         new_industry = sector_map.get(trade.code, '未知')
         
-        open_df = pd.read_sql("SELECT code FROM paper_trading WHERE status = 'OPEN'", engine)
+        open_df = pd.read_sql(text("SELECT code FROM paper_trading WHERE status = :status"), engine, params={"status": "OPEN"})
         if not open_df.empty and new_industry != '未知':
             sector_counts = {}
             for code in open_df['code']:
@@ -77,7 +77,7 @@ def list_paper_trades() -> Dict[str, Any]:
     if not engine:
         return {"trades": [], "stats": {}}
     try:
-        df = pd.read_sql("SELECT * FROM paper_trading ORDER BY entry_date DESC", engine)
+        df = pd.read_sql(text("SELECT * FROM paper_trading ORDER BY entry_date DESC"), engine)
         if df.empty:
             return {"trades": [], "stats": {"total_trades": 0, "win_rate": 0, "total_pl_pct": 0, "avg_hold_days": 0}}
 
@@ -110,8 +110,8 @@ def list_paper_trades() -> Dict[str, Any]:
                             match = snapshot[snapshot['code'] == code]
                             if not match.empty:
                                 price_map[code] = float(match.iloc[0]['price'])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to fetch market snapshot for paper trading price tracking: {e}")
 
         # --- 计算每笔交易的盈亏 ---
         trades = []
@@ -119,7 +119,7 @@ def list_paper_trades() -> Dict[str, Any]:
 
         # 获取行业映射
         try:
-            sector_df = pd.read_sql("SELECT code, industry FROM stock_basic WHERE industry IS NOT NULL", engine)
+            sector_df = pd.read_sql(text("SELECT code, industry FROM stock_basic WHERE industry IS NOT NULL"), engine)
             sector_map_data = dict(zip(sector_df['code'], sector_df['industry']))
         except Exception:
             pass
@@ -132,6 +132,7 @@ def list_paper_trades() -> Dict[str, Any]:
             status = row.get('status', 'OPEN')
             entry_price = float(row['entry_price'])
             entry_date = pd.to_datetime(row['entry_date'])
+            high_since_entry = float(row.get('high_since_entry') or entry_price)
 
             # --- 价格与日期处理 ---
             if status == 'CLOSED':
@@ -143,7 +144,6 @@ def list_paper_trades() -> Dict[str, Any]:
                 hold_days = (datetime.now() - entry_date).days
                 
                 # --- 移动止损数据更新 ---
-                high_since_entry = float(row.get('high_since_entry') or entry_price)
                 high_since_entry = max(high_since_entry, current_price)
                 # 即使价格没变，我们也需要 high_since_entry 来更新
                 price_updates.append({"price": current_price, "high": high_since_entry, "id": int(row['id'])})
@@ -277,11 +277,9 @@ def remove_paper_trade(id: int) -> Dict[str, str]:
 
 
 @router.post("/close/{id}")
-def close_paper_trade(id: int, data: dict) -> Dict[str, Any]:
+def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
     """平仓: 记录卖出价格和日期，将交易标记为 CLOSED"""
-    close_price = data.get("close_price")
-    if close_price is None:
-        raise HTTPException(status_code=400, detail="必须提供 close_price")
+    close_price = data.close_price
 
     engine = get_db_engine()
     if not engine:
@@ -328,7 +326,7 @@ def run_wind_control() -> Dict[str, Any]:
     if not engine: return {"status": "error"}
     
     try:
-        df = pd.read_sql("SELECT * FROM paper_trading WHERE status = 'OPEN'", engine)
+        df = pd.read_sql(text("SELECT * FROM paper_trading WHERE status = :status"), engine, params={"status": "OPEN"})
         if df.empty: return {"status": "success", "closed_count": 0}
         
         from core.data import get_market_snapshot
@@ -342,6 +340,8 @@ def run_wind_control() -> Dict[str, Any]:
 
         closed_count = 0
         alerts = []
+        close_updates = []  # 收集批量更新参数
+        close_date_str = datetime.now().strftime("%Y-%m-%d")
 
         for _, row in df.iterrows():
             code = row['code']
@@ -373,22 +373,25 @@ def run_wind_control() -> Dict[str, Any]:
             if reason:
                 # 生成更详细的智能备注
                 remark = f"{reason}。卖出时大盘状态：{regime.get('desc', 'N/A')}。"
-                
-                with engine.connect() as conn:
-                    conn.execute(text("""
-                        UPDATE paper_trading 
-                        SET close_price = :p, close_date = :d, status = 'CLOSED', remark = :r
-                        WHERE id = :id
-                    """), {
-                        "p": curr_price,
-                        "d": datetime.now().strftime("%Y-%m-%d"),
-                        "r": remark,
-                        "id": int(row['id'])
-                    })
-                    conn.commit()
+                close_updates.append({
+                    "p": curr_price,
+                    "d": close_date_str,
+                    "r": remark,
+                    "id": int(row['id'])
+                })
                 closed_count += 1
                 alerts.append(f"{row['name']}({code}) {reason}")
         
+        # 批量执行所有平仓更新 (一次连接，一次 commit)
+        if close_updates:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    UPDATE paper_trading 
+                    SET close_price = :p, close_date = :d, status = 'CLOSED', remark = :r
+                    WHERE id = :id
+                """), close_updates)
+                conn.commit()
+
         return {"status": "success", "closed_count": closed_count, "alerts": alerts}
     except Exception as e:
         logger.error(f"Wind control error: {e}")
@@ -402,7 +405,7 @@ def get_portfolio_stats() -> Dict[str, Any]:
     
     try:
         # 1. 获取所有交易记录
-        df = pd.read_sql("SELECT * FROM paper_trading ORDER BY entry_date ASC", engine)
+        df = pd.read_sql(text("SELECT * FROM paper_trading ORDER BY entry_date ASC"), engine)
         if df.empty:
             return {
                 "risk_metrics": {},

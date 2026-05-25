@@ -34,7 +34,8 @@ interface MarketStore {
 
     fetchMarketData: () => Promise<void>;
     fetchSyncStatus: () => Promise<void>;
-    fetchMarketRegime: () => Promise<any>;
+    fetchMarketPulse: () => Promise<void>;
+    fetchMarketRegime: (strategyType?: string) => Promise<any>;
     startSync: () => Promise<void>;
     startSyncFundamentals: () => Promise<void>;
     stopSync: () => Promise<void>;
@@ -86,13 +87,21 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
         }
     },
 
-    fetchMarketRegime: async () => {
+    fetchMarketPulse: async () => {
         try {
-            const res = await api.get('/api/market/regime');
+            const res = await api.get('/api/market/pulse');
             if (res.data && res.data.status) {
                 set({ marketRegime: res.data });
             }
-            return null;
+        } catch (e) {
+            console.error("Market pulse fetch failed", e);
+        }
+    },
+
+    fetchMarketRegime: async (strategyType = "squeeze") => {
+        try {
+            const res = await api.get(`/api/market/regime?strategy_type=${strategyType}`);
+            return res.data || null;
         } catch (e) {
             console.error("Market regime fetch failed", e);
             return null;

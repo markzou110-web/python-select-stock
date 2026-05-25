@@ -35,6 +35,7 @@ def get_signal_details(
 
     # --- 找到所有买入信号日期 ---
     signal_indices = _find_all_signal_indices(df, strategy_type, threshold, vol_multiplier, rsi_min, min_signals)
+    trailing_stops = []
 
     for idx in signal_indices:
         entry_price = close_vals[idx]
@@ -48,7 +49,7 @@ def get_signal_details(
             "reason": _get_signal_reason(df, idx, strategy_type),
         })
 
-        # 模拟卖出
+        # 模拟卖出 (同时收集移动止盈线轨迹)
         exit_price = entry_price
         exit_reason = "超时平仓"
         hold_days = max_hold_days
@@ -69,6 +70,14 @@ def get_signal_details(
             day_low = low_vals[future_idx]
             day_high = high_vals[future_idx]
 
+            # 更新最高收盘价和止盈线 (同步收集轨迹数据)
+            max_close_reached = max(max_close_reached, day_close)
+            stop_level = max_close_reached - atr * trailing_multiplier
+            trailing_stops.append({
+                "time": str(df['日期'].iloc[future_idx])[:10],
+                "value": round(float(stop_level), 2)
+            })
+
             # 1. 止损检查
             day_low_return = (day_low - entry_price) / entry_price
             if day_low_return <= stop_loss_ratio:
@@ -79,8 +88,7 @@ def get_signal_details(
                 break
             
             # 2. 移动止盈检查
-            max_close_reached = max(max_close_reached, day_close)
-            if day_close < (max_close_reached - atr * trailing_multiplier):
+            if day_close < stop_level:
                 exit_price = day_close
                 hold_days = day
                 exit_reason = "移动止盈"
@@ -104,36 +112,6 @@ def get_signal_details(
                 "pnl_pct": pnl_pct,
                 "hold_days": hold_days,
             })
-
-    # --- 阶段 1 优化: 全局追踪移动止盈线 ---
-    # 我们只追踪信号发生期间的止盈线轨迹
-    trailing_stops = []
-    
-    for idx in signal_indices:
-        atr = df['ATR'].iloc[idx] if 'ATR' in df.columns else df['收盘'].iloc[idx] * 0.03
-        max_close = df['收盘'].iloc[idx]
-        multiplier = 2.2
-        
-        # 记录从买入日后第 1 天开始到平仓日
-        # 注意：这里需要再次模拟以提取轨迹
-        for day in range(1, max_hold_days + 1):
-            f_idx = idx + day
-            if f_idx >= len(df): break
-            
-            day_close = df['收盘'].iloc[f_idx]
-            max_close = max(max_close, day_close)
-            stop_level = max_close - (atr * multiplier)
-            
-            trailing_stops.append({
-                "time": str(df['日期'].iloc[f_idx])[:10],
-                "value": round(float(stop_level), 2)
-            })
-            
-            # 如果跌破，停止该段轨迹
-            if day_close < stop_level or (df['最低'].iloc[f_idx] - df['收盘'].iloc[idx])/df['收盘'].iloc[idx] <= stop_loss_ratio:
-                break
-            if day == max_hold_days:
-                break
 
     return {
         "buy_signals": buy_signals, 

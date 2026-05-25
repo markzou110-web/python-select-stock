@@ -353,18 +353,15 @@ class TencentDataSource(DataSource):
         if df is None or df.empty:
             return None
 
-        # 腾讯返回的列名：date, open, close, high, low, amount
+        # 腾讯返回的列名中的 amount 实际上是成交量（手）
         df = df.rename(columns={
             'date': '日期',
             'open': '开盘',
             'high': '最高',
             'low': '最低',
             'close': '收盘',
-            'amount': '成交额'
+            'amount': '成交量'
         })
-
-        # 腾讯没有成交量，用成交额填充
-        df['成交量'] = df['成交额']
 
         # 筛选日期
         start_dt = datetime.strptime(start_date, "%Y%m%d")
