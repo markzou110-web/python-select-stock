@@ -78,7 +78,6 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const chartContainerRef = useRef<HTMLDivElement>(null);
-    const chartRef = useRef<IChartApi | null>(null);
 
     useEffect(() => {
         const fetchData = async () => {
@@ -100,12 +99,6 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     // Chart rendering
     useEffect(() => {
         if (!chartContainerRef.current || !data || data.kline.length === 0) return;
-
-        // Clear previous chart
-        if (chartRef.current) {
-            chartRef.current.remove();
-            chartRef.current = null;
-        }
 
         const isPaperTrade = data.stock_info?.is_paper_trade;
 
@@ -242,7 +235,6 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
         }
 
         chart.timeScale().fitContent();
-        chartRef.current = chart;
 
         const handleResize = () => {
             if (chartContainerRef.current) {
