@@ -609,6 +609,10 @@ def get_stock_full_analysis(code: str):
         if df.empty:
             raise HTTPException(status_code=404, detail="未找到该股票的历史数据")
 
+        # Ensure df has strictly unique ascending chronological dates
+        if '日期' in df.columns:
+            df = df.drop_duplicates(subset=['日期']).sort_values('日期').reset_index(drop=True)
+
         # 200 日 K线
         kline_df = df.tail(200).copy()
         kline_df['time'] = kline_df['日期'].astype(str)
@@ -632,6 +636,14 @@ def get_stock_full_analysis(code: str):
         signals = {}
         try:
             signals = get_signal_details(df, strategy_type="squeeze")
+            if "trailing_stops" in signals:
+                ts_dict = {}
+                for ts in signals["trailing_stops"]:
+                    t = ts["time"]
+                    val = float(ts["value"])
+                    if t not in ts_dict or val < ts_dict[t]:
+                        ts_dict[t] = val
+                signals["trailing_stops"] = [{"time": t, "value": v} for t, v in sorted(ts_dict.items())]
         except Exception as e:
             logger.warning(f"Signal generation for {code}: {e}")
 

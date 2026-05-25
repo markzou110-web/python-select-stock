@@ -95,11 +95,19 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                 const rawData = res.data.data;
 
                 if (rawData && rawData.length > 0) {
-                    candlestickSeries.setData(rawData);
+                    const uniqueKlineMap = new Map();
+                    rawData.forEach((item: any) => {
+                        if (item && item.time) {
+                            uniqueKlineMap.set(item.time, item);
+                        }
+                    });
+                    const sortedKline = Array.from(uniqueKlineMap.values()).sort((a: any, b: any) => a.time.localeCompare(b.time));
 
-                    ema20Series.setData(rawData.map((d: any) => ({ time: d.time, value: d.EMA20 })));
-                    ema120Series.setData(rawData.map((d: any) => ({ time: d.time, value: d.EMA120 })));
-                    ema250Series.setData(rawData.map((d: any) => ({ time: d.time, value: d.EMA250 })));
+                    candlestickSeries.setData(sortedKline);
+
+                    ema20Series.setData(sortedKline.map((d: any) => ({ time: d.time, value: d.EMA20 })));
+                    ema120Series.setData(sortedKline.map((d: any) => ({ time: d.time, value: d.EMA120 })));
+                    ema250Series.setData(sortedKline.map((d: any) => ({ time: d.time, value: d.EMA250 })));
 
                     chart.timeScale().fitContent();
                 }
@@ -147,7 +155,19 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                     }
 
                     if (signals.trailing_stops) {
-                        trailingStopSeries.setData(signals.trailing_stops);
+                        const uniqueTrailingMap = new Map();
+                        signals.trailing_stops.forEach((ts: any) => {
+                            if (ts && ts.time) {
+                                uniqueTrailingMap.set(ts.time, ts.value);
+                            }
+                        });
+                        const sortedTrailing = Array.from(uniqueTrailingMap.entries())
+                            .map(([time, value]) => ({ time, value }))
+                            .sort((a, b) => a.time.localeCompare(b.time));
+
+                        if (sortedTrailing.length > 0) {
+                            trailingStopSeries.setData(sortedTrailing);
+                        }
                     }
                 } catch (e) {
                     console.warn("Signal fetch failed (non-critical):", e);

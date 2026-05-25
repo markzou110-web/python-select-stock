@@ -146,10 +146,19 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
         const ema20 = chart.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 1, title: 'EMA20' });
         const ema60 = chart.addSeries(LineSeries, { color: '#8b5cf6', lineWidth: 1, title: 'EMA60' });
 
-        candleSeries.setData(data.kline);
-        ema5.setData(data.kline.map(d => ({ time: d.time, value: d.EMA5 })));
-        ema20.setData(data.kline.map(d => ({ time: d.time, value: d.EMA20 })));
-        ema60.setData(data.kline.map(d => ({ time: d.time, value: d.EMA60 })));
+        // Defensive deduplication and ascending sort by time (lightweight-charts constraint)
+        const uniqueKlineMap = new Map();
+        data.kline.forEach(item => {
+            if (item && item.time) {
+                uniqueKlineMap.set(item.time, item);
+            }
+        });
+        const sortedKline = Array.from(uniqueKlineMap.values()).sort((a, b) => a.time.localeCompare(b.time));
+
+        candleSeries.setData(sortedKline);
+        ema5.setData(sortedKline.map(d => ({ time: d.time, value: d.EMA5 })));
+        ema20.setData(sortedKline.map(d => ({ time: d.time, value: d.EMA20 })));
+        ema60.setData(sortedKline.map(d => ({ time: d.time, value: d.EMA60 })));
 
         // Signal markers
         if (data.signals?.buy_signals || data.signals?.sell_signals) {
@@ -185,11 +194,23 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
 
         // Trailing stop line
         if (data.signals?.trailing_stops) {
-            const trailingSeries = chart.addSeries(LineSeries, {
-                color: '#f97316', lineWidth: 2, lineStyle: 2,
-                lastValueVisible: false, priceLineVisible: false
+            const uniqueTrailingMap = new Map();
+            data.signals.trailing_stops.forEach((ts: any) => {
+                if (ts && ts.time) {
+                    uniqueTrailingMap.set(ts.time, ts.value);
+                }
             });
-            trailingSeries.setData(data.signals.trailing_stops);
+            const sortedTrailing = Array.from(uniqueTrailingMap.entries())
+                .map(([time, value]) => ({ time, value }))
+                .sort((a, b) => a.time.localeCompare(b.time));
+
+            if (sortedTrailing.length > 0) {
+                const trailingSeries = chart.addSeries(LineSeries, {
+                    color: '#f97316', lineWidth: 2, lineStyle: 2,
+                    lastValueVisible: false, priceLineVisible: false
+                });
+                trailingSeries.setData(sortedTrailing);
+            }
         }
 
         // Paper trade price lines
