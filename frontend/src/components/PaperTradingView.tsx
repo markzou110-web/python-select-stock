@@ -34,6 +34,7 @@ import {
 } from 'recharts';
 import { useScanStore } from '@/stores/scanStore';
 import PortfolioDashboard from './PortfolioDashboard';
+import StockDetailPage from './StockDetailPage';
 
 interface Trade {
     id: number;
@@ -95,6 +96,7 @@ export default function PaperTradingView() {
     const [closingId, setClosingId] = useState<number | null>(null);
     const [closePrice, setClosePrice] = useState('');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+    const [detailStock, setDetailStock] = useState<{ code: string; name: string } | null>(null);
     const [stats, setStats] = useState<Stats>({
         total_trades: 0, wins: 0, losses: 0, flat: 0,
         win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0,
@@ -151,6 +153,17 @@ export default function PaperTradingView() {
             <div className="flex-1 flex items-center justify-center p-20 text-slate-400">
                 <Loader2 className="animate-spin mr-2" /> 正在加载模拟仓数据...
             </div>
+        );
+    }
+
+    // Full-page detail view
+    if (detailStock) {
+        return (
+            <StockDetailPage
+                code={detailStock.code}
+                name={detailStock.name}
+                onBack={() => setDetailStock(null)}
+            />
         );
     }
 
@@ -345,7 +358,7 @@ export default function PaperTradingView() {
                                                 <td className="px-5 py-4">
                                                     <div 
                                                         className="flex flex-col cursor-pointer group"
-                                                        onClick={() => setSelectedStock({ 代码: t.code, 名称: t.name } as any)}
+                                                        onClick={() => setDetailStock({ code: t.code, name: t.name })}
                                                     >
                                                         <div className="flex items-center gap-2">
                                                             <span className="font-bold text-slate-700 group-hover:text-indigo-600 transition-colors">{t.name}</span>

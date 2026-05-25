@@ -6,7 +6,8 @@ import {
     ColorType,
     IChartApi,
     CandlestickSeries,
-    LineSeries
+    LineSeries,
+    createSeriesMarkers
 } from 'lightweight-charts';
 import api from '@/lib/api';
 import { TrendingUp, TrendingDown, Target, Zap } from 'lucide-react';
@@ -141,7 +142,8 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                     markers.sort((a, b) => a.time.localeCompare(b.time));
 
                     if (markers.length > 0) {
-                        (candlestickSeries as any).setMarkers(markers);
+                        const markersPlugin = createSeriesMarkers(candlestickSeries);
+                        markersPlugin.setMarkers(markers);
                     }
 
                     if (signals.trailing_stops) {
