@@ -42,6 +42,7 @@ export default function ResultsTable({
     const [optimizingStock, setOptimizingStock] = useState<ScanResult | null>(null);
     const [remarkStock, setRemarkStock] = useState<ScanResult | null>(null);
     const [remarkText, setRemarkText] = useState('');
+    const [addTradeMode, setAddTradeMode] = useState<'SIMULATED' | 'REAL'>('SIMULATED');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [groupBySector, setGroupBySector] = useState(false);
     const [sectorSortKey, setSectorSortKey] = useState<'count' | 'avgScore'>('count');
@@ -131,16 +132,18 @@ export default function ResultsTable({
         URL.revokeObjectURL(url);
     };
 
-    const addToWatchlist = async (stock: ScanResult, remark?: string) => {
+    const addToWatchlist = async (stock: ScanResult, remark?: string, mode: 'SIMULATED' | 'REAL' = 'SIMULATED') => {
         try {
             await api.post('/api/paper/add', {
                 code: stock.代码,
                 name: stock.名称,
                 price: stock.现价,
                 strategy_type: stock.strategy_type,
-                remark: remark || undefined
+                remark: remark || undefined,
+                trade_mode: mode
             });
-            showToast(`${stock.名称} 已加入模拟池`);
+            const modeLabel = mode === 'REAL' ? '实盘' : '模拟池';
+            showToast(`${stock.名称} 已加入${modeLabel}`);
         } catch (err) {
             console.error(err);
             showToast('加入失败，请重试', 'error');
@@ -149,9 +152,10 @@ export default function ResultsTable({
 
     const confirmAddToWatchlist = () => {
         if (remarkStock) {
-            addToWatchlist(remarkStock, remarkText);
+            addToWatchlist(remarkStock, remarkText, addTradeMode);
             setRemarkStock(null);
             setRemarkText('');
+            setAddTradeMode('SIMULATED');
         }
     };
 
@@ -665,11 +669,42 @@ export default function ResultsTable({
             )}
 
             {remarkStock && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => { setRemarkStock(null); setRemarkText(''); }}>
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => { setRemarkStock(null); setRemarkText(''); setAddTradeMode('SIMULATED'); }}>
                     <div className="bg-white rounded-2xl shadow-2xl p-6 w-[400px] space-y-4 animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
                         <div className="flex items-center justify-between">
-                            <h3 className="text-sm font-bold text-slate-800">加入模拟池</h3>
+                            <h3 className="text-sm font-bold text-slate-800">加入交易记录</h3>
                             <span className="text-xs text-slate-400 font-mono">{remarkStock.名称} {remarkStock.代码}</span>
+                        </div>
+                        {/* Trade Mode Selector */}
+                        <div>
+                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">交易模式</label>
+                            <div className="flex bg-slate-100 rounded-xl p-1 gap-1">
+                                <button
+                                    onClick={() => setAddTradeMode('SIMULATED')}
+                                    className={cn(
+                                        "flex-1 py-2 text-xs font-black rounded-lg transition-all",
+                                        addTradeMode === 'SIMULATED'
+                                            ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white shadow-md"
+                                            : "text-slate-400 hover:text-slate-600"
+                                    )}
+                                >
+                                    🔵 模拟盘
+                                </button>
+                                <button
+                                    onClick={() => setAddTradeMode('REAL')}
+                                    className={cn(
+                                        "flex-1 py-2 text-xs font-black rounded-lg transition-all",
+                                        addTradeMode === 'REAL'
+                                            ? "bg-gradient-to-r from-rose-500 to-red-500 text-white shadow-md"
+                                            : "text-slate-400 hover:text-slate-600"
+                                    )}
+                                >
+                                    🔴 实盘
+                                </button>
+                            </div>
+                            {addTradeMode === 'REAL' && (
+                                <p className="text-[10px] text-rose-500 font-bold mt-1.5">⚠️ 实盘记录将标记为真实交易</p>
+                            )}
                         </div>
                         <div>
                             <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block mb-1.5">加入原因 / 备注</label>
@@ -685,16 +720,21 @@ export default function ResultsTable({
                         </div>
                         <div className="flex justify-end gap-2">
                             <button
-                                onClick={() => { setRemarkStock(null); setRemarkText(''); }}
+                                onClick={() => { setRemarkStock(null); setRemarkText(''); setAddTradeMode('SIMULATED'); }}
                                 className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-600 rounded-xl transition-all"
                             >
                                 取消
                             </button>
                             <button
                                 onClick={confirmAddToWatchlist}
-                                className="px-4 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition-all"
+                                className={cn(
+                                    "px-4 py-2 text-xs font-bold text-white rounded-xl transition-all",
+                                    addTradeMode === 'REAL'
+                                        ? "bg-rose-600 hover:bg-rose-700"
+                                        : "bg-indigo-600 hover:bg-indigo-700"
+                                )}
                             >
-                                确认加入
+                                {addTradeMode === 'REAL' ? '确认加入实盘' : '确认加入模拟'}
                             </button>
                         </div>
                     </div>

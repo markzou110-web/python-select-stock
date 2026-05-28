@@ -119,6 +119,19 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
 
+            # --- Migration: add trade_mode column if missing ---
+            try:
+                conn.execute(text("""
+                    ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS trade_mode VARCHAR(20) DEFAULT 'SIMULATED' NOT NULL
+                """))
+                conn.execute(text("""
+                    UPDATE paper_trading SET trade_mode = 'SIMULATED' WHERE trade_mode IS NULL
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_mode ON paper_trading(trade_mode);"))
+                logger.info("Migration: trade_mode column ensured.")
+            except Exception as e:
+                logger.debug(f"trade_mode migration skipped (may already exist): {e}")
+
             conn.commit()
     except Exception as e:
         logger.error(f"Database init failed: {e}")

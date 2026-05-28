@@ -73,3 +73,42 @@ Decision thresholds:
 - `REDUCE`: score ≤ -1 OR RSI > 80 OR TP reached
 - `ADD`: score ≥ 3 + buffer >10% OR MACD golden cross + trend + RSI < 60
 - `HOLD`: default
+
+---
+
+## ✅ Feature: 模拟盘 vs 实盘 区分 (Phase 3)
+
+### 1. Goal
+在「拟合实盘」模块中新增交易模式维度，区分 **模拟盘 (SIMULATED)** 和 **实盘 (REAL)** 交易记录，便于用户在同一界面中分别管理两种模式的交易和统计。
+
+### 2. Implementation Checklist
+
+- `[x]` Task 1: Backend model & schema — `trade_mode` 字段 (SIMULATED | REAL)
+- `[x]` Task 2: Backend router — 写入/返回/按模式统计/Bark推送区分
+- `[x]` Task 3: Frontend PaperTradingView — 模式切换器 + 视觉徽章 + 按模式过滤
+- `[x]` Task 4: Frontend add-trade flows — AIDeepDive & ResultsTable 模式选择器
+- `[x]` Task 5: Build & verify
+
+### 3. Files Changed
+| File | Type | Description |
+|------|------|-------------|
+| `backend/core/models.py` | MODIFY | `PaperTrading.trade_mode` 字段 (String, default SIMULATED) |
+| `backend/schemas/paper_trade.py` | MODIFY | `trade_mode: Literal["SIMULATED", "REAL"]` 验证 |
+| `backend/core/db.py` | MODIFY | `init_db()` 自动迁移：ADD COLUMN IF NOT EXISTS |
+| `backend/routers/paper_trade.py` | MODIFY | 4 个端点全面支持 trade_mode + Bark 推送区分 |
+| `frontend/src/components/PaperTradingView.tsx` | MODIFY | 模式切换器 + 统计按模式展示 + 视觉标识 |
+| `frontend/src/components/AIDeepDive.tsx` | MODIFY | 加入弹窗增加交易模式选择器 |
+| `frontend/src/components/ResultsTable.tsx` | MODIFY | 加入弹窗增加交易模式选择器 |
+
+### 4. Key Design Decisions
+- **视觉区分**: 实盘 → 🔴红色竖线 + 红色徽章; 模拟 → 🔵蓝色虚线 + 蓝色徽章
+- **推送区分**: 「【实盘买入】」/「【实盘平仓】」/「【实盘风控平仓】」vs 模拟仓
+- **统计分离**: `stats_by_mode` 返回两种模式的独立胜率/盈亏/持仓数据
+- **向后兼容**: 现有记录自动标记为 SIMULATED，无数据丢失
+- **模拟转实盘**: `POST /api/paper/convert/{id}` 一键转换 + Bark 推送 + 确认对话框
+
+### Phase 3.3: 全面支持拼音首字母/中文/代码模糊搜索
+- **拼音简拼支持**: 引入 `pypinyin` 库，在后端建立极速的内存缓存（Lazy-loaded in-memory cache）。现在搜索框完美支持拼音首字母缩写搜索（例如：输入 `payh` 即可精准搜索出 `平安银行`；输入 `zgpa` 即可检索出 `中国平安`）。
+- **中文/代码检索**: 原生支持中文名称（如 `平安`）与数字代码（如 `000001`）的秒级检索，极大地改善了符合中国股民习惯的交互体验。
+
+

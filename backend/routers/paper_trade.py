@@ -13,9 +13,32 @@ from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code
 from core.data import get_market_snapshot, get_sector_map
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
+from core.risk_constants import (
+    FIXED_STOP_LOSS_PCT, FIXED_STOP_LOSS_RATIO,
+    TRAILING_STOP_RATIO, TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
+    TIME_STOP_DAYS
+)
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
+
+
+def send_paper_trade_notification(title: str, body: str):
+    """Sends a push notification via the Notifier, handling both async and sync loops."""
+    from core.notifier import notifier
+    import asyncio
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+            
+        if loop and loop.is_running():
+            loop.create_task(notifier.send(title, body, channels=["bark"]))
+        else:
+            asyncio.run(notifier.send(title, body, channels=["bark"]))
+    except Exception as exc:
+        logger.error(f"Failed to send paper trading notification: {exc}")
 
 
 @router.post("/add")
@@ -41,7 +64,7 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 sector_counts[ind] = sector_counts.get(ind, 0) + 1
             
             current_count = sector_counts.get(new_industry, 0)
-            if current_count >= MAX_SECTOR_POSITIONS:
+            if not trade.force and current_count >= MAX_SECTOR_POSITIONS:
                 return {
                     "status": "warning",
                     "detail": f"行业 [{new_industry}] 已有 {current_count} 个持仓，"
@@ -52,8 +75,8 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
 
         with engine.connect() as conn:
             conn.execute(text('''
-                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, status, strategy_type, remark)
-                VALUES (:code, :name, :price, :date, :price, 'OPEN', :strategy_type, :remark)
+                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, high_since_entry, status, strategy_type, remark, trade_mode)
+                VALUES (:code, :name, :price, :date, :price, :price, 'OPEN', :strategy_type, :remark, :trade_mode)
                 ON CONFLICT (code, entry_date) DO NOTHING
             '''), {
                 "code": trade.code,
@@ -61,9 +84,25 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "price": trade.price,
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "strategy_type": trade.strategy_type,
-                "remark": trade.remark
+                "remark": trade.remark,
+                "trade_mode": trade.trade_mode
             })
             conn.commit()
+
+        # 发送 Bark 实时推送 — 根据交易模式区分标题（使用统一风控常量）
+        stop_price = round(trade.price * FIXED_STOP_LOSS_RATIO, 2)
+        tp_price = round(trade.price * TAKE_PROFIT_RATIO, 2)
+        mode_label = "实盘买入" if trade.trade_mode == "REAL" else "模拟仓买入"
+        title = f"【{mode_label}】{trade.name} ({trade.code})"
+        body = (
+            f"交易模式：{'🔴 实盘' if trade.trade_mode == 'REAL' else '🔵 模拟盘'}\n"
+            f"入场价格：¥{trade.price:.2f}\n"
+            f"固定止损：¥{stop_price:.2f} ({FIXED_STOP_LOSS_PCT}%)\n"
+            f"目标止盈：¥{tp_price:.2f} (+{TAKE_PROFIT_PCT}%)\n"
+            f"交易备注：{trade.remark or '无'}"
+        )
+        send_paper_trade_notification(title, body)
+
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Error adding paper trade: {e}")
@@ -133,6 +172,10 @@ def list_paper_trades() -> Dict[str, Any]:
             entry_price = float(row['entry_price'])
             entry_date = pd.to_datetime(row['entry_date'])
             high_since_entry = float(row.get('high_since_entry') or entry_price)
+            # NaN 防御: pandas 读出 NaN 时 `or` 运算符无法捕获
+            import math
+            if math.isnan(high_since_entry):
+                high_since_entry = entry_price
 
             # --- 价格与日期处理 ---
             if status == 'CLOSED':
@@ -168,7 +211,8 @@ def list_paper_trades() -> Dict[str, Any]:
                 "high_since_entry": round(high_since_entry, 2) if status == 'OPEN' else None,
                 "close_price": round(float(row['close_price']), 2) if row.get('close_price') is not None else None,
                 "close_date": str(row['close_date']) if row.get('close_date') is not None else None,
-                "remark": row.get('remark') if row.get('remark') is not None else None
+                "remark": row.get('remark') if row.get('remark') is not None else None,
+                "trade_mode": row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
             }
             trades.append(trade_data)
 
@@ -252,12 +296,79 @@ def list_paper_trades() -> Dict[str, Any]:
             "pnl_attribution": calculate_pnl_attribution(trades)
         }
 
-        return {"trades": trades, "stats": stats}
+        # --- 按交易模式分组统计 ---
+        def _calc_mode_stats(mode_trades):
+            if not mode_trades:
+                return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "avg_pl_pct": 0, "total_pl_pct": 0, "avg_hold_days": 0}
+            m_wins = sum(1 for t in mode_trades if t['pl_pct'] > 0)
+            m_losses = sum(1 for t in mode_trades if t['pl_pct'] < 0)
+            m_total = len(mode_trades)
+            return {
+                "total": m_total,
+                "wins": m_wins,
+                "losses": m_losses,
+                "win_rate": round(m_wins / m_total * 100) if m_total > 0 else 0,
+                "avg_pl_pct": round(sum(t['pl_pct'] for t in mode_trades) / m_total, 2),
+                "total_pl_pct": round(sum(t['pl_pct'] for t in mode_trades), 2),
+                "avg_hold_days": round(sum(t['hold_days'] for t in mode_trades) / m_total, 1)
+            }
+
+        sim_trades = [t for t in trades if t.get('trade_mode') == 'SIMULATED']
+        real_trades = [t for t in trades if t.get('trade_mode') == 'REAL']
+        stats_by_mode = {
+            "SIMULATED": _calc_mode_stats(sim_trades),
+            "REAL": _calc_mode_stats(real_trades)
+        }
+
+        return {"trades": trades, "stats": stats, "stats_by_mode": stats_by_mode}
     except Exception as e:
         logger.error(f"Error listing paper trades: {e}")
         import traceback
         traceback.print_exc()
         return {"trades": [], "stats": {}}
+
+
+@router.post("/convert/{id}")
+def convert_trade_mode(id: int) -> Dict[str, Any]:
+    """将模拟盘交易转为实盘交易"""
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error", "detail": "Database unavailable"}
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT * FROM paper_trading WHERE id = :id"), {"id": id})
+            trade = result.fetchone()
+            if not trade:
+                raise HTTPException(status_code=404, detail="交易记录不存在")
+
+            t_map = trade._mapping
+            current_mode = t_map.get("trade_mode", "SIMULATED") or "SIMULATED"
+            if current_mode == "REAL":
+                return {"status": "warning", "detail": "该交易已经是实盘记录"}
+
+            conn.execute(text("""
+                UPDATE paper_trading SET trade_mode = 'REAL' WHERE id = :id
+            """), {"id": id})
+            conn.commit()
+
+        # 发送 Bark 推送通知
+        name = t_map["name"]
+        code = t_map["code"]
+        entry_price = float(t_map["entry_price"])
+        title = f"【模拟转实盘】{name} ({code})"
+        body = (
+            f"交易模式：🔵 模拟盘 → 🔴 实盘\n"
+            f"入场价格：¥{entry_price:.2f}\n"
+            f"该记录已标记为真实交易"
+        )
+        send_paper_trade_notification(title, body)
+
+        return {"status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error converting trade mode: {e}")
+        return {"status": "error", "detail": str(e)}
 
 
 @router.delete("/remove/{id}")
@@ -292,6 +403,12 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
             if not trade:
                 raise HTTPException(status_code=404, detail="交易记录不存在")
 
+            t_map = trade._mapping
+            code = t_map["code"]
+            name = t_map["name"]
+            entry_price = float(t_map["entry_price"])
+            trade_mode = t_map.get("trade_mode", "SIMULATED") or "SIMULATED"
+
             conn.execute(text("""
                 UPDATE paper_trading
                 SET close_price = :close_price, close_date = :close_date, status = 'CLOSED'
@@ -302,6 +419,19 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
                 "id": id
             })
             conn.commit()
+
+        # 发送 Bark 实时推送 — 根据交易模式区分
+        pl_pct = (float(close_price) - entry_price) / entry_price * 100
+        mode_label = "实盘平仓" if trade_mode == "REAL" else "模拟仓平仓"
+        title = f"【{mode_label}】{name} ({code})"
+        body = (
+            f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
+            f"买入价格：¥{entry_price:.2f}\n"
+            f"平仓价格：¥{float(close_price):.2f}\n"
+            f"累计盈亏：{pl_pct:+.2f}%"
+        )
+        send_paper_trade_notification(title, body)
+
         return {"status": "success"}
     except HTTPException:
         raise
@@ -320,7 +450,7 @@ def run_wind_control() -> Dict[str, Any]:
     3. 大盘极端风控: 双指数破位时强制清仓
     4. 时间止损: 持仓超过 N 天且未盈利 → 自动平仓
     """
-    TIME_STOP_DAYS = 5  # 时间止损天数
+    import math
     
     engine = get_db_engine()
     if not engine: return {"status": "error"}
@@ -348,6 +478,9 @@ def run_wind_control() -> Dict[str, Any]:
             entry_price = float(row['entry_price'])
             entry_date = pd.to_datetime(row['entry_date'])
             high_since_entry = float(row['high_since_entry'] or entry_price)
+            # NaN 防御: pandas 读出 NaN 时 `or` 运算符无法捕获
+            if math.isnan(high_since_entry):
+                high_since_entry = entry_price
             hold_days = (datetime.now() - entry_date).days
             
             # 获取当前行情
@@ -356,15 +489,15 @@ def run_wind_control() -> Dict[str, Any]:
             curr_price = float(match.iloc[0]['price'])
             pl_pct = (curr_price - entry_price) / entry_price * 100
             
-            # --- 风控逻辑判定 (按优先级) ---
-            stop_level = high_since_entry * 0.92 # 默认跌破高点 8% 触发
-            fixed_stop = entry_price * 0.91 # 默认固定止损 9%
+            # --- 风控逻辑判定 (按优先级, 使用统一风控常量) ---
+            stop_level = high_since_entry * TRAILING_STOP_RATIO  # 跌破高点触发
+            fixed_stop = entry_price * FIXED_STOP_LOSS_RATIO     # 固定止损
             
             reason = ""
             if curr_price <= fixed_stop:
-                reason = "触发固定止盈止损线 (入场成本 -9%)"
+                reason = f"触发固定止损线 (入场成本 {FIXED_STOP_LOSS_PCT}%)"
             elif curr_price <= stop_level:
-                reason = "触发 ATR 移动止盈线 (高点回撤 -8%)"
+                reason = f"触发移动止盈线 (高点回撤 {round((TRAILING_STOP_RATIO - 1) * 100)}%)"
             elif regime_status == "CRITICAL":
                 reason = "大盘极度走弱 (双指数破位)，强制清仓避险"
             elif hold_days >= TIME_STOP_DAYS and pl_pct <= 0:
@@ -381,6 +514,20 @@ def run_wind_control() -> Dict[str, Any]:
                 })
                 closed_count += 1
                 alerts.append(f"{row['name']}({code}) {reason}")
+
+                # 发送 Bark 风控平仓推送 — 根据交易模式区分
+                trade_mode = row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
+                mode_label = "实盘风控平仓" if trade_mode == "REAL" else "模拟仓风控平仓"
+                title = f"【{mode_label}】{row['name']} ({code})"
+                body = (
+                    f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
+                    f"平仓原因：{reason}\n"
+                    f"买入价格：¥{entry_price:.2f}\n"
+                    f"平仓价格：¥{curr_price:.2f}\n"
+                    f"最终收益：{pl_pct:+.2f}%\n"
+                    f"大盘状态：{regime.get('desc', 'N/A')}"
+                )
+                send_paper_trade_notification(title, body)
         
         # 批量执行所有平仓更新 (一次连接，一次 commit)
         if close_updates:

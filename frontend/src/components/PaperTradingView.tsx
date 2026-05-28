@@ -16,7 +16,8 @@ import {
     Trophy,
     Skull,
     LogOut,
-    CheckCircle2
+    CheckCircle2,
+    ArrowRightLeft
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
@@ -52,6 +53,17 @@ interface Trade {
     close_date?: string;
     remark?: string;
     high_since_entry?: number;
+    trade_mode: 'SIMULATED' | 'REAL';
+}
+
+interface ModeStats {
+    total: number;
+    wins: number;
+    losses: number;
+    win_rate: number;
+    avg_pl_pct: number;
+    total_pl_pct: number;
+    avg_hold_days: number;
 }
 
 interface Stats {
@@ -97,11 +109,17 @@ export default function PaperTradingView() {
     const [closePrice, setClosePrice] = useState('');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [detailStock, setDetailStock] = useState<{ code: string; name: string } | null>(null);
+    const [tradeMode, setTradeMode] = useState<'ALL' | 'SIMULATED' | 'REAL'>('ALL');
+    const [statsByMode, setStatsByMode] = useState<{ SIMULATED: ModeStats; REAL: ModeStats }>({
+        SIMULATED: { total: 0, wins: 0, losses: 0, win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0 },
+        REAL: { total: 0, wins: 0, losses: 0, win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0 }
+    });
     const [stats, setStats] = useState<Stats>({
         total_trades: 0, wins: 0, losses: 0, flat: 0,
         win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0,
         rolling_performance: []
     });
+    const selectedStock = useScanStore(s => s.selectedStock);
     const setSelectedStock = useScanStore(s => s.setSelectedStock);
 
     const fetchTrades = async (showRefresh = false) => {
@@ -111,6 +129,7 @@ export default function PaperTradingView() {
             const data = res.data;
             setTrades(data.trades || []);
             if (data.stats) setStats(data.stats);
+            if (data.stats_by_mode) setStatsByMode(data.stats_by_mode);
         } catch (err) {
             console.error("Fetch Trades Error:", err);
         } finally {
@@ -120,6 +139,15 @@ export default function PaperTradingView() {
     };
 
     useEffect(() => { fetchTrades(); }, []);
+
+    // Respond to global search selection on paper trading tab
+    useEffect(() => {
+        if (selectedStock) {
+            setDetailStock({ code: selectedStock.代码, name: selectedStock.名称 });
+            setSelectedStock(null);
+        }
+    }, [selectedStock, setSelectedStock]);
+
 
     const removeTrade = async (id: number) => {
         if (!confirm("确定移除该记录吗？（数据将被删除）")) return;
@@ -144,9 +172,49 @@ export default function PaperTradingView() {
         } catch (err) { console.error(err); }
     };
 
-    const openTrades = useMemo(() => trades.filter(t => t.status === 'OPEN'), [trades]);
-    const closedTrades = useMemo(() => trades.filter(t => t.status === 'CLOSED'), [trades]);
+    const convertToReal = async (id: number, name: string) => {
+        if (!confirm(`确定将「${name}」从模拟盘转入实盘吗？`)) return;
+        try {
+            const res = await api.post(`/api/paper/convert/${id}`);
+            if (res.data.status === 'success') {
+                setToast({ message: `${name} 已转入实盘 🔴`, type: 'success' });
+                setTimeout(() => setToast(null), 2500);
+                fetchTrades();
+            } else {
+                setToast({ message: res.data.detail || '转换失败', type: 'error' });
+                setTimeout(() => setToast(null), 2500);
+            }
+        } catch (err) {
+            console.error(err);
+            setToast({ message: '转换失败，请重试', type: 'error' });
+            setTimeout(() => setToast(null), 2500);
+        }
+    };
+
+    const modeFilter = (t: Trade) => tradeMode === 'ALL' || t.trade_mode === tradeMode;
+    const openTrades = useMemo(() => trades.filter(t => t.status === 'OPEN' && modeFilter(t)), [trades, tradeMode]);
+    const closedTrades = useMemo(() => trades.filter(t => t.status === 'CLOSED' && modeFilter(t)), [trades, tradeMode]);
     const displayTrades = tab === 'open' ? openTrades : (tab === 'closed' ? closedTrades : []);
+
+    // Counts for the mode bar
+    const simCount = useMemo(() => trades.filter(t => t.trade_mode === 'SIMULATED').length, [trades]);
+    const realCount = useMemo(() => trades.filter(t => t.trade_mode === 'REAL').length, [trades]);
+
+    // Active stats: use per-mode stats when a mode is selected, otherwise overall
+    const activeStats = useMemo(() => {
+        if (tradeMode === 'ALL') return stats;
+        const ms = statsByMode[tradeMode];
+        return {
+            ...stats,
+            total_trades: ms.total,
+            wins: ms.wins,
+            losses: ms.losses,
+            win_rate: ms.win_rate,
+            avg_pl_pct: ms.avg_pl_pct,
+            total_pl_pct: ms.total_pl_pct,
+            avg_hold_days: ms.avg_hold_days,
+        };
+    }, [tradeMode, stats, statsByMode]);
 
     if (loading && trades.length === 0) {
         return (
@@ -169,33 +237,74 @@ export default function PaperTradingView() {
 
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            {/* Trade Mode Switcher */}
+            <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                    <div className="flex bg-slate-100 rounded-2xl p-1.5 gap-1 shadow-inner">
+                        {(['ALL', 'SIMULATED', 'REAL'] as const).map((mode) => {
+                            const label = mode === 'ALL' ? '全部' : mode === 'SIMULATED' ? '🔵 模拟盘' : '🔴 实盘';
+                            const isActive = tradeMode === mode;
+                            return (
+                                <button
+                                    key={mode}
+                                    onClick={() => setTradeMode(mode)}
+                                    className={cn(
+                                        "px-4 py-2 text-xs font-black rounded-xl transition-all duration-300",
+                                        isActive && mode === 'REAL'
+                                            ? "bg-gradient-to-r from-rose-500 to-red-500 text-white shadow-lg shadow-rose-200"
+                                            : isActive && mode === 'SIMULATED'
+                                            ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white shadow-lg shadow-blue-200"
+                                            : isActive
+                                            ? "bg-white text-slate-800 shadow-md"
+                                            : "text-slate-400 hover:text-slate-600 hover:bg-white/50"
+                                    )}
+                                >
+                                    {label}
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                        <span className="flex items-center gap-1">
+                            <span className="w-2 h-2 rounded-full bg-blue-400"></span>
+                            模拟 {simCount} 笔
+                        </span>
+                        <span className="text-slate-200">|</span>
+                        <span className="flex items-center gap-1">
+                            <span className="w-2 h-2 rounded-full bg-rose-400"></span>
+                            实盘 {realCount} 笔
+                        </span>
+                    </div>
+                </div>
+            </div>
+
             {/* Header Stats */}
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
                 <StatCard
                     label="最大回撤"
-                    value={`${stats.max_drawdown}%`}
-                    sub={`盈亏比 ${stats.profit_factor}`}
+                    value={`${activeStats.max_drawdown}%`}
+                    sub={`盈亏比 ${activeStats.profit_factor}`}
                     icon={<AlertCircle size={20} />}
                     color="text-slate-600 bg-slate-50"
                 />
                 <StatCard
                     label="胜率 / 盈亏"
-                    value={`${stats.win_rate}%`}
-                    sub={`${stats.wins}胜 / ${stats.losses}负`}
+                    value={`${activeStats.win_rate}%`}
+                    sub={`${activeStats.wins}胜 / ${activeStats.losses}负`}
                     icon={<BarChart3 size={20} />}
-                    color={stats.win_rate >= 50 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
+                    color={activeStats.win_rate >= 50 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
                 />
                 <StatCard
                     label="平均收益/累计"
-                    value={`${stats.avg_pl_pct >= 0 ? '+' : ''}${stats.avg_pl_pct}%`}
-                    sub={`累计 ${stats.total_pl_pct >= 0 ? '+' : ''}${stats.total_pl_pct}%`}
+                    value={`${activeStats.avg_pl_pct >= 0 ? '+' : ''}${activeStats.avg_pl_pct}%`}
+                    sub={`累计 ${activeStats.total_pl_pct >= 0 ? '+' : ''}${activeStats.total_pl_pct}%`}
                     icon={<DollarSign size={20} />}
-                    color={stats.avg_pl_pct >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
+                    color={activeStats.avg_pl_pct >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"}
                 />
                 <StatCard
                     label="平均持仓/核心板块"
-                    value={`${stats.avg_hold_days}天`}
-                    sub={stats.sector_distribution?.[0]?.name || "N/A"}
+                    value={`${activeStats.avg_hold_days}天`}
+                    sub={activeStats.sector_distribution?.[0]?.name || "N/A"}
                     icon={<PieIcon size={20} />}
                     color="text-indigo-600 bg-indigo-50"
                 />
@@ -353,8 +462,12 @@ export default function PaperTradingView() {
                                         const pl_pct = t.status === 'CLOSED' && t.close_price
                                             ? ((t.close_price - t.entry_price) / t.entry_price * 100)
                                             : t.pl_pct;
+                                        const isReal = t.trade_mode === 'REAL';
                                         return (
-                                            <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
+                                            <tr key={t.id} className={cn(
+                                                "hover:bg-slate-50/50 transition-colors relative",
+                                                isReal ? "border-l-[3px] border-l-rose-400" : "border-l-[3px] border-l-blue-300 border-dashed"
+                                            )}>
                                                 <td className="px-5 py-4">
                                                     <div 
                                                         className="flex flex-col cursor-pointer group"
@@ -362,6 +475,15 @@ export default function PaperTradingView() {
                                                     >
                                                         <div className="flex items-center gap-2">
                                                             <span className="font-bold text-slate-700 group-hover:text-indigo-600 transition-colors">{t.name}</span>
+                                                            {/* Trade mode badge */}
+                                                            <span className={cn(
+                                                                "px-1.5 py-0.5 text-[9px] font-black rounded border",
+                                                                isReal
+                                                                    ? "bg-rose-50 text-rose-600 border-rose-200"
+                                                                    : "bg-blue-50 text-blue-500 border-blue-200"
+                                                            )}>
+                                                                {isReal ? '🔴 实盘' : '🔵 模拟'}
+                                                            </span>
                                                             {t.status === 'CLOSED' && (
                                                                 <span className="px-1.5 py-0.5 bg-emerald-50 text-emerald-600 text-[9px] font-black rounded border border-emerald-100">
                                                                     已平仓
@@ -441,6 +563,16 @@ export default function PaperTradingView() {
                                                                 </div>
                                                             ) : (
                                                                 <>
+                                                                    {/* Convert to Real button — only for SIMULATED */}
+                                                                    {!isReal && (
+                                                                        <button
+                                                                            onClick={() => convertToReal(t.id, t.name)}
+                                                                            className="p-1.5 text-rose-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-all"
+                                                                            title="转入实盘"
+                                                                        >
+                                                                            <ArrowRightLeft size={15} />
+                                                                        </button>
+                                                                    )}
                                                                     <button
                                                                         onClick={() => { setClosingId(t.id); setClosePrice(t.current_price.toFixed(2)); }}
                                                                         className="p-1.5 text-indigo-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all"

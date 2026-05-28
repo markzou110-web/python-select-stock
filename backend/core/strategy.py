@@ -1,6 +1,14 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Optional
+from core.risk_constants import (
+    FIXED_STOP_LOSS_PCT, TIER_HIGH_PROFIT_PCT, TIER_HIGH_TRAIL_RATIO,
+    TIER_MID_PROFIT_PCT, TIER_MID_TRAIL_RATIO,
+    CAPITAL_PROTECT_THRESHOLD_PCT, CAPITAL_PROTECT_FLOOR_PCT,
+    VOLUME_CLIMAX_MULTIPLIER, BACKTEST_MAX_HOLD_DAYS,
+    BACKTEST_TRAILING_ATR_MULT,
+    ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT
+)
 
 
 def get_signal_details(
@@ -298,9 +306,9 @@ def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param
 
 def _simulate_backtest(
     close_vals, high_vals, low_vals, signal_indices, 
-    stop_loss_pct=-8.0, take_profit_pct=5.0, max_hold_days=5,
+    stop_loss_pct=-8.0, max_hold_days=BACKTEST_MAX_HOLD_DAYS,
     atr_vals=None, vol_vals=None,
-    use_trailing_stop=True, trailing_multiplier=2.2, capital=100000,
+    use_trailing_stop=True, trailing_multiplier=BACKTEST_TRAILING_ATR_MULT, capital=100000,
     vol_cap_pct=0.05, time_stop_days=None,
 ) -> Dict[str, Any]:
     """
@@ -923,7 +931,7 @@ def evaluate_exit_signals(
     df: pd.DataFrame, 
     entry_price: float, 
     high_since_entry: float,
-    stop_loss_pct: float = -8.0
+    stop_loss_pct: float = FIXED_STOP_LOSS_PCT
 ) -> List[Dict[str, str]]:
     """
     高度优化的卖出/预警评估引擎。
@@ -944,18 +952,29 @@ def evaluate_exit_signals(
     
     alerts = []
 
-    # --- 1. 绝对止损 (Survival First) ---
-    if pl_pct <= stop_loss_pct:
+    # --- 1. 绝对止损 & ATR 自适应止损 (Survival First) ---
+    actual_stop_loss_pct = stop_loss_pct
+    atr = latest.get('ATR')
+    if atr and not pd.isna(atr) and atr > 0:
+        # 动态止损位 = entry - N * ATR
+        atr_stop_price = entry_price - (atr * ATR_STOP_MULTIPLIER)
+        atr_stop_pct = (atr_stop_price - entry_price) / entry_price * 100
+        
+        # 限制自适应止损在合理区间
+        atr_stop_pct = max(ATR_STOP_MAX_PCT, min(ATR_STOP_MIN_PCT, atr_stop_pct))
+        actual_stop_loss_pct = atr_stop_pct
+
+    if pl_pct <= actual_stop_loss_pct:
         alerts.append({
             "level": "critical",
-            "reason": f"触及硬性止损位 ({stop_loss_pct}%)",
+            "reason": f"触及风控止损位 ({round(actual_stop_loss_pct, 1)}%)",
             "suggestion": "触发风控底线，建议无条件平仓"
         })
         return alerts # 止损优先级最高，直接返回
 
     # --- 2. 保本逻辑 (Protect Capital) ---
-    # 如果曾经盈利超过 5%，但现在跌回 +1% 以内
-    if max_pl_pct >= 5.0 and pl_pct <= 1.0:
+    # 如果曾经盈利超过 CAPITAL_PROTECT_THRESHOLD_PCT%，但现在跌回 CAPITAL_PROTECT_FLOOR_PCT% 以内
+    if max_pl_pct >= CAPITAL_PROTECT_THRESHOLD_PCT and pl_pct <= CAPITAL_PROTECT_FLOOR_PCT:
         alerts.append({
             "level": "critical",
             "reason": "触发保本机制（盈利后回撤至成本线）",
@@ -963,20 +982,20 @@ def evaluate_exit_signals(
         })
 
     # --- 3. 阶梯移动止损 (Trailing Stop) ---
-    # 盈利 > 30%: 允许从最高点回落 5%
-    if max_pl_pct >= 30.0:
-        if curr_price < high_price * 0.95:
+    # 盈利 > TIER_HIGH_PROFIT_PCT%: 允许从最高点回落
+    if max_pl_pct >= TIER_HIGH_PROFIT_PCT:
+        if curr_price < high_price * TIER_HIGH_TRAIL_RATIO:
             alerts.append({
                 "level": "critical",
                 "reason": f"高位大幅回撤 ({round(high_price/curr_price*100-100, 1)}%)",
-                "suggestion": "触发 30% 档位移动止损，建议落袋为安"
+                "suggestion": f"触发 {TIER_HIGH_PROFIT_PCT}% 档位移动止损，建议落袋为安"
             })
-    # 盈利 > 15%: 允许从最高点回落 8%
-    elif max_pl_pct >= 15.0:
-        if curr_price < high_price * 0.92:
+    # 盈利 > TIER_MID_PROFIT_PCT%: 允许从最高点回落
+    elif max_pl_pct >= TIER_MID_PROFIT_PCT:
+        if curr_price < high_price * TIER_MID_TRAIL_RATIO:
             alerts.append({
                 "level": "warning",
-                "reason": "触及 15% 档位移动止盈线",
+                "reason": f"触及 {TIER_MID_PROFIT_PCT}% 档位移动止盈线",
                 "suggestion": "建议减仓 50% 或收紧止损"
             })
 
@@ -998,12 +1017,28 @@ def evaluate_exit_signals(
                 "suggestion": "关注支撑强度"
             })
 
+    # MACD 死叉检测
+    macd_dif = latest.get('MACD_DIF', 0)
+    macd_dea = latest.get('MACD_DEA', 0)
+    if len(df) >= 2:
+        prev_macd_dif = df.iloc[-2].get('MACD_DIF', 0)
+        prev_macd_dea = df.iloc[-2].get('MACD_DEA', 0)
+        
+        # 如果今天死叉 (前一天 DIF >= DEA, 今天 DIF < DEA)
+        if prev_macd_dif >= prev_macd_dea and macd_dif < macd_dea:
+            level = "warning" if macd_dif > 0 else "critical"  # 零轴下死叉更严重
+            alerts.append({
+                "level": level,
+                "reason": "日线 MACD 死叉",
+                "suggestion": "波段见顶信号，建议减仓或清仓"
+            })
+
     # --- 5. 情绪/量能见顶 (Climax) ---
     vol = float(latest['成交量'])
     vol_ma = latest.get('Vol_MA20', 0)
     is_red = curr_price < float(latest['开盘'])
     
-    if vol > vol_ma * 3.0 and is_red:
+    if vol > vol_ma * VOLUME_CLIMAX_MULTIPLIER and is_red:
         alerts.append({
             "level": "warning",
             "reason": "放量滞涨/阴线 (3倍巨量)",

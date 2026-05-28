@@ -51,6 +51,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
     const [showRemarkModal, setShowRemarkModal] = useState(false);
     const [remarkText, setRemarkText] = useState('');
     const [isAdding, setIsAdding] = useState(false);
+    const [addTradeMode, setAddTradeMode] = useState<'SIMULATED' | 'REAL'>('SIMULATED');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
 
     const showToast = (message: string, type: 'success' | 'error' = 'success') => {
@@ -171,7 +172,8 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
         };
     }, [chartData, stockInfo]);
 
-    const handleAddToWatchlist = async (force: boolean = false, customRemark?: string) => {
+    const handleAddToWatchlist = async (force: boolean = false, customRemark?: string, mode?: 'SIMULATED' | 'REAL') => {
+        const selectedMode = mode || addTradeMode;
         setIsAdding(true);
         try {
             // Determine active values from stock prop or calculated metadata
@@ -182,11 +184,13 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                 price: price,
                 strategy_type: stock.strategy_type || 'squeeze',
                 remark: customRemark || remarkText || '自动扫描并加入',
-                force: force
+                force: force,
+                trade_mode: selectedMode
             });
 
             if (res.data.status === 'success') {
-                showToast(`${stock.名称} 已成功加入模拟实盘！`);
+                const modeLabel = selectedMode === 'REAL' ? '实盘' : '模拟仓';
+                showToast(`${stock.名称} 已成功加入${modeLabel}！`);
                 setShowRemarkModal(false);
                 setRemarkText('');
                 // Automatically refresh simulated portfolio state
@@ -194,7 +198,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
             } else if (res.data.status === 'warning') {
                 // Trigger bypass option
                 if (window.confirm(res.data.detail)) {
-                    await handleAddToWatchlist(true, customRemark);
+                    await handleAddToWatchlist(true, customRemark, selectedMode);
                 }
             } else {
                 showToast(res.data.detail || '加入失败，请重试', 'error');
@@ -438,7 +442,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
 
             {/* Premium Remark Modal */}
             {showRemarkModal && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => { setShowRemarkModal(false); setRemarkText(''); }}>
+                <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => { setShowRemarkModal(false); setRemarkText(''); setAddTradeMode('SIMULATED'); }}>
                     <div className="bg-white rounded-2xl shadow-2xl p-6 w-[360px] mx-4 space-y-4 animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
                         <div className="flex items-center justify-between">
                             <h3 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
@@ -447,6 +451,41 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                             <span className="text-[10px] text-slate-400 font-mono font-bold bg-slate-50 px-2 py-0.5 rounded border border-slate-100">
                                 {stock.名称} {stock.代码}
                             </span>
+                        </div>
+                        {/* Trade Mode Selector */}
+                        <div>
+                            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">
+                                交易模式
+                            </label>
+                            <div className="flex bg-slate-100 rounded-xl p-1 gap-1">
+                                <button
+                                    onClick={() => setAddTradeMode('SIMULATED')}
+                                    className={cn(
+                                        "flex-1 py-2 text-xs font-black rounded-lg transition-all",
+                                        addTradeMode === 'SIMULATED'
+                                            ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white shadow-md"
+                                            : "text-slate-400 hover:text-slate-600"
+                                    )}
+                                >
+                                    🔵 模拟盘
+                                </button>
+                                <button
+                                    onClick={() => setAddTradeMode('REAL')}
+                                    className={cn(
+                                        "flex-1 py-2 text-xs font-black rounded-lg transition-all",
+                                        addTradeMode === 'REAL'
+                                            ? "bg-gradient-to-r from-rose-500 to-red-500 text-white shadow-md"
+                                            : "text-slate-400 hover:text-slate-600"
+                                    )}
+                                >
+                                    🔴 实盘
+                                </button>
+                            </div>
+                            {addTradeMode === 'REAL' && (
+                                <p className="text-[10px] text-rose-500 font-bold mt-1.5 flex items-center gap-1">
+                                    ⚠️ 实盘记录将标记为真实交易，请确认已实际买入
+                                </p>
+                            )}
                         </div>
                         <div>
                             <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">
@@ -464,7 +503,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                         </div>
                         <div className="flex justify-end gap-2 text-xs font-bold">
                             <button
-                                onClick={() => { setShowRemarkModal(false); setRemarkText(''); }}
+                                onClick={() => { setShowRemarkModal(false); setRemarkText(''); setAddTradeMode('SIMULATED'); }}
                                 className="px-4 py-2 text-slate-400 hover:text-slate-600 rounded-xl transition-all"
                             >
                                 取消
@@ -472,10 +511,15 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                             <button
                                 onClick={() => handleAddToWatchlist()}
                                 disabled={isAdding}
-                                className="px-4 py-2 text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition-all shadow-md shadow-indigo-100 flex items-center gap-1"
+                                className={cn(
+                                    "px-4 py-2 text-white rounded-xl transition-all shadow-md flex items-center gap-1",
+                                    addTradeMode === 'REAL'
+                                        ? "bg-rose-600 hover:bg-rose-700 shadow-rose-100"
+                                        : "bg-indigo-600 hover:bg-indigo-700 shadow-indigo-100"
+                                )}
                             >
                                 {isAdding && <Loader2 size={12} className="animate-spin" />}
-                                确认加入
+                                {addTradeMode === 'REAL' ? '确认加入实盘' : '确认加入模拟'}
                             </button>
                         </div>
                     </div>

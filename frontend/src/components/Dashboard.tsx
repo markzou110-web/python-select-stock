@@ -99,7 +99,12 @@ export default function Dashboard() {
                     loading={isScanning}
                     lastUpdated={lastUpdated}
                     onOpenFilters={() => setIsFilterOpen(true)}
-                    onSelectStock={setSelectedStock}
+                    onSelectStock={(stock) => {
+                        setSelectedStock(stock);
+                        if (activeView !== 'scanner' && activeView !== 'paper') {
+                            setActiveView('scanner');
+                        }
+                    }}
                 />
 
                 <div className="flex-1 overflow-y-auto px-8 pb-10">

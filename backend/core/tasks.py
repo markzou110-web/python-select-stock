@@ -51,6 +51,10 @@ def check_realtime_alerts():
             name = row['name']
             entry_price = float(row['entry_price'])
             high_since_entry = float(row.get('high_since_entry') or entry_price)
+            # NaN 防御: pandas 读出 NaN 时 `or` 运算符无法捕获
+            import math
+            if math.isnan(high_since_entry):
+                high_since_entry = entry_price
             
             curr_price = snapshot_map.get(code)
             if not curr_price: continue

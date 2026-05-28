@@ -57,6 +57,7 @@ class PaperTrading(Base):
     close_date = Column(Date, nullable=True)
     strategy_type = Column(String(20), nullable=True)
     remark = Column(Text, nullable=True)
+    trade_mode = Column(String(20), default='SIMULATED', nullable=False)  # SIMULATED | REAL
 
 class SystemSetting(Base):
     __tablename__ = "system_settings"

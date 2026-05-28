@@ -13,6 +13,9 @@ from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code, load_from_db, save_to_db
 from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
+from core.risk_constants import (
+    FIXED_STOP_LOSS_RATIO, TRAILING_STOP_RATIO, TAKE_PROFIT_RATIO
+)
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -162,12 +165,15 @@ def get_stock_detail(code: str):
             if paper_res:
                 entry_price = float(paper_res[0])
                 high_since_entry = float(paper_res[1]) if paper_res[1] is not None else entry_price
+                # NaN 防御
+                import math
+                if math.isnan(high_since_entry):
+                    high_since_entry = entry_price
                 is_paper_trade = True
                 buy_price = round(entry_price, 2)
-                # 固定止损 9% 或 移动止损 (高点回撤 8%)，两者取其高
-                stop_price = round(max(entry_price * 0.91, high_since_entry * 0.92), 2)
-                # 止盈 15%
-                take_profit_price = round(entry_price * 1.15, 2)
+                # 固定止损 OR 移动止损，取其高者
+                stop_price = round(max(entry_price * FIXED_STOP_LOSS_RATIO, high_since_entry * TRAILING_STOP_RATIO), 2)
+                take_profit_price = round(entry_price * TAKE_PROFIT_RATIO, 2)
                 paper_remark = str(paper_res[3] or "")
             
         _, stats = check_strategy(df)
@@ -674,10 +680,14 @@ def get_stock_full_analysis(code: str):
             if paper_res:
                 entry_price = float(paper_res[0])
                 high_since_entry = float(paper_res[1]) if paper_res[1] else entry_price
+                # NaN 防御
+                import math
+                if math.isnan(high_since_entry):
+                    high_since_entry = entry_price
                 is_paper_trade = True
                 buy_price = round(entry_price, 2)
-                stop_price = round(max(entry_price * 0.91, high_since_entry * 0.92), 2)
-                take_profit_price = round(entry_price * 1.15, 2)
+                stop_price = round(max(entry_price * FIXED_STOP_LOSS_RATIO, high_since_entry * TRAILING_STOP_RATIO), 2)
+                take_profit_price = round(entry_price * TAKE_PROFIT_RATIO, 2)
                 paper_remark = str(paper_res[3] or "")
                 if paper_res[4]:
                     entry_date = paper_res[4]
@@ -777,38 +787,99 @@ def get_stock_signals(
     )
 
 
-@router.get("/search")
-def search_stocks(query: str):
-    """
-    Fuzzy search stock by code or name
-    """
-    if not query:
-        return []
-    
+# In-memory cache for stock search (lazy initialized)
+_stocks_cache = None
+
+def _get_stocks_cache():
+    global _stocks_cache
+    if _stocks_cache is not None:
+        return _stocks_cache
+        
     engine = get_db_engine()
     if not engine:
         return []
         
     try:
+        import pypinyin
         with engine.connect() as conn:
-            stmt = text("""
-                SELECT code, name, industry 
-                FROM stock_basic 
-                WHERE code LIKE :q_code OR name LIKE :q_name OR name LIKE :q_name_fuzzy
-                LIMIT 15
-            """)
-            res = conn.execute(stmt, {
-                "q_code": f"{query}%",
-                "q_name": f"%{query}%",
-                "q_name_fuzzy": f"{query}%"
-            }).fetchall()
-            
-            return [{
-                "code": r[0],
-                "name": r[1],
-                "industry": r[2] or "未知"
-            } for r in res]
+            rows = conn.execute(text("SELECT code, name, industry FROM stock_basic")).fetchall()
+            cache = []
+            for r in rows:
+                code, name, industry = r
+                ind = industry or "未知"
+                # Extract initials
+                initials = ''.join([x[0] for x in pypinyin.lazy_pinyin(name) if x]).lower()
+                cache.append({
+                    "code": code,
+                    "name": name,
+                    "industry": ind,
+                    "initials": initials
+                })
+            _stocks_cache = cache
+            return _stocks_cache
     except Exception as e:
-        logger.error(f"Error searching stocks: {e}")
+        logger.error(f"Error building stock search cache: {e}")
         return []
+
+
+@router.get("/search")
+def search_stocks(query: str):
+    """
+    Fuzzy search stock by code, name, or pinyin initials
+    """
+    if not query:
+        return []
+        
+    q = query.strip().lower()
+    if not q:
+        return []
+        
+    cache = _get_stocks_cache()
+    if not cache:
+        # Fallback to direct DB query if cache is empty or fails
+        try:
+            engine = get_db_engine()
+            with engine.connect() as conn:
+                stmt = text("""
+                    SELECT code, name, industry 
+                    FROM stock_basic 
+                    WHERE code LIKE :q_code OR name LIKE :q_name OR name LIKE :q_name_fuzzy
+                    LIMIT 15
+                """)
+                res = conn.execute(stmt, {
+                    "q_code": f"{query}%",
+                    "q_name": f"%{query}%",
+                    "q_name_fuzzy": f"{query}%"
+                }).fetchall()
+                return [{
+                    "code": r[0],
+                    "name": r[1],
+                    "industry": r[2] or "未知"
+                } for r in res]
+        except Exception as e:
+            logger.error(f"Error fallback searching stocks: {e}")
+            return []
+
+    # In-memory fast search with initials, name, and code matching
+    matches = []
+    for item in cache:
+        code = item["code"]
+        name = item["name"]
+        initials = item["initials"]
+        
+        # Matches:
+        # 1. code starts with / contains query
+        # 2. name contains query (case-insensitive)
+        # 3. initials contains query (pinyin abbreviation)
+        if q in code or q in name.lower() or q in initials:
+            matches.append({
+                "code": code,
+                "name": name,
+                "industry": item["industry"]
+            })
+            if len(matches) >= 15:
+                break
+                
+    return matches
+
 

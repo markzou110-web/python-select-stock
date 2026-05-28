@@ -66,6 +66,74 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     total_a = sum(1 for s in stock_list if s.get('sop_grade') == 'A')
     total_b = sum(1 for s in stock_list if s.get('sop_grade') == 'B')
     lines.append(f"A级{total_a}只 | B级{total_b}只")
+    lines.append("")
+
+    # --- 附加上实盘股状态 ---
+    from sqlalchemy import text
+    from core.db import get_db_engine
+    engine = get_db_engine()
+    if engine:
+        import pandas as pd
+        from core.data import get_market_snapshot, get_index_hist
+        from core.indicators import calculate_indicators
+        from core.strategy import evaluate_exit_signals
+        from core.risk_constants import ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT
+        
+        try:
+            df_real = pd.read_sql("SELECT code, name, entry_price, high_since_entry FROM paper_trading WHERE status = 'OPEN' AND trade_mode = 'REAL'", engine)
+            if not df_real.empty:
+                lines.append("────────────────")
+                lines.append("【🔴 实盘持仓状态】")
+                
+                snapshot = get_market_snapshot()
+                snap_map = snapshot.set_index('code')['price'].to_dict() if not snapshot.empty else {}
+                bench_df = get_index_hist('000001')
+                
+                for _, row in df_real.iterrows():
+                    code = row['code']
+                    name = row['name']
+                    entry = float(row['entry_price'])
+                    high = float(row.get('high_since_entry') or entry)
+                    
+                    import math
+                    if math.isnan(high): high = entry
+                        
+                    curr = snap_map.get(code)
+                    if not curr:
+                        lines.append(f"• {name}: 暂无行情")
+                        continue
+                        
+                    pl_pct = (curr - entry) / entry * 100
+                    status_line = f"• {name}: 现价 {curr} ({pl_pct:+.2f}%)"
+                    
+                    # 获取指标
+                    query = text("SELECT date as \"日期\", close as \"收盘\", open as \"开盘\", high as \"最高\", low as \"最低\", vol as \"成交量\" FROM daily_k WHERE code = :code ORDER BY date DESC LIMIT 40")
+                    with engine.connect() as conn:
+                        df_hist = pd.read_sql(query, conn, params={'code': code})
+                        df_hist = df_hist.sort_values('日期')
+                    
+                    suggestion = "持股观望"
+                    if len(df_hist) >= 20:
+                        df_labeled = calculate_indicators(df_hist, current_price=curr, bench_df=bench_df)
+                        signals = evaluate_exit_signals(df_labeled, entry, high)
+                        if signals:
+                            # 取最高级别的报警
+                            sig = signals[0]
+                            icon = "🚨" if sig['level'] == 'critical' else "⚠️"
+                            suggestion = f"{icon} {sig['reason']} -> {sig['suggestion']}"
+                        else:
+                            # 没报警，显示自适应止损位
+                            atr = df_labeled.iloc[-1].get('ATR', 0)
+                            if atr > 0:
+                                atr_stop_pct = ((entry - atr * ATR_STOP_MULTIPLIER) - entry) / entry * 100
+                                act_stop_pct = max(ATR_STOP_MAX_PCT, min(ATR_STOP_MIN_PCT, atr_stop_pct))
+                                suggestion = f"✅ 安全区间 (防线 {act_stop_pct:.1f}%)"
+                    
+                    lines.append(status_line)
+                    lines.append(f"   └ {suggestion}")
+                lines.append("")
+        except Exception as e:
+            logger.error(f"Error appending real stock status: {e}")
 
     body = "\n".join(lines)
     logger.info(f"Notification: {body}")
