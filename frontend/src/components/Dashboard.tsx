@@ -14,6 +14,11 @@ import PaperTradingView from '@/components/PaperTradingView';
 import SettingsView from '@/components/SettingsView';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import AlertsView from '@/components/AlertsView';
+import OverviewView from '@/components/OverviewView';
+import SearchView from '@/components/SearchView';
+import ReviewCenter from '@/components/ReviewCenter';
+import WatchlistView from '@/components/WatchlistView';
+import StrategyTemplatesView from '@/components/StrategyTemplatesView';
 import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
@@ -110,7 +115,27 @@ export default function Dashboard() {
                 <div className="flex-1 overflow-y-auto px-8 pb-10">
                     <div className="flex gap-8 items-start">
                         <div className={cn("transition-all duration-500 space-y-10", selectedStock ? "flex-1 min-w-0" : "w-full")}>
-                            {activeView === 'scanner' ? (
+                            {activeView === 'overview' ? (
+                                <ErrorBoundary fallbackTitle="系统概览加载异常">
+                                    <OverviewView onNavigate={setActiveView} />
+                                </ErrorBoundary>
+                            ) : activeView === 'search' ? (
+                                <ErrorBoundary fallbackTitle="代码检索加载异常">
+                                    <SearchView />
+                                </ErrorBoundary>
+                            ) : activeView === 'review' ? (
+                                <ErrorBoundary fallbackTitle="交易复盘加载异常">
+                                    <ReviewCenter />
+                                </ErrorBoundary>
+                            ) : activeView === 'watchlist' ? (
+                                <ErrorBoundary fallbackTitle="观察池加载异常">
+                                    <WatchlistView />
+                                </ErrorBoundary>
+                            ) : activeView === 'templates' ? (
+                                <ErrorBoundary fallbackTitle="策略模板加载异常">
+                                    <StrategyTemplatesView />
+                                </ErrorBoundary>
+                            ) : activeView === 'scanner' ? (
                                 <>
                                     {/* Market Overview */}
                                     <div className="flex items-center gap-4 mb-2">
@@ -290,9 +315,13 @@ export default function Dashboard() {
                                 <ErrorBoundary fallbackTitle="预警页加载异常">
                                     <AlertsView />
                                 </ErrorBoundary>
-                            ) : (
+                            ) : activeView === 'settings' ? (
                                 <ErrorBoundary fallbackTitle="设置页加载异常">
                                     <SettingsView />
+                                </ErrorBoundary>
+                            ) : (
+                                <ErrorBoundary fallbackTitle="系统概览加载异常">
+                                    <OverviewView onNavigate={setActiveView} />
                                 </ErrorBoundary>
                             )}
                         </div>

@@ -19,7 +19,8 @@ import {
     Calculator as CalcIcon,
     Settings2,
     Shield,
-    Filter
+    Filter,
+    Eye
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import dynamic from 'next/dynamic';
@@ -147,6 +148,25 @@ export default function ResultsTable({
         } catch (err) {
             console.error(err);
             showToast('加入失败，请重试', 'error');
+        }
+    };
+
+    const addToObservation = async (stock: ScanResult) => {
+        try {
+            await api.post('/api/watchlist/add', {
+                code: stock.代码,
+                name: stock.名称,
+                industry: stock.行业,
+                watch_price: stock.现价,
+                strategy_type: stock.strategy_type || 'squeeze',
+                reason: `${stock.strategy_type || 'squeeze'} 扫描入选，Score ${stock.Score}`,
+                invalidation: stock.stop_price ? `跌破 ${stock.stop_price}` : '跌破关键均线或策略失效',
+                source: 'scan'
+            });
+            showToast(`${stock.名称} 已加入观察池`);
+        } catch (err) {
+            console.error(err);
+            showToast('加入观察池失败', 'error');
         }
     };
 
@@ -376,6 +396,13 @@ export default function ResultsTable({
                             title="加入模拟池"
                         >
                             <Plus size={18} />
+                        </button>
+                        <button
+                            onClick={(e) => { e.stopPropagation(); addToObservation(res); }}
+                            className="p-2 text-slate-400 hover:text-amber-600 hover:bg-amber-50 rounded-xl transition-all"
+                            title="加入观察池"
+                        >
+                            <Eye size={18} />
                         </button>
                         <button
                             onClick={(e) => { e.stopPropagation(); openChart(res.代码); }}

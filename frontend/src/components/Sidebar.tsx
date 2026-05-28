@@ -11,8 +11,10 @@ import {
     Cpu,
     RefreshCw,
     Database,
-    Clock,
-    Square
+    Square,
+    Star,
+    ClipboardList,
+    SlidersHorizontal
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAlertStore } from '@/stores/alertStore';
@@ -66,6 +68,18 @@ export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamen
                         label="拟合实盘"
                         active={activeView === 'paper'}
                         onClick={() => onNavigate('paper')}
+                    />
+                    <NavItem
+                        icon={<Star size={20} />}
+                        label="观察池"
+                        active={activeView === 'watchlist'}
+                        onClick={() => onNavigate('watchlist')}
+                    />
+                    <NavItem
+                        icon={<ClipboardList size={20} />}
+                        label="交易复盘"
+                        active={activeView === 'review'}
+                        onClick={() => onNavigate('review')}
                     />
                     <NavItem
                         icon={<Bell size={20} />}
@@ -143,6 +157,7 @@ export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamen
 
                 <div className="space-y-1 pt-2">
                     <NavItem icon={<Search size={20} />} label="代码检索" active={activeView === 'search'} onClick={() => onNavigate('search')} />
+                    <NavItem icon={<SlidersHorizontal size={20} />} label="策略模板" active={activeView === 'templates'} onClick={() => onNavigate('templates')} />
                     <NavItem icon={<Settings size={20} />} label="系统配置" active={activeView === 'settings'} onClick={() => onNavigate('settings')} />
                 </div>
 
