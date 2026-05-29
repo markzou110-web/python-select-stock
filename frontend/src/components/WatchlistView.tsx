@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { Archive, Loader2, RefreshCw, Star, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
+import { Archive, BellRing, Loader2, RefreshCw, Star, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -9,6 +9,8 @@ export default function WatchlistView() {
     const [items, setItems] = useState<any[]>([]);
     const [stats, setStats] = useState<any>({});
     const [loading, setLoading] = useState(true);
+    const [checking, setChecking] = useState(false);
+    const [notice, setNotice] = useState<string>('');
     const [status, setStatus] = useState<'WATCHING' | 'ALL'>('WATCHING');
 
     const fetchItems = async () => {
@@ -35,6 +37,19 @@ export default function WatchlistView() {
         fetchItems();
     };
 
+    const checkTriggers = async () => {
+        setChecking(true);
+        setNotice('');
+        try {
+            const res = await api.post('/api/watchlist/check-triggers?notify=true');
+            const count = res.data?.count || 0;
+            setNotice(count > 0 ? `发现 ${count} 条触发记录，已尝试推送通知` : '暂无触发记录');
+            await fetchItems();
+        } finally {
+            setChecking(false);
+        }
+    };
+
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="flex items-center justify-between">
@@ -46,9 +61,19 @@ export default function WatchlistView() {
                     <button onClick={() => setStatus(status === 'WATCHING' ? 'ALL' : 'WATCHING')} className="px-4 py-2 rounded-xl bg-white border border-slate-100 text-slate-600 text-xs font-black">
                         {status === 'WATCHING' ? '仅观察中' : '全部记录'}
                     </button>
+                    <button onClick={checkTriggers} disabled={checking} className="px-4 py-2 rounded-xl bg-amber-50 text-amber-700 text-xs font-black flex items-center gap-2 disabled:opacity-60">
+                        {checking ? <Loader2 size={14} className="animate-spin" /> : <BellRing size={14} />}
+                        检查触发
+                    </button>
                     <button onClick={fetchItems} className="p-2.5 rounded-xl bg-indigo-50 text-indigo-600"><RefreshCw size={16} /></button>
                 </div>
             </div>
+
+            {notice && (
+                <div className="px-4 py-3 rounded-xl bg-slate-50 border border-slate-100 text-sm font-bold text-slate-600">
+                    {notice}
+                </div>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <Summary label="观察标的" value={stats.total || 0} />
@@ -92,6 +117,11 @@ export default function WatchlistView() {
                                     <td className="px-4 py-5 text-center">
                                         <p className={cn("text-xs font-black", item.target_hit ? "text-rose-600" : "text-slate-500")}>目标 {item.target_price || '--'}</p>
                                         <p className={cn("text-xs font-black mt-1", item.stop_hit ? "text-emerald-600" : "text-slate-500")}>失效 {item.stop_price || '--'}</p>
+                                        {(item.target_hit || item.stop_hit) && (
+                                            <span className="inline-flex mt-2 px-2 py-1 rounded-full bg-amber-50 text-[10px] font-black text-amber-700">
+                                                已触发
+                                            </span>
+                                        )}
                                     </td>
                                     <td className="px-6 py-5">
                                         <p className="text-sm font-bold text-slate-600 line-clamp-2">{item.reason || "未填写"}</p>

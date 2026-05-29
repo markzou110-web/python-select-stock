@@ -2,10 +2,12 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from typing import Dict, Any
 from datetime import datetime
+import asyncio
 import pandas as pd
 
 from core.db import get_db_engine, validate_stock_code
 from core.logging_config import logger
+from core.notifier import notifier
 from core.risk_constants import FIXED_STOP_LOSS_RATIO, TAKE_PROFIT_RATIO
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
@@ -30,6 +32,36 @@ def _latest_prices(engine, codes):
     except Exception as exc:
         logger.warning(f"Watchlist latest price fetch failed: {exc}")
         return {}
+
+
+def _send_trigger_notification(alerts) -> Dict[str, bool]:
+    if not alerts:
+        return {}
+
+    title = f"Alpha Vision 观察池触发 {len(alerts)} 条"
+    lines = []
+    for alert in alerts[:8]:
+        reasons = "、".join(alert["reasons"])
+        lines.append(
+            f"{alert['name']}({alert['code']}) {reasons}: "
+            f"现价 {alert['current_price']}，观察收益 {alert['pl_pct']}%"
+        )
+    if len(alerts) > 8:
+        lines.append(f"另有 {len(alerts) - 8} 条触发记录，请打开观察池查看。")
+    body = "\n".join(lines)
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            loop.create_task(notifier.send(title, body, channels=["bark"]))
+            return {"bark": True}
+        return asyncio.run(notifier.send(title, body, channels=["bark"]))
+    except Exception as exc:
+        logger.error(f"Watchlist trigger notification error: {exc}")
+        return {"bark": False}
 
 
 @router.get("/list")
@@ -98,6 +130,41 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"List watchlist error: {exc}")
         return {"items": [], "stats": {}}
+
+
+@router.post("/check-triggers")
+def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
+    payload = list_watchlist(status="WATCHING")
+    alerts = []
+
+    for item in payload.get("items", []):
+        reasons = []
+        if item.get("target_hit"):
+            reasons.append("触达目标价")
+        if item.get("stop_hit"):
+            reasons.append("触发失效价")
+        if not reasons:
+            continue
+        alerts.append({
+            "id": item["id"],
+            "code": item["code"],
+            "name": item["name"],
+            "industry": item.get("industry") or "未知",
+            "current_price": item.get("current_price"),
+            "watch_price": item.get("watch_price"),
+            "target_price": item.get("target_price"),
+            "stop_price": item.get("stop_price"),
+            "pl_pct": item.get("pl_pct"),
+            "reasons": reasons,
+        })
+
+    notification = _send_trigger_notification(alerts) if notify and alerts else {}
+    return {
+        "status": "success",
+        "count": len(alerts),
+        "alerts": alerts,
+        "notification": notification,
+    }
 
 
 @router.post("/add")

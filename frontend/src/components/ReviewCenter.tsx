@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
+import { Activity, BarChart3, Download, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -23,6 +23,11 @@ export default function ReviewCenter() {
 
     useEffect(() => { fetchData(); }, [days]);
 
+    const exportCsv = () => {
+        const baseUrl = api.defaults.baseURL || 'http://127.0.0.1:8000';
+        window.open(`${baseUrl}/api/review/scan-performance/export?days=${days}`, '_blank');
+    };
+
     if (loading && !data) {
         return <div className="flex items-center justify-center p-20 text-slate-400"><Loader2 className="animate-spin mr-2" /> 正在计算复盘表现...</div>;
     }
@@ -40,6 +45,7 @@ export default function ReviewCenter() {
                     {[60, 120, 250].map(v => (
                         <button key={v} onClick={() => setDays(v)} className={cn("px-3 py-2 rounded-xl text-xs font-black", days === v ? "bg-indigo-600 text-white" : "bg-white border border-slate-100 text-slate-500")}>{v}日</button>
                     ))}
+                    <button onClick={exportCsv} className="p-2.5 rounded-xl bg-white border border-slate-100 text-slate-600 hover:text-indigo-600" title="导出CSV"><Download size={16} /></button>
                     <button onClick={fetchData} className="p-2.5 rounded-xl bg-white border border-slate-100 text-indigo-600"><RefreshCw size={16} /></button>
                 </div>
             </div>

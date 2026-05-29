@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from 'react';
-import { TrendingUp, Grid3x3, Loader2 } from 'lucide-react';
+import { CheckCircle2, Grid3x3, Loader2, Save, TrendingUp } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
 
@@ -12,19 +12,19 @@ interface HeatmapProps {
     onClose: () => void;
 }
 
-const PARAM_PRESETS: Record<string, { label: string; values: number[] }[]> = {
+const PARAM_PRESETS: Record<string, { key: string; label: string; values: number[] }[]> = {
     squeeze: [
-        { label: "RSI 最低值", values: [50, 55, 60, 65] },
-        { label: "止损 (%)", values: [-5, -8, -10, -12] },
-        { label: "量比倍数", values: [1.2, 1.5, 1.8, 2.0] },
+        { key: "rsi_min", label: "RSI 最低值", values: [50, 55, 60, 65] },
+        { key: "stop_loss_pct", label: "止损 (%)", values: [-5, -8, -10, -12] },
+        { key: "vol_multiplier", label: "量比倍数", values: [1.2, 1.5, 1.8, 2.0] },
     ],
     pine: [
-        { label: "最小信号数", values: [1, 2, 3, 4] },
-        { label: "止损 (%)", values: [-5, -8, -10, -12] },
+        { key: "pine_min_signals", label: "最小信号数", values: [1, 2, 3, 4] },
+        { key: "stop_loss_pct", label: "止损 (%)", values: [-5, -8, -10, -12] },
     ],
     consensus: [
-        { label: "量比倍数", values: [1.2, 1.5, 1.8, 2.0] },
-        { label: "止损 (%)", values: [-5, -8, -10, -12] },
+        { key: "vol_multiplier", label: "量比倍数", values: [1.2, 1.5, 1.8, 2.0] },
+        { key: "stop_loss_pct", label: "止损 (%)", values: [-5, -8, -10, -12] },
     ],
 };
 
@@ -33,6 +33,8 @@ export default function HeatmapOptimizer({ code, name, strategy, onClose }: Heat
     const [paramXIdx, setParamXIdx] = useState(0);
     const [paramYIdx, setParamYIdx] = useState(presets.length > 1 ? 1 : 0);
     const [loading, setLoading] = useState(false);
+    const [savingTemplate, setSavingTemplate] = useState(false);
+    const [savedTemplate, setSavedTemplate] = useState(false);
     const [result, setResult] = useState<{
         x_labels: string[];
         y_labels: string[];
@@ -43,13 +45,14 @@ export default function HeatmapOptimizer({ code, name, strategy, onClose }: Heat
     const runOptimize = async () => {
         setLoading(true);
         setResult(null);
+        setSavedTemplate(false);
         try {
             const res = await api.post('/api/scan/optimize', {
                 code,
                 strategy,
-                param_x: paramXIdx === 0 ? 'rsi_min' : paramXIdx === 1 ? 'stop_loss_pct' : 'vol_multiplier',
+                param_x: presets[paramXIdx].key,
                 param_x_values: presets[paramXIdx].values,
-                param_y: paramYIdx === 0 ? 'stop_loss_pct' : paramYIdx === 1 ? 'rsi_min' : 'vol_multiplier',
+                param_y: presets[paramYIdx].key,
                 param_y_values: presets[paramYIdx].values,
             });
             setResult(res.data);
@@ -57,6 +60,29 @@ export default function HeatmapOptimizer({ code, name, strategy, onClose }: Heat
             console.error('Optimize error:', err);
         } finally {
             setLoading(false);
+        }
+    };
+
+    const saveBestTemplate = async () => {
+        if (!result?.best) return;
+        setSavingTemplate(true);
+        try {
+            const params = {
+                strategy_type: strategy,
+                [presets[paramXIdx].key]: result.best.param_x,
+                [presets[paramYIdx].key]: result.best.param_y,
+            };
+            await api.post('/api/strategy-templates/save', {
+                name: `${name} 寻优参数`,
+                strategy_type: strategy,
+                description: `${code} 参数寻优结果：${presets[paramXIdx].label}=${result.best.param_x}，${presets[paramYIdx].label}=${result.best.param_y}，胜率 ${result.best.win_rate}%`,
+                params,
+            });
+            setSavedTemplate(true);
+        } catch (err) {
+            console.error('Save template error:', err);
+        } finally {
+            setSavingTemplate(false);
         }
     };
 
@@ -123,11 +149,21 @@ export default function HeatmapOptimizer({ code, name, strategy, onClose }: Heat
                 {result && (
                     <div className="space-y-3">
                         {result.best && (
-                            <div className="flex items-center gap-2 px-4 py-2 bg-emerald-50 border border-emerald-100 rounded-xl">
-                                <TrendingUp size={14} className="text-emerald-600" />
-                                <span className="text-xs font-bold text-emerald-700">
-                                    最佳: {presets[paramXIdx]?.label}={result.best.param_x}, {presets[paramYIdx]?.label}={result.best.param_y} → 胜率 {result.best.win_rate}%
-                                </span>
+                            <div className="flex items-center justify-between gap-3 px-4 py-2 bg-emerald-50 border border-emerald-100 rounded-xl">
+                                <div className="flex items-center gap-2 min-w-0">
+                                    <TrendingUp size={14} className="text-emerald-600 shrink-0" />
+                                    <span className="text-xs font-bold text-emerald-700 truncate">
+                                        最佳: {presets[paramXIdx]?.label}={result.best.param_x}, {presets[paramYIdx]?.label}={result.best.param_y} → 胜率 {result.best.win_rate}%
+                                    </span>
+                                </div>
+                                <button
+                                    onClick={saveBestTemplate}
+                                    disabled={savingTemplate || savedTemplate}
+                                    className="px-3 py-1.5 rounded-lg bg-white text-emerald-700 border border-emerald-100 text-[11px] font-black flex items-center gap-1.5 shrink-0 disabled:opacity-70"
+                                >
+                                    {savingTemplate ? <Loader2 size={12} className="animate-spin" /> : savedTemplate ? <CheckCircle2 size={12} /> : <Save size={12} />}
+                                    {savedTemplate ? '已保存' : '保存模板'}
+                                </button>
                             </div>
                         )}
 
