@@ -124,6 +124,9 @@ from routers.stock import router as stock_router
 from routers.settings import router as settings_router
 from routers.alert import router as alert_router
 from routers.kline import router as kline_router
+from routers.review import router as review_router
+from routers.watchlist import router as watchlist_router
+from routers.strategy_templates import router as strategy_templates_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -133,6 +136,9 @@ app.include_router(stock_router)
 app.include_router(settings_router)
 app.include_router(alert_router)
 app.include_router(kline_router)
+app.include_router(review_router)
+app.include_router(watchlist_router)
+app.include_router(strategy_templates_router)
 
 @app.get("/api/market/pulse")
 async def get_market_pulse():

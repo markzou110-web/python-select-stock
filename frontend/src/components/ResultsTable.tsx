@@ -19,7 +19,6 @@ import {
     Calculator as CalcIcon,
     Settings2,
     Shield,
-    Filter,
     Eye
 } from 'lucide-react';
 import { cn } from '@/lib/utils';

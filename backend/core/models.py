@@ -75,3 +75,31 @@ class StockFundamental(Base):
     revenue_yoy = Column(Float)
     label = Column(String(50))
     updated_at = Column(Date)
+
+class WatchlistItem(Base):
+    __tablename__ = "watchlist"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(20))
+    name = Column(String(50))
+    industry = Column(String(100), nullable=True)
+    source = Column(String(50), default="manual")
+    strategy_type = Column(String(20), default="squeeze")
+    watch_price = Column(Float)
+    target_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    status = Column(String(20), default="WATCHING")
+    reason = Column(Text, nullable=True)
+    invalidation = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class StrategyTemplate(Base):
+    __tablename__ = "strategy_templates"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100))
+    strategy_type = Column(String(20), default="squeeze")
+    params_json = Column(Text)
+    description = Column(Text, nullable=True)
+    is_default = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

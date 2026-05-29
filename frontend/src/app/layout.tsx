@@ -1,8 +1,5 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
 import "./globals.css";
-
-const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
   title: "Alpha Vision | 极光量化终端",
@@ -16,7 +13,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
-      <body className={`${inter.className} antialiased text-slate-900 bg-slate-50`}>
+      <body className="antialiased text-slate-900 bg-slate-50">
         {children}
       </body>
     </html>

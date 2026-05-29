@@ -115,6 +115,9 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date_code ON daily_k(date, code);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status_date ON paper_trading(status, entry_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_status ON watchlist(status);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_code_status ON watchlist(code, status);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_strategy_templates_type ON strategy_templates(strategy_type);"))
                 logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
