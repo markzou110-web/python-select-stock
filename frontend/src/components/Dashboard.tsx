@@ -89,7 +89,7 @@ export default function Dashboard() {
     }, []);
 
     return (
-        <div className="flex h-screen overflow-hidden w-full">
+        <div className="flex h-screen overflow-hidden w-full bg-slate-100">
             <Sidebar
                 syncProgress={syncProgress}
                 onStartSync={startSync}
@@ -98,7 +98,7 @@ export default function Dashboard() {
                 activeView={activeView}
                 onNavigate={setActiveView}
             />
-            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-slate-50">
+            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-slate-100">
                 <Header
                     onScan={startScan}
                     loading={isScanning}
@@ -112,9 +112,9 @@ export default function Dashboard() {
                     }}
                 />
 
-                <div className="flex-1 overflow-y-auto px-8 pb-10">
-                    <div className="flex gap-8 items-start">
-                        <div className={cn("transition-all duration-500 space-y-10", selectedStock ? "flex-1 min-w-0" : "w-full")}>
+                <div className="flex-1 overflow-y-auto px-6 py-5">
+                    <div className="flex gap-5 items-start">
+                        <div className={cn("transition-all duration-300 space-y-6", selectedStock ? "flex-1 min-w-0" : "w-full")}>
                             {activeView === 'overview' ? (
                                 <ErrorBoundary fallbackTitle="系统概览加载异常">
                                     <OverviewView onNavigate={setActiveView} />
@@ -138,30 +138,32 @@ export default function Dashboard() {
                             ) : activeView === 'scanner' ? (
                                 <>
                                     {/* Market Overview */}
-                                    <div className="flex items-center gap-4 mb-2">
-                                        <h2 className="text-sm font-extrabold text-slate-800 uppercase tracking-widest flex items-center gap-2">
-                                            大盘多因子风控
+                                    <div className="workspace-panel px-4 py-3 flex items-center justify-between">
+                                        <div className="flex items-center gap-3 min-w-0">
+                                            <h2 className="text-sm font-black text-slate-900 uppercase tracking-widest flex items-center gap-2">
+                                                大盘多因子风控
+                                            </h2>
                                             {marketRegime && (
                                                 <div className={cn(
-                                                    "inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border shadow-sm ml-2",
-                                                    marketRegime.status === "CRITICAL" && "bg-rose-50 border-rose-100 text-rose-700 shadow-rose-100/50",
-                                                    marketRegime.status === "OFFENSIVE" && "bg-emerald-50 border-emerald-100 text-emerald-700 shadow-emerald-100/50",
-                                                    marketRegime.status === "DEFENSIVE" && "bg-amber-50 border-amber-100 text-amber-700 shadow-amber-100/50"
+                                                    "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-black border",
+                                                    marketRegime.status === "CRITICAL" && "bg-rose-50 border-rose-200 text-rose-700",
+                                                    marketRegime.status === "OFFENSIVE" && "bg-teal-50 border-teal-200 text-teal-700",
+                                                    marketRegime.status === "DEFENSIVE" && "bg-amber-50 border-amber-200 text-amber-700"
                                                 )}>
-                                                    {marketRegime.status === "OFFENSIVE" ? "🚀 强力进攻" : 
-                                                     marketRegime.status === "CRITICAL" ? "🛡️ 严格防守" : "🚧 减仓观望"}
+                                                    {marketRegime.status === "OFFENSIVE" ? "强力进攻" :
+                                                     marketRegime.status === "CRITICAL" ? "严格防守" : "减仓观望"}
                                                 </div>
                                             )}
-                                        </h2>
+                                        </div>
                                         {marketRegime && (
-                                            <span className="text-[10px] text-slate-400 font-medium">
+                                            <span className="text-[10px] text-slate-500 font-bold truncate">
                                                 {marketRegime.desc} | {Object.entries(marketRegime.indices).map(([name, d]: [any, any]) => 
-                                                    `${name}: ${d.trend === 'BULL' ? '🟢' : '🔴'} `
+                                                    `${name}: ${d.trend === 'BULL' ? '多头' : '空头'} `
                                                 )}
                                             </span>
                                         )}
                                     </div>
-                                    <div className="flex gap-6 overflow-x-auto pb-2 scrollbar-none">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
                                         {marketLoading ? (
                                             Array(5).fill(0).map((_, i) => <MarketCard key={i} name="" price={0} pct={0} loading />)
                                         ) : (
@@ -171,7 +173,7 @@ export default function Dashboard() {
                                         )}
                                     </div>
                                     
-                                    <div className="my-6">
+                                    <div>
                                         <MarketSentiment />
                                     </div>
 
@@ -179,22 +181,19 @@ export default function Dashboard() {
                                     <SectorGrid sectors={sectors} />
 
                                     {/* Scan Actions & Filters */}
-                                    <div className="flex items-center justify-between pt-4 border-t border-slate-200">
-                                        <div className="flex items-center gap-4">
+                                    <div className="workspace-panel p-3 flex items-center justify-between gap-4">
+                                        <div className="flex items-center gap-3 flex-wrap">
                                             <button
                                                 onClick={startScan}
                                                 disabled={isScanning}
-                                                className={cn(
-                                                    "flex items-center gap-2 px-6 py-3 premium-gradient text-white rounded-2xl font-bold shadow-xl shadow-indigo-100 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 disabled:scale-100"
-                                                )}
+                                                className="primary-button"
                                             >
                                                 {isScanning ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
                                                 {isScanning ? '正在扫描全市场...' : '开始全市场扫描'}
                                             </button>
-                                            <div className="h-10 w-[1px] bg-slate-200 mx-2" />
                                             <button
                                                 onClick={() => setIsFilterOpen(true)}
-                                                className="flex items-center gap-2 px-4 py-3 bg-white border border-slate-200 rounded-2xl font-bold text-slate-600 hover:bg-slate-50 transition-all"
+                                                className="toolbar-button"
                                             >
                                                 <Filter size={18} />
                                                 策略参数配置
@@ -202,19 +201,19 @@ export default function Dashboard() {
 
                                             {/* History Selector */}
                                             {historyDates.length > 0 && (
-                                                <div className="flex items-center gap-3 pl-6 border-l border-slate-200 ml-2">
-                                                    <span className="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                                                        🕒 历史记录
+                                                <div className="flex items-center gap-2 pl-3 border-l border-slate-200">
+                                                    <span className="metric-label flex items-center gap-2">
+                                                        历史记录
                                                     </span>
                                                     <select
                                                         value={selectedDate}
                                                         onChange={(e) => loadHistory(e.target.value)}
-                                                        className="bg-white border border-slate-200 text-slate-600 text-sm font-bold rounded-xl px-4 py-2.5 outline-none focus:ring-2 focus:ring-indigo-500/20 transition-all cursor-pointer shadow-sm hover:border-slate-300"
+                                                        className="bg-white border border-slate-200 text-slate-700 text-xs font-bold rounded-md px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-300 transition-all cursor-pointer"
                                                     >
                                                         <option value="">-- 选择记录日期 --</option>
                                                         {historyDates.map(date => (
                                                             <option key={date} value={date}>
-                                                                📅 {date} {date === new Date().toISOString().split('T')[0] ? "(今日扫描)" : ""}
+                                                                {date} {date === new Date().toISOString().split('T')[0] ? "(今日扫描)" : ""}
                                                             </option>
                                                         ))}
                                                     </select>
@@ -222,22 +221,22 @@ export default function Dashboard() {
                                             )}
                                         </div>
 
-                                        <div className="flex items-center gap-2 bg-white p-1.5 rounded-2xl border border-slate-200">
+                                        <div className="flex items-center gap-1 bg-slate-50 p-1 rounded-lg border border-slate-200 shrink-0">
                                             <button
                                                 onClick={() => setViewMode('list')}
-                                                className={cn("p-2 rounded-xl transition-all", viewMode === 'list' ? "bg-indigo-50 text-indigo-600" : "text-slate-400 hover:text-slate-600")}
+                                                className={cn("p-2 rounded-md transition-colors", viewMode === 'list' ? "bg-white text-blue-700 shadow-sm" : "text-slate-400 hover:text-slate-600")}
                                             >
                                                 <List size={20} />
                                             </button>
                                             <button
                                                 onClick={() => setViewMode('grid')}
-                                                className={cn("p-2 rounded-xl transition-all", viewMode === 'grid' ? "bg-indigo-50 text-indigo-600" : "text-slate-400 hover:text-slate-600")}
+                                                className={cn("p-2 rounded-md transition-colors", viewMode === 'grid' ? "bg-white text-blue-700 shadow-sm" : "text-slate-400 hover:text-slate-600")}
                                             >
                                                 <LayoutGrid size={20} />
                                             </button>
                                             <button
                                                 onClick={() => setViewMode('history')}
-                                                className={cn("p-2 rounded-xl transition-all flex items-center gap-1.5", viewMode === 'history' ? "bg-indigo-50 text-indigo-600" : "text-slate-400 hover:text-slate-600")}
+                                                className={cn("p-2 rounded-md transition-colors flex items-center gap-1.5", viewMode === 'history' ? "bg-white text-blue-700 shadow-sm" : "text-slate-400 hover:text-slate-600")}
                                                 title="历史回溯"
                                             >
                                                 <Calendar size={20} />
@@ -245,7 +244,7 @@ export default function Dashboard() {
                                             <div className="mx-1 h-6 w-[1px] bg-slate-200" />
                                             <button
                                                 onClick={handleExport}
-                                                className="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
+                                                className="p-2 text-slate-400 hover:text-blue-700 hover:bg-white rounded-md transition-colors"
                                             >
                                                 <Download size={20} />
                                             </button>
@@ -253,7 +252,7 @@ export default function Dashboard() {
                                     </div>
 
                                     {/* Results Section */}
-                                    <div className="flex flex-col gap-8">
+                                    <div className="flex flex-col gap-5">
                                         {viewMode === 'history' ? (
                                             <ErrorBoundary fallbackTitle="历史回溯加载异常">
                                                 <ScanHistoryView availableDates={availableDates.map(d => d.date)} />
@@ -267,10 +266,10 @@ export default function Dashboard() {
                                                 />
                                             </ErrorBoundary>
                                         ) : (
-                                            <div className="glass-card min-h-[400px] flex flex-col items-center justify-center text-slate-400 p-20 border-dashed border-2">
+                                            <div className="glass-card min-h-[360px] flex flex-col items-center justify-center text-slate-400 p-16 border-dashed border">
                                                 {isScanning ? (
                                                     <div className="flex flex-col items-center animate-pulse w-full max-w-md">
-                                                        <div className="w-16 h-16 bg-indigo-50 text-indigo-500 rounded-full flex items-center justify-center mb-6 shadow-indigo-100 shadow-xl">
+                                                        <div className="w-14 h-14 bg-blue-50 text-blue-700 rounded-lg flex items-center justify-center mb-5">
                                                             <Zap size={32} />
                                                         </div>
                                                         <p className="font-bold text-lg text-slate-600 mb-2">正在分析全市场个股...</p>
@@ -282,12 +281,12 @@ export default function Dashboard() {
                                                                 </div>
                                                                 <div className="w-full bg-slate-100 rounded-full h-2 mb-2 overflow-hidden">
                                                                     <div 
-                                                                        className="premium-gradient h-2 rounded-full transition-all duration-300"
+                                                                        className="bg-blue-700 h-2 rounded-full transition-all duration-300"
                                                                         style={{ width: `${scanProgress.total > 0 ? (scanProgress.current / scanProgress.total) * 100 : 0}%` }}
                                                                     />
                                                                 </div>
                                                                 <div className="text-center text-[10px] text-slate-400 font-mono tracking-widest uppercase mt-4">
-                                                                    已耗时: <span className="text-indigo-500 font-bold">{scanProgress.elapsed}s</span>
+                                                                    已耗时: <span className="text-blue-700 font-bold">{scanProgress.elapsed}s</span>
                                                                 </div>
                                                             </div>
                                                         ) : (
@@ -296,7 +295,7 @@ export default function Dashboard() {
                                                     </div>
                                                 ) : (
                                                     <>
-                                                        <div className="w-16 h-16 bg-slate-100 rounded-2xl flex items-center justify-center mb-4">
+                                                        <div className="w-14 h-14 bg-slate-100 rounded-lg flex items-center justify-center mb-4">
                                                             <Search size={32} strokeWidth={1.5} />
                                                         </div>
                                                         <p className="font-bold text-lg text-slate-600">暂无扫描结果</p>
@@ -328,7 +327,7 @@ export default function Dashboard() {
 
                         {/* Global Sidebar: AI Deep Dive (K-Line) */}
                         {selectedStock && (
-                            <div className="w-[450px] sticky top-0 animate-in slide-in-from-right-8 duration-500 h-fit">
+                            <div className="w-[430px] sticky top-0 animate-in slide-in-from-right-8 duration-300 h-fit">
                                 <ErrorBoundary fallbackTitle="AI 深度分析加载异常">
                                     <AIDeepDive
                                         stock={selectedStock}

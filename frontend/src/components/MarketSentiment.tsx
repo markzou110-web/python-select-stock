@@ -55,16 +55,16 @@ const MarketSentiment: React.FC = () => {
 
     if (loading) {
         return (
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5 flex items-center justify-center min-h-[120px]">
-                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-600"></div>
+            <div className="workspace-panel p-5 flex items-center justify-center min-h-[120px]">
+                <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-700"></div>
             </div>
         );
     }
 
     if (error || !data) {
         return (
-            <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5 text-sm text-gray-500 min-h-[120px] flex items-center">
-                ⚠️ 暂无情绪数据: {error}
+            <div className="workspace-panel p-5 text-sm text-slate-500 min-h-[120px] flex items-center">
+                暂无情绪数据: {error}
             </div>
         );
     }
@@ -75,67 +75,67 @@ const MarketSentiment: React.FC = () => {
     let statusText = "震荡分化";
     
     if (data.sentiment_score >= 80) {
-        scoreColor = "text-red-500";
-        bgPulse = "bg-red-50";
-        statusText = "极度亢奋 🔥";
+        scoreColor = "text-rose-600";
+        bgPulse = "bg-rose-50";
+        statusText = "极度亢奋";
     } else if (data.sentiment_score >= 60) {
-        scoreColor = "text-orange-500";
-        bgPulse = "bg-orange-50";
-        statusText = "多头主导 📈";
+        scoreColor = "text-amber-600";
+        bgPulse = "bg-amber-50";
+        statusText = "多头主导";
     } else if (data.sentiment_score < 20) {
+        scoreColor = "text-blue-700";
+        bgPulse = "bg-blue-50";
+        statusText = "冰点退潮";
+    } else if (data.sentiment_score < 40) {
         scoreColor = "text-blue-600";
         bgPulse = "bg-blue-50";
-        statusText = "冰点退潮 🧊";
-    } else if (data.sentiment_score < 40) {
-        scoreColor = "text-blue-400";
-        bgPulse = "bg-blue-50";
-        statusText = "空头压制 📉";
+        statusText = "空头压制";
     }
 
     return (
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
+        <div className="workspace-panel p-4">
             <div className="flex items-center justify-between mb-4">
-                <h3 className="font-bold text-gray-800 flex items-center gap-2">
-                    <span className="text-xl">🌡️</span> 市场情绪温度计
+                <h3 className="font-black text-slate-900 flex items-center gap-2">
+                    市场情绪温度计
                 </h3>
-                <span className="text-xs text-gray-400">{data.date}</span>
+                <span className="metric-label">{data.date}</span>
             </div>
 
-            <div className="flex flex-col lg:flex-row gap-6">
+            <div className="flex flex-col lg:flex-row gap-5">
                 {/* Left Section: Current Snapshot */}
-                <div className="flex flex-col md:flex-row items-center gap-6 lg:w-1/2">
+                <div className="flex flex-col md:flex-row items-center gap-5 lg:w-1/2">
                     <div className="flex flex-col items-center">
-                        <div className={`relative w-24 h-24 rounded-full flex items-center justify-center border-4 border-gray-100 ${bgPulse}`}>
-                            <div className={`text-3xl font-bold ${scoreColor}`}>
+                        <div className={`relative w-20 h-20 rounded-lg flex items-center justify-center border border-slate-200 ${bgPulse}`}>
+                            <div className={`text-3xl font-black font-mono ${scoreColor}`}>
                                 {data.sentiment_score}
                             </div>
                         </div>
-                        <div className={`mt-2 font-medium ${scoreColor}`}>{statusText}</div>
+                        <div className={`mt-2 text-xs font-black ${scoreColor}`}>{statusText}</div>
                     </div>
 
                     <div className="flex-1 w-full grid grid-cols-3 gap-3">
-                        <div className="bg-gray-50 rounded-lg p-3 text-center">
-                            <div className="text-xs text-gray-500 mb-1">涨停</div>
-                            <div className="text-xl font-bold text-red-500">{data.limit_up_count}</div>
+                        <div className="bg-slate-50 rounded-lg p-3 text-center border border-slate-100">
+                            <div className="metric-label mb-1">涨停</div>
+                            <div className="text-xl font-black font-mono text-rose-600">{data.limit_up_count}</div>
                         </div>
-                        <div className="bg-gray-50 rounded-lg p-3 text-center">
-                            <div className="text-xs text-gray-500 mb-1">跌停</div>
-                            <div className="text-xl font-bold text-green-500">{data.limit_down_count}</div>
+                        <div className="bg-slate-50 rounded-lg p-3 text-center border border-slate-100">
+                            <div className="metric-label mb-1">跌停</div>
+                            <div className="text-xl font-black font-mono text-teal-600">{data.limit_down_count}</div>
                         </div>
-                        <div className="bg-gray-50 rounded-lg p-3 text-center">
-                            <div className="text-xs text-gray-500 mb-1">连板</div>
-                            <div className="text-xl font-bold text-orange-500">{data.max_streak}</div>
+                        <div className="bg-slate-50 rounded-lg p-3 text-center border border-slate-100">
+                            <div className="metric-label mb-1">连板</div>
+                            <div className="text-xl font-black font-mono text-amber-600">{data.max_streak}</div>
                         </div>
                     </div>
                 </div>
 
                 {/* Right Section: History Trend */}
                 <div className="flex-1 h-32 lg:h-auto min-h-[120px]">
-                    <div className="text-[10px] text-gray-400 mb-2 uppercase font-bold tracking-wider">最近 10 日情绪趋势 (涨跌停家数)</div>
+                    <div className="metric-label mb-2">最近 10 日情绪趋势 (涨跌停家数)</div>
                     {history.length > 0 ? (
                         <ResponsiveContainer width="100%" height="100%">
                             <AreaChart data={history}>
-                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
                                 <XAxis 
                                     dataKey="date" 
                                     hide 
@@ -143,12 +143,12 @@ const MarketSentiment: React.FC = () => {
                                 <YAxis hide domain={[0, 'auto']} />
                                 <Tooltip 
                                     labelClassName="text-xs font-bold"
-                                    contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 12px rgba(0,0,0,0.1)' }}
+                                    contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', boxShadow: '0 8px 20px rgba(15,23,42,0.08)' }}
                                 />
                                 <Area 
                                     type="monotone" 
                                     dataKey="up" 
-                                    stroke="#ef4444" 
+                                    stroke="#e11d48"
                                     fill="#fecaca" 
                                     name="涨停"
                                     strokeWidth={2}
@@ -156,28 +156,28 @@ const MarketSentiment: React.FC = () => {
                                 <Area 
                                     type="monotone" 
                                     dataKey="down" 
-                                    stroke="#22c55e" 
-                                    fill="#bbf7d0" 
+                                    stroke="#0d9488"
+                                    fill="#ccfbf1"
                                     name="跌停"
                                     strokeWidth={2}
                                 />
                             </AreaChart>
                         </ResponsiveContainer>
                     ) : (
-                        <div className="h-full flex items-center justify-center text-gray-300 text-xs italic">
+                        <div className="h-full flex items-center justify-center text-slate-300 text-xs italic">
                             正在建立历史通道...
                         </div>
                     )}
                 </div>
             </div>
             
-            <div className="mt-4 w-full h-1.5 bg-gray-100 rounded-full overflow-hidden flex">
+            <div className="mt-4 w-full h-1.5 bg-slate-100 rounded-full overflow-hidden flex">
                 <div 
-                    className="h-full bg-red-400 transition-all duration-1000 ease-out"
+                    className="h-full bg-rose-500 transition-all duration-1000 ease-out"
                     style={{ width: `${data.sentiment_score}%` }}
                 ></div>
                 <div 
-                    className="h-full bg-green-400 transition-all duration-1000 ease-out"
+                    className="h-full bg-teal-500 transition-all duration-1000 ease-out"
                     style={{ width: `${100 - data.sentiment_score}%` }}
                 ></div>
             </div>

@@ -1,14 +1,17 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f8fafc;
-  --foreground: #0f172a;
+  --background: #f4f6f8;
+  --foreground: #111827;
   --card: #ffffff;
-  --card-foreground: #1e293b;
-  --primary: #6366f1;
+  --card-foreground: #1f2937;
+  --primary: #3157d5;
   --primary-foreground: #ffffff;
-  --border: #e2e8f0;
-  --radius: 1rem;
+  --border: #d9dee7;
+  --muted: #667085;
+  --surface: #ffffff;
+  --surface-subtle: #f7f9fc;
+  --radius: 0.5rem;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -25,23 +28,49 @@ body {
   color: var(--foreground);
   background: var(--background);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+  font-size: 14px;
+  letter-spacing: 0;
 }
 
 @layer components {
   .glass-card {
-    @apply bg-white/70 backdrop-blur-md border border-white/20 shadow-xl rounded-2xl;
+    @apply bg-white border border-slate-200 shadow-sm;
+    border-radius: 8px !important;
+    backdrop-filter: none !important;
   }
   
   .premium-gradient {
-    @apply bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500;
+    @apply bg-blue-700;
   }
 
   .nav-item {
-    @apply flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 hover:bg-indigo-50 hover:text-indigo-600;
+    @apply flex items-center gap-3 px-3 py-2 rounded-md transition-colors duration-150 hover:bg-slate-100 hover:text-blue-700;
   }
 
   .nav-item.active {
-    @apply bg-indigo-600 text-white shadow-lg shadow-indigo-200;
+    @apply bg-blue-50 text-blue-700 shadow-none;
+    box-shadow: inset 3px 0 0 #3157d5;
+  }
+
+  .workspace-panel {
+    @apply bg-white border border-slate-200 shadow-sm;
+    border-radius: 8px;
+  }
+
+  .toolbar-button {
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .primary-button {
+    @apply inline-flex items-center justify-center gap-2 rounded-md bg-blue-700 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .metric-label {
+    @apply text-[10px] font-bold uppercase tracking-widest text-slate-500;
+  }
+
+  .metric-value {
+    @apply font-mono font-bold tabular-nums text-slate-900;
   }
 }
 
