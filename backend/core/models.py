@@ -42,6 +42,16 @@ class ScanHistory(Base):
     strategy_type = Column(String(20))
     roe = Column(Float, nullable=True)
     net_profit_yoy = Column(Float, nullable=True)
+    price_action_score = Column(Float, nullable=True)
+    price_action_regime = Column(String(50), nullable=True)
+    price_action_signal = Column(String(50), nullable=True)
+    price_action_pattern = Column(String(50), nullable=True)
+    price_action_entry_quality = Column(String(50), nullable=True)
+    price_action_summary = Column(Text, nullable=True)
+    pa_entry_price = Column(Float, nullable=True)
+    pa_stop_price = Column(Float, nullable=True)
+    pa_target_price = Column(Float, nullable=True)
+    pa_risk_reward = Column(Float, nullable=True)
 
 class PaperTrading(Base):
     __tablename__ = "paper_trading"

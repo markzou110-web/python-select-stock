@@ -135,6 +135,25 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"trade_mode migration skipped (may already exist): {e}")
 
+            # --- Migration: price action P0 fields ---
+            try:
+                conn.execute(text("""
+                    ALTER TABLE scan_history
+                    ADD COLUMN IF NOT EXISTS price_action_score FLOAT,
+                    ADD COLUMN IF NOT EXISTS price_action_regime VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS price_action_signal VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS price_action_pattern VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS price_action_entry_quality VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS price_action_summary TEXT,
+                    ADD COLUMN IF NOT EXISTS pa_entry_price FLOAT,
+                    ADD COLUMN IF NOT EXISTS pa_stop_price FLOAT,
+                    ADD COLUMN IF NOT EXISTS pa_target_price FLOAT,
+                    ADD COLUMN IF NOT EXISTS pa_risk_reward FLOAT
+                """))
+                logger.info("Migration: price action columns ensured.")
+            except Exception as e:
+                logger.debug(f"price action migration skipped (may already exist): {e}")
+
             conn.commit()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
@@ -267,16 +286,28 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                     "shadow_ratio": float(r.get('影线比', 0)),
                     "strategy_type": r.get('strategy_type', 'squeeze'),
                     "roe": float(r.get('ROE', 0)) if r.get('ROE') is not None else None,
-                    "net_profit_yoy": float(r.get('净利YOY', 0)) if r.get('净利YOY') is not None else None
+                    "net_profit_yoy": float(r.get('净利YOY', 0)) if r.get('净利YOY') is not None else None,
+                    "price_action_score": float(r.get('price_action_score', 0)) if r.get('price_action_score') is not None else None,
+                    "price_action_regime": r.get('price_action_regime'),
+                    "price_action_signal": r.get('price_action_signal'),
+                    "price_action_pattern": r.get('price_action_pattern'),
+                    "price_action_entry_quality": r.get('price_action_entry_quality'),
+                    "price_action_summary": r.get('price_action_summary'),
+                    "pa_entry_price": float(r.get('pa_entry_price', 0)) if r.get('pa_entry_price') is not None else None,
+                    "pa_stop_price": float(r.get('pa_stop_price', 0)) if r.get('pa_stop_price') is not None else None,
+                    "pa_target_price": float(r.get('pa_target_price', 0)) if r.get('pa_target_price') is not None else None,
+                    "pa_risk_reward": float(r.get('pa_risk_reward', 0)) if r.get('pa_risk_reward') is not None else None
                 })
 
             # 一次性批量插入 (executemany)
             if rows:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy
+                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
+                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward
                     ) VALUES (
-                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy
+                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
+                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -293,7 +324,17 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         shadow_ratio = EXCLUDED.shadow_ratio,
                         strategy_type = EXCLUDED.strategy_type,
                         roe = EXCLUDED.roe,
-                        net_profit_yoy = EXCLUDED.net_profit_yoy
+                        net_profit_yoy = EXCLUDED.net_profit_yoy,
+                        price_action_score = EXCLUDED.price_action_score,
+                        price_action_regime = EXCLUDED.price_action_regime,
+                        price_action_signal = EXCLUDED.price_action_signal,
+                        price_action_pattern = EXCLUDED.price_action_pattern,
+                        price_action_entry_quality = EXCLUDED.price_action_entry_quality,
+                        price_action_summary = EXCLUDED.price_action_summary,
+                        pa_entry_price = EXCLUDED.pa_entry_price,
+                        pa_stop_price = EXCLUDED.pa_stop_price,
+                        pa_target_price = EXCLUDED.pa_target_price,
+                        pa_risk_reward = EXCLUDED.pa_risk_reward
                 '''), rows)
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
@@ -344,7 +385,17 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
             "shadow_ratio": "影线比",
             "strategy_type": "strategy_type",
             "roe": "ROE",
-            "net_profit_yoy": "净利YOY"
+            "net_profit_yoy": "净利YOY",
+            "price_action_score": "price_action_score",
+            "price_action_regime": "price_action_regime",
+            "price_action_signal": "price_action_signal",
+            "price_action_pattern": "price_action_pattern",
+            "price_action_entry_quality": "price_action_entry_quality",
+            "price_action_summary": "price_action_summary",
+            "pa_entry_price": "pa_entry_price",
+            "pa_stop_price": "pa_stop_price",
+            "pa_target_price": "pa_target_price",
+            "pa_risk_reward": "pa_risk_reward"
         }
         
         # 仅过滤并重命名 DataFrame 中存在的列，以防结构字段缺失

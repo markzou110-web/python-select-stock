@@ -263,11 +263,27 @@ export default function ResultsTable({
                 </td>
 
                 <td className="px-4 py-5">
-                    <div className="flex flex-col items-center gap-1">
-                        {res.结构 && (
-                            <div className="px-2 py-0.5 bg-blue-50 text-blue-600 rounded-lg text-[10px] font-black border border-blue-100 mb-0.5">
-                                {res.结构}
+                    <div className="flex flex-col items-center gap-1.5 min-w-[120px]">
+                        <div className="flex items-center gap-2">
+                            <span className={cn(
+                                "px-2 py-0.5 rounded-md text-[10px] font-black border",
+                                (res.price_action_score || 0) >= 70 ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                    (res.price_action_score || 0) >= 55 ? "bg-blue-50 text-blue-700 border-blue-100" :
+                                        "bg-slate-50 text-slate-500 border-slate-100"
+                            )}>
+                                PA {res.price_action_score ?? '--'}
+                            </span>
+                            {res.price_action_entry_quality && (
+                                <span className="text-[9px] font-black text-slate-400">{res.price_action_entry_quality}</span>
+                            )}
+                        </div>
+                        {(res.price_action_regime || res.结构) && (
+                            <div className="px-2 py-0.5 bg-blue-50 text-blue-700 rounded-md text-[10px] font-black border border-blue-100 max-w-[130px] truncate">
+                                {res.price_action_regime || res.结构}
                             </div>
+                        )}
+                        {res.price_action_pattern && (
+                            <span className="text-[10px] font-bold text-slate-600 max-w-[130px] truncate">{res.price_action_pattern}</span>
                         )}
                         <div className="flex items-center gap-1">
                             <span className="text-[10px] font-bold text-slate-300">上影比</span>
@@ -425,7 +441,7 @@ export default function ResultsTable({
             </tr>
             {expandedRow === res.代码 && (
                 <tr className="bg-slate-50/30 animate-in fade-in slide-in-from-top-2 duration-300">
-                    <td colSpan={9} className="px-8 py-6">
+                    <td colSpan={10} className="px-8 py-6">
                         <div className="flex flex-col gap-4">
                             {/* SOP 操作建议卡片 */}
                             {res.entry_price && (
@@ -447,6 +463,24 @@ export default function ResultsTable({
                                                 {res.sop_bonuses?.map((b, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-amber-50 text-amber-600 rounded-full font-bold border border-amber-100">⭐ {b}</span>)}
                                                 {res.sop_vetoes?.map((v, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-rose-50 text-rose-500 rounded-full font-bold border border-rose-100">❌ {v}</span>)}
                                             </div>
+                                        </div>
+                                    )}
+                                    {res.price_action_summary && (
+                                        <div className="flex-1 min-w-[260px] p-4 bg-blue-50 rounded-2xl border border-blue-100">
+                                            <div className="text-[10px] font-bold text-blue-500 uppercase tracking-widest mb-2">Al Brooks 价格行为</div>
+                                            <div className="text-sm font-black text-slate-800">{res.price_action_summary}</div>
+                                            <div className="grid grid-cols-3 gap-2 mt-3 text-xs">
+                                                <div><span className="text-slate-400">入场</span><div className="font-black text-blue-700">¥{res.pa_entry_price || '--'}</div></div>
+                                                <div><span className="text-slate-400">失效</span><div className="font-black text-rose-600">¥{res.pa_stop_price || '--'}</div></div>
+                                                <div><span className="text-slate-400">测算目标</span><div className="font-black text-emerald-600">¥{res.pa_target_price || '--'}</div></div>
+                                            </div>
+                                            {res.price_action_risks && res.price_action_risks.length > 0 && (
+                                                <div className="mt-3 flex flex-wrap gap-1.5">
+                                                    {res.price_action_risks.map((risk, i) => (
+                                                        <span key={i} className="text-[10px] px-2 py-0.5 bg-white text-slate-500 rounded-full font-bold border border-blue-100">{risk}</span>
+                                                    ))}
+                                                </div>
+                                            )}
                                         </div>
                                     )}
                                 </div>
@@ -508,7 +542,7 @@ export default function ResultsTable({
                         : "bg-slate-50/80 hover:bg-slate-100/80"
                 )}
             >
-                <td colSpan={9} className="px-8 py-4">
+                <td colSpan={10} className="px-8 py-4">
                     <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
                             <div className={cn(

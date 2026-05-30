@@ -30,6 +30,7 @@ from core.strategy import (
     check_strategy, check_pine_strategy, check_consensus_strategy,
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
 )
+from core.price_action import analyze_price_action
 from routers.market import fetch_mine_sweeper_data
 
 
@@ -698,6 +699,11 @@ def perform_market_scan(
                 if df_hist is not None and not df_hist.empty:
                     res['entry_price'] = round(float(df_hist['最高'].iloc[-1]), 2)
                     res['stop_price'] = round(float(res['entry_price']) * 0.92, 2)
+
+                    pa = analyze_price_action(df_hist)
+                    res.update(pa)
+                    if not res.get('结构') and pa.get('price_action_pattern') not in (None, "无明确形态"):
+                        res['结构'] = pa.get('price_action_pattern')
                 else:
                     res['entry_price'] = res.get('现价', 0)
                     res['stop_price'] = round(float(res.get('现价', 0)) * 0.92, 2)

@@ -35,6 +35,18 @@ export interface ScanResult {
     mkt_cap_yi?: number;
     sector_trend?: string;
     sector_pct?: number;
+    price_action_score?: number;
+    price_action_regime?: string;
+    price_action_signal?: string;
+    price_action_pattern?: string;
+    price_action_entry_quality?: string;
+    price_action_summary?: string;
+    price_action_risks?: string[];
+    pa_entry_price?: number;
+    pa_stop_price?: number;
+    pa_target_price?: number;
+    pa_risk_reward?: number;
+    pa_tags?: string[];
 }
 
 export interface BacktestStats {
