@@ -1,6 +1,6 @@
 import pandas as pd
 
-from core.price_action import analyze_price_action
+from core.price_action import analyze_price_action, build_price_action_annotations
 
 
 def _ohlc_from_closes(closes):
@@ -41,3 +41,14 @@ def test_price_action_handles_short_data():
 
     assert result["price_action_score"] == 0
     assert result["price_action_regime"] == "数据不足"
+
+
+def test_price_action_annotations_include_summary_and_lines():
+    closes = [10 + i * 0.08 for i in range(60)]
+    df = _ohlc_from_closes(closes)
+
+    annotations = build_price_action_annotations(df)
+
+    assert annotations["summary"]["price_action_score"] > 0
+    assert isinstance(annotations["markers"], list)
+    assert any(line["kind"] in {"entry", "stop"} for line in annotations["lines"])

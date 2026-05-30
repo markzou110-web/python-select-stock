@@ -12,6 +12,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
     const chartContainerRef = useRef<HTMLDivElement>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [priceAction, setPriceAction] = useState<any>(null);
 
     useEffect(() => {
         let chart: IChartApi | null = null;
@@ -24,6 +25,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                 setLoading(true);
                 const response = await api.get(`/api/kline/${code}?strategy_type=${strategyType || 'squeeze'}`);
                 const data = response.data;
+                setPriceAction(data.price_action || null);
 
                 if (!chartContainerRef.current) return;
 
@@ -95,6 +97,27 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     trailingSeries!.setData(validTrailing);
                 }
 
+                // Add Al Brooks-style price action lines: trendline, entry trigger, invalidation level
+                if (data.price_action_lines && data.price_action_lines.length > 0) {
+                    data.price_action_lines.forEach((line: any) => {
+                        const lineSeries = chart!.addSeries(LineSeries, {
+                            color: line.color || '#2563eb',
+                            lineWidth: line.kind === 'entry' || line.kind === 'stop' ? 1 : 2,
+                            lineStyle: line.style === 'dotted' ? 1 : line.style === 'dashed' ? 2 : 0,
+                            title: line.label,
+                            crosshairMarkerVisible: false,
+                            lastValueVisible: line.kind === 'entry' || line.kind === 'stop',
+                            priceLineVisible: false,
+                        });
+                        const points = (line.points || [])
+                            .map((p: any) => ({ time: p.time, value: parseFloat(p.value) }))
+                            .filter((p: any) => p.time && !isNaN(p.value));
+                        if (points.length >= 2) {
+                            lineSeries.setData(points);
+                        }
+                    });
+                }
+
                 if (data.markers && data.markers.length > 0) {
                     const markersPlugin = createSeriesMarkers(candlestickSeries!);
                     markersPlugin.setMarkers(data.markers);
@@ -150,6 +173,11 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     {name} <span className="text-slate-500 text-sm ml-2">{code}</span>
                 </div>
                 <div className="text-xs text-slate-500 flex items-center gap-3">
+                    {priceAction?.price_action_regime && (
+                        <span className="flex items-center gap-1 font-black text-blue-700">
+                            PA: {priceAction.price_action_regime} · {priceAction.price_action_entry_quality}
+                        </span>
+                    )}
                     <span className="flex items-center gap-1">
                         <div className="w-2 h-2 rounded-full bg-[#ff9800]"></div> Range Filter
                     </span>
@@ -173,6 +201,15 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     </span>
                 </div>
             </div>
+            {priceAction?.price_action_summary && (
+                <div className="px-4 py-2 bg-blue-50/60 border-b border-blue-100 flex flex-wrap items-center gap-3 text-[11px]">
+                    <span className="font-black text-blue-800">{priceAction.price_action_summary}</span>
+                    <span className="font-bold text-slate-500">入场 {priceAction.pa_entry_price || '--'}</span>
+                    <span className="font-bold text-rose-600">失效 {priceAction.pa_stop_price || '--'}</span>
+                    <span className="font-bold text-emerald-700">目标 {priceAction.pa_target_price || '--'}</span>
+                    <span className="font-bold text-slate-400">评分 {priceAction.price_action_score ?? '--'}</span>
+                </div>
+            )}
             <div ref={chartContainerRef} className="w-full h-[400px]" />
         </div>
     );

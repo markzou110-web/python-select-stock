@@ -265,3 +265,109 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_risk_reward": rr,
         "pa_tags": list(dict.fromkeys(tags))[:5],
     }
+
+
+def build_price_action_annotations(df: pd.DataFrame, lookback: int = 90) -> Dict[str, Any]:
+    """
+    Build chart-ready price action markers and trend/support lines.
+
+    The result is intentionally lightweight so the frontend can render it with
+    lightweight-charts without understanding the recognition internals.
+    """
+    if df is None or df.empty or len(df) < 20:
+        return {"summary": analyze_price_action(df), "markers": [], "lines": []}
+
+    work = df.copy().reset_index(drop=True)
+    work["日期"] = pd.to_datetime(work["日期"], errors="coerce")
+    for col in ["开盘", "最高", "最低", "收盘"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["日期", "开盘", "最高", "最低", "收盘"]).reset_index(drop=True)
+    if len(work) < 20:
+        return {"summary": analyze_price_action(work), "markers": [], "lines": []}
+
+    summary = analyze_price_action(work)
+    start_idx = max(20, len(work) - lookback)
+    markers = []
+    seen_dates = set()
+
+    for idx in range(start_idx, len(work)):
+        sub = work.iloc[:idx + 1]
+        pa = analyze_price_action(sub)
+        signal = pa.get("price_action_signal")
+        pattern = pa.get("price_action_pattern")
+        score = int(pa.get("price_action_score") or 0)
+        if score < 55 or signal in (None, "暂无", "普通K线"):
+            continue
+
+        time_str = work["日期"].iloc[idx].strftime("%Y-%m-%d")
+        if time_str in seen_dates:
+            continue
+        seen_dates.add(time_str)
+
+        is_bull = any(word in str(signal) + str(pattern) for word in ["多头", "H2", "突破", "回踩", "反转"])
+        markers.append({
+            "time": time_str,
+            "position": "belowBar" if is_bull else "aboveBar",
+            "color": "#2563eb" if is_bull else "#dc2626",
+            "shape": "circle",
+            "text": f"PA {pattern if pattern and pattern != '无明确形态' else signal}",
+        })
+
+    recent = work.tail(min(len(work), 120)).reset_index(drop=True)
+    high_points = _local_extrema(recent["最高"], "high")
+    low_points = _local_extrema(recent["最低"], "low")
+    lines = []
+
+    def point(idx: int, col: str) -> Dict[str, Any]:
+        return {
+            "time": recent["日期"].iloc[idx].strftime("%Y-%m-%d"),
+            "value": round(_safe_float(recent[col].iloc[idx]), 2),
+        }
+
+    if len(low_points) >= 2:
+        p1, p2 = low_points[-2], low_points[-1]
+        if p1 < p2:
+            lines.append({
+                "kind": "support",
+                "label": "上升趋势线/支撑",
+                "color": "#0d9488",
+                "style": "dashed",
+                "points": [point(p1, "最低"), point(p2, "最低")],
+            })
+
+    if len(high_points) >= 2:
+        p1, p2 = high_points[-2], high_points[-1]
+        if p1 < p2:
+            lines.append({
+                "kind": "resistance",
+                "label": "下降趋势线/压力",
+                "color": "#dc2626",
+                "style": "dashed",
+                "points": [point(p1, "最高"), point(p2, "最高")],
+            })
+
+    if summary.get("pa_entry_price") and summary.get("pa_stop_price"):
+        last_time = work["日期"].iloc[-1].strftime("%Y-%m-%d")
+        first_time = work["日期"].iloc[max(0, len(work) - 25)].strftime("%Y-%m-%d")
+        lines.append({
+            "kind": "entry",
+            "label": "PA入场触发",
+            "color": "#2563eb",
+            "style": "solid",
+            "points": [
+                {"time": first_time, "value": summary["pa_entry_price"]},
+                {"time": last_time, "value": summary["pa_entry_price"]},
+            ],
+        })
+        lines.append({
+            "kind": "stop",
+            "label": "PA失效位",
+            "color": "#e11d48",
+            "style": "dotted",
+            "points": [
+                {"time": first_time, "value": summary["pa_stop_price"]},
+                {"time": last_time, "value": summary["pa_stop_price"]},
+            ],
+        })
+
+    return {"summary": summary, "markers": markers[-24:], "lines": lines}

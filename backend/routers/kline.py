@@ -36,6 +36,7 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             raise HTTPException(status_code=404, detail="No historical data found for this stock.")
             
         from core.indicators import calculate_indicators
+        from core.price_action import build_price_action_annotations
         # Calculate all indicators including Pine Script indicators (Range Filter, QQE)
         df = calculate_indicators(df, enable_pine_indicators=True)
         
@@ -101,6 +102,11 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                 })
                 added_dates.add(time_str)
 
+        # 4. Al Brooks-style price action annotations
+        price_action = build_price_action_annotations(df)
+        for marker in price_action.get("markers", []):
+            markers_data.append(marker)
+
         # 确保 markers 严格按照时间升序排列，解决 lightweight-charts 的 Assertion failed 崩溃问题
         markers_data.sort(key=lambda x: x["time"])
 
@@ -119,7 +125,9 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             "candlestick": candlestick_data,
             "rf_filter": rf_filter_data,
             "markers": markers_data,
-            "trailing_stops": trailing_stops_data
+            "trailing_stops": trailing_stops_data,
+            "price_action": price_action.get("summary", {}),
+            "price_action_lines": price_action.get("lines", [])
         }
         
     except Exception as e:
