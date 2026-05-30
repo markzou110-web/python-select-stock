@@ -3,6 +3,12 @@ import numpy as np
 import akshare as ak
 from core.logging_config import logger
 
+def _attach_date_key(df: pd.DataFrame) -> pd.DataFrame:
+    keyed = df.copy()
+    keyed['_date_key'] = pd.to_datetime(keyed['日期'], errors='coerce').dt.normalize()
+    return keyed
+
+
 def calculate_ema(df: pd.DataFrame, period: int, col: str = '收盘') -> pd.DataFrame:
     """计算指定周期的 EMA"""
     df[f'EMA{period}'] = df[col].ewm(span=period, adjust=False).mean()
@@ -70,19 +76,29 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     # Relative Strength (RS) vs SSE (000001) - Optimized with pre-filtered bench_df
     try:
         if bench_df is not None and not bench_df.empty:
-            df = df.merge(bench_df, on='日期', suffixes=('', '_bench'), how='left')
+            keyed_df = _attach_date_key(df)
+            keyed_bench = _attach_date_key(bench_df)
+            keyed_bench = keyed_bench[['_date_key', '收盘']].rename(columns={'收盘': '收盘_bench'})
+            df = keyed_df.merge(keyed_bench, on='_date_key', how='left').drop(columns=['_date_key'])
             df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
             df['RS_MA50'] = df['RS'].rolling(window=50).mean()
+            df.drop(columns=['收盘_bench'], inplace=True)
         else:
             # Fallback (mostly for K-line where bench_df might not be passed)
             from .data import get_index_hist
             b_df = get_index_hist("000001")
             if not b_df.empty:
-                min_date, max_date = df['日期'].min(), df['日期'].max()
-                b_slice = b_df[(b_df['日期'] >= min_date) & (b_df['日期'] <= max_date)][['日期', '收盘']]
-                df = df.merge(b_slice, on='日期', suffixes=('', '_bench'), how='left')
+                keyed_df = _attach_date_key(df)
+                keyed_bench = _attach_date_key(b_df)
+                min_date, max_date = keyed_df['_date_key'].min(), keyed_df['_date_key'].max()
+                b_slice = keyed_bench[
+                    (keyed_bench['_date_key'] >= min_date) &
+                    (keyed_bench['_date_key'] <= max_date)
+                ][['_date_key', '收盘']].rename(columns={'收盘': '收盘_bench'})
+                df = keyed_df.merge(b_slice, on='_date_key', how='left').drop(columns=['_date_key'])
                 df['RS'] = df['收盘'] / df['收盘_bench'].ffill()
                 df['RS_MA50'] = df['RS'].rolling(window=50).mean()
+                df.drop(columns=['收盘_bench'], inplace=True)
     except Exception as e:
         logger.warning(f"Error calculating RS indicator: {e}")
 

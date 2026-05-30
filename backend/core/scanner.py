@@ -445,7 +445,9 @@ def perform_market_scan(
             # 预先过滤出需要的日期范围
             hist_end = datetime.now() if not data_date else datetime.strptime(data_date, "%Y-%m-%d")
             hist_start = hist_end - timedelta(days=365)
-            mask = (bench_df['日期'] >= hist_start.strftime("%Y-%m-%d")) & (bench_df['日期'] <= hist_end.strftime("%Y-%m-%d"))
+            bench_df = bench_df.copy()
+            bench_df['日期'] = pd.to_datetime(bench_df['日期'], errors='coerce')
+            mask = (bench_df['日期'] >= hist_start) & (bench_df['日期'] <= hist_end)
             bench_slice = bench_df.loc[mask, ['日期', '收盘']].copy()
             logger.info(f"Pre-filtered benchmark data: {len(bench_slice)} points.")
 
