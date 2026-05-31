@@ -34,11 +34,7 @@ python3 -m streamlit run app.py
 - `walkthrough.md`: 详细的功能演进与运行演示。
 
 ## 数据库信息（ PostgreSQL ）
-Host: localhost
-Port: 5432
-User: liangzou (这是您的 Mac 用户名)
-Password: (留空即可)
-Database: stock_db
+
 
 ## git testing difference
 testing 
