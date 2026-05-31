@@ -48,17 +48,42 @@ export default function ResultsTable({
     const [sectorSortKey, setSectorSortKey] = useState<'count' | 'avgScore'>('count');
     const [collapsedSectors, setCollapsedSectors] = useState<Set<string>>(new Set());
     const [sopFilterOnly, setSopFilterOnly] = useState(false);
+    const [brooksFilter, setBrooksFilter] = useState<'ALL' | 'READY' | 'NO_AVOID' | 'LOW_RISK' | 'PULLBACK'>('ALL');
+
+    const applyBrooksFilter = (rows: ScanResult[]) => {
+        if (brooksFilter === 'READY') {
+            return rows.filter(r => r.pa_trade_plan?.action === 'READY' || r.pa_trade_action === 'READY');
+        }
+        if (brooksFilter === 'NO_AVOID') {
+            return rows.filter(r => (r.pa_trade_plan?.action || r.pa_trade_action) !== 'AVOID');
+        }
+        if (brooksFilter === 'LOW_RISK') {
+            return rows.filter(r => {
+                const risk = r.pa_trade_plan?.risk_pct ?? r.pa_risk_pct ?? 999;
+                return risk > 0 && risk <= 8;
+            });
+        }
+        if (brooksFilter === 'PULLBACK') {
+            return rows.filter(r => {
+                const setup = r.pa_trade_plan?.setup || r.pa_trade_setup || r.price_action_pattern || '';
+                return setup.includes('H2') || setup.includes('回踩');
+            });
+        }
+        return rows;
+    };
 
     // SOP 过滤: 仅显示 A/B 级
-    const filteredResults = sopFilterOnly
-        ? results.filter(r => r.sop_grade === 'A' || r.sop_grade === 'B')
-        : results;
+    const filteredResults = applyBrooksFilter(
+        sopFilterOnly
+            ? results.filter(r => r.sop_grade === 'A' || r.sop_grade === 'B')
+            : results
+    );
 
     // ── Sector grouping logic ──
     const sectorGroups = useMemo(() => {
         if (!groupBySector) return null;
         const map = new Map<string, ScanResult[]>();
-        results.forEach(r => {
+        filteredResults.forEach(r => {
             const sector = (r.行业 && r.行业.trim()) || '未分类';
             if (!map.has(sector)) map.set(sector, []);
             map.get(sector)!.push(r);
@@ -77,7 +102,7 @@ export default function ResultsTable({
             });
         }
         return entries;
-    }, [results, groupBySector, sectorSortKey]);
+    }, [filteredResults, groupBySector, sectorSortKey]);
 
     const toggleSectorCollapse = (sector: string) => {
         setCollapsedSectors(prev => {
@@ -94,6 +119,29 @@ export default function ResultsTable({
     };
 
     if (results.length === 0) return null;
+
+    const explainBrooksAction = (stock: ScanResult) => {
+        const action = stock.pa_trade_plan?.action || stock.pa_trade_action || 'WAIT';
+        if (action === 'READY') return '条件接近成熟，可等待触发价确认后按计划执行。';
+        if (action === 'WATCH') return '结构值得跟踪，但不适合直接追价，先放入观察池。';
+        if (action === 'AVOID') return '结构或位置不佳，暂时回避主动买入。';
+        return '方向尚未确认，等待下一根K线或尾盘定型。';
+    };
+
+    const explainBrooksScore = (score?: number) => {
+        if (!score) return '暂无评分';
+        if (score >= 72) return '高质量结构';
+        if (score >= 55) return '可观察结构';
+        if (score >= 40) return '低把握结构';
+        return '观望结构';
+    };
+
+    const explainRiskReward = (rr?: number) => {
+        if (!rr) return '空间未确认';
+        if (rr >= 2) return '风险收益较优';
+        if (rr >= 1.5) return '风险收益可接受';
+        return '风险收益偏低';
+    };
 
     const toggleRow = (code: string) => {
         setExpandedRow(expandedRow === code ? null : code);
@@ -134,13 +182,22 @@ export default function ResultsTable({
 
     const addToWatchlist = async (stock: ScanResult, remark?: string, mode: 'SIMULATED' | 'REAL' = 'SIMULATED') => {
         try {
+            const plan = stock.pa_trade_plan;
             await api.post('/api/paper/add', {
                 code: stock.代码,
                 name: stock.名称,
                 price: stock.现价,
                 strategy_type: stock.strategy_type,
                 remark: remark || undefined,
-                trade_mode: mode
+                trade_mode: mode,
+                entry_source: 'scan_current_price',
+                entry_signal_date: stock.date || stock.日期 || undefined,
+                entry_reason_snapshot: `${plan?.setup || stock.结构 || stock.price_action_pattern || '扫描入选'} / ${plan?.action_label || '未分级'} / Score ${stock.Score ?? '--'}`,
+                pa_trade_action: plan?.action || stock.pa_trade_action,
+                pa_trade_setup: plan?.setup || stock.pa_trade_setup,
+                pa_entry_condition: plan?.entry_condition,
+                pa_invalidation: plan?.invalidation,
+                pa_risk_pct: plan?.risk_pct ?? stock.pa_risk_pct,
             });
             const modeLabel = mode === 'REAL' ? '实盘' : '模拟池';
             showToast(`${stock.名称} 已加入${modeLabel}`);
@@ -152,15 +209,23 @@ export default function ResultsTable({
 
     const addToObservation = async (stock: ScanResult) => {
         try {
+            const plan = stock.pa_trade_plan;
             await api.post('/api/watchlist/add', {
                 code: stock.代码,
                 name: stock.名称,
                 industry: stock.行业,
                 watch_price: stock.现价,
+                target_price: stock.pa_entry_price || stock.target_price,
+                stop_price: stock.pa_stop_price || stock.stop_price,
                 strategy_type: stock.strategy_type || 'squeeze',
-                reason: `${stock.strategy_type || 'squeeze'} 扫描入选，Score ${stock.Score}`,
-                invalidation: stock.stop_price ? `跌破 ${stock.stop_price}` : '跌破关键均线或策略失效',
-                source: 'scan'
+                reason: plan?.entry_condition || `${stock.strategy_type || 'squeeze'} 扫描入选，Score ${stock.Score}`,
+                invalidation: plan?.invalidation || (stock.stop_price ? `跌破 ${stock.stop_price}` : '跌破关键均线或策略失效'),
+                source: 'scan',
+                pa_trade_action: plan?.action || stock.pa_trade_action,
+                pa_trade_setup: plan?.setup || stock.pa_trade_setup,
+                pa_entry_condition: plan?.entry_condition,
+                pa_invalidation: plan?.invalidation,
+                pa_risk_pct: plan?.risk_pct ?? stock.pa_risk_pct,
             });
             showToast(`${stock.名称} 已加入观察池`);
         } catch (err) {
@@ -450,7 +515,7 @@ export default function ResultsTable({
                                         <div className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest mb-2">📌 操作建议</div>
                                         <div className="grid grid-cols-2 gap-2 text-sm">
                                             <div><span className="text-slate-400 text-xs">入场价</span><div className="font-black text-indigo-600">¥{res.entry_price}</div></div>
-                                            <div><span className="text-slate-400 text-xs">止损价(-8%)</span><div className="font-black text-rose-500">¥{res.stop_price}</div></div>
+                                            <div><span className="text-slate-400 text-xs">计划失效位</span><div className="font-black text-rose-500">¥{res.plan_stop_price || res.stop_price}</div></div>
                                             <div><span className="text-slate-400 text-xs">5日涨幅</span><div className={cn("font-bold", (res.pct_5d || 0) > 10 ? "text-rose-500" : "text-slate-600")}>{(res.pct_5d || 0) > 0 ? '+' : ''}{res.pct_5d?.toFixed(1)}%</div></div>
                                             <div><span className="text-slate-400 text-xs">流通市值</span><div className="font-bold text-slate-600">{res.mkt_cap_yi ? `${res.mkt_cap_yi}亿` : '---'}</div></div>
                                         </div>
@@ -466,18 +531,74 @@ export default function ResultsTable({
                                         </div>
                                     )}
                                     {res.price_action_summary && (
-                                        <div className="flex-1 min-w-[260px] p-4 bg-blue-50 rounded-2xl border border-blue-100">
-                                            <div className="text-[10px] font-bold text-blue-500 uppercase tracking-widest mb-2">Al Brooks 价格行为</div>
-                                            <div className="text-sm font-black text-slate-800">{res.price_action_summary}</div>
-                                            <div className="grid grid-cols-3 gap-2 mt-3 text-xs">
-                                                <div><span className="text-slate-400">入场</span><div className="font-black text-blue-700">¥{res.pa_entry_price || '--'}</div></div>
-                                                <div><span className="text-slate-400">失效</span><div className="font-black text-rose-600">¥{res.pa_stop_price || '--'}</div></div>
-                                                <div><span className="text-slate-400">测算目标</span><div className="font-black text-emerald-600">¥{res.pa_target_price || '--'}</div></div>
+                                        <div className="flex-[2] min-w-[360px] p-4 bg-blue-50 rounded-2xl border border-blue-100">
+                                            <div className="flex items-start justify-between gap-3 mb-3">
+                                                <div>
+                                                    <div className="text-[10px] font-bold text-blue-500 uppercase tracking-widest">Al Brooks 价格行为解读</div>
+                                                    <div className="text-sm font-black text-slate-800 mt-1">{res.price_action_summary}</div>
+                                                </div>
+                                                <span className={cn(
+                                                    "text-[10px] font-black px-2 py-1 rounded-lg border shrink-0",
+                                                    (res.price_action_score || 0) >= 72 ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                                        (res.price_action_score || 0) >= 55 ? "bg-white text-blue-700 border-blue-100" :
+                                                            "bg-amber-50 text-amber-700 border-amber-100"
+                                                )}>
+                                                    PA {res.price_action_score ?? '--'} · {explainBrooksScore(res.price_action_score)}
+                                                </span>
+                                            </div>
+                                            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                <BrooksInfo label="市场结构" value={res.pa_market_cycle || res.price_action_regime || '--'} note="判断趋势/区间环境" />
+                                                <BrooksInfo label="信号K" value={res.price_action_signal || '--'} note="最后一根K的多空主动性" />
+                                                <BrooksInfo label="形态" value={res.price_action_pattern || res.结构 || '--'} note="当前可交易结构" />
+                                                <BrooksInfo label="区间位置" value={res.pa_range_location || '--'} note="追价或低吸的位置判断" />
+                                            </div>
+                                            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-3 text-xs">
+                                                <BrooksInfo label="触发价" value={res.pa_entry_price ? `¥${res.pa_entry_price}` : '--'} note="有效突破后才算入场" tone="blue" />
+                                                <BrooksInfo label="失效位" value={res.pa_stop_price ? `¥${res.pa_stop_price}` : '--'} note="跌破则结构失效" tone="rose" />
+                                                <BrooksInfo label="目标价" value={res.pa_target_price ? `¥${res.pa_target_price}` : '--'} note="按结构风险测算" tone="emerald" />
+                                                <BrooksInfo label="风险收益" value={res.pa_risk_reward ? `${res.pa_risk_reward}R` : '--'} note={explainRiskReward(res.pa_risk_reward)} />
+                                            </div>
+                                            <div className="mt-3 p-3 bg-white/80 border border-blue-100 rounded-xl">
+                                                <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">建议操作</div>
+                                                <p className="text-xs font-bold text-slate-700 leading-relaxed">{explainBrooksAction(res)}</p>
+                                                {res.pa_trade_plan?.entry_condition && (
+                                                    <p className="text-[11px] font-semibold text-slate-500 mt-1">触发条件：{res.pa_trade_plan.entry_condition}</p>
+                                                )}
                                             </div>
                                             {res.price_action_risks && res.price_action_risks.length > 0 && (
                                                 <div className="mt-3 flex flex-wrap gap-1.5">
                                                     {res.price_action_risks.map((risk, i) => (
                                                         <span key={i} className="text-[10px] px-2 py-0.5 bg-white text-slate-500 rounded-full font-bold border border-blue-100">{risk}</span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                    {res.pa_trade_plan && (
+                                        <div className="flex-1 min-w-[300px] p-4 bg-white rounded-2xl border border-slate-200 shadow-sm">
+                                            <div className="flex items-center justify-between gap-3 mb-3">
+                                                <div>
+                                                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Brooks 交易计划</div>
+                                                    <div className="text-sm font-black text-slate-800">{res.pa_trade_plan.setup}</div>
+                                                </div>
+                                                <span className={cn(
+                                                    "text-[10px] font-black px-2 py-1 rounded-lg border",
+                                                    res.pa_trade_plan.action === 'READY' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                                        res.pa_trade_plan.action === 'AVOID' ? "bg-rose-50 text-rose-700 border-rose-100" :
+                                                            "bg-amber-50 text-amber-700 border-amber-100"
+                                                )}>
+                                                    {res.pa_trade_plan.action_label}
+                                                </span>
+                                            </div>
+                                            <div className="space-y-2 text-xs font-semibold text-slate-600">
+                                                <p><span className="text-slate-400">触发：</span>{res.pa_trade_plan.entry_condition}</p>
+                                                <p><span className="text-slate-400">失效：</span>{res.pa_trade_plan.invalidation}</p>
+                                                <p><span className="text-slate-400">仓位：</span>{res.pa_trade_plan.position_hint} / 风险 {res.pa_trade_plan.risk_pct || 0}%</p>
+                                            </div>
+                                            {res.pa_trade_plan.avoid_reasons?.length > 0 && (
+                                                <div className="mt-3 flex flex-wrap gap-1.5">
+                                                    {res.pa_trade_plan.avoid_reasons.map((reason, i) => (
+                                                        <span key={i} className="text-[10px] px-2 py-0.5 bg-slate-50 text-slate-500 rounded-full font-bold border border-slate-100">{reason}</span>
                                                     ))}
                                                 </div>
                                             )}
@@ -644,6 +765,18 @@ export default function ResultsTable({
                         <Shield size={16} />
                         仅看 A/B 级
                     </button>
+                    <select
+                        value={brooksFilter}
+                        onChange={e => setBrooksFilter(e.target.value as typeof brooksFilter)}
+                        className="px-3 py-2 bg-slate-50 text-slate-600 rounded-xl text-xs font-black border-2 border-transparent outline-none hover:bg-slate-100"
+                        title="Brooks价格行为过滤"
+                    >
+                        <option value="ALL">Brooks 全部</option>
+                        <option value="READY">仅 READY</option>
+                        <option value="NO_AVOID">排除 AVOID</option>
+                        <option value="LOW_RISK">风险≤8%</option>
+                        <option value="PULLBACK">H2/回踩</option>
+                    </select>
                     <button
                         onClick={handleExport}
                         className="flex items-center gap-2 px-4 py-2 bg-slate-50 text-slate-500 rounded-xl text-sm font-bold hover:bg-slate-100 transition-all"
@@ -850,6 +983,33 @@ function SopGradeBadge({ grade }: { grade?: string }) {
         default:
             return <span className="text-[10px] text-slate-300">—</span>;
     }
+}
+
+function BrooksInfo({
+    label,
+    value,
+    note,
+    tone = 'slate'
+}: {
+    label: string;
+    value: string | number;
+    note: string;
+    tone?: 'slate' | 'blue' | 'rose' | 'emerald';
+}) {
+    const toneClass = {
+        slate: 'text-slate-800',
+        blue: 'text-blue-700',
+        rose: 'text-rose-600',
+        emerald: 'text-emerald-600',
+    }[tone];
+
+    return (
+        <div className="p-2.5 bg-white/80 border border-blue-100 rounded-xl">
+            <div className="text-[10px] font-bold text-slate-400">{label}</div>
+            <div className={cn("text-xs font-black mt-0.5 truncate", toneClass)}>{value}</div>
+            <div className="text-[10px] font-semibold text-slate-400 mt-1 leading-snug">{note}</div>
+        </div>
+    );
 }
 
 function SectorTrendBadge({ trend, pct }: { trend?: string; pct?: number }) {

@@ -135,6 +135,30 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"trade_mode migration skipped (may already exist): {e}")
 
+            # --- Migration: paper trading entry source metadata ---
+            try:
+                conn.execute(text("""
+                    ALTER TABLE paper_trading
+                    ADD COLUMN IF NOT EXISTS entry_source VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS entry_signal_date DATE,
+                    ADD COLUMN IF NOT EXISTS entry_reason_snapshot TEXT
+                """))
+                logger.info("Migration: paper trading entry metadata columns ensured.")
+            except Exception as e:
+                logger.debug(f"paper trading entry metadata migration skipped: {e}")
+
+            # --- Migration: paper trading close audit metadata ---
+            try:
+                conn.execute(text("""
+                    ALTER TABLE paper_trading
+                    ADD COLUMN IF NOT EXISTS close_source VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS closed_by VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP
+                """))
+                logger.info("Migration: paper trading close audit columns ensured.")
+            except Exception as e:
+                logger.debug(f"paper trading close audit migration skipped: {e}")
+
             # --- Migration: price action P0 fields ---
             try:
                 conn.execute(text("""
@@ -148,11 +172,38 @@ def init_db(engine=None):
                     ADD COLUMN IF NOT EXISTS pa_entry_price FLOAT,
                     ADD COLUMN IF NOT EXISTS pa_stop_price FLOAT,
                     ADD COLUMN IF NOT EXISTS pa_target_price FLOAT,
-                    ADD COLUMN IF NOT EXISTS pa_risk_reward FLOAT
+                    ADD COLUMN IF NOT EXISTS pa_risk_reward FLOAT,
+                    ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
+                    ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
+                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT
                 """))
                 logger.info("Migration: price action columns ensured.")
             except Exception as e:
                 logger.debug(f"price action migration skipped (may already exist): {e}")
+
+            # --- Migration: Brooks trade-plan snapshots ---
+            try:
+                conn.execute(text("""
+                    ALTER TABLE paper_trading
+                    ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
+                    ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
+                    ADD COLUMN IF NOT EXISTS pa_entry_condition TEXT,
+                    ADD COLUMN IF NOT EXISTS pa_invalidation TEXT,
+                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT
+                """))
+                conn.execute(text("""
+                    ALTER TABLE watchlist
+                    ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
+                    ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
+                    ADD COLUMN IF NOT EXISTS pa_entry_condition TEXT,
+                    ADD COLUMN IF NOT EXISTS pa_invalidation TEXT,
+                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_pa_action ON scan_history(pa_trade_action);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_pa_action ON watchlist(pa_trade_action);"))
+                logger.info("Migration: Brooks trade-plan snapshot columns ensured.")
+            except Exception as e:
+                logger.debug(f"Brooks trade-plan migration skipped: {e}")
 
             conn.commit()
     except Exception as e:
@@ -267,6 +318,7 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
             # 批量构建参数列表
             rows = []
             for r in results:
+                pa_plan = r.get('pa_trade_plan') or {}
                 rows.append({
                     "code": r.get('代码'),
                     "name": r.get('名称'),
@@ -296,7 +348,10 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                     "pa_entry_price": float(r.get('pa_entry_price', 0)) if r.get('pa_entry_price') is not None else None,
                     "pa_stop_price": float(r.get('pa_stop_price', 0)) if r.get('pa_stop_price') is not None else None,
                     "pa_target_price": float(r.get('pa_target_price', 0)) if r.get('pa_target_price') is not None else None,
-                    "pa_risk_reward": float(r.get('pa_risk_reward', 0)) if r.get('pa_risk_reward') is not None else None
+                    "pa_risk_reward": float(r.get('pa_risk_reward', 0)) if r.get('pa_risk_reward') is not None else None,
+                    "pa_trade_action": pa_plan.get("action"),
+                    "pa_trade_setup": pa_plan.get("setup"),
+                    "pa_risk_pct": float(pa_plan.get("risk_pct", 0)) if pa_plan.get("risk_pct") is not None else None
                 })
 
             # 一次性批量插入 (executemany)
@@ -304,10 +359,10 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                 conn.execute(text('''
                     INSERT INTO scan_history (
                         code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
-                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward
+                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct
                     ) VALUES (
                         :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
-                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward
+                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -334,7 +389,10 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         pa_entry_price = EXCLUDED.pa_entry_price,
                         pa_stop_price = EXCLUDED.pa_stop_price,
                         pa_target_price = EXCLUDED.pa_target_price,
-                        pa_risk_reward = EXCLUDED.pa_risk_reward
+                        pa_risk_reward = EXCLUDED.pa_risk_reward,
+                        pa_trade_action = EXCLUDED.pa_trade_action,
+                        pa_trade_setup = EXCLUDED.pa_trade_setup,
+                        pa_risk_pct = EXCLUDED.pa_risk_pct
                 '''), rows)
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
@@ -395,7 +453,10 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
             "pa_entry_price": "pa_entry_price",
             "pa_stop_price": "pa_stop_price",
             "pa_target_price": "pa_target_price",
-            "pa_risk_reward": "pa_risk_reward"
+            "pa_risk_reward": "pa_risk_reward",
+            "pa_trade_action": "pa_trade_action",
+            "pa_trade_setup": "pa_trade_setup",
+            "pa_risk_pct": "pa_risk_pct"
         }
         
         # 仅过滤并重命名 DataFrame 中存在的列，以防结构字段缺失
@@ -406,7 +467,24 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
         if "strategy_type" not in df_mapped.columns:
             df_mapped["strategy_type"] = "squeeze"
             
-        return df_mapped.to_dict('records')
+        records = df_mapped.to_dict('records')
+        for record in records:
+            if record.get("pa_trade_action") or record.get("pa_trade_setup"):
+                record["pa_trade_plan"] = {
+                    "action": record.get("pa_trade_action") or "WAIT",
+                    "action_label": record.get("pa_trade_action") or "历史计划",
+                    "setup": record.get("pa_trade_setup") or record.get("price_action_pattern") or "历史结构",
+                    "quality": record.get("price_action_entry_quality") or "观望",
+                    "entry_condition": "历史记录仅保留 Brooks 计划摘要，请打开个股详情刷新完整计划。",
+                    "invalidation": f"跌破 {record.get('pa_stop_price')}" if record.get("pa_stop_price") else "历史记录未保存完整失效条件。",
+                    "risk_pct": record.get("pa_risk_pct") or 0,
+                    "risk_reward": record.get("pa_risk_reward") or 0,
+                    "position_hint": "历史快照",
+                    "checklist": [],
+                    "management": [],
+                    "avoid_reasons": [],
+                }
+        return records
     except Exception as e:
         logger.error(f"Error loading scan history for {date_str}: {e}")
         return []

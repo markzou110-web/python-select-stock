@@ -24,11 +24,11 @@ TRAILING_STOP_PCT = -8.0            # 从高点回落 8% 触发
 TRAILING_STOP_RATIO = 1.0 + TRAILING_STOP_PCT / 100.0  # 0.92
 
 # ── 阶梯移动止盈 (Tiered Trailing Stop for evaluate_exit_signals) ──
-# 盈利超过 30%: 允许从最高点回落 5%
-TIER_HIGH_PROFIT_PCT = 30.0
+# 盈利超过 20%: 允许从最高点回落 5%
+TIER_HIGH_PROFIT_PCT = 20.0
 TIER_HIGH_TRAIL_RATIO = 0.95  # 5% trail
-# 盈利超过 15%: 允许从最高点回落 8%
-TIER_MID_PROFIT_PCT = 15.0
+# 盈利超过 10%: 允许从最高点回落 8%
+TIER_MID_PROFIT_PCT = 10.0
 TIER_MID_TRAIL_RATIO = 0.92  # 8% trail
 
 # ── 保本机制 (Capital Protection) ──

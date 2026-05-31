@@ -13,9 +13,10 @@ from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code
 from core.data import get_market_snapshot, get_sector_map
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
+from core.risk_engine import compute_paper_risk_levels, safe_float
 from core.risk_constants import (
     FIXED_STOP_LOSS_PCT, FIXED_STOP_LOSS_RATIO,
-    TRAILING_STOP_RATIO, TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
+    TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
     TIME_STOP_DAYS
 )
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
@@ -75,8 +76,18 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
 
         with engine.connect() as conn:
             conn.execute(text('''
-                INSERT INTO paper_trading (code, name, entry_price, entry_date, current_price, high_since_entry, status, strategy_type, remark, trade_mode)
-                VALUES (:code, :name, :price, :date, :price, :price, 'OPEN', :strategy_type, :remark, :trade_mode)
+                INSERT INTO paper_trading (
+                    code, name, entry_price, entry_date, current_price, high_since_entry,
+                    status, strategy_type, remark, trade_mode,
+                    entry_source, entry_signal_date, entry_reason_snapshot,
+                    pa_trade_action, pa_trade_setup, pa_entry_condition, pa_invalidation, pa_risk_pct
+                )
+                VALUES (
+                    :code, :name, :price, :date, :price, :price,
+                    'OPEN', :strategy_type, :remark, :trade_mode,
+                    :entry_source, CAST(:entry_signal_date AS DATE), :entry_reason_snapshot,
+                    :pa_trade_action, :pa_trade_setup, :pa_entry_condition, :pa_invalidation, :pa_risk_pct
+                )
                 ON CONFLICT (code, entry_date) DO NOTHING
             '''), {
                 "code": trade.code,
@@ -85,7 +96,15 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "strategy_type": trade.strategy_type,
                 "remark": trade.remark,
-                "trade_mode": trade.trade_mode
+                "trade_mode": trade.trade_mode,
+                "entry_source": trade.entry_source or "manual_current_price",
+                "entry_signal_date": trade.entry_signal_date or datetime.now().strftime("%Y-%m-%d"),
+                "entry_reason_snapshot": trade.entry_reason_snapshot or trade.remark,
+                "pa_trade_action": trade.pa_trade_action,
+                "pa_trade_setup": trade.pa_trade_setup,
+                "pa_entry_condition": trade.pa_entry_condition,
+                "pa_invalidation": trade.pa_invalidation,
+                "pa_risk_pct": trade.pa_risk_pct,
             })
             conn.commit()
 
@@ -97,6 +116,8 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
         body = (
             f"交易模式：{'🔴 实盘' if trade.trade_mode == 'REAL' else '🔵 模拟盘'}\n"
             f"入场价格：¥{trade.price:.2f}\n"
+            f"价格来源：{trade.entry_source or 'manual_current_price'}\n"
+            f"信号日期：{trade.entry_signal_date or datetime.now().strftime('%Y-%m-%d')}\n"
             f"固定止损：¥{stop_price:.2f} ({FIXED_STOP_LOSS_PCT}%)\n"
             f"目标止盈：¥{tp_price:.2f} (+{TAKE_PROFIT_PCT}%)\n"
             f"交易备注：{trade.remark or '无'}"
@@ -125,17 +146,19 @@ def list_paper_trades() -> Dict[str, Any]:
 
         # 方法1: 从 daily_k 表获取最新收盘价
         price_map = {}
+        high_map = {}
         try:
             placeholders = ','.join([f':code_{i}' for i in range(len(codes))])
             params = {f"code_{i}": c for i, c in enumerate(codes)}
             price_df = pd.read_sql(text(f"""
-                SELECT DISTINCT ON (code) code, close as latest_price, date as latest_date
+                SELECT DISTINCT ON (code) code, close as latest_price, high, date as latest_date
                 FROM daily_k
                 WHERE code IN ({placeholders})
                 ORDER BY code, date DESC
             """), engine, params=params)
             for _, row in price_df.iterrows():
                 price_map[row['code']] = float(row['latest_price'])
+                high_map[row['code']] = float(row.get('high') or row['latest_price'])
         except Exception as e:
             logger.warning(f"Paper trading: DB price fetch failed: {e}")
 
@@ -149,6 +172,7 @@ def list_paper_trades() -> Dict[str, Any]:
                             match = snapshot[snapshot['code'] == code]
                             if not match.empty:
                                 price_map[code] = float(match.iloc[0]['price'])
+                                high_map[code] = float(match.iloc[0].get('high') or match.iloc[0]['price'])
             except Exception as e:
                 logger.warning(f"Failed to fetch market snapshot for paper trading price tracking: {e}")
 
@@ -169,13 +193,9 @@ def list_paper_trades() -> Dict[str, Any]:
         for _, row in df.iterrows():
             code = row['code']
             status = row.get('status', 'OPEN')
-            entry_price = float(row['entry_price'])
+            entry_price = safe_float(row['entry_price'])
             entry_date = pd.to_datetime(row['entry_date'])
-            high_since_entry = float(row.get('high_since_entry') or entry_price)
-            # NaN 防御: pandas 读出 NaN 时 `or` 运算符无法捕获
-            import math
-            if math.isnan(high_since_entry):
-                high_since_entry = entry_price
+            high_since_entry = safe_float(row.get('high_since_entry'), entry_price)
 
             # --- 价格与日期处理 ---
             if status == 'CLOSED':
@@ -187,7 +207,8 @@ def list_paper_trades() -> Dict[str, Any]:
                 hold_days = (datetime.now() - entry_date).days
                 
                 # --- 移动止损数据更新 ---
-                high_since_entry = max(high_since_entry, current_price)
+                current_high = high_map.get(code, current_price)
+                high_since_entry = max(high_since_entry, current_price, current_high)
                 # 即使价格没变，我们也需要 high_since_entry 来更新
                 price_updates.append({"price": current_price, "high": high_since_entry, "id": int(row['id'])})
 
@@ -211,8 +232,19 @@ def list_paper_trades() -> Dict[str, Any]:
                 "high_since_entry": round(high_since_entry, 2) if status == 'OPEN' else None,
                 "close_price": round(float(row['close_price']), 2) if row.get('close_price') is not None else None,
                 "close_date": str(row['close_date']) if row.get('close_date') is not None else None,
+                "close_source": row.get('close_source') if row.get('close_source') is not None else None,
+                "closed_by": row.get('closed_by') if row.get('closed_by') is not None else None,
+                "updated_at": str(row.get('updated_at')) if row.get('updated_at') is not None else None,
                 "remark": row.get('remark') if row.get('remark') is not None else None,
-                "trade_mode": row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
+                "trade_mode": row.get('trade_mode', 'SIMULATED') or 'SIMULATED',
+                "entry_source": row.get('entry_source') if row.get('entry_source') is not None else None,
+                "entry_signal_date": str(row.get('entry_signal_date')) if row.get('entry_signal_date') is not None else None,
+                "entry_reason_snapshot": row.get('entry_reason_snapshot') if row.get('entry_reason_snapshot') is not None else None,
+                "pa_trade_action": row.get('pa_trade_action') if row.get('pa_trade_action') is not None else None,
+                "pa_trade_setup": row.get('pa_trade_setup') if row.get('pa_trade_setup') is not None else None,
+                "pa_entry_condition": row.get('pa_entry_condition') if row.get('pa_entry_condition') is not None else None,
+                "pa_invalidation": row.get('pa_invalidation') if row.get('pa_invalidation') is not None else None,
+                "pa_risk_pct": safe_float(row.get('pa_risk_pct')) if row.get('pa_risk_pct') is not None else None,
             }
             trades.append(trade_data)
 
@@ -411,11 +443,17 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
 
             conn.execute(text("""
                 UPDATE paper_trading
-                SET close_price = :close_price, close_date = :close_date, status = 'CLOSED'
+                SET close_price = :close_price,
+                    close_date = :close_date,
+                    status = 'CLOSED',
+                    close_source = 'manual',
+                    closed_by = 'user',
+                    updated_at = :updated_at
                 WHERE id = :id
             """), {
                 "close_price": float(close_price),
                 "close_date": datetime.now().strftime("%Y-%m-%d"),
+                "updated_at": datetime.now(),
                 "id": id
             })
             conn.commit()
@@ -445,13 +483,10 @@ def run_wind_control() -> Dict[str, Any]:
     """风控：自动扫描所有持仓，根据多重止损逻辑触发卖出通知/平仓
     
     止损规则优先级:
-    1. 固定止损: 跌破入场成本 -9%
-    2. ATR 移动止盈: 从持仓期最高价回撤 -8%
-    3. 大盘极端风控: 双指数破位时强制清仓
-    4. 时间止损: 持仓超过 N 天且未盈利 → 自动平仓
+    1. 统一执行风控: 初始/结构/保本/移动风控取当前有效位
+    2. 大盘极端风控: 双指数破位时强制清仓
+    3. 时间止损: 持仓超过 N 天且未盈利 → 自动平仓
     """
-    import math
-    
     engine = get_db_engine()
     if not engine: return {"status": "error"}
     
@@ -469,35 +504,33 @@ def run_wind_control() -> Dict[str, Any]:
         regime_status = regime.get("status", "UNKNOWN")
 
         closed_count = 0
+        warned_real_count = 0
         alerts = []
         close_updates = []  # 收集批量更新参数
         close_date_str = datetime.now().strftime("%Y-%m-%d")
 
         for _, row in df.iterrows():
             code = row['code']
-            entry_price = float(row['entry_price'])
+            entry_price = safe_float(row['entry_price'])
             entry_date = pd.to_datetime(row['entry_date'])
-            high_since_entry = float(row['high_since_entry'] or entry_price)
-            # NaN 防御: pandas 读出 NaN 时 `or` 运算符无法捕获
-            if math.isnan(high_since_entry):
-                high_since_entry = entry_price
+            high_since_entry = safe_float(row.get('high_since_entry'), entry_price)
             hold_days = (datetime.now() - entry_date).days
             
             # 获取当前行情
             match = snapshot[snapshot['code'] == code]
             if match.empty: continue
             curr_price = float(match.iloc[0]['price'])
+            curr_high = safe_float(match.iloc[0].get('high'), curr_price)
+            high_since_entry = max(high_since_entry, curr_high, curr_price)
             pl_pct = (curr_price - entry_price) / entry_price * 100
             
-            # --- 风控逻辑判定 (按优先级, 使用统一风控常量) ---
-            stop_level = high_since_entry * TRAILING_STOP_RATIO  # 跌破高点触发
-            fixed_stop = entry_price * FIXED_STOP_LOSS_RATIO     # 固定止损
+            # --- 风控逻辑判定 (按优先级, 使用统一风控引擎) ---
+            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price)
+            stop_level = risk_levels["active_stop_price"]
             
             reason = ""
-            if curr_price <= fixed_stop:
-                reason = f"触发固定止损线 (入场成本 {FIXED_STOP_LOSS_PCT}%)"
-            elif curr_price <= stop_level:
-                reason = f"触发移动止盈线 (高点回撤 {round((TRAILING_STOP_RATIO - 1) * 100)}%)"
+            if curr_price <= stop_level:
+                reason = f"触发执行风控价 ¥{stop_level:.2f} ({risk_levels['risk_stage']})"
             elif regime_status == "CRITICAL":
                 reason = "大盘极度走弱 (双指数破位)，强制清仓避险"
             elif hold_days >= TIME_STOP_DAYS and pl_pct <= 0:
@@ -506,25 +539,33 @@ def run_wind_control() -> Dict[str, Any]:
             if reason:
                 # 生成更详细的智能备注
                 remark = f"{reason}。卖出时大盘状态：{regime.get('desc', 'N/A')}。"
-                close_updates.append({
-                    "p": curr_price,
-                    "d": close_date_str,
-                    "r": remark,
-                    "id": int(row['id'])
-                })
-                closed_count += 1
-                alerts.append(f"{row['name']}({code}) {reason}")
-
                 # 发送 Bark 风控平仓推送 — 根据交易模式区分
                 trade_mode = row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
-                mode_label = "实盘风控平仓" if trade_mode == "REAL" else "模拟仓风控平仓"
+                if trade_mode == "REAL":
+                    warned_real_count += 1
+                    alerts.append(f"{row['name']}({code}) 实盘风控预警: {reason}")
+                    mode_label = "实盘风控预警"
+                    action_line = "系统不会自动平仓，请人工确认是否卖出。"
+                else:
+                    close_updates.append({
+                        "p": curr_price,
+                        "d": close_date_str,
+                        "r": remark,
+                        "u": datetime.now(),
+                        "id": int(row['id'])
+                    })
+                    closed_count += 1
+                    alerts.append(f"{row['name']}({code}) 模拟仓自动平仓: {reason}")
+                    mode_label = "模拟仓风控平仓"
+                    action_line = "模拟仓已按风控规则自动平仓。"
                 title = f"【{mode_label}】{row['name']} ({code})"
                 body = (
                     f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
+                    f"处理方式：{action_line}\n"
                     f"平仓原因：{reason}\n"
                     f"买入价格：¥{entry_price:.2f}\n"
-                    f"平仓价格：¥{curr_price:.2f}\n"
-                    f"最终收益：{pl_pct:+.2f}%\n"
+                    f"当前价格：¥{curr_price:.2f}\n"
+                    f"当前收益：{pl_pct:+.2f}%\n"
                     f"大盘状态：{regime.get('desc', 'N/A')}"
                 )
                 send_paper_trade_notification(title, body)
@@ -534,12 +575,18 @@ def run_wind_control() -> Dict[str, Any]:
             with engine.connect() as conn:
                 conn.execute(text("""
                     UPDATE paper_trading 
-                    SET close_price = :p, close_date = :d, status = 'CLOSED', remark = :r
+                    SET close_price = :p,
+                        close_date = :d,
+                        status = 'CLOSED',
+                        remark = :r,
+                        close_source = 'wind_control_auto',
+                        closed_by = 'system',
+                        updated_at = :u
                     WHERE id = :id
                 """), close_updates)
                 conn.commit()
 
-        return {"status": "success", "closed_count": closed_count, "alerts": alerts}
+        return {"status": "success", "closed_count": closed_count, "warned_real_count": warned_real_count, "alerts": alerts}
     except Exception as e:
         logger.error(f"Wind control error: {e}")
         return {"status": "error"}

@@ -22,6 +22,8 @@ def _empty_response() -> Dict[str, Any]:
         },
         "horizons": [],
         "by_strategy": [],
+        "by_price_action": [],
+        "by_pa_action": [],
         "by_industry": [],
         "recent_dates": [],
     }
@@ -34,7 +36,10 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
 
     query = text("""
         WITH signals AS (
-            SELECT code, name, industry, strategy_type, date AS signal_date, price
+            SELECT
+                code, name, industry, strategy_type, date AS signal_date, price,
+                price_action_pattern, price_action_regime, price_action_entry_quality,
+                pa_trade_action, pa_trade_setup, pa_risk_pct
             FROM scan_history
             WHERE date >= CURRENT_DATE - (:days || ' days')::interval
               AND price IS NOT NULL
@@ -46,6 +51,12 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.name,
                 s.industry,
                 COALESCE(s.strategy_type, 'squeeze') AS strategy_type,
+                s.price_action_pattern,
+                s.price_action_regime,
+                s.price_action_entry_quality,
+                COALESCE(s.pa_trade_action, 'UNKNOWN') AS pa_trade_action,
+                COALESCE(s.pa_trade_setup, s.price_action_pattern, '未知') AS pa_trade_setup,
+                s.pa_risk_pct,
                 s.signal_date,
                 s.price,
                 h1.close AS close_1d,
@@ -128,6 +139,8 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
 
         by_strategy = metric_frame(df.groupby("strategy_type", dropna=False), "strategy")
         by_industry = metric_frame(df.groupby("industry", dropna=False), "industry")
+        by_price_action = metric_frame(df.groupby("pa_trade_setup", dropna=False), "setup")
+        by_pa_action = metric_frame(df.groupby("pa_trade_action", dropna=False), "action")
 
         recent = []
         for date_value, group in df.groupby("signal_date"):
@@ -155,6 +168,8 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             },
             "horizons": horizons,
             "by_strategy": by_strategy,
+            "by_price_action": by_price_action,
+            "by_pa_action": by_pa_action,
             "by_industry": by_industry,
             "recent_dates": recent[:20],
         }
@@ -169,11 +184,13 @@ def export_scan_performance(days: int = 120):
     if df.empty:
         df = pd.DataFrame(columns=[
             "code", "name", "industry", "strategy_type", "signal_date", "price",
+            "pa_trade_action", "pa_trade_setup", "pa_risk_pct",
             "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
         ])
 
     export_cols = [
         "code", "name", "industry", "strategy_type", "signal_date", "price",
+        "pa_trade_action", "pa_trade_setup", "pa_risk_pct",
         "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
     ]
     export_df = df[[c for c in export_cols if c in df.columns]].copy()
@@ -184,6 +201,9 @@ def export_scan_performance(days: int = 120):
         "strategy_type": "策略",
         "signal_date": "信号日期",
         "price": "信号价",
+        "pa_trade_action": "Brooks动作",
+        "pa_trade_setup": "Brooks形态",
+        "pa_risk_pct": "Brooks风险%",
         "ret_1d": "1日收益%",
         "ret_3d": "3日收益%",
         "ret_5d": "5日收益%",

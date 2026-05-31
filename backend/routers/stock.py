@@ -13,9 +13,8 @@ from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code, load_from_db, save_to_db
 from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
-from core.risk_constants import (
-    FIXED_STOP_LOSS_RATIO, TRAILING_STOP_RATIO, TAKE_PROFIT_RATIO
-)
+from core.price_action import build_price_action_annotations
+from core.risk_engine import compute_paper_risk_levels, safe_float
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -142,12 +141,25 @@ def get_stock_detail(code: str):
         # --- 增补计算该股票的完整元数据 ---
         engine = get_db_engine()
         from core.strategy import check_strategy, calculate_historical_win_rate
+        price_action = build_price_action_annotations(df)
         
         is_paper_trade = False
         buy_price = 0.0
         stop_price = 0.0
         take_profit_price = 0.0
+        initial_stop_price = 0.0
+        structure_stop_price = 0.0
+        capital_protect_price = 0.0
+        moving_stop_price = 0.0
+        max_pl_pct = 0.0
+        risk_reward = None
+        risk_notes = []
+        risk_stage = ""
         paper_remark = ""
+        entry_date_str = None
+        entry_source = None
+        entry_signal_date = None
+        entry_reason_snapshot = None
         
         with engine.connect() as conn:
             basic_res = conn.execute(text("SELECT name, industry FROM stock_basic WHERE code = :code"), {"code": code}).fetchone()
@@ -156,25 +168,39 @@ def get_stock_detail(code: str):
             
             # 检查是否有持仓中的拟合实盘记录
             paper_res = conn.execute(text("""
-                SELECT entry_price, high_since_entry, status, remark
+                SELECT entry_price, high_since_entry, status, remark, entry_date,
+                       entry_source, entry_signal_date, entry_reason_snapshot
                 FROM paper_trading 
                 WHERE code = :code AND status = 'OPEN'
                 LIMIT 1
             """), {"code": code}).fetchone()
             
             if paper_res:
-                entry_price = float(paper_res[0])
-                high_since_entry = float(paper_res[1]) if paper_res[1] is not None else entry_price
-                # NaN 防御
-                import math
-                if math.isnan(high_since_entry):
-                    high_since_entry = entry_price
+                entry_price = safe_float(paper_res[0])
+                high_since_entry = safe_float(paper_res[1], entry_price)
                 is_paper_trade = True
-                buy_price = round(entry_price, 2)
-                # 固定止损 OR 移动止损，取其高者
-                stop_price = round(max(entry_price * FIXED_STOP_LOSS_RATIO, high_since_entry * TRAILING_STOP_RATIO), 2)
-                take_profit_price = round(entry_price * TAKE_PROFIT_RATIO, 2)
+                risk_levels = compute_paper_risk_levels(
+                    entry_price,
+                    high_since_entry,
+                    float(df.iloc[-1]['收盘']),
+                    price_action.get("summary", {}),
+                )
+                buy_price = risk_levels["buy_price"]
+                stop_price = risk_levels["stop_price"]
+                take_profit_price = risk_levels["take_profit_price"]
+                initial_stop_price = risk_levels["initial_stop_price"]
+                structure_stop_price = risk_levels["structure_stop_price"]
+                capital_protect_price = risk_levels["capital_protect_price"]
+                moving_stop_price = risk_levels["moving_stop_price"]
+                max_pl_pct = risk_levels["max_pl_pct"]
+                risk_reward = risk_levels["risk_reward"]
+                risk_notes = risk_levels["risk_notes"]
+                risk_stage = risk_levels["risk_stage"]
                 paper_remark = str(paper_res[3] or "")
+                entry_date_str = str(paper_res[4]) if paper_res[4] else None
+                entry_source = paper_res[5]
+                entry_signal_date = str(paper_res[6]) if paper_res[6] else None
+                entry_reason_snapshot = paper_res[7]
             
         _, stats = check_strategy(df)
         bt = calculate_historical_win_rate(df)
@@ -207,8 +233,21 @@ def get_stock_detail(code: str):
             "is_paper_trade": is_paper_trade,
             "buy_price": buy_price,
             "stop_price": stop_price,
+            "active_stop_price": stop_price,
+            "initial_stop_price": initial_stop_price,
+            "structure_stop_price": structure_stop_price,
+            "capital_protect_price": capital_protect_price,
+            "moving_stop_price": moving_stop_price,
             "take_profit_price": take_profit_price,
+            "max_pl_pct": max_pl_pct,
+            "risk_reward": risk_reward,
+            "risk_notes": risk_notes,
+            "risk_stage": risk_stage,
             "paper_remark": paper_remark,
+            "entry_date": entry_date_str,
+            "entry_source": entry_source,
+            "entry_signal_date": entry_signal_date,
+            "entry_reason_snapshot": entry_reason_snapshot,
             "回测统计": {
                 "avg_return": bt['avg_return'],
                 "max_drawdown": bt['max_drawdown'],
@@ -222,6 +261,8 @@ def get_stock_detail(code: str):
             "code": code,
             "data": records,
             "stock_info": stock_info,
+            "price_action": price_action.get("summary", {}),
+            "price_action_lines": price_action.get("lines", []),
             "indicators": {
                 "rsi": float(df.iloc[-1].get('RSI', 0)),
                 "dif": float(df.iloc[-1].get('MACD_DIF', 0)),
@@ -656,12 +697,25 @@ def get_stock_full_analysis(code: str):
         # 3. 基础信息 + 拟合实盘数据
         engine = get_db_engine()
         from core.strategy import check_strategy, calculate_historical_win_rate
+        price_action = build_price_action_annotations(df)
 
         is_paper_trade = False
         buy_price = 0.0
         stop_price = 0.0
         take_profit_price = 0.0
+        initial_stop_price = 0.0
+        structure_stop_price = 0.0
+        capital_protect_price = 0.0
+        moving_stop_price = 0.0
+        max_pl_pct = 0.0
+        risk_reward = None
+        risk_notes = []
+        risk_stage = ""
         paper_remark = ""
+        entry_date_str = None
+        entry_source = None
+        entry_signal_date = None
+        entry_reason_snapshot = None
         hold_days = 0
         pl_pct = 0.0
 
@@ -671,30 +725,45 @@ def get_stock_full_analysis(code: str):
             industry = basic_res[1] if basic_res else "未知"
 
             paper_res = conn.execute(text("""
-                SELECT entry_price, high_since_entry, status, remark, entry_date, current_price
+                SELECT entry_price, high_since_entry, status, remark, entry_date, current_price,
+                       entry_source, entry_signal_date, entry_reason_snapshot
                 FROM paper_trading
                 WHERE code = :code AND status = 'OPEN'
                 LIMIT 1
             """), {"code": code}).fetchone()
 
             if paper_res:
-                entry_price = float(paper_res[0])
-                high_since_entry = float(paper_res[1]) if paper_res[1] else entry_price
-                # NaN 防御
-                import math
-                if math.isnan(high_since_entry):
-                    high_since_entry = entry_price
+                entry_price = safe_float(paper_res[0])
+                high_since_entry = safe_float(paper_res[1], entry_price)
                 is_paper_trade = True
-                buy_price = round(entry_price, 2)
-                stop_price = round(max(entry_price * FIXED_STOP_LOSS_RATIO, high_since_entry * TRAILING_STOP_RATIO), 2)
-                take_profit_price = round(entry_price * TAKE_PROFIT_RATIO, 2)
+                curr_price = safe_float(paper_res[5], float(df.iloc[-1]['收盘']))
+                risk_levels = compute_paper_risk_levels(
+                    entry_price,
+                    high_since_entry,
+                    curr_price,
+                    price_action.get("summary", {}),
+                )
+                buy_price = risk_levels["buy_price"]
+                stop_price = risk_levels["stop_price"]
+                take_profit_price = risk_levels["take_profit_price"]
+                initial_stop_price = risk_levels["initial_stop_price"]
+                structure_stop_price = risk_levels["structure_stop_price"]
+                capital_protect_price = risk_levels["capital_protect_price"]
+                moving_stop_price = risk_levels["moving_stop_price"]
+                max_pl_pct = risk_levels["max_pl_pct"]
+                risk_reward = risk_levels["risk_reward"]
+                risk_notes = risk_levels["risk_notes"]
+                risk_stage = risk_levels["risk_stage"]
                 paper_remark = str(paper_res[3] or "")
+                entry_source = paper_res[6]
+                entry_signal_date = str(paper_res[7]) if paper_res[7] else None
+                entry_reason_snapshot = paper_res[8]
                 if paper_res[4]:
                     entry_date = paper_res[4]
                     if isinstance(entry_date, str):
                         entry_date = datetime.strptime(entry_date, "%Y-%m-%d").date()
+                    entry_date_str = str(entry_date)
                     hold_days = (datetime.now().date() - entry_date).days
-                curr_price = float(paper_res[5]) if paper_res[5] else float(df.iloc[-1]['收盘'])
                 pl_pct = round(((curr_price - entry_price) / entry_price) * 100, 2)
 
         close = float(df.iloc[-1]['收盘'])
@@ -713,10 +782,23 @@ def get_stock_full_analysis(code: str):
             "is_paper_trade": is_paper_trade,
             "buy_price": buy_price,
             "stop_price": stop_price,
+            "active_stop_price": stop_price,
+            "initial_stop_price": initial_stop_price,
+            "structure_stop_price": structure_stop_price,
+            "capital_protect_price": capital_protect_price,
+            "moving_stop_price": moving_stop_price,
             "take_profit_price": take_profit_price,
+            "max_pl_pct": max_pl_pct,
+            "risk_reward": risk_reward,
+            "risk_notes": risk_notes,
+            "risk_stage": risk_stage,
             "hold_days": hold_days,
             "pl_pct": pl_pct,
             "paper_remark": paper_remark,
+            "entry_date": entry_date_str,
+            "entry_source": entry_source,
+            "entry_signal_date": entry_signal_date,
+            "entry_reason_snapshot": entry_reason_snapshot,
         }
 
         # 4. 概念板块 (异步友好 + 24小时缓存)
@@ -735,6 +817,8 @@ def get_stock_full_analysis(code: str):
             "code": code,
             "kline": kline_records,
             "signals": signals,
+            "price_action": price_action.get("summary", {}),
+            "price_action_lines": price_action.get("lines", []),
             "stock_info": stock_info,
             "concepts": concepts,
             "financials": financials,
@@ -881,5 +965,3 @@ def search_stocks(query: str):
                 break
                 
     return matches
-
-

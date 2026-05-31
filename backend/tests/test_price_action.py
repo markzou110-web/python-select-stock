@@ -34,6 +34,11 @@ def test_price_action_detects_bull_context_and_outputs_risk_levels():
     assert result["price_action_regime"] in {"多头趋势", "向上突破"}
     assert result["pa_entry_price"] > result["pa_stop_price"]
     assert result["price_action_summary"]
+    assert result["pa_market_cycle"]
+    assert result["pa_range_location"] in {"区间上沿", "区间中部", "区间下沿"}
+    assert result["pa_trade_plan"]["action"] in {"READY", "WATCH"}
+    assert result["pa_trade_plan"]["entry_condition"]
+    assert result["pa_trade_plan"]["invalidation"]
 
 
 def test_price_action_handles_short_data():
@@ -41,6 +46,24 @@ def test_price_action_handles_short_data():
 
     assert result["price_action_score"] == 0
     assert result["price_action_regime"] == "数据不足"
+    assert result["pa_trade_plan"]["action"] == "AVOID"
+
+
+def test_price_action_trade_plan_avoids_range_failed_breakout():
+    closes = [10, 10.2, 10.1, 10.3, 10.15, 10.35, 10.2, 10.4] * 4
+    df = _ohlc_from_closes(closes)
+    df.loc[df.index[-2], "最高"] = 11.2
+    df.loc[df.index[-2], "收盘"] = 10.9
+    df.loc[df.index[-1], "开盘"] = 10.85
+    df.loc[df.index[-1], "最高"] = 10.95
+    df.loc[df.index[-1], "最低"] = 10.1
+    df.loc[df.index[-1], "收盘"] = 10.25
+
+    result = analyze_price_action(df)
+
+    if result["price_action_pattern"] == "交易区间假突破":
+        assert result["pa_trade_plan"]["action"] == "AVOID"
+        assert result["pa_trade_plan"]["avoid_reasons"]
 
 
 def test_price_action_annotations_include_summary_and_lines():

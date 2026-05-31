@@ -31,6 +31,7 @@ from core.strategy import (
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
 )
 from core.price_action import analyze_price_action
+from core.risk_engine import compute_paper_risk_levels
 from routers.market import fetch_mine_sweeper_data
 
 
@@ -695,18 +696,29 @@ def perform_market_scan(
                 else:
                     res['pct_5d'] = 0.0
 
-                # 入场价 (当日最高价作为突破确认位) 和 止损价 (-8%)
+                # 候选计划价：突破确认位 + 结构失效/初始风控，而不是简单 -8%
                 if df_hist is not None and not df_hist.empty:
-                    res['entry_price'] = round(float(df_hist['最高'].iloc[-1]), 2)
-                    res['stop_price'] = round(float(res['entry_price']) * 0.92, 2)
-
                     pa = analyze_price_action(df_hist)
                     res.update(pa)
+                    entry_price = float(pa.get('pa_entry_price') or df_hist['最高'].iloc[-1])
+                    current_price = float(df_hist['收盘'].iloc[-1])
+                    risk = compute_paper_risk_levels(entry_price, entry_price, current_price, pa)
+                    res['entry_price'] = round(entry_price, 2)
+                    res['stop_price'] = risk['active_stop_price']
+                    res['plan_stop_price'] = risk['active_stop_price']
+                    res['initial_stop_price'] = risk['initial_stop_price']
+                    res['structure_stop_price'] = risk['structure_stop_price']
+                    res['target_price'] = risk['take_profit_price']
+                    res['risk_reward'] = risk['risk_reward']
+                    res['risk_notes'] = risk['risk_notes']
                     if not res.get('结构') and pa.get('price_action_pattern') not in (None, "无明确形态"):
                         res['结构'] = pa.get('price_action_pattern')
                 else:
                     res['entry_price'] = res.get('现价', 0)
-                    res['stop_price'] = round(float(res.get('现价', 0)) * 0.92, 2)
+                    risk = compute_paper_risk_levels(float(res.get('现价', 0)), float(res.get('现价', 0)), float(res.get('现价', 0)))
+                    res['stop_price'] = risk['active_stop_price']
+                    res['plan_stop_price'] = risk['active_stop_price']
+                    res['target_price'] = risk['take_profit_price']
 
             except Exception as e:
                 logger.error(f"Supplement error for {res.get('代码')}: {e}")

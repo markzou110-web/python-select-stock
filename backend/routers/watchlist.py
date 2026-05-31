@@ -115,6 +115,11 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
                 "status": row.get("status") or "WATCHING",
                 "reason": row.get("reason") or "",
                 "invalidation": row.get("invalidation") or "",
+                "pa_trade_action": row.get("pa_trade_action") or "",
+                "pa_trade_setup": row.get("pa_trade_setup") or "",
+                "pa_entry_condition": row.get("pa_entry_condition") or "",
+                "pa_invalidation": row.get("pa_invalidation") or "",
+                "pa_risk_pct": round(float(row.get("pa_risk_pct")), 2) if row.get("pa_risk_pct") is not None else None,
                 "created_at": row["created_at"].isoformat() if row.get("created_at") is not None else "",
                 "latest_date": latest.get("date"),
             })
@@ -140,9 +145,9 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
     for item in payload.get("items", []):
         reasons = []
         if item.get("target_hit"):
-            reasons.append("触达目标价")
+            reasons.append("Brooks入场触发" if item.get("pa_trade_action") else "触达目标价")
         if item.get("stop_hit"):
-            reasons.append("触发失效价")
+            reasons.append("触发Brooks失效位" if item.get("pa_trade_action") else "触发失效价")
         if not reasons:
             continue
         alerts.append({
@@ -193,10 +198,14 @@ def add_watchlist_item(data: Dict[str, Any]) -> Dict[str, Any]:
             conn.execute(text("""
                 INSERT INTO watchlist (
                     code, name, industry, source, strategy_type, watch_price,
-                    target_price, stop_price, status, reason, invalidation, created_at, updated_at
+                    target_price, stop_price, status, reason, invalidation,
+                    pa_trade_action, pa_trade_setup, pa_entry_condition, pa_invalidation, pa_risk_pct,
+                    created_at, updated_at
                 ) VALUES (
                     :code, :name, :industry, :source, :strategy_type, :watch_price,
-                    :target_price, :stop_price, 'WATCHING', :reason, :invalidation, :created_at, :updated_at
+                    :target_price, :stop_price, 'WATCHING', :reason, :invalidation,
+                    :pa_trade_action, :pa_trade_setup, :pa_entry_condition, :pa_invalidation, :pa_risk_pct,
+                    :created_at, :updated_at
                 )
             """), {
                 "code": code,
@@ -209,6 +218,11 @@ def add_watchlist_item(data: Dict[str, Any]) -> Dict[str, Any]:
                 "stop_price": float(stop_price) if stop_price is not None else None,
                 "reason": data.get("reason") or "",
                 "invalidation": data.get("invalidation") or "",
+                "pa_trade_action": data.get("pa_trade_action"),
+                "pa_trade_setup": data.get("pa_trade_setup"),
+                "pa_entry_condition": data.get("pa_entry_condition"),
+                "pa_invalidation": data.get("pa_invalidation"),
+                "pa_risk_pct": float(data.get("pa_risk_pct")) if data.get("pa_risk_pct") is not None else None,
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
             })

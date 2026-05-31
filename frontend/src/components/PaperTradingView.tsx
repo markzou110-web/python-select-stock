@@ -51,9 +51,15 @@ interface Trade {
     status: string;
     close_price?: number;
     close_date?: string;
+    close_source?: string;
+    closed_by?: string;
+    updated_at?: string;
     remark?: string;
     high_since_entry?: number;
     trade_mode: 'SIMULATED' | 'REAL';
+    entry_source?: string;
+    entry_signal_date?: string;
+    entry_reason_snapshot?: string;
 }
 
 interface ModeStats {
@@ -236,35 +242,49 @@ export default function PaperTradingView() {
     }
 
     return (
-        <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        <div className="mx-auto w-full max-w-[1680px] space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
             {/* Trade Mode Switcher */}
-            <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                    <div className="flex bg-slate-100 rounded-2xl p-1.5 gap-1 shadow-inner">
+            <div className="workspace-panel px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-3 min-w-0">
+                    <div className="flex bg-slate-100 rounded-md p-1 gap-1">
                         {(['ALL', 'SIMULATED', 'REAL'] as const).map((mode) => {
-                            const label = mode === 'ALL' ? '全部' : mode === 'SIMULATED' ? '🔵 模拟盘' : '🔴 实盘';
+                            const label = mode === 'ALL' ? '全部' : mode === 'SIMULATED' ? '模拟盘' : '实盘';
                             const isActive = tradeMode === mode;
+                            const count = mode === 'ALL' ? trades.length : mode === 'SIMULATED' ? simCount : realCount;
                             return (
                                 <button
                                     key={mode}
                                     onClick={() => setTradeMode(mode)}
                                     className={cn(
-                                        "px-4 py-2 text-xs font-black rounded-xl transition-all duration-300",
+                                        "inline-flex items-center gap-2 px-3 py-2 text-xs font-black rounded-md transition-all duration-150",
                                         isActive && mode === 'REAL'
-                                            ? "bg-gradient-to-r from-rose-500 to-red-500 text-white shadow-lg shadow-rose-200"
+                                            ? "bg-rose-600 text-white shadow-sm"
                                             : isActive && mode === 'SIMULATED'
-                                            ? "bg-gradient-to-r from-blue-500 to-indigo-500 text-white shadow-lg shadow-blue-200"
+                                            ? "bg-blue-700 text-white shadow-sm"
                                             : isActive
                                             ? "bg-white text-slate-800 shadow-md"
                                             : "text-slate-400 hover:text-slate-600 hover:bg-white/50"
                                     )}
                                 >
+                                    {mode !== 'ALL' && (
+                                        <span className={cn(
+                                            "h-2 w-2 rounded-full",
+                                            mode === 'SIMULATED' ? "bg-blue-400" : "bg-rose-400",
+                                            isActive && "bg-white"
+                                        )} />
+                                    )}
                                     {label}
+                                    <span className={cn(
+                                        "rounded bg-white/70 px-1.5 py-0.5 font-mono text-[10px]",
+                                        isActive ? "text-current" : "text-slate-400"
+                                    )}>
+                                        {count}
+                                    </span>
                                 </button>
                             );
                         })}
                     </div>
-                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400">
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-500">
                         <span className="flex items-center gap-1">
                             <span className="w-2 h-2 rounded-full bg-blue-400"></span>
                             模拟 {simCount} 笔
@@ -384,21 +404,21 @@ export default function PaperTradingView() {
                 </div>
             )}
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="grid grid-cols-1 2xl:grid-cols-[minmax(0,1fr)_420px] gap-6">
                 {/* Trade List or Analytics */}
-                <div className="lg:col-span-2 space-y-4">
-                    <div className="flex items-center justify-between px-2">
-                        <div className="flex items-center gap-4">
+                <div className="space-y-4 min-w-0">
+                    <div className="flex flex-wrap items-center justify-between gap-3 px-2">
+                        <div className="flex flex-wrap items-center gap-4 min-w-0">
                             <h3 className="font-bold text-slate-800 flex items-center gap-2">
                                 <Clock size={18} className="text-slate-400" />
                                 {tab === 'analytics' ? '分析报告' : '交易记录'}
                             </h3>
                             {/* Tabs */}
-                            <div className="flex bg-slate-100 rounded-xl p-1 gap-0.5">
+                            <div className="flex bg-slate-100 rounded-md p-1 gap-0.5">
                                 <button
                                     onClick={() => setTab('open')}
                                     className={cn(
-                                        "px-3 py-1 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all",
+                                        "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
                                         tab === 'open' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
                                     )}
                                 >
@@ -407,7 +427,7 @@ export default function PaperTradingView() {
                                 <button
                                     onClick={() => setTab('closed')}
                                     className={cn(
-                                        "px-3 py-1 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all",
+                                        "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
                                         tab === 'closed' ? "bg-white text-emerald-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
                                     )}
                                 >
@@ -416,7 +436,7 @@ export default function PaperTradingView() {
                                 <button
                                     onClick={() => setTab('analytics')}
                                     className={cn(
-                                        "px-3 py-1 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all",
+                                        "px-3 py-1.5 text-[10px] font-black uppercase tracking-widest rounded-md transition-all",
                                         tab === 'analytics' ? "bg-white text-indigo-600 shadow-sm" : "text-slate-400 hover:text-slate-600"
                                     )}
                                 >
@@ -428,7 +448,7 @@ export default function PaperTradingView() {
                             <button
                                 onClick={() => fetchTrades(true)}
                                 disabled={refreshing}
-                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-xl transition-all disabled:opacity-50"
+                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-md transition-all disabled:opacity-50"
                             >
                                 <RefreshCw size={12} className={refreshing ? "animate-spin" : ""} />
                                 刷新价格
@@ -441,8 +461,8 @@ export default function PaperTradingView() {
                             <PortfolioDashboard />
                         </div>
                     ) : (
-                        <div className="glass-card overflow-hidden">
-                            <table className="w-full text-left">
+                        <div className="glass-card overflow-x-auto">
+                            <table className="w-full min-w-[980px] text-left">
                                 <thead className="bg-slate-50/50 border-b border-slate-100">
                                     <tr>
                                         <th className="px-5 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">标的信息</th>
@@ -494,6 +514,11 @@ export default function PaperTradingView() {
                                                             <span className="text-[10px] font-mono font-medium text-slate-400 group-hover:text-indigo-400 transition-colors">{t.code}</span>
                                                             <span className="text-[9px] font-bold text-slate-300">{t.entry_date}</span>
                                                             {t.close_date && <span className="text-[9px] font-bold text-emerald-400">→ {t.close_date}</span>}
+                                                            {t.status === 'CLOSED' && (t.close_source || t.closed_by) && (
+                                                                <span className="text-[9px] font-black text-slate-300">
+                                                                    {t.close_source || '--'} / {t.closed_by || '--'}
+                                                                </span>
+                                                            )}
                                                         </div>
                                                         {t.remark && (
                                                             <span className="text-[10px] text-slate-400 italic leading-relaxed line-clamp-1" title={t.remark}>
@@ -502,7 +527,16 @@ export default function PaperTradingView() {
                                                         )}
                                                     </div>
                                                 </td>
-                                                <td className="px-4 py-4 text-center font-mono font-bold text-slate-600 text-sm">{t.entry_price.toFixed(2)}</td>
+                                                <td className="px-4 py-4 text-center">
+                                                    <div className="flex flex-col items-center">
+                                                        <span className="font-mono font-bold text-slate-600 text-sm">{t.entry_price.toFixed(2)}</span>
+                                                        {(t.entry_source || t.entry_signal_date) && (
+                                                            <span className="text-[9px] text-slate-400 font-bold mt-0.5" title={t.entry_reason_snapshot || undefined}>
+                                                                {t.entry_signal_date || '--'} · {t.entry_source || '未知来源'}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                </td>
                                                 <td className="px-4 py-4 text-center">
                                                     <div className="flex flex-col items-center">
                                                         <span className={cn(
@@ -616,12 +650,12 @@ export default function PaperTradingView() {
                 </div>
 
                 {/* Sidebar charts */}
-                <div className="space-y-4">
+                <div className="space-y-4 min-w-0 2xl:sticky 2xl:top-5 self-start">
                     <h3 className="font-bold text-slate-800 flex items-center gap-2 px-2">
                         <PieIcon size={18} className="text-slate-400" />
                         板块胜率分布图
                     </h3>
-                    <div className="glass-card p-6 h-[400px]">
+                    <div className="glass-card p-5 h-[400px]">
                         {stats.sector_distribution && stats.sector_distribution.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
                                 <BarChart data={stats.sector_distribution} layout="vertical" margin={{ left: 20 }}>
@@ -661,7 +695,7 @@ export default function PaperTradingView() {
                         )}
                         
                         {stats.sector_distribution && stats.sector_distribution.length > 0 && (
-                            <div className="mt-6 p-4 bg-indigo-50 rounded-2xl border border-indigo-100 flex gap-3">
+                            <div className="mt-4 p-4 bg-indigo-50 rounded-md border border-indigo-100 flex gap-3">
                                 <AlertCircle size={16} className="text-indigo-600 shrink-0" />
                                 <p className="text-[10px] text-indigo-700 font-medium leading-relaxed">
                                     决策建议：您的模拟盈亏显示 <span className="font-black">{stats.sector_distribution[0]?.name}</span> 胜率

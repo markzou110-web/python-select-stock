@@ -5,6 +5,8 @@ from .db import get_db_engine
 from .data import get_market_snapshot
 from .indicators import calculate_indicators
 from core.strategy import evaluate_exit_signals
+from core.risk_engine import safe_float
+from core.trading_calendar import is_a_share_after_close_sync_window, is_a_share_intraday_session
 import pandas as pd
 from datetime import datetime
 from sqlalchemy import text
@@ -19,9 +21,7 @@ def check_realtime_alerts():
     4. 触发手机推送
     """
     now = datetime.now()
-    # 仅在 A 股交易时间段运行 (简化判断)
-    is_market_open = (9 <= now.hour <= 15) and (now.weekday() < 5)
-    if not is_market_open:
+    if not is_a_share_intraday_session(now):
         logger.debug("Market is closed. Skipping real-time check.")
         return "Market closed"
 
@@ -38,6 +38,7 @@ def check_realtime_alerts():
             return "Failed to fetch snapshot"
             
         snapshot_map = snapshot.set_index('code')['price'].to_dict()
+        snapshot_high_map = snapshot.set_index('code')['high'].to_dict() if 'high' in snapshot.columns else {}
 
         # 在循环外部，仅抓取一次大盘基准指数历史 K 线（用于 RS 计算），彻底消除循环内 24 次冗余的网络请求
         from core.data import get_index_hist
@@ -49,15 +50,12 @@ def check_realtime_alerts():
         for _, row in df_paper.iterrows():
             code = row['code']
             name = row['name']
-            entry_price = float(row['entry_price'])
-            high_since_entry = float(row.get('high_since_entry') or entry_price)
-            # NaN 防御: pandas 读出 NaN 时 `or` 运算符无法捕获
-            import math
-            if math.isnan(high_since_entry):
-                high_since_entry = entry_price
+            entry_price = safe_float(row['entry_price'])
+            high_since_entry = safe_float(row.get('high_since_entry'), entry_price)
             
             curr_price = snapshot_map.get(code)
             if not curr_price: continue
+            high_since_entry = max(high_since_entry, safe_float(snapshot_high_map.get(code), curr_price), curr_price)
 
             # 3. 拉取最近 K 线计算技术指标 (EMA, VolMA 等)
             # 这里复用 alert.py 的逻辑，但为了性能只取少量数据
@@ -124,6 +122,11 @@ def daily_sync():
     """
     每天下午 18:00 自动执行全市场数据同步
     """
+    now = datetime.now()
+    if not is_a_share_after_close_sync_window(now):
+        logger.info("Non-trading day or before close. Skipping scheduled daily sync.")
+        return "Market closed"
+
     logger.info("Starting scheduled daily data sync...")
     try:
         from routers.sync import background_sync_task

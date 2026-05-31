@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
     X,
     Zap,
@@ -24,15 +24,9 @@ import {
     PolarAngleAxis,
     ResponsiveContainer
 } from 'recharts';
-import {
-    createChart,
-    ColorType,
-    CandlestickSeries,
-    LineSeries,
-    IChartApi
-} from 'lightweight-charts';
 import api from '@/lib/api';
 import { useTradeStore } from '@/stores/tradeStore';
+import SplitKLineCharts from './SplitKLineCharts';
 
 interface AIDeepDiveProps {
     stock: any;
@@ -44,8 +38,8 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
     const [loading, setLoading] = useState(true);
     const [chartData, setChartData] = useState<any[]>([]);
     const [stockInfo, setStockInfo] = useState<any>(null);
-    const chartContainerRef = useRef<HTMLDivElement>(null);
-    const chartRef = useRef<IChartApi | null>(null);
+    const [priceAction, setPriceAction] = useState<any>(null);
+    const [priceActionLines, setPriceActionLines] = useState<any[]>([]);
 
     // Simulated trading addition states
     const [showRemarkModal, setShowRemarkModal] = useState(false);
@@ -66,6 +60,8 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                 const res = await api.get(`/api/stock/detail?code=${stock.代码}`);
                 const data = res.data.data;
                 setChartData(data);
+                setPriceAction(res.data.price_action || null);
+                setPriceActionLines(res.data.price_action_lines || []);
 
                 // Use API-returned stock_info values if available, fallback to props
                 const info = res.data.stock_info || stock;
@@ -90,88 +86,6 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
         fetchData();
     }, [stock]);
 
-    useEffect(() => {
-        if (!chartContainerRef.current || chartData.length === 0) return;
-
-        const isPaperTrade = stockInfo?.is_paper_trade;
-
-        const chart = createChart(chartContainerRef.current, {
-            layout: {
-                background: { type: ColorType.Solid, color: 'transparent' },
-                textColor: '#94a3b8',
-            },
-            grid: {
-                vertLines: { visible: false },
-                horzLines: { color: 'rgba(148, 163, 184, 0.05)' },
-            },
-            width: chartContainerRef.current.clientWidth,
-            height: isPaperTrade ? 220 : 180,
-            timeScale: {
-                borderVisible: false,
-                visible: isPaperTrade ? true : false
-            },
-            rightPriceScale: {
-                visible: isPaperTrade ? true : false,
-                borderVisible: false,
-                scaleMargins: {
-                    top: 0.15,
-                    bottom: 0.15,
-                },
-            },
-            handleScroll: isPaperTrade ? true : false,
-            handleScale: isPaperTrade ? true : false,
-        });
-
-        const candlestickSeries = chart.addSeries(CandlestickSeries, {
-            upColor: '#ef4444',
-            downColor: '#22c55e',
-            borderVisible: false,
-            wickUpColor: '#ef4444',
-            wickDownColor: '#22c55e',
-        });
-
-        const ema5Series = chart.addSeries(LineSeries, { color: '#6366f1', lineWidth: 1 });
-        const ema20Series = chart.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 1 });
-
-        candlestickSeries.setData(chartData);
-        ema5Series.setData(chartData.map(d => ({ time: d.time, value: d.EMA5 })));
-        ema20Series.setData(chartData.map(d => ({ time: d.time, value: d.EMA20 })));
-
-        if (isPaperTrade) {
-            candlestickSeries.createPriceLine({
-                price: stockInfo.buy_price,
-                color: '#6366f1',
-                lineWidth: 2,
-                lineStyle: 2, // Dashed
-                axisLabelVisible: true,
-                title: '买入价',
-            });
-            candlestickSeries.createPriceLine({
-                price: stockInfo.stop_price,
-                color: '#f43f5e',
-                lineWidth: 2,
-                lineStyle: 2, // Dashed
-                axisLabelVisible: true,
-                title: '止损价',
-            });
-            candlestickSeries.createPriceLine({
-                price: stockInfo.take_profit_price,
-                color: '#10b981',
-                lineWidth: 2,
-                lineStyle: 2, // Dashed
-                axisLabelVisible: true,
-                title: '止盈价',
-            });
-        }
-
-        chart.timeScale().fitContent();
-        chartRef.current = chart;
-
-        return () => {
-            chart.remove();
-        };
-    }, [chartData, stockInfo]);
-
     const handleAddToWatchlist = async (force: boolean = false, customRemark?: string, mode?: 'SIMULATED' | 'REAL') => {
         const selectedMode = mode || addTradeMode;
         setIsAdding(true);
@@ -185,7 +99,10 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                 strategy_type: stock.strategy_type || 'squeeze',
                 remark: customRemark || remarkText || '自动扫描并加入',
                 force: force,
-                trade_mode: selectedMode
+                trade_mode: selectedMode,
+                entry_source: stock.现价 ? 'scan_current_price' : 'last_kline_close',
+                entry_signal_date: chartData.length > 0 ? chartData[chartData.length - 1].time : undefined,
+                entry_reason_snapshot: `${stock.结构 || stock.price_action_pattern || '策略信号'} / Score ${stock.Score ?? '--'}`
             });
 
             if (res.data.status === 'success') {
@@ -260,10 +177,10 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                                 <p className="text-sm font-extrabold text-slate-700 font-mono">¥{stockInfo.buy_price.toFixed(2)}</p>
                             </div>
                             <div className="p-3 bg-white/80 backdrop-blur-md rounded-2xl border border-slate-100 text-center shadow-sm relative group">
-                                <p className="text-[9px] font-black text-rose-500 tracking-wider mb-0.5">移动止损</p>
-                                <p className="text-sm font-extrabold text-rose-600 font-mono">¥{stockInfo.stop_price.toFixed(2)}</p>
+                                <p className="text-[9px] font-black text-rose-500 tracking-wider mb-0.5">执行风控</p>
+                                <p className="text-sm font-extrabold text-rose-600 font-mono">¥{(stockInfo.active_stop_price || stockInfo.stop_price).toFixed(2)}</p>
                                 <span className="text-[8px] font-bold text-rose-400/80 block mt-0.5">
-                                    {(100 * (stockInfo.现价 - stockInfo.stop_price) / stockInfo.现价).toFixed(1)}% 缓冲
+                                    {stockInfo.risk_stage || '分阶段'} · {(100 * (stockInfo.现价 - (stockInfo.active_stop_price || stockInfo.stop_price)) / stockInfo.现价).toFixed(1)}% 缓冲
                                 </span>
                             </div>
                             <div className="p-3 bg-white/80 backdrop-blur-md rounded-2xl border border-slate-100 text-center shadow-sm">
@@ -280,6 +197,14 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                                 <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">📝 持仓纪律/备注</p>
                                 <p className="text-xs font-semibold text-slate-600 leading-relaxed italic">
                                     “ {stockInfo.paper_remark} ”
+                                </p>
+                            </div>
+                        )}
+                        {(stockInfo.entry_source || stockInfo.entry_signal_date || stockInfo.entry_reason_snapshot) && (
+                            <div className="p-3 bg-white/50 backdrop-blur-sm rounded-2xl border border-slate-100/80">
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">买入依据</p>
+                                <p className="text-xs font-semibold text-slate-600 leading-relaxed">
+                                    {stockInfo.entry_reason_snapshot || '未记录'} · 买入 {stockInfo.entry_date || '未记录'} · 信号 {stockInfo.entry_signal_date || '未记录'} · {stockInfo.entry_source || '未记录'}
                                 </p>
                             </div>
                         )}
@@ -396,26 +321,39 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     </div>
                 )}
 
-                {/* 4. Mini Chart */}
+                {/* 4. Split Mini Charts */}
                 <div className="space-y-3">
                     <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                             <Info size={16} className="text-slate-400" />
-                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">60日趋势预览 (Mini)</h4>
+                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">60日趋势 / 价格行为</h4>
                         </div>
                     </div>
                     <div className={cn(
-                        "bg-slate-50/50 rounded-2xl flex items-center justify-center border border-slate-100 relative group overflow-hidden",
-                        stockInfo?.is_paper_trade ? "h-[220px]" : "h-[180px]"
+                        "bg-slate-50/50 rounded-2xl border border-slate-100 relative group overflow-hidden",
+                        loading && "min-h-[220px] flex items-center justify-center"
                     )}>
                         {loading ? (
                             <Loader2 className="animate-spin text-slate-300" size={24} />
                         ) : (
-                            <div ref={chartContainerRef} className="w-full h-full" />
+                            <SplitKLineCharts
+                                candles={chartData}
+                                emaLines={[
+                                    { key: 'EMA5', label: 'EMA5', color: '#6366f1' },
+                                    { key: 'EMA20', label: 'EMA20', color: '#f59e0b' },
+                                ]}
+                                priceAction={priceAction}
+                                priceActionLines={priceActionLines}
+                                riskLevels={stockInfo}
+                                paperLines={stockInfo?.is_paper_trade ? [
+                                    { price: stockInfo.buy_price, label: '买入价', color: '#6366f1', date: stockInfo.entry_date },
+                                    { price: stockInfo.active_stop_price || stockInfo.stop_price, label: '止损价', color: '#f43f5e' },
+                                    { price: stockInfo.take_profit_price, label: '止盈价', color: '#10b981' },
+                                ] : []}
+                                height={stockInfo?.is_paper_trade ? 220 : 190}
+                                compact
+                            />
                         )}
-                        <div className="absolute top-2 left-2 z-10 flex gap-2">
-                            <span className="text-[9px] font-bold px-1.5 py-0.5 bg-indigo-50 text-indigo-500 rounded-md">EMA5/20</span>
-                        </div>
                     </div>
                 </div>
             </div>

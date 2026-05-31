@@ -2,13 +2,12 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Optional
 from core.risk_constants import (
-    FIXED_STOP_LOSS_PCT, TIER_HIGH_PROFIT_PCT, TIER_HIGH_TRAIL_RATIO,
-    TIER_MID_PROFIT_PCT, TIER_MID_TRAIL_RATIO,
-    CAPITAL_PROTECT_THRESHOLD_PCT, CAPITAL_PROTECT_FLOOR_PCT,
+    FIXED_STOP_LOSS_PCT, TIER_HIGH_PROFIT_PCT,
     VOLUME_CLIMAX_MULTIPLIER, BACKTEST_MAX_HOLD_DAYS,
     BACKTEST_TRAILING_ATR_MULT,
     ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT
 )
+from core.risk_engine import compute_paper_risk_levels
 
 
 def get_signal_details(
@@ -951,6 +950,8 @@ def evaluate_exit_signals(
     max_pl_pct = (high_price - entry_price) / entry_price * 100
     
     alerts = []
+    risk = compute_paper_risk_levels(entry_price, high_price, curr_price)
+    active_stop = risk.get("active_stop_price") or risk.get("stop_price") or 0
 
     # --- 1. 绝对止损 & ATR 自适应止损 (Survival First) ---
     actual_stop_loss_pct = stop_loss_pct
@@ -964,6 +965,14 @@ def evaluate_exit_signals(
         atr_stop_pct = max(ATR_STOP_MAX_PCT, min(ATR_STOP_MIN_PCT, atr_stop_pct))
         actual_stop_loss_pct = atr_stop_pct
 
+    if curr_price <= active_stop:
+        alerts.append({
+            "level": "critical",
+            "reason": f"触及执行风控价 ¥{active_stop:.2f}（{risk.get('risk_stage', '分阶段风控')}）",
+            "suggestion": "触发当前风控底线，建议无条件平仓"
+        })
+        return alerts
+
     if pl_pct <= actual_stop_loss_pct:
         alerts.append({
             "level": "critical",
@@ -973,8 +982,7 @@ def evaluate_exit_signals(
         return alerts # 止损优先级最高，直接返回
 
     # --- 2. 保本逻辑 (Protect Capital) ---
-    # 如果曾经盈利超过 CAPITAL_PROTECT_THRESHOLD_PCT%，但现在跌回 CAPITAL_PROTECT_FLOOR_PCT% 以内
-    if max_pl_pct >= CAPITAL_PROTECT_THRESHOLD_PCT and pl_pct <= CAPITAL_PROTECT_FLOOR_PCT:
+    if risk.get("capital_protect_price") and curr_price <= risk["capital_protect_price"]:
         alerts.append({
             "level": "critical",
             "reason": "触发保本机制（盈利后回撤至成本线）",
@@ -982,22 +990,12 @@ def evaluate_exit_signals(
         })
 
     # --- 3. 阶梯移动止损 (Trailing Stop) ---
-    # 盈利 > TIER_HIGH_PROFIT_PCT%: 允许从最高点回落
-    if max_pl_pct >= TIER_HIGH_PROFIT_PCT:
-        if curr_price < high_price * TIER_HIGH_TRAIL_RATIO:
-            alerts.append({
-                "level": "critical",
-                "reason": f"高位大幅回撤 ({round(high_price/curr_price*100-100, 1)}%)",
-                "suggestion": f"触发 {TIER_HIGH_PROFIT_PCT}% 档位移动止损，建议落袋为安"
-            })
-    # 盈利 > TIER_MID_PROFIT_PCT%: 允许从最高点回落
-    elif max_pl_pct >= TIER_MID_PROFIT_PCT:
-        if curr_price < high_price * TIER_MID_TRAIL_RATIO:
-            alerts.append({
-                "level": "warning",
-                "reason": f"触及 {TIER_MID_PROFIT_PCT}% 档位移动止盈线",
-                "suggestion": "建议减仓 50% 或收紧止损"
-            })
+    if risk.get("moving_stop_price") and curr_price < risk["moving_stop_price"]:
+        alerts.append({
+            "level": "critical" if max_pl_pct >= TIER_HIGH_PROFIT_PCT else "warning",
+            "reason": f"触及{risk.get('risk_stage', '移动风控')}线 ¥{risk['moving_stop_price']:.2f}",
+            "suggestion": "建议减仓或落袋，避免盈利回吐"
+        })
 
     # --- 4. 技术趋势破位 (Trend Break) ---
     ema5 = latest.get('EMA5', 0)

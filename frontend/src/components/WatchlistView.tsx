@@ -126,6 +126,24 @@ export default function WatchlistView() {
                                     <td className="px-6 py-5">
                                         <p className="text-sm font-bold text-slate-600 line-clamp-2">{item.reason || "未填写"}</p>
                                         {item.invalidation && <p className="text-[10px] font-bold text-slate-400 mt-1">失效条件：{item.invalidation}</p>}
+                                        {item.pa_trade_action && (
+                                            <div className="mt-2 flex flex-wrap gap-1.5">
+                                                <span className={cn(
+                                                    "text-[10px] px-2 py-0.5 rounded-full font-black border",
+                                                    item.pa_trade_action === 'READY' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                                        item.pa_trade_action === 'AVOID' ? "bg-rose-50 text-rose-700 border-rose-100" :
+                                                            "bg-amber-50 text-amber-700 border-amber-100"
+                                                )}>
+                                                    {item.pa_trade_action}
+                                                </span>
+                                                {item.pa_trade_setup && (
+                                                    <span className="text-[10px] px-2 py-0.5 bg-blue-50 text-blue-700 rounded-full font-bold border border-blue-100">{item.pa_trade_setup}</span>
+                                                )}
+                                                {item.pa_risk_pct != null && (
+                                                    <span className="text-[10px] px-2 py-0.5 bg-slate-50 text-slate-500 rounded-full font-bold border border-slate-100">风险 {item.pa_risk_pct}%</span>
+                                                )}
+                                            </div>
+                                        )}
                                     </td>
                                     <td className="px-6 py-5 text-right">
                                         <div className="flex items-center justify-end gap-2">

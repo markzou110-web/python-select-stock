@@ -36,6 +36,102 @@ def _local_extrema(values: pd.Series, mode: str) -> List[int]:
     return points
 
 
+def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a price-action summary into an execution-oriented trade plan.
+
+    The plan is deliberately conservative for A-shares: it separates setups
+    from orders and calls out T+1/overnight risk instead of implying intraday
+    stop execution is always possible.
+    """
+    score = int(summary.get("price_action_score") or 0)
+    regime = str(summary.get("price_action_regime") or "")
+    signal = str(summary.get("price_action_signal") or "")
+    pattern = str(summary.get("price_action_pattern") or "")
+    quality = str(summary.get("price_action_entry_quality") or "观望")
+    entry_price = _safe_float(summary.get("pa_entry_price"))
+    stop_price = _safe_float(summary.get("pa_stop_price"))
+    target_price = _safe_float(summary.get("pa_target_price"))
+    risk_reward = _safe_float(summary.get("pa_risk_reward"))
+    risks = list(summary.get("price_action_risks") or [])
+
+    setup_name = pattern if pattern and pattern != "无明确形态" else signal
+    invalidation = "暂无明确结构失效位。"
+    if stop_price > 0:
+        invalidation = f"收盘或次日盘中有效跌破 {stop_price:.2f}，视为结构失效。"
+
+    risk_pct = 0.0
+    if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
+        risk_pct = round((entry_price - stop_price) / entry_price * 100, 2)
+
+    action = "WAIT"
+    action_label = "等待确认"
+    entry_condition = "等待下一根K线确认方向，不提前预判。"
+    avoid_reasons: List[str] = []
+
+    bearish_context = regime in {"空头趋势", "向下破位"} or "空头" in signal
+    if score < 40 or bearish_context:
+        action = "AVOID"
+        action_label = "暂不参与"
+        avoid_reasons.append("价格行为结构偏弱，先排除主动买入计划。")
+    elif regime == "交易区间":
+        action = "WATCH"
+        action_label = "只观察不追价"
+        entry_condition = "交易区间内只接受下半部反转确认，区间上半部不追突破。"
+        if "假突破" in pattern:
+            action = "AVOID"
+            action_label = "假突破回避"
+            avoid_reasons.append("突破后回到区间内，按 Brooks 假突破处理。")
+        elif score >= 65:
+            entry_condition = "若放量突破区间上沿并收在高位，再按突破确认观察。"
+    elif "H2" in pattern or "回踩" in pattern:
+        action = "READY" if score >= 55 else "WATCH"
+        action_label = "回踩二次入场"
+        entry_condition = f"回踩不破结构位后，突破信号K高点 {entry_price:.2f} 再触发。"
+    elif "突破" in pattern or regime == "向上突破":
+        action = "READY" if score >= 60 else "WATCH"
+        action_label = "突破确认"
+        entry_condition = f"只在价格有效站上 {entry_price:.2f} 且收盘保持强势时执行。"
+    elif score >= 72 and "多头" in signal:
+        action = "READY"
+        action_label = "强趋势K确认"
+        entry_condition = f"次日不大幅高开追价，突破 {entry_price:.2f} 后再按计划执行。"
+
+    if risk_pct >= 10:
+        avoid_reasons.append("结构止损距离超过10%，不适合满仓或重仓。")
+    elif risk_pct >= 8:
+        avoid_reasons.append("结构止损距离偏大，仓位需下调。")
+    if risk_reward and risk_reward < 1.5:
+        avoid_reasons.append("上方空间相对止损距离不足，风险收益比偏低。")
+
+    checklist = [
+        "14:30后确认K线形态仍保持强势",
+        "板块内有至少2只以上个股同步走强",
+        "未出现长上影或放量回落",
+    ]
+    management = [
+        invalidation,
+        "A股T+1下，当日入场后无法日内止损，隔夜风险需提前计入仓位。",
+    ]
+    if target_price > 0:
+        management.append(f"第一测算目标 {target_price:.2f}，到达前优先观察收盘强弱。")
+
+    return {
+        "action": action,
+        "action_label": action_label,
+        "setup": setup_name or "暂无明确结构",
+        "quality": quality,
+        "entry_condition": entry_condition,
+        "invalidation": invalidation,
+        "risk_pct": risk_pct,
+        "risk_reward": risk_reward,
+        "position_hint": "轻仓/观察" if risk_pct >= 8 or action != "READY" else "标准仓位候选",
+        "checklist": checklist,
+        "management": management,
+        "avoid_reasons": list(dict.fromkeys(avoid_reasons + risks))[:5],
+    }
+
+
 def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Analyze recent OHLCV bars and return a normalized price action summary.
@@ -50,11 +146,21 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "price_action_entry_quality": "观望",
         "price_action_summary": "K线样本不足，暂不识别价格行为结构。",
         "price_action_risks": [],
+        "pa_market_cycle": "数据不足",
+        "pa_range_location": "未知",
         "pa_entry_price": None,
         "pa_stop_price": None,
         "pa_target_price": None,
         "pa_risk_reward": 0,
         "pa_tags": [],
+        "pa_trade_plan": build_price_action_trade_plan({
+            "price_action_score": 0,
+            "price_action_regime": "数据不足",
+            "price_action_signal": "暂无",
+            "price_action_pattern": "无明确形态",
+            "price_action_entry_quality": "观望",
+            "price_action_risks": [],
+        }),
     }
     if df is None or df.empty or len(df) < 20:
         return empty
@@ -89,6 +195,16 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     prior_high_20 = _safe_float(work["最高"].iloc[-21:-1].max()) if len(work) >= 21 else _safe_float(recent["最高"].max())
     prior_low_20 = _safe_float(work["最低"].iloc[-21:-1].min()) if len(work) >= 21 else _safe_float(recent["最低"].min())
     recent_width_pct = (recent["最高"].max() - recent["最低"].min()) / max(_safe_float(last["收盘"]), 0.01)
+    recent_high = _safe_float(recent["最高"].max())
+    recent_low = _safe_float(recent["最低"].min())
+    range_height = max(recent_high - recent_low, 0.01)
+    range_position = (_safe_float(last["收盘"]) - recent_low) / range_height
+    if range_position >= 0.67:
+        range_location = "区间上沿"
+    elif range_position <= 0.33:
+        range_location = "区间下沿"
+    else:
+        range_location = "区间中部"
 
     overlap_count = 0
     for i in range(1, len(recent)):
@@ -120,6 +236,14 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         regime = "交易区间"
         regime_score = 14
 
+    market_cycle = regime
+    if regime == "多头趋势" and bull_trend_bars >= 9 and overlap_ratio < 0.45:
+        market_cycle = "Always In Long"
+    elif regime == "空头趋势" and bear_trend_bars >= 9 and overlap_ratio < 0.45:
+        market_cycle = "Always In Short"
+    elif regime == "交易区间":
+        market_cycle = f"交易区间-{range_location}"
+
     signal = "普通K线"
     signal_score = 8
     tags: List[str] = []
@@ -139,6 +263,8 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     )
     is_inside_bar = last["最高"] <= prev["最高"] and last["最低"] >= prev["最低"]
     is_outside_bar = last["最高"] >= prev["最高"] and last["最低"] <= prev["最低"]
+    is_micro_double_bottom = abs(_safe_float(last["最低"]) - _safe_float(prev["最低"])) <= atr20 * 0.35 and last["收盘"] > last["开盘"]
+    is_micro_double_top = abs(_safe_float(last["最高"]) - _safe_float(prev["最高"])) <= atr20 * 0.35 and last["收盘"] < last["开盘"]
 
     if is_bull_trend_bar:
         signal = "强多头趋势K"
@@ -164,6 +290,14 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         signal = "外包K"
         signal_score = 14
         tags.append("波动扩大")
+    elif is_micro_double_bottom:
+        signal = "微型双底反转K"
+        signal_score = 16
+        tags.append("微型双底")
+    elif is_micro_double_top:
+        signal = "微型双顶压力K"
+        signal_score = 6
+        risks.append("近两根K线形成微型双顶，上方供给需确认。")
 
     pattern = "无明确形态"
     pattern_score = 0
@@ -235,7 +369,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         location_score = 8
         risks.append("位于交易区间上半部，追价优势不足。")
     elif regime == "交易区间":
-        location_score = 14
+        location_score = 16 if range_location == "区间下沿" and is_bull_reversal else 14
 
     score = max(0, min(100, regime_score + signal_score + pattern_score + location_score))
     if not risks and score >= 60:
@@ -251,7 +385,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         quality = "观望"
 
     summary = f"{regime} / {pattern} / {signal}"
-    return {
+    result = {
         "price_action_score": int(round(score)),
         "price_action_regime": regime,
         "price_action_signal": signal,
@@ -259,12 +393,16 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "price_action_entry_quality": quality,
         "price_action_summary": summary,
         "price_action_risks": risks[:4],
+        "pa_market_cycle": market_cycle,
+        "pa_range_location": range_location,
         "pa_entry_price": entry_price,
         "pa_stop_price": stop_price,
         "pa_target_price": target_price,
         "pa_risk_reward": rr,
         "pa_tags": list(dict.fromkeys(tags))[:5],
     }
+    result["pa_trade_plan"] = build_price_action_trade_plan(result)
+    return result
 
 
 def build_price_action_annotations(df: pd.DataFrame, lookback: int = 90) -> Dict[str, Any]:

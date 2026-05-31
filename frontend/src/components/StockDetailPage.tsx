@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
     ArrowLeft,
     TrendingUp,
@@ -26,15 +26,8 @@ import {
     PlusCircle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import {
-    createChart,
-    ColorType,
-    CandlestickSeries,
-    LineSeries,
-    IChartApi,
-    createSeriesMarkers
-} from 'lightweight-charts';
 import api from '@/lib/api';
+import SplitKLineCharts from './SplitKLineCharts';
 
 interface StockDetailPageProps {
     code: string;
@@ -71,13 +64,14 @@ interface FullAnalysisData {
         reasoning: string[];
         action_label: string;
     };
+    price_action?: any;
+    price_action_lines?: any[];
 }
 
 export default function StockDetailPage({ code, name, onBack }: StockDetailPageProps) {
     const [data, setData] = useState<FullAnalysisData | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const chartContainerRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         const fetchData = async () => {
@@ -95,159 +89,6 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
         };
         fetchData();
     }, [code]);
-
-    // Chart rendering
-    useEffect(() => {
-        if (!chartContainerRef.current || !data || data.kline.length === 0) return;
-
-        const isPaperTrade = data.stock_info?.is_paper_trade;
-
-        const chart = createChart(chartContainerRef.current, {
-            layout: {
-                background: { type: ColorType.Solid, color: 'transparent' },
-                textColor: '#64748b',
-            },
-            grid: {
-                vertLines: { color: 'rgba(148, 163, 184, 0.08)' },
-                horzLines: { color: 'rgba(148, 163, 184, 0.08)' },
-            },
-            width: chartContainerRef.current.clientWidth,
-            height: 500,
-            timeScale: {
-                borderColor: 'rgba(148, 163, 184, 0.15)',
-                timeVisible: false,
-            },
-            rightPriceScale: {
-                borderColor: 'rgba(148, 163, 184, 0.15)',
-                scaleMargins: { top: 0.08, bottom: 0.08 },
-            },
-            crosshair: {
-                vertLine: { color: 'rgba(99, 102, 241, 0.3)', width: 1 },
-                horzLine: { color: 'rgba(99, 102, 241, 0.3)', width: 1 },
-            },
-        });
-
-        const candleSeries = chart.addSeries(CandlestickSeries, {
-            upColor: '#ef4444',
-            downColor: '#22c55e',
-            borderVisible: false,
-            wickUpColor: '#ef4444',
-            wickDownColor: '#22c55e',
-        });
-
-        const ema5 = chart.addSeries(LineSeries, { color: '#6366f1', lineWidth: 1, title: 'EMA5' });
-        const ema20 = chart.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 1, title: 'EMA20' });
-        const ema60 = chart.addSeries(LineSeries, { color: '#8b5cf6', lineWidth: 1, title: 'EMA60' });
-
-        // Defensive deduplication and ascending sort by time (lightweight-charts constraint)
-        const uniqueKlineMap = new Map();
-        data.kline.forEach(item => {
-            if (item && item.time) {
-                uniqueKlineMap.set(item.time, item);
-            }
-        });
-        const sortedKline = Array.from(uniqueKlineMap.values()).sort((a, b) => a.time.localeCompare(b.time));
-
-        candleSeries.setData(sortedKline);
-        ema5.setData(sortedKline.map(d => ({ time: d.time, value: d.EMA5 })));
-        ema20.setData(sortedKline.map(d => ({ time: d.time, value: d.EMA20 })));
-        ema60.setData(sortedKline.map(d => ({ time: d.time, value: d.EMA60 })));
-
-        // Signal markers
-        if (data.signals?.buy_signals || data.signals?.sell_signals) {
-            const markers: any[] = [];
-            if (data.signals.buy_signals) {
-                for (const sig of data.signals.buy_signals) {
-                    markers.push({
-                        time: sig.time,
-                        position: 'belowBar',
-                        color: '#ef4444',
-                        shape: 'arrowUp',
-                        text: 'B',
-                    });
-                }
-            }
-            if (data.signals.sell_signals) {
-                for (const sig of data.signals.sell_signals) {
-                    markers.push({
-                        time: sig.time,
-                        position: 'aboveBar',
-                        color: sig.pnl_pct >= 0 ? '#22c55e' : '#f59e0b',
-                        shape: 'arrowDown',
-                        text: sig.pnl_pct >= 0 ? `+${sig.pnl_pct}%` : `${sig.pnl_pct}%`,
-                    });
-                }
-            }
-            markers.sort((a, b) => a.time.localeCompare(b.time));
-            if (markers.length > 0) {
-                const markersPlugin = createSeriesMarkers(candleSeries);
-                markersPlugin.setMarkers(markers);
-            }
-        }
-
-        // Trailing stop line
-        if (data.signals?.trailing_stops) {
-            const uniqueTrailingMap = new Map();
-            data.signals.trailing_stops.forEach((ts: any) => {
-                if (ts && ts.time) {
-                    uniqueTrailingMap.set(ts.time, ts.value);
-                }
-            });
-            const sortedTrailing = Array.from(uniqueTrailingMap.entries())
-                .map(([time, value]) => ({ time, value }))
-                .sort((a, b) => a.time.localeCompare(b.time));
-
-            if (sortedTrailing.length > 0) {
-                const trailingSeries = chart.addSeries(LineSeries, {
-                    color: '#f97316', lineWidth: 2, lineStyle: 2,
-                    lastValueVisible: false, priceLineVisible: false
-                });
-                trailingSeries.setData(sortedTrailing);
-            }
-        }
-
-        // Paper trade price lines
-        if (isPaperTrade) {
-            candleSeries.createPriceLine({
-                price: data.stock_info.buy_price,
-                color: '#6366f1',
-                lineWidth: 2,
-                lineStyle: 2,
-                axisLabelVisible: true,
-                title: '买入价',
-            });
-            candleSeries.createPriceLine({
-                price: data.stock_info.stop_price,
-                color: '#f43f5e',
-                lineWidth: 2,
-                lineStyle: 2,
-                axisLabelVisible: true,
-                title: '止损价',
-            });
-            candleSeries.createPriceLine({
-                price: data.stock_info.take_profit_price,
-                color: '#10b981',
-                lineWidth: 2,
-                lineStyle: 2,
-                axisLabelVisible: true,
-                title: '止盈价',
-            });
-        }
-
-        chart.timeScale().fitContent();
-
-        const handleResize = () => {
-            if (chartContainerRef.current) {
-                chart.applyOptions({ width: chartContainerRef.current.clientWidth });
-            }
-        };
-        window.addEventListener('resize', handleResize);
-
-        return () => {
-            window.removeEventListener('resize', handleResize);
-            chart.remove();
-        };
-    }, [data]);
 
     if (loading) {
         return (
@@ -279,6 +120,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const suggestion = data.ai_suggestion;
     const risk = data.risk_assessment;
     const fin = data.financials;
+    const activeStopPrice = info.active_stop_price || info.stop_price || 0;
 
     const actionColors: Record<string, { bg: string; text: string; border: string; glow: string }> = {
         ADD: { bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-200', glow: 'shadow-emerald-100' },
@@ -342,7 +184,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 )}
             </div>
 
-            {/* ═══ Full-Width K-Line Chart ═══ */}
+            {/* ═══ Split K-Line / Price Action Charts ═══ */}
             <div className="glass-card overflow-hidden">
                 {/* Chart legend */}
                 <div className="px-5 py-3 bg-slate-50/50 border-b border-slate-100 flex items-center justify-between">
@@ -377,16 +219,70 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                             </>
                         )}
                     </div>
-                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">200日K线</span>
+                    <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">200日K线 / 价格行为</span>
                 </div>
-                <div ref={chartContainerRef} className="w-full h-[500px]" />
+                <SplitKLineCharts
+                    candles={data.kline}
+                    emaLines={[
+                        { key: 'EMA5', label: 'EMA5', color: '#6366f1' },
+                        { key: 'EMA20', label: 'EMA20', color: '#f59e0b' },
+                        { key: 'EMA60', label: 'EMA60', color: '#8b5cf6' },
+                    ]}
+                    trailingStops={data.signals?.trailing_stops || []}
+                    buySignals={data.signals?.buy_signals || []}
+                    sellSignals={data.signals?.sell_signals || []}
+                    priceAction={data.price_action}
+                    priceActionLines={data.price_action_lines || []}
+                    riskLevels={info}
+                    paperLines={info.is_paper_trade ? [
+                        { price: info.buy_price, label: '买入价', color: '#6366f1', date: info.entry_date },
+                        { price: activeStopPrice, label: '止损价', color: '#f43f5e' },
+                        { price: info.take_profit_price, label: '止盈价', color: '#10b981' },
+                    ] : []}
+                    height={460}
+                />
             </div>
+
+            {data.price_action?.pa_trade_plan && (
+                <div className="glass-card p-5 border border-slate-200">
+                    <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4">
+                        <div className="space-y-2 flex-1">
+                            <div className="flex items-center gap-2">
+                                <Target size={16} className="text-blue-500" />
+                                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">Brooks 交易计划</h4>
+                                <span className={cn(
+                                    "text-[10px] font-black px-2 py-0.5 rounded-lg border",
+                                    data.price_action.pa_trade_plan.action === 'READY' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                        data.price_action.pa_trade_plan.action === 'AVOID' ? "bg-rose-50 text-rose-700 border-rose-100" :
+                                            "bg-amber-50 text-amber-700 border-amber-100"
+                                )}>
+                                    {data.price_action.pa_trade_plan.action_label}
+                                </span>
+                            </div>
+                            <div className="text-base font-black text-slate-800">{data.price_action.pa_trade_plan.setup}</div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-semibold text-slate-600">
+                                <p><span className="text-slate-400">触发：</span>{data.price_action.pa_trade_plan.entry_condition}</p>
+                                <p><span className="text-slate-400">失效：</span>{data.price_action.pa_trade_plan.invalidation}</p>
+                                <p><span className="text-slate-400">仓位：</span>{data.price_action.pa_trade_plan.position_hint} / 风险 {data.price_action.pa_trade_plan.risk_pct || 0}%</p>
+                            </div>
+                        </div>
+                        {data.price_action.pa_trade_plan.avoid_reasons?.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 lg:max-w-sm">
+                                {data.price_action.pa_trade_plan.avoid_reasons.map((reason: string, i: number) => (
+                                    <span key={i} className="text-[10px] px-2 py-0.5 bg-slate-50 text-slate-500 rounded-full font-bold border border-slate-100">{reason}</span>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
 
             {/* ═══ Trading Metrics Strip ═══ */}
             {info.is_paper_trade && (
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
                     <MetricCard label="买入均价" value={`¥${info.buy_price.toFixed(2)}`} color="text-indigo-600" icon={<DollarSign size={14} />} />
-                    <MetricCard label="移动止损" value={`¥${info.stop_price.toFixed(2)}`} color="text-rose-600" icon={<ShieldAlert size={14} />} />
+                    <MetricCard label="初始止损" value={`¥${(info.initial_stop_price || 0).toFixed(2)}`} color="text-rose-500" icon={<ShieldAlert size={14} />} />
+                    <MetricCard label="执行风控" value={`¥${activeStopPrice.toFixed(2)}`} color="text-rose-600" icon={<ShieldAlert size={14} />} />
                     <MetricCard label="目标止盈" value={`¥${info.take_profit_price.toFixed(2)}`} color="text-emerald-600" icon={<Target size={14} />} />
                     <MetricCard
                         label="当前盈亏"
@@ -395,6 +291,14 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                         icon={info.pl_pct >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
                     />
                     <MetricCard label="持仓天数" value={`${info.hold_days}天`} color="text-slate-600" icon={<Clock size={14} />} />
+                </div>
+            )}
+            {info.is_paper_trade && (info.entry_source || info.entry_signal_date || info.entry_reason_snapshot) && (
+                <div className="glass-card px-4 py-3 text-xs font-semibold text-slate-500 flex flex-wrap gap-x-5 gap-y-1">
+                    <span>买入依据：{info.entry_reason_snapshot || '未记录'}</span>
+                    <span>买入日期：{info.entry_date || '未记录'}</span>
+                    <span>信号日期：{info.entry_signal_date || '未记录'}</span>
+                    <span>价格来源：{info.entry_source || '未记录'}</span>
                 </div>
             )}
 

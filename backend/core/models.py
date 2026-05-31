@@ -52,6 +52,9 @@ class ScanHistory(Base):
     pa_stop_price = Column(Float, nullable=True)
     pa_target_price = Column(Float, nullable=True)
     pa_risk_reward = Column(Float, nullable=True)
+    pa_trade_action = Column(String(20), nullable=True)
+    pa_trade_setup = Column(String(80), nullable=True)
+    pa_risk_pct = Column(Float, nullable=True)
 
 class PaperTrading(Base):
     __tablename__ = "paper_trading"
@@ -65,9 +68,20 @@ class PaperTrading(Base):
     status = Column(String(20), default='OPEN')
     close_price = Column(Float, nullable=True)
     close_date = Column(Date, nullable=True)
+    close_source = Column(String(50), nullable=True)
+    closed_by = Column(String(50), nullable=True)
+    updated_at = Column(DateTime, nullable=True)
     strategy_type = Column(String(20), nullable=True)
     remark = Column(Text, nullable=True)
     trade_mode = Column(String(20), default='SIMULATED', nullable=False)  # SIMULATED | REAL
+    entry_source = Column(String(50), nullable=True)
+    entry_signal_date = Column(Date, nullable=True)
+    entry_reason_snapshot = Column(Text, nullable=True)
+    pa_trade_action = Column(String(20), nullable=True)
+    pa_trade_setup = Column(String(80), nullable=True)
+    pa_entry_condition = Column(Text, nullable=True)
+    pa_invalidation = Column(Text, nullable=True)
+    pa_risk_pct = Column(Float, nullable=True)
 
 class SystemSetting(Base):
     __tablename__ = "system_settings"
@@ -100,6 +114,11 @@ class WatchlistItem(Base):
     status = Column(String(20), default="WATCHING")
     reason = Column(Text, nullable=True)
     invalidation = Column(Text, nullable=True)
+    pa_trade_action = Column(String(20), nullable=True)
+    pa_trade_setup = Column(String(80), nullable=True)
+    pa_entry_condition = Column(Text, nullable=True)
+    pa_invalidation = Column(Text, nullable=True)
+    pa_risk_pct = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

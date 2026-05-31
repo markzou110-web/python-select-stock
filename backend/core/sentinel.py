@@ -11,6 +11,7 @@ import asyncio
 from core.config import config
 from core.logging_config import logger
 from core.db import get_setting
+from core.trading_calendar import is_a_share_intraday_session
 
 
 def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str]:
@@ -19,6 +20,9 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     Only sends A/B grade stocks with actionable information.
     """
     if not stock_list:
+        return None
+    if not is_a_share_intraday_session():
+        logger.info("Sentinel: Market is closed, skip Bark intraday notification.")
         return None
 
     # 仅推送 A 和 B 级标的
@@ -78,6 +82,7 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         from core.indicators import calculate_indicators
         from core.strategy import evaluate_exit_signals
         from core.risk_constants import ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT
+        from core.risk_engine import safe_float
         
         try:
             df_real = pd.read_sql("SELECT code, name, entry_price, high_since_entry FROM paper_trading WHERE status = 'OPEN' AND trade_mode = 'REAL'", engine)
@@ -87,21 +92,20 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
                 
                 snapshot = get_market_snapshot()
                 snap_map = snapshot.set_index('code')['price'].to_dict() if not snapshot.empty else {}
+                snap_high_map = snapshot.set_index('code')['high'].to_dict() if not snapshot.empty and 'high' in snapshot.columns else {}
                 bench_df = get_index_hist('000001')
                 
                 for _, row in df_real.iterrows():
                     code = row['code']
                     name = row['name']
-                    entry = float(row['entry_price'])
-                    high = float(row.get('high_since_entry') or entry)
-                    
-                    import math
-                    if math.isnan(high): high = entry
+                    entry = safe_float(row['entry_price'])
+                    high = safe_float(row.get('high_since_entry'), entry)
                         
                     curr = snap_map.get(code)
                     if not curr:
                         lines.append(f"• {name}: 暂无行情")
                         continue
+                    high = max(high, safe_float(snap_high_map.get(code), curr), curr)
                         
                     pl_pct = (curr - entry) / entry * 100
                     status_line = f"• {name}: 现价 {curr} ({pl_pct:+.2f}%)"
@@ -184,6 +188,12 @@ class IntradaySentinel:
                     self.triggered_today.clear()
 
                 if current_time in self.schedule_times and current_time not in self.triggered_today:
+                    if not is_a_share_intraday_session(now):
+                        logger.info(f"Sentinel skipped at {current_time}: non-trading session.")
+                        self.triggered_today.add(current_time)
+                        time.sleep(30)
+                        continue
+
                     logger.info(f"Sentinel Triggered at {current_time}: Automated check...")
                     self.triggered_today.add(current_time)
                     try:

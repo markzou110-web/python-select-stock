@@ -63,6 +63,11 @@ export default function ReviewCenter() {
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <ChartCard title="Brooks 动作表现" data={data?.by_pa_action || []} xKey="action" barKey="win_rate" suffix="%" />
+                <TableCard title="Brooks 形态表现" rows={data?.by_price_action || []} nameKey="setup" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <TableCard title="板块表现 Top" rows={data?.by_industry || []} nameKey="industry" />
                 <TableCard title="最近扫描日期表现" rows={data?.recent_dates || []} nameKey="date" />
             </div>

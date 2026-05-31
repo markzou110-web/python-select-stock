@@ -31,8 +31,16 @@ export interface ScanResult {
     sop_bonuses?: string[];
     entry_price?: number;
     stop_price?: number;
+    plan_stop_price?: number;
+    initial_stop_price?: number;
+    structure_stop_price?: number;
+    target_price?: number;
+    risk_reward?: number;
+    risk_notes?: string[];
     pct_5d?: number;
     mkt_cap_yi?: number;
+    date?: string;
+    日期?: string;
     sector_trend?: string;
     sector_pct?: number;
     price_action_score?: number;
@@ -42,11 +50,30 @@ export interface ScanResult {
     price_action_entry_quality?: string;
     price_action_summary?: string;
     price_action_risks?: string[];
+    pa_market_cycle?: string;
+    pa_range_location?: string;
     pa_entry_price?: number;
     pa_stop_price?: number;
     pa_target_price?: number;
     pa_risk_reward?: number;
     pa_tags?: string[];
+    pa_trade_action?: 'READY' | 'WATCH' | 'WAIT' | 'AVOID' | string;
+    pa_trade_setup?: string;
+    pa_risk_pct?: number;
+    pa_trade_plan?: {
+        action: 'READY' | 'WATCH' | 'WAIT' | 'AVOID';
+        action_label: string;
+        setup: string;
+        quality: string;
+        entry_condition: string;
+        invalidation: string;
+        risk_pct: number;
+        risk_reward: number;
+        position_hint: string;
+        checklist: string[];
+        management: string[];
+        avoid_reasons: string[];
+    };
 }
 
 export interface BacktestStats {

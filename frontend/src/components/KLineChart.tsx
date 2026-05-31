@@ -1,16 +1,9 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from 'react';
-import {
-    createChart,
-    ColorType,
-    IChartApi,
-    CandlestickSeries,
-    LineSeries,
-    createSeriesMarkers
-} from 'lightweight-charts';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '@/lib/api';
-import { TrendingUp, TrendingDown, Target, Zap } from 'lucide-react';
+import { Target, TrendingDown, TrendingUp, Zap } from 'lucide-react';
+import SplitKLineCharts from './SplitKLineCharts';
 
 interface KLineChartProps {
     code: string;
@@ -38,137 +31,22 @@ interface SignalData {
 }
 
 export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLineChartProps) {
-    const chartContainerRef = useRef<HTMLDivElement>(null);
-    const chartRef = useRef<IChartApi | null>(null);
+    const [chartData, setChartData] = useState<any | null>(null);
     const [signalData, setSignalData] = useState<SignalData | null>(null);
+    const [loading, setLoading] = useState(true);
     const [signalLoading, setSignalLoading] = useState(false);
 
     useEffect(() => {
-        if (!chartContainerRef.current) return;
-
-        const handleResize = () => {
-            chartRef.current?.applyOptions({ width: chartContainerRef.current?.clientWidth });
-        };
-
-        const chart = createChart(chartContainerRef.current, {
-            layout: {
-                background: { type: ColorType.Solid, color: 'transparent' },
-                textColor: '#64748b',
-            },
-            grid: {
-                vertLines: { color: 'rgba(148, 163, 184, 0.1)' },
-                horzLines: { color: 'rgba(148, 163, 184, 0.1)' },
-            },
-            width: chartContainerRef.current.clientWidth,
-            height: 400,
-            timeScale: {
-                borderColor: 'rgba(148, 163, 184, 0.2)',
-            },
-        });
-
-        const candlestickSeries = chart.addSeries(CandlestickSeries, {
-            upColor: '#ef4444',
-            downColor: '#22c55e',
-            borderVisible: false,
-            wickUpColor: '#ef4444',
-            wickDownColor: '#22c55e',
-        });
-
-        const ema20Series = chart.addSeries(LineSeries, { color: '#f59e0b', lineWidth: 1, title: 'EMA20' });
-        const ema120Series = chart.addSeries(LineSeries, { color: '#3b82f6', lineWidth: 1, title: 'EMA120' });
-        const ema250Series = chart.addSeries(LineSeries, { color: '#8b5cf6', lineWidth: 1, title: 'EMA250' });
-        
-        const trailingStopSeries = chart.addSeries(LineSeries, { 
-            color: '#f97316', 
-            lineWidth: 2, 
-            lineStyle: 2, // Dashed
-            title: 'Trailing Stop',
-            lastValueVisible: false,
-            priceLineVisible: false
-        });
-
-        chartRef.current = chart;
-
         const fetchData = async () => {
+            setLoading(true);
             try {
-                const res = await api.get(`/api/stock/${code}/kline?local_only=true`);
-                const rawData = res.data.data;
+                const res = await api.get(`/api/kline/${code}?strategy_type=${strategyType}`);
+                setChartData(res.data);
 
-                if (rawData && rawData.length > 0) {
-                    const uniqueKlineMap = new Map();
-                    rawData.forEach((item: any) => {
-                        if (item && item.time) {
-                            uniqueKlineMap.set(item.time, item);
-                        }
-                    });
-                    const sortedKline = Array.from(uniqueKlineMap.values()).sort((a: any, b: any) => a.time.localeCompare(b.time));
-
-                    candlestickSeries.setData(sortedKline);
-
-                    ema20Series.setData(sortedKline.map((d: any) => ({ time: d.time, value: d.EMA20 })));
-                    ema120Series.setData(sortedKline.map((d: any) => ({ time: d.time, value: d.EMA120 })));
-                    ema250Series.setData(sortedKline.map((d: any) => ({ time: d.time, value: d.EMA250 })));
-
-                    chart.timeScale().fitContent();
-                }
-
-                // Fetch buy/sell signals for overlay
                 setSignalLoading(true);
                 try {
                     const sigRes = await api.get(`/api/stock/${code}/signals?strategy=${strategyType}`);
-                    const signals: SignalData = sigRes.data;
-                    setSignalData(signals);
-
-                    // Build markers array for lightweight-charts
-                    const markers: any[] = [];
-
-                    if (signals.buy_signals) {
-                        for (const sig of signals.buy_signals) {
-                            markers.push({
-                                time: sig.time,
-                                position: 'belowBar',
-                                color: '#ef4444',
-                                shape: 'arrowUp',
-                                text: 'B',
-                            });
-                        }
-                    }
-
-                    if (signals.sell_signals) {
-                        for (const sig of signals.sell_signals) {
-                            markers.push({
-                                time: sig.time,
-                                position: 'aboveBar',
-                                color: sig.pnl_pct >= 0 ? '#22c55e' : '#f59e0b',
-                                shape: 'arrowDown',
-                                text: sig.pnl_pct >= 0 ? `+${sig.pnl_pct}%` : `${sig.pnl_pct}%`,
-                            });
-                        }
-                    }
-
-                    // Sort markers by time (required by lightweight-charts)
-                    markers.sort((a, b) => a.time.localeCompare(b.time));
-
-                    if (markers.length > 0) {
-                        const markersPlugin = createSeriesMarkers(candlestickSeries);
-                        markersPlugin.setMarkers(markers);
-                    }
-
-                    if (signals.trailing_stops) {
-                        const uniqueTrailingMap = new Map();
-                        signals.trailing_stops.forEach((ts: any) => {
-                            if (ts && ts.time) {
-                                uniqueTrailingMap.set(ts.time, ts.value);
-                            }
-                        });
-                        const sortedTrailing = Array.from(uniqueTrailingMap.entries())
-                            .map(([time, value]) => ({ time, value }))
-                            .sort((a, b) => a.time.localeCompare(b.time));
-
-                        if (sortedTrailing.length > 0) {
-                            trailingStopSeries.setData(sortedTrailing);
-                        }
-                    }
+                    setSignalData(sigRes.data);
                 } catch (e) {
                     console.warn("Signal fetch failed (non-critical):", e);
                 } finally {
@@ -176,20 +54,14 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                 }
             } catch (e) {
                 console.error("Failed to fetch kline data", e);
+            } finally {
+                setLoading(false);
             }
         };
 
         fetchData();
-
-        window.addEventListener('resize', handleResize);
-
-        return () => {
-            window.removeEventListener('resize', handleResize);
-            chart.remove();
-        };
     }, [code, strategyType]);
 
-    // Compute signal stats
     const totalBuys = signalData?.buy_signals?.length || 0;
     const totalSells = signalData?.sell_signals?.length || 0;
     const wins = signalData?.sell_signals?.filter(s => s.pnl_pct > 0).length || 0;
@@ -202,42 +74,48 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
         ? (signalData!.sell_signals.reduce((acc, s) => acc + s.hold_days, 0) / totalSells).toFixed(1)
         : '0';
 
-    return (
-        <div className="w-full h-full relative flex flex-col">
-            <div className="absolute top-4 left-6 z-10 flex gap-4">
-                <div className="flex items-center gap-1.5">
-                    <div className="w-2.5 h-2.5 rounded-full bg-amber-500" />
-                    <span className="text-[10px] font-bold text-slate-500">EMA 20</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                    <div className="w-2.5 h-2.5 rounded-full bg-blue-500" />
-                    <span className="text-[10px] font-bold text-slate-500">EMA 120</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                    <div className="w-2.5 h-2.5 rounded-full bg-purple-500" />
-                    <span className="text-[10px] font-bold text-slate-500">EMA 250</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                    <div className="w-3 h-0.5 bg-orange-500 border-t border-dashed border-orange-500" />
-                    <span className="text-[10px] font-bold text-orange-500">移动止损</span>
-                </div>
-                {totalBuys > 0 && (
-                    <>
-                        <div className="w-px h-4 bg-slate-200" />
-                        <div className="flex items-center gap-1.5">
-                            <div className="w-0 h-0 border-l-[4px] border-r-[4px] border-b-[6px] border-transparent border-b-red-500" />
-                            <span className="text-[10px] font-bold text-rose-500">买入 B ({totalBuys})</span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                            <div className="w-0 h-0 border-l-[4px] border-r-[4px] border-t-[6px] border-transparent border-t-emerald-500" />
-                            <span className="text-[10px] font-bold text-emerald-500">卖出 S ({totalSells})</span>
-                        </div>
-                    </>
-                )}
-            </div>
-            <div ref={chartContainerRef} className="w-full flex-1" />
+    const emaLines = useMemo(() => [
+        { key: 'EMA20', label: 'EMA20', color: '#f59e0b' },
+        { key: 'EMA120', label: 'EMA120', color: '#3b82f6' },
+        { key: 'EMA250', label: 'EMA250', color: '#8b5cf6' },
+    ], []);
 
-            {/* Signal Summary Panel */}
+    if (loading) {
+        return (
+            <div className="w-full h-[420px] flex items-center justify-center bg-slate-50 rounded-lg">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600" />
+            </div>
+        );
+    }
+
+    return (
+        <div className="w-full h-full relative flex flex-col bg-white border border-slate-200 rounded-lg overflow-hidden">
+            <div className="px-4 py-2 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
+                <div className="font-bold text-slate-800">
+                    {name} <span className="text-slate-500 text-sm ml-2">{code}</span>
+                </div>
+                <div className="flex items-center gap-3 text-[10px] font-bold text-slate-500">
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" />EMA20</span>
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-blue-500" />EMA120</span>
+                    <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-purple-500" />EMA250</span>
+                </div>
+            </div>
+
+            {chartData && (
+                <SplitKLineCharts
+                    candles={chartData.candlestick || []}
+                    emaLines={emaLines}
+                    rfFilter={chartData.rf_filter || []}
+                    trailingStops={chartData.trailing_stops || signalData?.trailing_stops || []}
+                    markers={chartData.markers || []}
+                    buySignals={signalData?.buy_signals || []}
+                    sellSignals={signalData?.sell_signals || []}
+                    priceAction={chartData.price_action || null}
+                    priceActionLines={chartData.price_action_lines || []}
+                    height={400}
+                />
+            )}
+
             {totalBuys > 0 && !signalLoading && (
                 <div className="px-4 py-3 bg-gradient-to-r from-slate-50 to-indigo-50/30 border-t border-slate-100 flex items-center justify-between gap-4">
                     <div className="flex items-center gap-1.5">
