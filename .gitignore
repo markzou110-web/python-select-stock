@@ -1,2 +1,25 @@
 *.db
+*.sqlite
+*.sqlite3
 *.log
+
+# Local secrets and runtime configuration
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/db_config.json
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+backend/venv_new/
+.pytest_cache/
+
+# Local process files
+*.pid
+.backend_pid
+.frontend_pid
+.celery_pid

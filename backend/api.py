@@ -1382,7 +1382,7 @@ def scan_market_post(request: ScanRequest):
 def get_settings_api():
     return {
         "sentinel_time": get_setting("sentinel_time", "14:30"),
-        "bark_key": BARK_KEY
+        "bark_configured": bool(BARK_KEY and "YOUR_BARK_KEY" not in BARK_KEY)
     }
 
 @app.post("/api/settings")

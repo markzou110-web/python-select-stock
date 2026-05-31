@@ -18,7 +18,7 @@ import api from '@/lib/api';
 export default function SettingsView() {
     const [settings, setSettings] = useState({
         sentinel_time: "14:20",
-        bark_key: ""
+        bark_configured: false
     });
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -138,12 +138,12 @@ export default function SettingsView() {
                             </label>
                             <input
                                 type="password"
-                                value={settings.bark_key}
+                                value={settings.bark_configured ? '已配置' : '未配置'}
                                 disabled
                                 className="w-full bg-slate-100 border border-slate-100 text-slate-400 font-mono font-bold rounded-xl px-4 py-3 cursor-not-allowed"
                             />
                             <p className="text-[10px] text-slate-400 font-medium">
-                                🔒 已通过后台环境配置文件加载。如需修改，请直接编辑 `backend/api.py` 中的 BARK_KEY。
+                                🔒 已通过后台环境变量加载。如需修改，请设置后端运行环境中的 BARK_KEY。
                             </p>
                         </div>
                     </div>

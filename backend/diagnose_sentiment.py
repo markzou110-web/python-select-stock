@@ -23,7 +23,6 @@ def check_env_variable():
     print(f"\nZHIPUAI_API_KEY: {'✅ 已设置' if zhipu_key else '❌ 未设置'}")
     if zhipu_key:
         print(f"   Key 长度: {len(zhipu_key)} 字符")
-        print(f"   Key 前缀: {zhipu_key[:10]}...")
         if zhipu_key == "your_zhipuai_api_key_here":
             print("   ⚠️  警告: 使用的是示例 Key，请替换为真实 Key")
         elif len(zhipu_key) < 20:
@@ -31,7 +30,7 @@ def check_env_variable():
 
     print(f"\nDEEPSEEK_API_KEY: {'✅ 已设置' if deepseek_key else '❌ 未设置'}")
     if deepseek_key:
-        print(f"   Key 前缀: {deepseek_key[:10]}...")
+        print("   ✅ 已配置非空 Key")
 
     return zhipu_key, deepseek_key
 
@@ -54,16 +53,14 @@ def check_dotenv():
                 content = f.read()
                 if 'ZHIPUAI_API_KEY' in content:
                     print("   ✅ 文件中包含 ZHIPUAI_API_KEY")
-                    # 提取值
                     for line in content.split('\n'):
                         if 'ZHIPUAI_API_KEY' in line and not line.strip().startswith('#'):
-                            print(f"   配置行: {line}")
                             if '=' in line:
                                 value = line.split('=')[1].strip()
                                 if value == "your_zhipuai_api_key_here":
                                     print("   ⚠️  使用的是示例 Key")
-                                elif len(value) > 10:
-                                    print(f"   Key 前缀: {value[:10]}...")
+                                elif value:
+                                    print("   ✅ 已配置非空 Key")
                 else:
                     print("   ⚠️  文件中未找到 ZHIPUAI_API_KEY")
 
