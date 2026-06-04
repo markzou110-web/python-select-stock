@@ -37,6 +37,32 @@ from core.sector_strength import build_sector_strength, build_sector_history_con
 from routers.market import fetch_mine_sweeper_data
 
 
+EXECUTABLE_PA_ACTIONS = {"READY", "WATCH"}
+BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
+
+
+def _pa_plan_action(res: Dict[str, Any]) -> str:
+    plan = res.get('pa_trade_plan') or {}
+    return str(plan.get('action') or res.get('pa_trade_action') or "").upper()
+
+
+def _daily_limit_tolerance_pct(code: str) -> float:
+    code = str(code or "")
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return 30.5
+    if code.startswith(("300", "301", "688", "689")):
+        return 20.5
+    return 10.5
+
+
+def _is_abnormal_price_move(code: str, pct: Any) -> bool:
+    try:
+        pct_value = abs(float(pct or 0))
+    except (TypeError, ValueError):
+        return False
+    return pct_value > _daily_limit_tolerance_pct(code)
+
+
 def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
     """Translate Brooks price-action context into a bounded scan ranking adjustment."""
     adjustment = 0.0
@@ -74,7 +100,10 @@ def _is_momentum_watch_candidate(res: Dict[str, Any], vetoes: List[str]) -> bool
     """Keep strong movers visible without promoting them to executable A/B candidates."""
     if not vetoes:
         return False
-    fatal_vetoes = {"地雷预警", "市值<30亿", "板块下跌", "上影线过长", "Brooks风险偏高"}
+    fatal_vetoes = {
+        "地雷预警", "市值<30亿", "板块下跌", "上影线过长",
+        "Brooks风险偏高", "异常价格跳变", "价格行为回避", "低质量价格结构",
+    }
     if any(v in fatal_vetoes for v in vetoes):
         return False
     has_momentum_veto = any(v in {"涨幅>7%", "5日涨>15%"} for v in vetoes)
@@ -93,6 +122,73 @@ def _is_momentum_watch_candidate(res: Dict[str, Any], vetoes: List[str]) -> bool
     volume_ok = bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') == '放量突破'
     trend_ok = res.get('price_action_regime') in {'向上突破', '多头趋势'} or res.get('pa_weekly_context') == '周线多头'
     return structure_ok and (volume_ok or trend_ok)
+
+
+def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
+    """Classify scan hits into executable, observation, or blocked trade buckets."""
+    action = _pa_plan_action(res)
+    setup = str(res.get('pa_trade_setup') or "")
+    strategy_type = str(res.get('strategy_type') or "")
+    blockers: List[str] = []
+
+    if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
+        blockers.append("异常价格跳变，排除交易")
+    if action == "AVOID":
+        blockers.append("价格行为建议回避")
+    elif action and action not in EXECUTABLE_PA_ACTIONS:
+        blockers.append("交易计划未确认")
+    elif not action and strategy_type in {"tv_dual", "tv_dual_strict"}:
+        blockers.append("缺少价格行为交易计划")
+    if setup in BLOCKED_PA_SETUPS:
+        blockers.append(f"{setup}结构不进入交易池")
+    if res.get('sector_trend') == 'DOWN':
+        blockers.append("板块下跌")
+    if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
+        blockers.append("板块扩散转弱")
+    if float(res.get('涨幅%', 0) or 0) >= 9.8:
+        blockers.append("涨停/近涨停，等待隔日确认")
+    elif float(res.get('涨幅%', 0) or 0) > 7:
+        blockers.append("涨幅偏高，等待回踩确认")
+
+    score = float(res.get('final_rank_score', res.get('Score', 0)) or 0)
+    if action == "READY":
+        score += 8
+    elif action == "WATCH":
+        score += 2
+    elif action == "AVOID":
+        score -= 20
+    elif action:
+        score -= 8
+
+    if setup in BLOCKED_PA_SETUPS:
+        score -= 12
+    if res.get('sector_trend') == 'LEAD':
+        score += 5
+    if (res.get('sector_alignment_score') or 0) >= 75:
+        score += 5
+    if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
+        score -= 25
+    if float(res.get('涨幅%', 0) or 0) > 7:
+        score -= 8
+
+    grade = res.get('sop_grade')
+    fatal_markers = ("回避", "结构不进入交易池", "异常价格跳变", "板块下跌")
+    has_fatal_blocker = any(any(marker in b for marker in fatal_markers) for b in blockers)
+    trade_eligible = grade in {"A", "B"} and not blockers and strategy_type != "sector_watch"
+    if trade_eligible:
+        bucket = "TRADE"
+    elif has_fatal_blocker:
+        bucket = "BLOCK"
+    else:
+        bucket = "OBSERVE"
+
+    res['trade_eligible'] = trade_eligible
+    res['trade_bucket'] = bucket
+    res['trade_blockers'] = blockers
+    res['final_trade_score'] = round(score, 2)
+    if strategy_type == "pine":
+        res['trade_timeframe'] = "SHORT_1_2D"
+        res['exit_hint'] = "Pine信号按1-2个交易日短线管理，次日不强则降级观察"
 
 
 def _apply_sop_filter(results, market_regime, sector_trends):
@@ -115,6 +211,12 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             vetoes.append("地雷预警")
         if 0 < res.get('mkt_cap_yi', 0) < 30:
             vetoes.append("市值<30亿")
+        if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
+            vetoes.append("异常价格跳变")
+        if _pa_plan_action(res) == "AVOID":
+            vetoes.append("价格行为回避")
+        if str(res.get('pa_trade_setup') or "") in BLOCKED_PA_SETUPS:
+            vetoes.append("低质量价格结构")
 
         # 板块下跌否决
         sector = res.get('行业', '')
@@ -199,6 +301,7 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             res['sop_bonuses'].append("强势动量观察")
             res['momentum_watch_only'] = True
             res['momentum_watch_reason'] = "涨幅/短线涨幅偏高，不追买；保留观察回踩或次日确认"
+        _apply_trade_execution_profile(res)
 
 
 def _early_watch_quality(res: Dict[str, Any]) -> tuple[bool, List[str]]:
@@ -357,6 +460,17 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
 
     if len(df) < min_days:
         return {"reason": f"样本不足({len(df)})"}
+
+    if len(df) >= 2:
+        try:
+            latest_close = float(df['收盘'].iloc[-1])
+            prev_close = float(df['收盘'].iloc[-2])
+            if prev_close > 0:
+                daily_pct = (latest_close - prev_close) / prev_close * 100
+                if _is_abnormal_price_move(code, daily_pct):
+                    return {"reason": f"异常价格跳变({daily_pct:.2f}%)"}
+        except (TypeError, ValueError, KeyError):
+            pass
 
     try:
         # 技术指标计算 - 预加载数据可能已有通用指标，但仍缺少 Pine 专属指标。
