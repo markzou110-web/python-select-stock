@@ -57,6 +57,9 @@ def run_single_backtest(payload: Dict[str, Any]):
             "trailing_multiplier": payload.get("trailing_multiplier", 2.2),
             "time_stop_days": payload.get("time_stop_days"),
             "capital": payload.get("capital", 100000),
+            "entry_mode": payload.get("entry_mode", "signal_close"),
+            "max_open_gap_pct": payload.get("max_open_gap_pct", 3.0),
+            "limit_up_gap_pct": payload.get("limit_up_gap_pct", 9.5),
         },
     )
     result["meta"] = {

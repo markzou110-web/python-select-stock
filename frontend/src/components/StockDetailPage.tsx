@@ -519,6 +519,58 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 </div>
             )}
 
+            {(info.position_decision || info.trade_bucket || info.latest_scan_pa_action) && (
+                <div className="glass-card p-5 border border-slate-200">
+                    <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                        <div className="flex items-start gap-3">
+                            <div className={cn(
+                                "w-10 h-10 rounded-xl flex items-center justify-center",
+                                info.trade_bucket === 'BLOCK' || info.position_decision?.grade === 'EXIT'
+                                    ? "bg-rose-50 text-rose-600"
+                                    : info.trade_bucket === 'TRADE' || info.position_decision?.grade?.startsWith('HOLD')
+                                        ? "bg-emerald-50 text-emerald-600"
+                                        : "bg-amber-50 text-amber-600"
+                            )}>
+                                {info.trade_bucket === 'BLOCK' || info.position_decision?.grade === 'EXIT' ? <XCircle size={20} /> : <CheckCircle2 size={20} />}
+                            </div>
+                            <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">执行纪律</h4>
+                                    {info.trade_bucket && (
+                                        <span className={cn(
+                                            "px-2 py-0.5 rounded-md border text-[10px] font-black",
+                                            info.trade_bucket === 'TRADE' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                                info.trade_bucket === 'BLOCK' ? "bg-rose-50 text-rose-700 border-rose-100" :
+                                                    "bg-sky-50 text-sky-700 border-sky-100"
+                                        )}>
+                                            {info.trade_bucket}
+                                        </span>
+                                    )}
+                                    {info.final_trade_score != null && (
+                                        <span className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-100 text-[10px] font-black text-slate-500">
+                                            交易分 {Number(info.final_trade_score).toFixed(0)}
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="mt-1 text-base font-black text-slate-800">
+                                    {info.position_decision?.label || info.latest_scan_pa_action || '等待确认'}
+                                </div>
+                                <p className="mt-1 text-xs font-semibold text-slate-500">
+                                    {info.position_decision?.action || (info.trade_bucket === 'TRADE' ? '14:40后确认接近入场线、未破失效线再小仓' : info.trade_bucket === 'BLOCK' ? '只复盘不交易，不追高开或结构失效票' : '先观察，等回踩/放量站稳')}
+                                </p>
+                            </div>
+                        </div>
+                        {Array.isArray(info.trade_blockers) && info.trade_blockers.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 lg:max-w-md">
+                                {info.trade_blockers.slice(0, 4).map((reason: string, idx: number) => (
+                                    <span key={idx} className="text-[10px] px-2 py-0.5 bg-rose-50 text-rose-600 rounded-full font-bold border border-rose-100">{reason}</span>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+
             {/* ═══ Trading Metrics Strip ═══ */}
             {info.is_paper_trade && (
                 <div className="grid grid-cols-2 md:grid-cols-6 gap-3">

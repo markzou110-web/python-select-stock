@@ -69,6 +69,7 @@ export default function ReviewCenter() {
     }
 
     const summary = data?.summary || {};
+    const execution = data?.execution_summary || {};
 
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -91,6 +92,19 @@ export default function ReviewCenter() {
                 <Stat label="5日胜率" value={`${summary.win_rate_5d || 0}%`} sub={`均收 ${summary.avg_return_5d >= 0 ? '+' : ''}${summary.avg_return_5d || 0}%`} icon={<TrendingUp size={20} />} hot={(summary.win_rate_5d || 0) >= 50} />
                 <Stat label="优势板块" value={summary.best_bucket || "暂无"} sub="按5日胜率排序" icon={<BarChart3 size={20} />} />
                 <Stat label="薄弱板块" value={summary.worst_bucket || "暂无"} sub="建议降低权重" icon={<Activity size={20} />} />
+            </div>
+
+            <div className="glass-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-black text-slate-800">执行过滤效果</h3>
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Trade bucket review</span>
+                </div>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                    <MiniStat label="可交易信号" value={`${execution.trade_signals || 0}`} />
+                    <MiniStat label="可交易1日胜率" value={`${execution.trade_win_rate_1d || 0}%`} hot={(execution.trade_win_rate_1d || 0) >= 50} />
+                    <MiniStat label="可交易1日均收" value={`${(execution.trade_avg_return_1d || 0) >= 0 ? '+' : ''}${execution.trade_avg_return_1d || 0}%`} hot={(execution.trade_avg_return_1d || 0) >= 0} />
+                    <MiniStat label="过滤Alpha" value={`${(execution.filter_alpha_1d || 0) >= 0 ? '+' : ''}${execution.filter_alpha_1d || 0}%`} hot={(execution.filter_alpha_1d || 0) >= 0} />
+                </div>
             </div>
 
             <NextDayFollowupCard
@@ -124,12 +138,16 @@ export default function ReviewCenter() {
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="交易桶表现" rows={data?.by_trade_bucket || []} nameKey="bucket" />
                 <TableCard title="陷阱风险分桶" rows={data?.by_pa_trap_risk || []} nameKey="risk" />
-                <TableCard title="Brooks 独立策略回测" rows={data?.brooks_backtests || []} nameKey="strategy" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="Brooks 独立策略回测" rows={data?.brooks_backtests || []} nameKey="strategy" />
                 <TableCard title="板块表现 Top" rows={data?.by_industry || []} nameKey="industry" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <TableCard title="最近扫描日期表现" rows={data?.recent_dates || []} nameKey="date" />
             </div>
         </div>
@@ -165,6 +183,11 @@ function NextDayFollowupCard({
         风控触发: 'bg-slate-100 text-slate-700 border-slate-200',
         未触发: 'bg-slate-50 text-slate-500 border-slate-100',
         待跟踪: 'bg-slate-50 text-slate-400 border-slate-100',
+    };
+    const bucketTone: Record<string, string> = {
+        TRADE: 'bg-emerald-50 text-emerald-700 border-emerald-100',
+        WATCH: 'bg-sky-50 text-sky-700 border-sky-100',
+        BLOCK: 'bg-rose-50 text-rose-700 border-rose-100',
     };
 
     return (
@@ -207,6 +230,7 @@ function NextDayFollowupCard({
                         <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
                             <th className="py-2 pr-3">股票</th>
                             <th className="py-2 pr-3">状态</th>
+                            <th className="py-2 pr-3">执行</th>
                             <th className="py-2 pr-3">信号价</th>
                             <th className="py-2 pr-3">入场线</th>
                             <th className="py-2 pr-3">最高涨幅</th>
@@ -224,6 +248,12 @@ function NextDayFollowupCard({
                                 <td className="py-3 pr-3">
                                     <span className={cn("px-2 py-1 rounded-md border text-[10px] font-black", statusTone[item.followup_status] || statusTone['未触发'])}>
                                         {item.followup_status}
+                                    </span>
+                                </td>
+                                <td className="py-3 pr-3 min-w-[160px]">
+                                    <div className="font-bold text-slate-600">{item.execution_action || '--'}</div>
+                                    <span className={cn("inline-flex mt-1 px-1.5 py-0.5 rounded border text-[10px] font-black", bucketTone[item.trade_bucket] || 'bg-slate-50 text-slate-500 border-slate-100')}>
+                                        {item.trade_bucket || 'UNKNOWN'}
                                     </span>
                                 </td>
                                 <td className="py-3 pr-3 font-bold text-slate-600">{formatPrice(item.signal_price)}</td>

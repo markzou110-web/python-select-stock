@@ -29,6 +29,8 @@ def _empty_response() -> Dict[str, Any]:
         "by_pa_trend_phase": [],
         "by_pa_weekly_context": [],
         "by_pa_trap_risk": [],
+        "by_trade_bucket": [],
+        "execution_summary": {},
         "brooks_backtests": [],
         "by_industry": [],
         "recent_dates": [],
@@ -50,6 +52,10 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE(price_action_detail->>'pa_volume_pattern', '未知') AS pa_volume_pattern,
                 COALESCE(price_action_detail->>'pa_trend_phase', '未知') AS pa_trend_phase,
                 COALESCE(price_action_detail->>'pa_weekly_context', '未知') AS pa_weekly_context,
+                COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
+                COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
+                COALESCE((price_action_detail->>'final_trade_score')::float, score, 0) AS final_trade_score,
+                COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers,
                 CASE
                     WHEN COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) >= 75 THEN '高陷阱风险'
                     WHEN COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) >= 45 THEN '中陷阱风险'
@@ -80,6 +86,10 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.pa_volume_pattern,
                 s.pa_trend_phase,
                 s.pa_weekly_context,
+                s.trade_bucket,
+                s.trade_eligible,
+                s.final_trade_score,
+                s.trade_blockers,
                 s.pa_trap_risk_bucket,
                 s.pa_trap_risk,
                 s.pa_always_in_strength,
@@ -174,6 +184,22 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         by_pa_trend_phase = metric_frame(df.groupby("pa_trend_phase", dropna=False), "phase")
         by_pa_weekly_context = metric_frame(df.groupby("pa_weekly_context", dropna=False), "context")
         by_pa_trap_risk = metric_frame(df.groupby("pa_trap_risk_bucket", dropna=False), "risk")
+        by_trade_bucket = metric_frame(df.groupby("trade_bucket", dropna=False), "bucket")
+
+        ret_1d_all = df["ret_1d"].dropna()
+        trade_ret_1d = df.loc[df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
+        blocked_ret_1d = df.loc[df["trade_bucket"].eq("BLOCK"), "ret_1d"].dropna()
+        watch_ret_1d = df.loc[df["trade_bucket"].eq("WATCH"), "ret_1d"].dropna()
+        execution_summary = {
+            "trade_signals": int(len(trade_ret_1d)),
+            "trade_win_rate_1d": round(float((trade_ret_1d > 0).mean() * 100), 1) if not trade_ret_1d.empty else 0,
+            "trade_avg_return_1d": round(float(trade_ret_1d.mean()), 2) if not trade_ret_1d.empty else 0,
+            "watch_signals": int(len(watch_ret_1d)),
+            "watch_avg_return_1d": round(float(watch_ret_1d.mean()), 2) if not watch_ret_1d.empty else 0,
+            "blocked_signals": int(len(blocked_ret_1d)),
+            "blocked_avg_return_1d": round(float(blocked_ret_1d.mean()), 2) if not blocked_ret_1d.empty else 0,
+            "filter_alpha_1d": round(float(trade_ret_1d.mean() - ret_1d_all.mean()), 2) if not trade_ret_1d.empty and not ret_1d_all.empty else 0,
+        }
 
         def strategy_backtest(name: str, mask: pd.Series) -> Dict[str, Any]:
             returns = df.loc[mask, "ret_5d"].dropna()
@@ -230,6 +256,8 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_pa_trend_phase": by_pa_trend_phase,
             "by_pa_weekly_context": by_pa_weekly_context,
             "by_pa_trap_risk": by_pa_trap_risk,
+            "by_trade_bucket": by_trade_bucket,
+            "execution_summary": execution_summary,
             "brooks_backtests": brooks_backtests,
             "by_industry": by_industry,
             "recent_dates": recent[:20],
@@ -257,7 +285,10 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
             scan_df = pd.read_sql(
                 text("""
                     SELECT code, name, industry, date, price, score, strategy_type,
-                           pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price
+                           pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
+                           COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
+                           COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
+                           COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers
                     FROM scan_history
                     WHERE date = :date
                     ORDER BY score DESC
@@ -302,7 +333,11 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
                 "score": round(float(signal.get("score") or 0), 1),
                 "strategy_type": signal.get("strategy_type"),
                 "setup": signal.get("pa_trade_setup") or signal.get("pa_trade_action") or "历史信号",
+                "trade_bucket": signal.get("trade_bucket") or "UNKNOWN",
+                "trade_eligible": str(signal.get("trade_eligible")).lower() == "true",
+                "trade_blockers": signal.get("trade_blockers") or "",
                 "followup_status": "待跟踪",
+                "execution_action": "待下一交易日确认",
                 "max_gain_pct": None,
                 "latest_gain_pct": None,
                 "latest_close": None,
@@ -336,8 +371,27 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
             else:
                 status = "未触发"
 
+            trade_bucket = item.get("trade_bucket")
+            if trade_bucket == "BLOCK":
+                action = "禁止追买：只复盘不交易"
+            elif stop_line and min_low <= stop_line:
+                action = "取消：已触发风控线"
+            elif first_open_gap is not None and first_open_gap >= 9.5:
+                action = "不追：涨停/一字高开"
+            elif first_open_gap is not None and first_open_gap > 3:
+                action = "不追：高开超过3%，等回踩"
+            elif entry_line and max_high >= entry_line and latest_gain >= 0:
+                action = "尾盘确认可试：小仓、贴近入场线"
+            elif max_gain >= 3 and latest_gain < 1:
+                action = "冲高回落：不买，等二次确认"
+            elif trade_bucket == "WATCH":
+                action = "观察：等回踩/放量站稳"
+            else:
+                action = "未触发：继续观察"
+
             item.update({
                 "followup_status": status,
+                "execution_action": action,
                 "max_gain_pct": round(max_gain, 2),
                 "latest_gain_pct": round(latest_gain, 2),
                 "first_open_gap_pct": round(first_open_gap, 2) if first_open_gap is not None else None,
@@ -372,6 +426,7 @@ def export_scan_performance(days: int = 120):
             "code", "name", "industry", "strategy_type", "signal_date", "price",
             "pa_trade_action", "pa_trade_setup", "pa_risk_pct",
             "pa_h2_quality", "pa_volume_pattern", "pa_trend_phase", "pa_weekly_context", "pa_trap_risk_bucket",
+            "trade_bucket", "trade_eligible", "final_trade_score", "trade_blockers",
             "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
         ])
 
@@ -379,6 +434,7 @@ def export_scan_performance(days: int = 120):
         "code", "name", "industry", "strategy_type", "signal_date", "price",
         "pa_trade_action", "pa_trade_setup", "pa_risk_pct",
         "pa_h2_quality", "pa_volume_pattern", "pa_trend_phase", "pa_weekly_context", "pa_trap_risk_bucket",
+        "trade_bucket", "trade_eligible", "final_trade_score", "trade_blockers",
         "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
     ]
     export_df = df[[c for c in export_cols if c in df.columns]].copy()
@@ -397,6 +453,10 @@ def export_scan_performance(days: int = 120):
         "pa_trend_phase": "趋势阶段",
         "pa_weekly_context": "周线环境",
         "pa_trap_risk_bucket": "陷阱风险",
+        "trade_bucket": "交易桶",
+        "trade_eligible": "可交易",
+        "final_trade_score": "最终交易分",
+        "trade_blockers": "过滤原因",
         "ret_1d": "1日收益%",
         "ret_3d": "3日收益%",
         "ret_5d": "5日收益%",
@@ -428,14 +488,14 @@ def export_next_day_followup(date: Optional[str] = None, limit: int = 300):
         export_df = pd.DataFrame(columns=[
             "code", "name", "industry", "signal_date", "signal_price",
             "entry_line", "stop_line", "followup_status", "max_gain_pct",
-            "latest_gain_pct", "latest_close", "latest_date", "setup",
+            "latest_gain_pct", "latest_close", "latest_date", "setup", "execution_action",
         ])
 
     export_cols = [
         "code", "name", "industry", "signal_date", "signal_price",
         "entry_line", "stop_line", "followup_status", "max_gain_pct",
         "latest_gain_pct", "first_open_gap_pct", "latest_close", "latest_date",
-        "days_tracked", "strategy_type", "setup",
+        "days_tracked", "strategy_type", "setup", "trade_bucket", "trade_blockers", "execution_action",
     ]
     export_df = export_df[[c for c in export_cols if c in export_df.columns]].copy()
     rename_map = {
@@ -447,6 +507,7 @@ def export_next_day_followup(date: Optional[str] = None, limit: int = 300):
         "entry_line": "入场线",
         "stop_line": "止损线",
         "followup_status": "跟踪状态",
+        "execution_action": "执行动作",
         "max_gain_pct": "最高涨幅%",
         "latest_gain_pct": "最新表现%",
         "first_open_gap_pct": "次日开盘跳空%",
@@ -455,6 +516,8 @@ def export_next_day_followup(date: Optional[str] = None, limit: int = 300):
         "days_tracked": "跟踪天数",
         "strategy_type": "策略",
         "setup": "形态",
+        "trade_bucket": "交易桶",
+        "trade_blockers": "过滤原因",
     }
     export_df = export_df.rename(columns=rename_map)
     for col in ["最高涨幅%", "最新表现%", "次日开盘跳空%"]:

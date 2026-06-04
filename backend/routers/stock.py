@@ -161,6 +161,21 @@ def _resolve_chart_strategy(code: str, engine) -> str:
     return "squeeze"
 
 
+def _position_decision_grade(pl_pct: float, stop_price: float, current_price: float, risk_stage: str = "") -> dict:
+    stop_buffer = ((current_price - stop_price) / current_price * 100) if current_price > 0 and stop_price > 0 else None
+    if stop_buffer is not None and stop_buffer <= 0:
+        return {"grade": "EXIT", "label": "跌破风控线", "action": "尾盘优先处理，禁止补仓"}
+    if stop_buffer is not None and stop_buffer < 2:
+        return {"grade": "REDUCE", "label": "贴近风控线", "action": "只减不加，跌破执行止损"}
+    if pl_pct >= 8:
+        return {"grade": "HOLD_PROFIT", "label": "盈利跟踪", "action": "持有，按动态止盈线保护利润"}
+    if pl_pct >= 3:
+        return {"grade": "HOLD", "label": "健康持有", "action": "持有观察，不追高加仓"}
+    if pl_pct < -3 or risk_stage in {"risk_control", "danger"}:
+        return {"grade": "DEFENSIVE", "label": "弱势防守", "action": "不加仓，反弹弱则降仓"}
+    return {"grade": "WATCH", "label": "持仓观察", "action": "等放量站稳或突破后再处理"}
+
+
 @router.get("/detail")
 def get_stock_detail(code: str):
     """
@@ -298,6 +313,12 @@ def get_stock_detail(code: str):
             "risk_reward": risk_reward,
             "risk_notes": risk_notes,
             "risk_stage": risk_stage,
+            "position_decision": _position_decision_grade(
+                round(((close - buy_price) / buy_price) * 100, 2) if is_paper_trade and buy_price > 0 else 0,
+                stop_price,
+                close,
+                risk_stage,
+            ) if is_paper_trade else None,
             "paper_remark": paper_remark,
             "entry_date": entry_date_str,
             "entry_source": entry_source,
@@ -817,6 +838,10 @@ def get_stock_full_analysis(code: str):
         latest_sector_phase = None
         latest_sector_momentum_score = None
         latest_sector_alignment_score = None
+        latest_trade_bucket = None
+        latest_trade_eligible = None
+        latest_final_trade_score = None
+        latest_trade_blockers = None
         hold_days = 0
         pl_pct = 0.0
         current_price = safe_float(df.iloc[-1]['收盘'])
@@ -918,6 +943,10 @@ def get_stock_full_analysis(code: str):
                 latest_sector_phase = detail.get("sector_phase")
                 latest_sector_momentum_score = detail.get("sector_momentum_score")
                 latest_sector_alignment_score = detail.get("sector_alignment_score")
+                latest_trade_bucket = detail.get("trade_bucket")
+                latest_trade_eligible = detail.get("trade_eligible")
+                latest_final_trade_score = detail.get("final_trade_score")
+                latest_trade_blockers = detail.get("trade_blockers")
 
         close = current_price
         prev_close = float(df.iloc[-2]['收盘']) if len(df) > 1 else close
@@ -953,6 +982,7 @@ def get_stock_full_analysis(code: str):
             "risk_reward": risk_reward,
             "risk_notes": risk_notes,
             "risk_stage": risk_stage,
+            "position_decision": _position_decision_grade(pl_pct, stop_price, close, risk_stage) if is_paper_trade else None,
             "hold_days": hold_days,
             "pl_pct": pl_pct,
             "paper_remark": paper_remark,
@@ -966,6 +996,10 @@ def get_stock_full_analysis(code: str):
             "latest_scan_score": latest_scan_score,
             "latest_scan_pa_action": latest_scan_pa_action,
             "latest_scan_pa_setup": latest_scan_pa_setup,
+            "trade_bucket": latest_trade_bucket,
+            "trade_eligible": latest_trade_eligible,
+            "final_trade_score": latest_final_trade_score,
+            "trade_blockers": latest_trade_blockers,
             "sector_phase": latest_sector_phase,
             "sector_momentum_score": latest_sector_momentum_score,
             "sector_alignment_score": latest_sector_alignment_score,

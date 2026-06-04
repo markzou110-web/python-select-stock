@@ -15,6 +15,19 @@ from core.trading_calendar import is_a_share_intraday_session
 
 
 def _candidate_action_label(stock: Dict[str, Any]) -> str:
+    trade_bucket = stock.get('trade_bucket')
+    trade_eligible = stock.get('trade_eligible')
+    blockers = stock.get('trade_blockers') or []
+    if isinstance(blockers, str):
+        blockers_text = blockers.strip("[]'\" ")
+    else:
+        blockers_text = "、".join(str(item) for item in blockers[:2])
+    if trade_bucket == 'BLOCK' or trade_eligible is False:
+        reason = f"；原因：{blockers_text}" if blockers_text else ""
+        return f"尾盘动作：禁止追买，只复盘不交易{reason}"
+    if trade_bucket == 'WATCH':
+        return "尾盘动作：观察池，等回踩/放量站稳，不在高开或冲高回落时买"
+
     if stock.get('sector_watch_only'):
         pct = float(stock.get('涨幅%') or stock.get('pct_chg') or 0)
         if pct >= 7:
@@ -38,6 +51,18 @@ def _candidate_action_label(stock: Dict[str, Any]) -> str:
     if grade == 'C':
         return "尾盘动作：观察池候选，只跟踪不买入"
     return "尾盘动作：只观察，不追价"
+
+
+def _candidate_push_bucket(stock: Dict[str, Any]) -> str:
+    if stock.get('sector_watch_only'):
+        return "观察"
+    if stock.get('trade_bucket') == 'TRADE' or stock.get('trade_eligible') is True:
+        return "可交易"
+    if stock.get('trade_bucket') == 'BLOCK' or stock.get('trade_eligible') is False:
+        return "禁止追买"
+    if stock.get('sop_grade') in ('A', 'B'):
+        return "可交易"
+    return "观察"
 
 
 def _brooks_alert_line(stock: Dict[str, Any]) -> Optional[str]:
@@ -141,7 +166,20 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
 
     executable = [
         s for s in stock_list
-        if not s.get('sector_watch_only') and s.get('sop_grade') in ('A', 'B', 'M', 'C')
+        if (
+            not s.get('sector_watch_only')
+            and s.get('sop_grade') in ('A', 'B', 'M', 'C')
+            and s.get('trade_bucket') != 'BLOCK'
+            and s.get('trade_eligible') is not False
+        )
+    ]
+    blocked = [
+        s for s in stock_list
+        if (
+            not s.get('sector_watch_only')
+            and s.get('sop_grade') in ('A', 'B', 'M', 'C')
+            and (s.get('trade_bucket') == 'BLOCK' or s.get('trade_eligible') is False)
+        )
     ]
     sector_watch = [
         s for s in stock_list
@@ -150,7 +188,11 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
 
     selected: List[Dict[str, Any]] = []
     seen_codes = set()
-    for group, limit in ((sorted(executable, key=rank_key), executable_limit), (sorted(sector_watch, key=rank_key), sector_watch_limit)):
+    for group, limit in (
+        (sorted(executable, key=rank_key), executable_limit),
+        (sorted(sector_watch, key=rank_key), sector_watch_limit),
+        (sorted(blocked, key=rank_key), max(1, sector_watch_limit)),
+    ):
         picked = 0
         for stock in group:
             code = stock.get('代码') or stock.get('code')
@@ -413,40 +455,55 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     sector_emoji = {'LEAD': '🚀领涨', 'FOLLOW': '📈跟涨', 'FLAT': '➖横盘', 'DOWN': '📉下跌'}
 
     grade_icons = {'A': '🟢', 'B': '🔵', 'M': '🟠', 'C': '⚪'}
-    for s in push_stocks[:8]:
-        grade = s.get('sop_grade', '?')
-        grade_icon = grade_icons.get(grade, '⚪')
-        name = s.get('名称', s.get('name', ''))
-        code = s.get('代码', s.get('code', ''))
-        sector = s.get('行业', '')
-        s_trend = sector_emoji.get(s.get('sector_trend', ''), '')
-        s_pct = s.get('sector_pct', 0)
-        entry = s.get('entry_price', 0)
-        stop = s.get('plan_stop_price') or s.get('stop_price', 0)
-        target = s.get('target_price') or s.get('pa_target_price')
-        win_rate = s.get('历史胜率', 'N/A')
-        pf = s.get('回测统计', {}).get('profit_factor', 'N/A')
+    section_titles = {
+        "可交易": "【可交易候选】",
+        "观察": "【观察池】",
+        "禁止追买": "【禁止追买/风险样本】",
+    }
+    grouped = {"可交易": [], "观察": [], "禁止追买": []}
+    for s in push_stocks[:10]:
+        grouped.setdefault(_candidate_push_bucket(s), []).append(s)
 
-        lines.append(f"{grade_icon} {grade}级 {name} ({code})")
-        lines.append(f"  {_candidate_action_label(s)}")
-        if s.get('sector_watch_only'):
-            lines.extend(_sector_watch_advice_lines(s))
-        if sector:
-            lines.append(f"  板块: {sector} {s_trend}{'+' if s_pct >= 0 else ''}{s_pct}%")
-        target_text = f" | 目标: {target}" if target else ""
-        lines.append(f"  入场: {entry} | 失效: {stop}{target_text}")
-        lines.append(f"  胜率: {win_rate} | 盈亏比: {pf}")
-        sector_line = _sector_alignment_line(s)
-        if sector_line:
-            lines.append(sector_line)
-        brooks_line = _brooks_alert_line(s)
-        if brooks_line:
-            lines.append(brooks_line)
-        # 加分项
-        bonuses = s.get('sop_bonuses', [])
-        if bonuses:
-            lines.append(f"  ⭐ {'、'.join(bonuses)}")
-        lines.append("")
+    for section in ("可交易", "观察", "禁止追买"):
+        stocks = grouped.get(section) or []
+        if not stocks:
+            continue
+        lines.append(section_titles[section])
+        for s in stocks:
+            grade = s.get('sop_grade', '?')
+            grade_icon = grade_icons.get(grade, '⚪')
+            name = s.get('名称', s.get('name', ''))
+            code = s.get('代码', s.get('code', ''))
+            sector = s.get('行业', '')
+            s_trend = sector_emoji.get(s.get('sector_trend', ''), '')
+            s_pct = s.get('sector_pct', 0)
+            entry = s.get('entry_price', 0)
+            stop = s.get('plan_stop_price') or s.get('stop_price', 0)
+            target = s.get('target_price') or s.get('pa_target_price')
+            win_rate = s.get('历史胜率', 'N/A')
+            pf = s.get('回测统计', {}).get('profit_factor', 'N/A')
+            final_score = s.get('final_trade_score')
+
+            score_text = f" | 交易分: {final_score}" if final_score is not None else ""
+            lines.append(f"{grade_icon} {grade}级 {name} ({code}){score_text}")
+            lines.append(f"  {_candidate_action_label(s)}")
+            if s.get('sector_watch_only'):
+                lines.extend(_sector_watch_advice_lines(s))
+            if sector:
+                lines.append(f"  板块: {sector} {s_trend}{'+' if s_pct >= 0 else ''}{s_pct}%")
+            target_text = f" | 目标: {target}" if target else ""
+            lines.append(f"  入场: {entry} | 失效: {stop}{target_text}")
+            lines.append(f"  胜率: {win_rate} | 盈亏比: {pf}")
+            sector_line = _sector_alignment_line(s)
+            if sector_line:
+                lines.append(sector_line)
+            brooks_line = _brooks_alert_line(s)
+            if brooks_line:
+                lines.append(brooks_line)
+            bonuses = s.get('sop_bonuses', [])
+            if bonuses:
+                lines.append(f"  ⭐ {'、'.join(bonuses)}")
+            lines.append("")
 
     total_a = sum(1 for s in stock_list if s.get('sop_grade') == 'A')
     total_b = sum(1 for s in stock_list if s.get('sop_grade') == 'B')

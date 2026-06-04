@@ -26,6 +26,8 @@ def _empty_result(reason: str = "无有效信号") -> Dict[str, Any]:
             "avg_hold_days": 0,
             "total_return": 0,
             "final_equity": 100000,
+            "skipped_high_open": 0,
+            "skipped_limit_up": 0,
         },
         "trades": [],
         "equity_curve": [],
@@ -85,6 +87,9 @@ def run_single_stock_backtest(
     stop_loss_pct = float(params.get("stop_loss_pct", -8.0))
     trailing_multiplier = float(params.get("trailing_multiplier", 2.2))
     initial_capital = float(params.get("capital", 100000))
+    entry_mode = str(params.get("entry_mode") or "signal_close")
+    max_open_gap_pct = float(params.get("max_open_gap_pct", 3.0))
+    limit_up_gap_pct = float(params.get("limit_up_gap_pct", 9.5))
     time_stop_days = params.get("time_stop_days")
     time_stop_days = int(time_stop_days) if time_stop_days else None
 
@@ -93,6 +98,7 @@ def run_single_stock_backtest(
         return _empty_result("回测区间内无策略信号")
 
     close_vals = df["收盘"].astype(float).to_numpy()
+    open_vals = df["开盘"].astype(float).to_numpy()
     high_vals = df["最高"].astype(float).to_numpy()
     low_vals = df["最低"].astype(float).to_numpy()
     atr_vals = df["ATR"].astype(float).to_numpy() if "ATR" in df.columns else None
@@ -108,16 +114,37 @@ def run_single_stock_backtest(
     next_allowed_idx = 0
     max_equity = initial_capital
     max_drawdown = 0.0
+    skipped_high_open = 0
+    skipped_limit_up = 0
 
     for idx in raw_signals:
         if idx < next_allowed_idx:
             continue
 
-        entry_price = close_vals[idx]
+        signal_price = close_vals[idx]
+        entry_idx = idx
+        entry_price = signal_price
+        open_gap_pct = None
+        if entry_mode == "next_open_confirm":
+            entry_idx = idx + 1
+            if entry_idx >= len(df):
+                continue
+            entry_price = open_vals[entry_idx]
+            if signal_price > 0:
+                open_gap_pct = (entry_price - signal_price) / signal_price * 100
+                if open_gap_pct >= limit_up_gap_pct:
+                    skipped_limit_up += 1
+                    next_allowed_idx = entry_idx + 1
+                    continue
+                if open_gap_pct > max_open_gap_pct:
+                    skipped_high_open += 1
+                    next_allowed_idx = entry_idx + 1
+                    continue
+
         if entry_price <= 0:
             continue
 
-        atr = atr_vals[idx] if atr_vals is not None and not np.isnan(atr_vals[idx]) else entry_price * 0.03
+        atr = atr_vals[entry_idx] if atr_vals is not None and not np.isnan(atr_vals[entry_idx]) else entry_price * 0.03
         stop_ratio = stop_loss_pct / 100.0
         max_close_since_entry = entry_price
         exit_price = entry_price
@@ -127,10 +154,10 @@ def run_single_stock_backtest(
         time_stopped = False
 
         for day in range(1, max_hold_days + 1):
-            future_idx = idx + day
+            future_idx = entry_idx + day
             if future_idx >= len(df):
                 hold_days = max(day - 1, 0)
-                exit_price = close_vals[min(idx + hold_days, len(df) - 1)]
+                exit_price = close_vals[min(entry_idx + hold_days, len(df) - 1)]
                 exit_reason = "数据结束"
                 break
 
@@ -161,7 +188,7 @@ def run_single_stock_backtest(
             if day == max_hold_days:
                 exit_price = day_close
 
-        exit_idx = min(idx + hold_days, len(df) - 1)
+        exit_idx = min(entry_idx + hold_days, len(df) - 1)
         shares = max(int(equity / entry_price / 100) * 100, 100)
         buy_cost = entry_price * shares
         sell_cost = exit_price * shares
@@ -177,7 +204,8 @@ def run_single_stock_backtest(
         max_drawdown = min(max_drawdown, drawdown)
 
         trades.append({
-            "entry_date": dates[idx],
+            "signal_date": dates[idx],
+            "entry_date": dates[entry_idx],
             "exit_date": dates[exit_idx],
             "entry_price": round(float(entry_price), 2),
             "exit_price": round(float(exit_price), 2),
@@ -188,6 +216,8 @@ def run_single_stock_backtest(
             "net_pnl": round(float(net_pnl), 2),
             "hit_stop": hit_stop,
             "time_stopped": time_stopped,
+            "entry_mode": entry_mode,
+            "open_gap_pct": round(float(open_gap_pct), 2) if open_gap_pct is not None else None,
         })
         equity_curve.append({"date": dates[exit_idx], "equity": round(float(equity), 2)})
         next_allowed_idx = exit_idx + 1
@@ -214,6 +244,9 @@ def run_single_stock_backtest(
             "final_equity": round(float(equity), 2),
             "stop_loss_hits": sum(1 for trade in trades if trade["hit_stop"]),
             "time_stopped": sum(1 for trade in trades if trade["time_stopped"]),
+            "skipped_high_open": skipped_high_open,
+            "skipped_limit_up": skipped_limit_up,
+            "entry_mode": entry_mode,
         },
         "trades": trades,
         "equity_curve": equity_curve,

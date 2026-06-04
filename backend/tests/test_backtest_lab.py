@@ -57,3 +57,24 @@ def test_single_stock_backtest_handles_no_signal():
     assert result["summary"]["signal_count"] == 0
     assert result["trades"] == []
     assert result["reason"] == "回测区间内无策略信号"
+
+
+def test_next_open_backtest_skips_high_open_signal():
+    df = _pine_fixture()
+    signal_idx = 125
+    df.loc[signal_idx + 1, "开盘"] = df.loc[signal_idx, "收盘"] * 1.05
+
+    result = run_single_stock_backtest(
+        df,
+        strategy_type="pine",
+        params={
+            "pine_min_signals": 3,
+            "entry_mode": "next_open_confirm",
+            "max_open_gap_pct": 3,
+            "max_hold_days": 5,
+        },
+    )
+
+    assert result["summary"]["skipped_high_open"] == 1
+    assert result["trades"][0]["signal_date"] == "2025-05-19"
+    assert result["trades"][0]["entry_date"] == "2025-05-20"

@@ -6,6 +6,7 @@ import api from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface BacktestTrade {
+    signal_date?: string;
     entry_date: string;
     exit_date: string;
     entry_price: number;
@@ -15,6 +16,8 @@ interface BacktestTrade {
     exit_reason: string;
     signal_reason: string;
     net_pnl: number;
+    entry_mode?: string;
+    open_gap_pct?: number | null;
 }
 
 interface BacktestResult {
@@ -29,6 +32,9 @@ interface BacktestResult {
         final_equity: number;
         stop_loss_hits?: number;
         time_stopped?: number;
+        skipped_high_open?: number;
+        skipped_limit_up?: number;
+        entry_mode?: string;
     };
     trades: BacktestTrade[];
     equity_curve: Array<{ date: string; equity: number }>;
@@ -50,6 +56,8 @@ export default function BacktestLab() {
     const [stopLossPct, setStopLossPct] = useState(-8);
     const [maxHoldDays, setMaxHoldDays] = useState(10);
     const [pineMinSignals, setPineMinSignals] = useState(3);
+    const [entryMode, setEntryMode] = useState('next_open_confirm');
+    const [maxOpenGapPct, setMaxOpenGapPct] = useState(3);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [result, setResult] = useState<BacktestResult | null>(null);
@@ -66,6 +74,8 @@ export default function BacktestLab() {
                 stop_loss_pct: stopLossPct,
                 max_hold_days: maxHoldDays,
                 pine_min_signals: pineMinSignals,
+                entry_mode: entryMode,
+                max_open_gap_pct: maxOpenGapPct,
             }, { timeout: 20000 });
             setResult(res.data);
         } catch (err) {
@@ -98,7 +108,7 @@ export default function BacktestLab() {
             </div>
 
             <section className="glass-card p-5">
-                <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-6 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-8 gap-3">
                     <Field label="股票代码">
                         <input value={code} onChange={event => setCode(event.target.value)} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20" />
                     </Field>
@@ -121,6 +131,15 @@ export default function BacktestLab() {
                     <Field label="Pine信号数">
                         <input type="number" min={1} max={5} value={pineMinSignals} onChange={event => setPineMinSignals(Number(event.target.value))} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20" />
                     </Field>
+                    <Field label="成交模式">
+                        <select value={entryMode} onChange={event => setEntryMode(event.target.value)} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20">
+                            <option value="next_open_confirm">次日开盘确认</option>
+                            <option value="signal_close">信号收盘成交</option>
+                        </select>
+                    </Field>
+                    <Field label="高开过滤%">
+                        <input type="number" value={maxOpenGapPct} onChange={event => setMaxOpenGapPct(Number(event.target.value))} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20" />
+                    </Field>
                 </div>
                 {error && <div className="mt-4 rounded-xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</div>}
             </section>
@@ -142,6 +161,8 @@ export default function BacktestLab() {
                                 <Tiny label="盈亏比" value={result.summary.profit_factor} />
                                 <Tiny label="均持有" value={`${result.summary.avg_hold_days}天`} />
                                 <Tiny label="最终权益" value={Math.round(result.summary.final_equity)} />
+                                <Tiny label="高开跳过" value={result.summary.skipped_high_open || 0} />
+                                <Tiny label="涨停跳过" value={result.summary.skipped_limit_up || 0} />
                             </div>
                             {result.reason && <p className="text-xs font-bold text-slate-400">{result.reason}</p>}
                             {result.meta && (
@@ -177,6 +198,7 @@ export default function BacktestLab() {
                                 <thead className="bg-slate-50 text-slate-400 font-black uppercase tracking-wider">
                                     <tr>
                                         <th className="px-3 py-2">入场</th>
+                                        <th className="px-3 py-2">信号</th>
                                         <th className="px-3 py-2">出场</th>
                                         <th className="px-3 py-2">价格</th>
                                         <th className="px-3 py-2">收益</th>
@@ -186,10 +208,14 @@ export default function BacktestLab() {
                                 </thead>
                                 <tbody className="divide-y divide-slate-100 bg-white">
                                     {result.trades.length === 0 ? (
-                                        <tr><td colSpan={6} className="px-3 py-8 text-center text-slate-400 font-bold">暂无成交记录</td></tr>
+                                        <tr><td colSpan={7} className="px-3 py-8 text-center text-slate-400 font-bold">暂无成交记录</td></tr>
                                     ) : result.trades.map((trade, idx) => (
                                         <tr key={`${trade.entry_date}-${idx}`}>
                                             <td className="px-3 py-2 font-mono">{trade.entry_date}</td>
+                                            <td className="px-3 py-2 font-mono">
+                                                {trade.signal_date || trade.entry_date}
+                                                {trade.open_gap_pct != null && <span className="ml-1 text-slate-400">({trade.open_gap_pct >= 0 ? '+' : ''}{trade.open_gap_pct}%)</span>}
+                                            </td>
                                             <td className="px-3 py-2 font-mono">{trade.exit_date}</td>
                                             <td className="px-3 py-2 font-mono">{trade.entry_price} → {trade.exit_price}</td>
                                             <td className={cn("px-3 py-2 font-black", trade.return_pct >= 0 ? "text-emerald-600" : "text-rose-600")}>{trade.return_pct}%</td>

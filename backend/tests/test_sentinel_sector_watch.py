@@ -26,3 +26,21 @@ def test_sector_watch_action_is_observation_only():
 
     assert "不追" in label
     assert "买点" in label
+
+
+def test_blocked_candidate_pushes_as_no_chase_sample():
+    stock = {
+        "代码": "000005",
+        "名称": "五号",
+        "sop_grade": "A",
+        "trade_bucket": "BLOCK",
+        "trade_eligible": False,
+        "trade_blockers": ["高开风险"],
+    }
+
+    selected = _select_intraday_push_stocks([stock], executable_limit=1, sector_watch_limit=1)
+    label = _candidate_action_label(stock)
+
+    assert selected == [stock]
+    assert "禁止追买" in label
+    assert "高开风险" in label
