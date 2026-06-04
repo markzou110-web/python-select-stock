@@ -19,10 +19,18 @@ import SearchView from '@/components/SearchView';
 import ReviewCenter from '@/components/ReviewCenter';
 import WatchlistView from '@/components/WatchlistView';
 import StrategyTemplatesView from '@/components/StrategyTemplatesView';
+import OperationsCenter from '@/components/OperationsCenter';
+import BacktestLab from '@/components/BacktestLab';
+import StockDetailPage from '@/components/StockDetailPage';
+import SectorRadarView from '@/components/SectorRadarView';
 import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
 import { useMarketStore } from '@/stores/marketStore';
+
+interface MarketPulseIndex {
+    trend?: string;
+}
 
 export default function Dashboard() {
     // ── Market store ──
@@ -63,6 +71,7 @@ export default function Dashboard() {
 
     // ── Local UI state ──
     const [activeView, setActiveView] = React.useState('scanner');
+    const [searchDetailStock, setSearchDetailStock] = React.useState<{ code: string; name: string } | null>(null);
 
     // ── Initialization ──
     useEffect(() => {
@@ -96,7 +105,10 @@ export default function Dashboard() {
                 onStartSyncFundamentals={startSyncFundamentals}
                 onStopSync={stopSync}
                 activeView={activeView}
-                onNavigate={setActiveView}
+                onNavigate={(view) => {
+                    setSearchDetailStock(null);
+                    setActiveView(view);
+                }}
             />
             <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-slate-100">
                 <Header
@@ -105,17 +117,26 @@ export default function Dashboard() {
                     lastUpdated={lastUpdated}
                     onOpenFilters={() => setIsFilterOpen(true)}
                     onSelectStock={(stock) => {
-                        setSelectedStock(stock);
-                        if (activeView !== 'scanner' && activeView !== 'paper') {
-                            setActiveView('scanner');
-                        }
+                        setSelectedStock(null);
+                        setSearchDetailStock({
+                            code: stock.code || stock.代码,
+                            name: stock.name || stock.名称,
+                        });
                     }}
                 />
 
                 <div className="flex-1 overflow-y-auto px-6 py-5">
                     <div className="flex gap-5 items-start">
                         <div className={cn("transition-all duration-300 space-y-6", selectedStock ? "flex-1 min-w-0" : "w-full")}>
-                            {activeView === 'overview' ? (
+                            {searchDetailStock ? (
+                                <ErrorBoundary fallbackTitle="个股详情加载异常">
+                                    <StockDetailPage
+                                        code={searchDetailStock.code}
+                                        name={searchDetailStock.name}
+                                        onBack={() => setSearchDetailStock(null)}
+                                    />
+                                </ErrorBoundary>
+                            ) : activeView === 'overview' ? (
                                 <ErrorBoundary fallbackTitle="系统概览加载异常">
                                     <OverviewView onNavigate={setActiveView} />
                                 </ErrorBoundary>
@@ -127,13 +148,30 @@ export default function Dashboard() {
                                 <ErrorBoundary fallbackTitle="交易复盘加载异常">
                                     <ReviewCenter />
                                 </ErrorBoundary>
+                            ) : activeView === 'backtest' ? (
+                                <ErrorBoundary fallbackTitle="策略回测加载异常">
+                                    <BacktestLab />
+                                </ErrorBoundary>
                             ) : activeView === 'watchlist' ? (
                                 <ErrorBoundary fallbackTitle="观察池加载异常">
-                                    <WatchlistView />
+                                    <WatchlistView
+                                        onOpenStock={(stock) => {
+                                            setSelectedStock(null);
+                                            setSearchDetailStock(stock);
+                                        }}
+                                    />
+                                </ErrorBoundary>
+                            ) : activeView === 'sector-radar' ? (
+                                <ErrorBoundary fallbackTitle="板块雷达加载异常">
+                                    <SectorRadarView />
                                 </ErrorBoundary>
                             ) : activeView === 'templates' ? (
                                 <ErrorBoundary fallbackTitle="策略模板加载异常">
                                     <StrategyTemplatesView />
+                                </ErrorBoundary>
+                            ) : activeView === 'ops' ? (
+                                <ErrorBoundary fallbackTitle="专业驾驶舱加载异常">
+                                    <OperationsCenter />
                                 </ErrorBoundary>
                             ) : activeView === 'scanner' ? (
                                 <>
@@ -157,7 +195,7 @@ export default function Dashboard() {
                                         </div>
                                         {marketRegime && (
                                             <span className="text-[10px] text-slate-500 font-bold truncate">
-                                                {marketRegime.desc} | {Object.entries(marketRegime.indices).map(([name, d]: [any, any]) => 
+                                                {marketRegime.desc} | {Object.entries(marketRegime.indices as Record<string, MarketPulseIndex>).map(([name, d]) => 
                                                     `${name}: ${d.trend === 'BULL' ? '多头' : '空头'} `
                                                 )}
                                             </span>
@@ -167,7 +205,7 @@ export default function Dashboard() {
                                         {marketLoading ? (
                                             Array(5).fill(0).map((_, i) => <MarketCard key={i} name="" price={0} pct={0} loading />)
                                         ) : (
-                                            Object.entries(indices).map(([name, data]: [string, any]) => (
+                                            Object.entries(indices).map(([name, data]) => (
                                                 <MarketCard key={name} name={name} price={data.price} pct={data.pct} />
                                             ))
                                         )}

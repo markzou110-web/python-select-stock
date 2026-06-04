@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useCallback, useEffect, useState, useMemo } from 'react';
 import {
     Trash2,
     TrendingUp,
@@ -128,7 +128,7 @@ export default function PaperTradingView() {
     const selectedStock = useScanStore(s => s.selectedStock);
     const setSelectedStock = useScanStore(s => s.setSelectedStock);
 
-    const fetchTrades = async (showRefresh = false) => {
+    const fetchTrades = useCallback(async (showRefresh = false) => {
         if (showRefresh) setRefreshing(true); else setLoading(true);
         try {
             const res = await api.get('/api/paper/list');
@@ -142,9 +142,13 @@ export default function PaperTradingView() {
             setLoading(false);
             setRefreshing(false);
         }
-    };
+    }, []);
 
-    useEffect(() => { fetchTrades(); }, []);
+    useEffect(() => {
+        fetchTrades();
+        const intervalId = window.setInterval(() => fetchTrades(true), 30000);
+        return () => window.clearInterval(intervalId);
+    }, [fetchTrades]);
 
     // Respond to global search selection on paper trading tab
     useEffect(() => {

@@ -36,6 +36,81 @@ def _local_extrema(values: pd.Series, mode: str) -> List[int]:
     return points
 
 
+def _count_pullback_legs(work: pd.DataFrame, direction: str, lookback: int = 12) -> int:
+    """
+    Count simple pullback legs before the latest signal bar.
+
+    For a bull setup, pullback legs are consecutive down-close runs. For a bear
+    setup, they are consecutive up-close runs. The latest bar is excluded so the
+    entry bar does not become part of the pullback being evaluated.
+    """
+    if len(work) < 4:
+        return 0
+
+    closes = work["收盘"].tail(lookback + 1).astype(float).reset_index(drop=True)
+    moves = closes.diff().iloc[1:-1]
+    if moves.empty:
+        return 0
+
+    leg_count = 0
+    in_leg = False
+    for move in moves:
+        is_pullback = move < 0 if direction == "bull" else move > 0
+        if is_pullback and not in_leg:
+            leg_count += 1
+            in_leg = True
+        elif not is_pullback:
+            in_leg = False
+    return leg_count
+
+
+def _volume_series(work: pd.DataFrame) -> pd.Series:
+    for col in ("成交量", "vol", "volume"):
+        if col in work.columns:
+            return pd.to_numeric(work[col], errors="coerce").fillna(0)
+    return pd.Series([0] * len(work), index=work.index, dtype=float)
+
+
+def _chunked_weekly_context(work: pd.DataFrame) -> Dict[str, Any]:
+    if len(work) < 25:
+        return {"context": "周线数据不足", "score": 0, "note": "日线样本不足，暂不做多周期确认。"}
+
+    chunks = []
+    for start in range(max(0, len(work) - 60), len(work), 5):
+        part = work.iloc[start:start + 5]
+        if len(part) < 3:
+            continue
+        chunks.append({
+            "open": _safe_float(part["开盘"].iloc[0]),
+            "high": _safe_float(part["最高"].max()),
+            "low": _safe_float(part["最低"].min()),
+            "close": _safe_float(part["收盘"].iloc[-1]),
+        })
+    if len(chunks) < 5:
+        return {"context": "周线数据不足", "score": 0, "note": "周线合成样本不足，暂不做多周期确认。"}
+
+    weekly = pd.DataFrame(chunks)
+    weekly["EMA5"] = weekly["close"].ewm(span=5, adjust=False).mean()
+    weekly["EMA10"] = weekly["close"].ewm(span=10, adjust=False).mean()
+    last_w = weekly.iloc[-1]
+    prev_w = weekly.iloc[-2]
+    prior_high = _safe_float(weekly["high"].iloc[:-1].tail(8).max())
+    prior_low = _safe_float(weekly["low"].iloc[:-1].tail(8).min())
+    width_pct = (_safe_float(weekly["high"].tail(8).max()) - _safe_float(weekly["low"].tail(8).min())) / max(_safe_float(last_w["close"]), 0.01)
+
+    if last_w["close"] > last_w["EMA5"] > last_w["EMA10"] and last_w["EMA5"] >= prev_w["EMA5"]:
+        return {"context": "周线多头", "score": 25, "note": "周线收盘位于均线之上，日线多头信号获得确认。"}
+    if last_w["close"] < last_w["EMA5"] < last_w["EMA10"] and last_w["EMA5"] <= prev_w["EMA5"]:
+        return {"context": "周线空头", "score": -25, "note": "周线结构偏空，日线做多信号需要降级。"}
+    if last_w["close"] > prior_high:
+        return {"context": "周线向上突破", "score": 20, "note": "周线突破近端压力，日线突破更容易延续。"}
+    if last_w["close"] < prior_low:
+        return {"context": "周线向下破位", "score": -25, "note": "周线跌破近端支撑，日线反弹先按弱修复处理。"}
+    if width_pct <= 0.18:
+        return {"context": "周线交易区间", "score": -5, "note": "周线仍在交易区间，日线信号需要看位置。"}
+    return {"context": "周线中性", "score": 0, "note": "周线方向未形成明确确认。"}
+
+
 def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert a price-action summary into an execution-oriented trade plan.
@@ -53,6 +128,11 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
     stop_price = _safe_float(summary.get("pa_stop_price"))
     target_price = _safe_float(summary.get("pa_target_price"))
     risk_reward = _safe_float(summary.get("pa_risk_reward"))
+    trap_risk = int(summary.get("pa_trap_risk") or 0)
+    h2_quality = str(summary.get("pa_h2_quality") or "不适用")
+    trend_damage = str(summary.get("pa_trend_damage") or "无")
+    mtf_score = int(summary.get("pa_multi_timeframe_score") or 0)
+    volume_risk = str(summary.get("pa_volume_risk") or "无")
     risks = list(summary.get("price_action_risks") or [])
 
     setup_name = pattern if pattern and pattern != "无明确形态" else signal
@@ -103,6 +183,25 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
         avoid_reasons.append("结构止损距离偏大，仓位需下调。")
     if risk_reward and risk_reward < 1.5:
         avoid_reasons.append("上方空间相对止损距离不足，风险收益比偏低。")
+    if trap_risk >= 75:
+        avoid_reasons.append("多头陷阱风险偏高，突破计划需要降级。")
+        if action == "READY":
+            action = "WATCH"
+            action_label = "陷阱风险待确认"
+    if "H2" in pattern and h2_quality == "弱":
+        avoid_reasons.append("H2质量偏弱，需等待更强信号K或回踩确认。")
+    if trend_damage in {"跌破EMA60", "跌破EMA20", "短线低点破坏"}:
+        avoid_reasons.append("趋势结构出现破坏，入场计划需等待修复。")
+        if action == "READY":
+            action = "WATCH"
+            action_label = "趋势修复待确认"
+    if mtf_score <= -20:
+        avoid_reasons.append("多周期结构不支持日线做多，计划需降级。")
+        if action == "READY":
+            action = "WATCH"
+            action_label = "周线确认不足"
+    if volume_risk not in {"无", "", "量能中性"}:
+        avoid_reasons.append(volume_risk)
 
     checklist = [
         "14:30后确认K线形态仍保持强势",
@@ -153,6 +252,36 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_target_price": None,
         "pa_risk_reward": 0,
         "pa_tags": [],
+        "pa_pullback_legs": 0,
+        "pa_pullback_structure": "数据不足",
+        "pa_breakout_quality": "无突破",
+        "pa_failure_risk": 0,
+        "pa_entry_quality_score": 0,
+        "pa_h2_quality": "不适用",
+        "pa_range_rule": "数据不足",
+        "pa_failed_breakout_type": None,
+        "pa_trap_risk": 0,
+        "pa_micro_channel": "无",
+        "pa_always_in_strength": 0,
+        "pa_trend_damage": "无",
+        "pa_channel_state": "无明显通道",
+        "pa_position_strategy": "等待更多K线",
+        "pa_weekly_context": "周线数据不足",
+        "pa_multi_timeframe_score": 0,
+        "pa_multi_timeframe_note": "日线样本不足，暂不做多周期确认。",
+        "pa_volume_pattern": "量能不足",
+        "pa_volume_confirmed": False,
+        "pa_volume_risk": "量能数据不足",
+        "pa_failed_second_entry": None,
+        "pa_second_entry_risk": 0,
+        "pa_gap_type": "无缺口",
+        "pa_gap_risk": 0,
+        "pa_range_width_quality": "未知",
+        "pa_range_center_risk": 0,
+        "pa_range_failed_breakout_count": 0,
+        "pa_trend_phase": "数据不足",
+        "pa_trend_phase_action": "等待更多K线",
+        "pa_decision_summary": "K线样本不足，暂不识别价格行为结构。",
         "pa_trade_plan": build_price_action_trade_plan({
             "price_action_score": 0,
             "price_action_regime": "数据不足",
@@ -176,6 +305,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         work["EMA20"] = work["收盘"].ewm(span=20, adjust=False).mean()
     if "EMA60" not in work.columns:
         work["EMA60"] = work["收盘"].ewm(span=60, adjust=False).mean()
+    volumes = _volume_series(work)
 
     recent = work.tail(20).copy()
     last = work.iloc[-1]
@@ -191,9 +321,15 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     last_body_ratio = _safe_float(body_ratio.iloc[-1])
     last_close_position = _safe_float((last["收盘"] - last["最低"]) / last_range, 0.5)
     atr20 = _safe_float(bar_range.tail(20).mean(), 0.01)
+    avg_volume_20 = _safe_float(volumes.tail(20).mean())
+    last_volume = _safe_float(volumes.iloc[-1])
+    prev_volume = _safe_float(volumes.iloc[-2])
+    volume_ratio = last_volume / max(avg_volume_20, 1.0) if avg_volume_20 > 0 else 0.0
 
     prior_high_20 = _safe_float(work["最高"].iloc[-21:-1].max()) if len(work) >= 21 else _safe_float(recent["最高"].max())
     prior_low_20 = _safe_float(work["最低"].iloc[-21:-1].min()) if len(work) >= 21 else _safe_float(recent["最低"].min())
+    prior_high_before_prev = _safe_float(work["最高"].iloc[-22:-2].max()) if len(work) >= 22 else prior_high_20
+    prior_low_before_prev = _safe_float(work["最低"].iloc[-22:-2].min()) if len(work) >= 22 else prior_low_20
     recent_width_pct = (recent["最高"].max() - recent["最低"].min()) / max(_safe_float(last["收盘"]), 0.01)
     recent_high = _safe_float(recent["最高"].max())
     recent_low = _safe_float(recent["最低"].min())
@@ -244,6 +380,21 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     elif regime == "交易区间":
         market_cycle = f"交易区间-{range_location}"
 
+    weekly = _chunked_weekly_context(work)
+    weekly_context = weekly["context"]
+    mtf_score = int(weekly["score"])
+    mtf_note = str(weekly["note"])
+    if weekly_context in {"周线多头", "周线向上突破"} and regime in {"多头趋势", "向上突破"}:
+        mtf_score += 15
+        mtf_note = f"{mtf_note} 日线与周线方向共振。"
+    elif weekly_context in {"周线空头", "周线向下破位"} and regime in {"多头趋势", "向上突破"}:
+        mtf_score -= 15
+        mtf_note = f"{mtf_note} 日线多头与周线方向冲突。"
+    elif weekly_context == "周线交易区间" and range_location == "区间上沿":
+        mtf_score -= 10
+        mtf_note = f"{mtf_note} 且日线位于上沿，追价降权。"
+    mtf_score = int(max(-50, min(50, mtf_score)))
+
     signal = "普通K线"
     signal_score = 8
     tags: List[str] = []
@@ -265,6 +416,68 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     is_outside_bar = last["最高"] >= prev["最高"] and last["最低"] <= prev["最低"]
     is_micro_double_bottom = abs(_safe_float(last["最低"]) - _safe_float(prev["最低"])) <= atr20 * 0.35 and last["收盘"] > last["开盘"]
     is_micro_double_top = abs(_safe_float(last["最高"]) - _safe_float(prev["最高"])) <= atr20 * 0.35 and last["收盘"] < last["开盘"]
+    breaks_prev_high = last["最高"] > prev["最高"] and last["收盘"] > prev["收盘"]
+    breaks_prev_low = last["最低"] < prev["最低"] and last["收盘"] < prev["收盘"]
+    bull_pullback_legs = _count_pullback_legs(work, "bull")
+    bear_pullback_legs = _count_pullback_legs(work, "bear")
+    bull_context = regime in {"多头趋势", "向上突破"} or (last["收盘"] > ema20_now > ema60_now and ema20_now >= ema20_prev)
+    bear_context = regime in {"空头趋势", "向下破位"} or (last["收盘"] < ema20_now < ema60_now and ema20_now <= ema20_prev)
+    ema20_last_prev = _safe_float(work["EMA20"].iloc[-2])
+    ema60_last_prev = _safe_float(work["EMA60"].iloc[-2])
+    prior_bull_context = prev["收盘"] > ema20_last_prev > ema60_last_prev
+    prior_bear_context = prev["收盘"] < ema20_last_prev < ema60_last_prev
+
+    last_5 = work.tail(5)
+    rising_lows = bool(last_5["最低"].is_monotonic_increasing)
+    falling_highs = bool(last_5["最高"].is_monotonic_decreasing)
+    bull_closes_5 = int((last_5["收盘"] > last_5["开盘"]).sum())
+    bear_closes_5 = int((last_5["收盘"] < last_5["开盘"]).sum())
+    micro_channel = "无"
+    if rising_lows and bull_closes_5 >= 3:
+        micro_channel = "多头微型通道"
+        tags.append("微型通道")
+    elif falling_highs and bear_closes_5 >= 3:
+        micro_channel = "空头微型通道"
+        tags.append("微型通道")
+
+    always_in_strength = 0
+    if bull_context:
+        always_in_strength = 35
+        if last["收盘"] > ema20_now > ema60_now:
+            always_in_strength += 20
+        if bull_trend_bars >= 8:
+            always_in_strength += 20
+        if overlap_ratio < 0.45:
+            always_in_strength += 15
+        if micro_channel == "多头微型通道":
+            always_in_strength += 10
+    elif bear_context:
+        always_in_strength = 20
+        if last["收盘"] < ema20_now < ema60_now:
+            always_in_strength += 20
+        if bear_trend_bars >= 8:
+            always_in_strength += 20
+        if overlap_ratio < 0.45:
+            always_in_strength += 10
+        if micro_channel == "空头微型通道":
+            always_in_strength += 10
+    always_in_strength = int(max(0, min(100, always_in_strength)))
+
+    trend_damage = "无"
+    if bull_context or prior_bull_context:
+        if last["收盘"] < ema60_now:
+            trend_damage = "跌破EMA60"
+        elif last["收盘"] < ema20_now:
+            trend_damage = "跌破EMA20"
+        elif breaks_prev_low and last["收盘"] < prev["最低"]:
+            trend_damage = "短线低点破坏"
+    elif bear_context or prior_bear_context:
+        if last["收盘"] > ema60_now:
+            trend_damage = "站回EMA60"
+        elif last["收盘"] > ema20_now:
+            trend_damage = "站回EMA20"
+        elif breaks_prev_high and last["收盘"] > prev["最高"]:
+            trend_damage = "短线高点修复"
 
     if is_bull_trend_bar:
         signal = "强多头趋势K"
@@ -299,10 +512,33 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         signal_score = 6
         risks.append("近两根K线形成微型双顶，上方供给需确认。")
 
+    gap_pct = (_safe_float(last["开盘"]) - _safe_float(prev["收盘"])) / max(_safe_float(prev["收盘"]), 0.01)
+    gap_type = "无缺口"
+    gap_risk = 0
+    if gap_pct >= 0.03 and last["收盘"] > last["开盘"] and last_close_position >= 0.65:
+        gap_type = "向上跳空延续"
+        gap_risk = 20
+        tags.append("跳空延续")
+    elif gap_pct >= 0.03 and last["收盘"] < last["开盘"]:
+        gap_type = "高开低走缺口失败"
+        gap_risk = 75
+        risks.append("高开后收弱，需防缺口失败。")
+        tags.append("缺口失败")
+    elif gap_pct <= -0.03 and last["收盘"] < last["开盘"]:
+        gap_type = "向下跳空破位"
+        gap_risk = 80
+        risks.append("向下跳空破位，短线风险升高。")
+        tags.append("跳空破位")
+    elif gap_pct <= -0.03 and last["收盘"] > last["开盘"]:
+        gap_type = "向下跳空修复"
+        gap_risk = 35
+        tags.append("缺口修复")
+
     pattern = "无明确形态"
     pattern_score = 0
     near_ema20 = abs(_safe_float(last["收盘"]) - ema20_now) <= atr20 * 1.2
     broke_recent_high = last["收盘"] > prior_high_20 and is_bull_trend_bar
+    broke_recent_low = last["收盘"] < prior_low_20 and is_bear_trend_bar
 
     last_10 = work.tail(10)
     had_breakout = bool((last_10["最高"].shift(1) > work["最高"].rolling(20).max().shift(2).tail(10)).fillna(False).any())
@@ -312,18 +548,64 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         is_bull_reversal and
         work["收盘"].iloc[-2] < work["收盘"].iloc[-3]
     )
-    if broke_recent_high:
+    h1_entry = bull_context and bull_pullback_legs == 1 and breaks_prev_high and last["收盘"] > last["开盘"]
+    h2_entry = bull_context and bull_pullback_legs >= 2 and breaks_prev_high and last["收盘"] > last["开盘"]
+    l1_entry = bear_context and bear_pullback_legs == 1 and breaks_prev_low and last["收盘"] < last["开盘"]
+    l2_entry = bear_context and bear_pullback_legs >= 2 and breaks_prev_low and last["收盘"] < last["开盘"]
+
+    failed_second_entry = None
+    second_entry_risk = 0
+    prior_bull_second_try = (
+        prev["收盘"] > prev["开盘"] and
+        prev["最高"] > work["最高"].iloc[-3] and
+        _count_pullback_legs(work.iloc[:-1], "bull") >= 2
+    )
+    prior_bear_second_try = (
+        prev["收盘"] < prev["开盘"] and
+        prev["最低"] < work["最低"].iloc[-3] and
+        _count_pullback_legs(work.iloc[:-1], "bear") >= 2
+    )
+    if prior_bull_second_try and last["收盘"] < prev["最低"]:
+        failed_second_entry = "失败H2"
+        second_entry_risk = 80
+        risks.append("H2触发后跌破信号K低点，二次入场失败。")
+        tags.append("失败H2")
+    elif prior_bear_second_try and last["收盘"] > prev["最高"]:
+        failed_second_entry = "失败L2"
+        second_entry_risk = 35
+        tags.append("失败L2")
+
+    if h2_entry or pullback_then_bull:
+        pattern = "H2二次入场"
+        pattern_score = 18
+        tags.append("H2")
+    elif h1_entry:
+        pattern = "H1首次入场"
+        pattern_score = 14
+        tags.append("H1")
+    elif l2_entry:
+        pattern = "L2二次做空信号"
+        pattern_score = 2
+        risks.append("出现 L2 空头二次入场，做多计划应回避。")
+        tags.append("L2")
+    elif l1_entry:
+        pattern = "L1首次做空信号"
+        pattern_score = 3
+        risks.append("出现 L1 空头入场，短线结构偏弱。")
+        tags.append("L1")
+    elif broke_recent_high:
         pattern = "突破前高"
         pattern_score = 18
         tags.append("突破")
+    elif broke_recent_low:
+        pattern = "跌破前低"
+        pattern_score = 2
+        risks.append("空头破位结构，不适合主动做多。")
+        tags.append("破位")
     elif had_breakout and near_ema20 and last["收盘"] > last["开盘"]:
         pattern = "突破回踩"
         pattern_score = 20
         tags.append("回踩确认")
-    elif pullback_then_bull:
-        pattern = "H2二次入场"
-        pattern_score = 18
-        tags.append("H2")
 
     high_points = _local_extrema(work["最高"].tail(35), "high")
     low_points = _local_extrema(work["最低"].tail(35), "low")
@@ -341,12 +623,140 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
             pattern_score = max(pattern_score, 17)
             tags.append("楔形反转")
 
-    returned_to_range = prev["最高"] > prior_high_20 and last["收盘"] < prior_high_20
+    returned_to_range = prev["最高"] > prior_high_before_prev and last["收盘"] < prior_high_before_prev
+    downside_returned_to_range = prev["最低"] < prior_low_before_prev and last["收盘"] > prior_low_before_prev
+    failed_breakout_type = None
     if regime == "交易区间" and returned_to_range:
         pattern = "交易区间假突破"
         pattern_score = 6
         risks.append("突破后回到区间内，先按假突破处理。")
         tags.append("假突破")
+        failed_breakout_type = "上沿突破失败"
+    elif regime == "交易区间" and downside_returned_to_range:
+        failed_breakout_type = "下沿假破反弹"
+        tags.append("假破反弹")
+
+    range_rule = "趋势环境不适用"
+    if regime == "交易区间":
+        if failed_breakout_type == "上沿突破失败":
+            range_rule = "上沿突破失败"
+        elif failed_breakout_type == "下沿假破反弹":
+            range_rule = "下沿假破反弹"
+        elif range_location == "区间上沿":
+            range_rule = "上沿不追突破"
+        elif range_location == "区间下沿":
+            range_rule = "下沿只看反转确认"
+        else:
+            range_rule = "中部无交易优势"
+
+    pullback_legs = bull_pullback_legs if bull_context else bear_pullback_legs
+    if pullback_legs >= 2:
+        pullback_structure = "双腿回调"
+    elif pullback_legs == 1:
+        pullback_structure = "单腿回调"
+    else:
+        pullback_structure = "无清晰回调"
+
+    breakout_quality = "无突破"
+    if broke_recent_high or broke_recent_low:
+        if last_body_ratio >= 0.6 and (last_close_position >= 0.72 or last_close_position <= 0.28):
+            breakout_quality = "强突破"
+        elif last_body_ratio >= 0.45:
+            breakout_quality = "普通突破"
+        else:
+            breakout_quality = "弱突破"
+    elif had_breakout and last["收盘"] <= prior_high_20:
+        failed_breakout_type = failed_breakout_type or "突破后无延续"
+
+    failed_breakout_count = 0
+    for idx in range(max(21, len(work) - 20), len(work)):
+        prev_high = _safe_float(work["最高"].iloc[max(0, idx - 20):idx].max())
+        if work["最高"].iloc[idx] > prev_high and work["收盘"].iloc[idx] < prev_high:
+            failed_breakout_count += 1
+    range_width_quality = "趋势环境不适用"
+    range_center_risk = 0
+    if regime == "交易区间":
+        if recent_width_pct >= 0.22:
+            range_width_quality = "区间过宽"
+        elif recent_width_pct >= 0.10:
+            range_width_quality = "区间可交易"
+        else:
+            range_width_quality = "区间过窄"
+        range_center_risk = int(max(0, min(100, (1 - abs(range_position - 0.5) * 2) * 70)))
+
+    volume_pattern = "量能中性"
+    volume_confirmed = False
+    volume_risk = "无"
+    if avg_volume_20 <= 0:
+        volume_pattern = "量能不足"
+        volume_risk = "量能数据不足"
+    elif (broke_recent_high or regime == "向上突破") and volume_ratio >= 1.4 and last["收盘"] > last["开盘"]:
+        volume_pattern = "放量突破"
+        volume_confirmed = True
+    elif (h2_entry or pullback_then_bull) and prev_volume < avg_volume_20 and volume_ratio >= 1.15:
+        volume_pattern = "缩量回调后放量反包"
+        volume_confirmed = True
+    elif failed_breakout_type in {"上沿突破失败", "突破后无延续"} and volume_ratio >= 1.3:
+        volume_pattern = "放量失败突破"
+        volume_risk = "放量突破失败，陷阱风险升高。"
+    elif last["收盘"] < prior_low_20 and volume_ratio >= 1.3:
+        volume_pattern = "放量破位"
+        volume_risk = "放量跌破支撑，短线需防继续下探。"
+    elif volume_ratio < 0.75 and (broke_recent_high or h2_entry):
+        volume_pattern = "缩量上攻"
+        volume_risk = "上攻量能不足，突破延续性需要确认。"
+
+    failure_risk = 20
+    if regime == "交易区间" and range_location == "区间上沿":
+        failure_risk += 25
+    if returned_to_range:
+        failure_risk += 35
+    if upper_shadow.iloc[-1] > body.iloc[-1] * 1.5:
+        failure_risk += 20
+    if breakout_quality == "弱突破":
+        failure_risk += 15
+    if regime in {"空头趋势", "向下破位"}:
+        failure_risk += 25
+    if gap_risk >= 70:
+        failure_risk += 15
+    if second_entry_risk >= 70:
+        failure_risk += 20
+    if volume_risk not in {"无", "量能数据不足"}:
+        failure_risk += 10
+    failure_risk = int(max(0, min(100, failure_risk)))
+
+    entry_quality_score = 0
+    h2_quality = "不适用"
+    if h2_entry or pullback_then_bull:
+        entry_quality_score = 35
+        if near_ema20:
+            entry_quality_score += 20
+        if is_bull_trend_bar or is_bull_reversal:
+            entry_quality_score += 20
+        if regime != "交易区间" or range_location != "区间上沿":
+            entry_quality_score += 15
+        if bull_pullback_legs >= 2:
+            entry_quality_score += 10
+        if failed_breakout_type:
+            entry_quality_score -= 20
+        entry_quality_score = int(max(0, min(100, entry_quality_score)))
+        if entry_quality_score >= 75:
+            h2_quality = "强"
+        elif entry_quality_score >= 55:
+            h2_quality = "中"
+        else:
+            h2_quality = "弱"
+
+    trap_risk = failure_risk
+    if failed_breakout_type in {"上沿突破失败", "突破后无延续"}:
+        trap_risk += 20
+    if regime == "交易区间" and range_location == "区间上沿":
+        trap_risk += 10
+    if volume_pattern == "放量失败突破":
+        trap_risk += 15
+    if gap_type == "高开低走缺口失败":
+        trap_risk += 15
+    trap_risk = int(max(0, min(100, trap_risk)))
 
     entry_price = round(_safe_float(last["最高"]) + 0.01, 2)
     stop_anchor = min(_safe_float(last["最低"]), _safe_float(recent["最低"].tail(5).min()))
@@ -361,6 +771,72 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         risks.append("信号K止损距离超过10%，仓位需下调。")
     if upper_shadow.iloc[-1] > body.iloc[-1] * 1.5:
         risks.append("上影线偏长，存在上方供给。")
+    if failure_risk >= 70:
+        risks.append("突破失败风险偏高，需等待收盘或次日确认。")
+    if failed_breakout_type == "突破后无延续":
+        risks.append("突破后缺少后续跟进，需防多头陷阱。")
+    if volume_risk not in {"无", "量能数据不足"}:
+        risks.append(volume_risk)
+    if mtf_score <= -25:
+        risks.append("周线与日线信号冲突，多周期确认不足。")
+    if trend_damage in {"跌破EMA20", "短线低点破坏"}:
+        risks.append("多头趋势出现首次破坏，追买需等待二次确认。")
+    elif trend_damage == "跌破EMA60":
+        risks.append("中期趋势结构被破坏，主动做多应降级。")
+
+    channel_state = "无明显通道"
+    if micro_channel == "多头微型通道":
+        channel_state = "多头微型通道延续"
+    elif micro_channel == "空头微型通道":
+        channel_state = "空头微型通道延续"
+    if last["最高"] > prior_high_20 + atr20 * 0.5 and upper_shadow.iloc[-1] > body.iloc[-1] * 1.2:
+        channel_state = "上轨过冲回落"
+        risks.append("通道上轨过冲后回落，短线有获利回吐风险。")
+    elif last["最低"] < prior_low_20 - atr20 * 0.5 and lower_shadow.iloc[-1] > body.iloc[-1] * 1.2:
+        channel_state = "下轨假破反弹"
+        tags.append("通道假破")
+
+    if trend_damage in {"跌破EMA60", "跌破EMA20", "短线低点破坏"}:
+        position_strategy = "减仓或等待二次确认"
+    elif regime == "交易区间" and range_location == "区间上沿":
+        position_strategy = "区间上沿不追价"
+    elif regime == "交易区间" and range_location == "区间下沿":
+        position_strategy = "只等反转确认"
+    elif always_in_strength >= 75 and micro_channel == "多头微型通道":
+        position_strategy = "强趋势持有等待首次回调"
+    elif always_in_strength >= 65 and bull_context:
+        position_strategy = "顺势观察回踩入场"
+    elif bear_context:
+        position_strategy = "空头环境回避做多"
+    else:
+        position_strategy = "等待突破或回踩确认"
+
+    trend_phase = "震荡观察"
+    trend_phase_action = "等待区间边界信号"
+    if trend_damage in {"跌破EMA60", "跌破EMA20", "短线低点破坏"}:
+        trend_phase = "趋势破坏"
+        trend_phase_action = "减仓并等待修复"
+    elif channel_state == "上轨过冲回落" or "楔形" in tags:
+        trend_phase = "衰竭段"
+        trend_phase_action = "不追高，优先保护利润"
+    elif h2_entry or pullback_then_bull:
+        trend_phase = "二次入场"
+        trend_phase_action = "只在触发价有效站上后执行"
+    elif bull_context and bull_pullback_legs == 1:
+        trend_phase = "首次回调"
+        trend_phase_action = "等待H2或强反转K"
+    elif broke_recent_high or regime == "向上突破":
+        trend_phase = "初始突破"
+        trend_phase_action = "观察突破质量和量能确认"
+    elif always_in_strength >= 75:
+        trend_phase = "加速段"
+        trend_phase_action = "持有为主，等待首次像样回调"
+    elif bull_context:
+        trend_phase = "第一波拉升"
+        trend_phase_action = "顺势观察回踩入场"
+    elif bear_context:
+        trend_phase = "空头趋势"
+        trend_phase_action = "回避主动做多"
 
     location_score = 10
     if regime in {"多头趋势", "向上突破"} and near_ema20:
@@ -385,6 +861,23 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         quality = "观望"
 
     summary = f"{regime} / {pattern} / {signal}"
+    decision_parts = [summary]
+    if weekly_context != "周线数据不足":
+        decision_parts.append(f"{weekly_context}({mtf_score:+d})")
+    if volume_pattern != "量能中性":
+        decision_parts.append(volume_pattern)
+    if trend_phase:
+        decision_parts.append(f"阶段：{trend_phase}")
+    if failed_breakout_type:
+        decision_parts.append(f"假突破：{failed_breakout_type}")
+    if gap_type != "无缺口":
+        decision_parts.append(f"缺口：{gap_type}")
+    if trend_damage != "无":
+        decision_parts.append(f"趋势破坏：{trend_damage}")
+    if trap_risk >= 70:
+        decision_parts.append(f"陷阱风险{trap_risk}%")
+    decision_parts.append(position_strategy)
+    decision_summary = "；".join(decision_parts)
     result = {
         "price_action_score": int(round(score)),
         "price_action_regime": regime,
@@ -400,6 +893,36 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_target_price": target_price,
         "pa_risk_reward": rr,
         "pa_tags": list(dict.fromkeys(tags))[:5],
+        "pa_pullback_legs": pullback_legs,
+        "pa_pullback_structure": pullback_structure,
+        "pa_breakout_quality": breakout_quality,
+        "pa_failure_risk": failure_risk,
+        "pa_entry_quality_score": entry_quality_score,
+        "pa_h2_quality": h2_quality,
+        "pa_range_rule": range_rule,
+        "pa_failed_breakout_type": failed_breakout_type,
+        "pa_trap_risk": trap_risk,
+        "pa_micro_channel": micro_channel,
+        "pa_always_in_strength": always_in_strength,
+        "pa_trend_damage": trend_damage,
+        "pa_channel_state": channel_state,
+        "pa_position_strategy": position_strategy,
+        "pa_weekly_context": weekly_context,
+        "pa_multi_timeframe_score": mtf_score,
+        "pa_multi_timeframe_note": mtf_note,
+        "pa_volume_pattern": volume_pattern,
+        "pa_volume_confirmed": volume_confirmed,
+        "pa_volume_risk": volume_risk,
+        "pa_failed_second_entry": failed_second_entry,
+        "pa_second_entry_risk": second_entry_risk,
+        "pa_gap_type": gap_type,
+        "pa_gap_risk": gap_risk,
+        "pa_range_width_quality": range_width_quality,
+        "pa_range_center_risk": range_center_risk,
+        "pa_range_failed_breakout_count": failed_breakout_count,
+        "pa_trend_phase": trend_phase,
+        "pa_trend_phase_action": trend_phase_action,
+        "pa_decision_summary": decision_summary,
     }
     result["pa_trade_plan"] = build_price_action_trade_plan(result)
     return result

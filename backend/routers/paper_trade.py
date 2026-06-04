@@ -6,22 +6,102 @@ Extracted from api.py.
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 
 from core.logging_config import logger
-from core.db import get_db_engine, validate_stock_code
+from core.db import get_db_engine, validate_stock_code, save_failure_sample
 from core.data import get_market_snapshot, get_sector_map
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
 from core.risk_engine import compute_paper_risk_levels, safe_float
 from core.risk_constants import (
     FIXED_STOP_LOSS_PCT, FIXED_STOP_LOSS_RATIO,
     TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
-    TIME_STOP_DAYS
+    TIME_STOP_WARNING_DAYS, TIME_STOP_REVIEW_DAYS,
+    TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT
 )
+from core.portfolio_risk import evaluate_portfolio_risk_budget
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
+
+
+def _time_stop_policy(strategy_type: str | None) -> Dict[str, Any]:
+    strategy = (strategy_type or "").lower()
+    if strategy == "squeeze":
+        return {"warning_days": 7, "review_days": 10, "force_days": 12, "label": "均线粘合/蓄势"}
+    if strategy in {"price_action", "brooks", "pa"}:
+        return {"warning_days": 7, "review_days": 10, "force_days": 15, "label": "价格行为"}
+    return {
+        "warning_days": TIME_STOP_WARNING_DAYS,
+        "review_days": TIME_STOP_REVIEW_DAYS,
+        "force_days": TIME_STOP_FORCE_DAYS,
+        "label": "短线共振",
+    }
+
+
+def _fallback_business_hold_days(entry_date: pd.Timestamp, now: datetime) -> int:
+    start = entry_date.date() + timedelta(days=1)
+    end = now.date()
+    if start > end:
+        return 0
+    return len(pd.bdate_range(start=start, end=end))
+
+
+def _count_holding_trading_days(engine, code: str, entry_date: pd.Timestamp, now: datetime) -> int:
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT DISTINCT date
+                FROM daily_k
+                WHERE code = :code AND date > :entry_date AND date <= :today
+                ORDER BY date ASC
+            """), {
+                "code": code,
+                "entry_date": entry_date.date(),
+                "today": now.date(),
+            }).fetchall()
+        if rows:
+            return len(rows)
+    except Exception as exc:
+        logger.warning(f"Failed to count trading hold days for {code}: {exc}")
+    return _fallback_business_hold_days(entry_date, now)
+
+
+def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: str | None) -> Dict[str, Any] | None:
+    if pl_pct > 0:
+        return None
+
+    policy = _time_stop_policy(strategy_type)
+    if hold_trading_days >= policy["force_days"]:
+        return {
+            "reason": (
+                f"时间止损确认: 持仓 {hold_trading_days} 个交易日仍未盈利 "
+                f"({pl_pct:.1f}%)，建议平仓或移出实盘持仓"
+            ),
+            "should_close": True,
+            "severity": "close",
+        }
+    if hold_trading_days >= policy["review_days"]:
+        action = "亏损加重，建议减仓/退出候选" if pl_pct <= TIME_STOP_REVIEW_LOSS_PCT else "建议人工复核"
+        return {
+            "reason": (
+                f"时间止损复核: {policy['label']}策略持仓 {hold_trading_days} 个交易日未盈利 "
+                f"({pl_pct:.1f}%)，{action}"
+            ),
+            "should_close": False,
+            "severity": "review",
+        }
+    if hold_trading_days >= policy["warning_days"]:
+        return {
+            "reason": (
+                f"时间止损预警: {policy['label']}策略持仓 {hold_trading_days} 个交易日未盈利 "
+                f"({pl_pct:.1f}%)，暂不自动平仓"
+            ),
+            "should_close": False,
+            "severity": "warning",
+        }
+    return None
 
 
 def send_paper_trade_notification(title: str, body: str):
@@ -52,6 +132,16 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     if not engine:
         return {"status": "error"}
     try:
+        budget_check = evaluate_portfolio_risk_budget(engine, trade.model_dump(), force=bool(trade.force))
+        if budget_check["status"] == "warning":
+            return {
+                "status": "warning",
+                "detail": "组合风险预算触发，请确认是否继续。",
+                "warnings": budget_check["warnings"],
+                "summary": budget_check["summary"],
+                "budget": budget_check["budget"],
+            }
+
         # --- 行业集中度控制 (Sector Exposure Control) ---
         MAX_SECTOR_POSITIONS = 2  # 同行业最多 2 个持仓
         sector_map = get_sector_map()
@@ -143,10 +233,24 @@ def list_paper_trades() -> Dict[str, Any]:
 
         # --- 获取最新价格 ---
         codes = df['code'].unique().tolist()
+        open_codes = df[df.get('status', 'OPEN') == 'OPEN']['code'].unique().tolist()
 
-        # 方法1: 从 daily_k 表获取最新收盘价
+        # 方法1: OPEN 持仓优先从实时快照获取盘中价格
         price_map = {}
         high_map = {}
+        if open_codes:
+            try:
+                snapshot = get_market_snapshot()
+                if not snapshot.empty:
+                    for code in open_codes:
+                        match = snapshot[snapshot['code'] == code]
+                        if not match.empty:
+                            price_map[code] = float(match.iloc[0]['price'])
+                            high_map[code] = float(match.iloc[0].get('high') or match.iloc[0]['price'])
+            except Exception as e:
+                logger.warning(f"Failed to fetch live market snapshot for paper trading price tracking: {e}")
+
+        # 方法2: 实时源缺失时，从 daily_k 表回退最新收盘价
         try:
             placeholders = ','.join([f':code_{i}' for i in range(len(codes))])
             params = {f"code_{i}": c for i, c in enumerate(codes)}
@@ -157,24 +261,11 @@ def list_paper_trades() -> Dict[str, Any]:
                 ORDER BY code, date DESC
             """), engine, params=params)
             for _, row in price_df.iterrows():
-                price_map[row['code']] = float(row['latest_price'])
-                high_map[row['code']] = float(row.get('high') or row['latest_price'])
+                if row['code'] not in price_map:
+                    price_map[row['code']] = float(row['latest_price'])
+                    high_map[row['code']] = float(row.get('high') or row['latest_price'])
         except Exception as e:
             logger.warning(f"Paper trading: DB price fetch failed: {e}")
-
-        # 方法2: 尝试从实时快照补充缺失的
-        if len(price_map) < len(codes):
-            try:
-                snapshot = get_market_snapshot()
-                if not snapshot.empty:
-                    for code in codes:
-                        if code not in price_map:
-                            match = snapshot[snapshot['code'] == code]
-                            if not match.empty:
-                                price_map[code] = float(match.iloc[0]['price'])
-                                high_map[code] = float(match.iloc[0].get('high') or match.iloc[0]['price'])
-            except Exception as e:
-                logger.warning(f"Failed to fetch market snapshot for paper trading price tracking: {e}")
 
         # --- 计算每笔交易的盈亏 ---
         trades = []
@@ -460,6 +551,17 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
 
         # 发送 Bark 实时推送 — 根据交易模式区分
         pl_pct = (float(close_price) - entry_price) / entry_price * 100
+        if pl_pct < 0:
+            save_failure_sample({
+                "code": code,
+                "name": name,
+                "sample_date": datetime.now().strftime("%Y-%m-%d"),
+                "strategy_type": t_map.get("strategy_type"),
+                "failure_type": "manual_loss_close",
+                "reason": t_map.get("entry_reason_snapshot") or t_map.get("remark") or "手动亏损平仓",
+                "pnl_pct": round(pl_pct, 2),
+                "source": "paper_trade_close",
+            }, engine)
         mode_label = "实盘平仓" if trade_mode == "REAL" else "模拟仓平仓"
         title = f"【{mode_label}】{name} ({code})"
         body = (
@@ -485,7 +587,7 @@ def run_wind_control() -> Dict[str, Any]:
     止损规则优先级:
     1. 统一执行风控: 初始/结构/保本/移动风控取当前有效位
     2. 大盘极端风控: 双指数破位时强制清仓
-    3. 时间止损: 持仓超过 N 天且未盈利 → 自动平仓
+    3. 时间风控: 按交易日分层预警/复核/确认平仓
     """
     engine = get_db_engine()
     if not engine: return {"status": "error"}
@@ -505,6 +607,7 @@ def run_wind_control() -> Dict[str, Any]:
 
         closed_count = 0
         warned_real_count = 0
+        warned_simulated_count = 0
         alerts = []
         close_updates = []  # 收集批量更新参数
         close_date_str = datetime.now().strftime("%Y-%m-%d")
@@ -514,7 +617,8 @@ def run_wind_control() -> Dict[str, Any]:
             entry_price = safe_float(row['entry_price'])
             entry_date = pd.to_datetime(row['entry_date'])
             high_since_entry = safe_float(row.get('high_since_entry'), entry_price)
-            hold_days = (datetime.now() - entry_date).days
+            now = datetime.now()
+            hold_trading_days = _count_holding_trading_days(engine, code, entry_date, now)
             
             # 获取当前行情
             match = snapshot[snapshot['code'] == code]
@@ -529,12 +633,20 @@ def run_wind_control() -> Dict[str, Any]:
             stop_level = risk_levels["active_stop_price"]
             
             reason = ""
+            should_close = True
             if curr_price <= stop_level:
                 reason = f"触发执行风控价 ¥{stop_level:.2f} ({risk_levels['risk_stage']})"
             elif regime_status == "CRITICAL":
                 reason = "大盘极度走弱 (双指数破位)，强制清仓避险"
-            elif hold_days >= TIME_STOP_DAYS and pl_pct <= 0:
-                reason = f"时间止损: 持仓 {hold_days} 天未盈利 ({pl_pct:.1f}%)"
+            else:
+                time_stop = _evaluate_time_stop(
+                    hold_trading_days,
+                    pl_pct,
+                    row.get("strategy_type"),
+                )
+                if time_stop:
+                    reason = time_stop["reason"]
+                    should_close = bool(time_stop["should_close"])
 
             if reason:
                 # 生成更详细的智能备注
@@ -546,7 +658,7 @@ def run_wind_control() -> Dict[str, Any]:
                     alerts.append(f"{row['name']}({code}) 实盘风控预警: {reason}")
                     mode_label = "实盘风控预警"
                     action_line = "系统不会自动平仓，请人工确认是否卖出。"
-                else:
+                elif should_close:
                     close_updates.append({
                         "p": curr_price,
                         "d": close_date_str,
@@ -558,11 +670,16 @@ def run_wind_control() -> Dict[str, Any]:
                     alerts.append(f"{row['name']}({code}) 模拟仓自动平仓: {reason}")
                     mode_label = "模拟仓风控平仓"
                     action_line = "模拟仓已按风控规则自动平仓。"
+                else:
+                    warned_simulated_count += 1
+                    alerts.append(f"{row['name']}({code}) 模拟仓风控预警: {reason}")
+                    mode_label = "模拟仓风控预警"
+                    action_line = "模拟仓暂不自动平仓，请人工复核。"
                 title = f"【{mode_label}】{row['name']} ({code})"
                 body = (
                     f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
                     f"处理方式：{action_line}\n"
-                    f"平仓原因：{reason}\n"
+                    f"风控原因：{reason}\n"
                     f"买入价格：¥{entry_price:.2f}\n"
                     f"当前价格：¥{curr_price:.2f}\n"
                     f"当前收益：{pl_pct:+.2f}%\n"
@@ -586,7 +703,13 @@ def run_wind_control() -> Dict[str, Any]:
                 """), close_updates)
                 conn.commit()
 
-        return {"status": "success", "closed_count": closed_count, "warned_real_count": warned_real_count, "alerts": alerts}
+        return {
+            "status": "success",
+            "closed_count": closed_count,
+            "warned_real_count": warned_real_count,
+            "warned_simulated_count": warned_simulated_count,
+            "alerts": alerts
+        }
     except Exception as e:
         logger.error(f"Wind control error: {e}")
         return {"status": "error"}

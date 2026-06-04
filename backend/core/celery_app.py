@@ -43,9 +43,20 @@ celery_app.conf.update(
             'task': 'tasks.check_realtime_alerts',
             'schedule': 300.0, # 每 5 分钟检查一次
         },
-        'daily-sync-at-1800': {
+        'market-sync-before-open': {
             'task': 'tasks.daily_sync',
-            'schedule': crontab(hour=18, minute=0), # 每天下午 18:00 执行同步
+            'schedule': crontab(hour=8, minute=30),
+            'kwargs': {'slot': '盘前'},
+        },
+        'market-sync-at-noon': {
+            'task': 'tasks.daily_sync',
+            'schedule': crontab(hour=12, minute=10),
+            'kwargs': {'slot': '中午'},
+        },
+        'market-sync-after-close': {
+            'task': 'tasks.daily_sync',
+            'schedule': crontab(hour=18, minute=0),
+            'kwargs': {'slot': '晚上'},
         },
     },
 )

@@ -1,17 +1,22 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { Archive, BellRing, Loader2, RefreshCw, Star, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
+import { Archive, BellRing, LineChart, Loader2, PlusCircle, RefreshCw, Star, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
 
-export default function WatchlistView() {
+interface WatchlistViewProps {
+    onOpenStock?: (stock: { code: string; name: string }) => void;
+}
+
+export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
     const [items, setItems] = useState<any[]>([]);
     const [stats, setStats] = useState<any>({});
     const [loading, setLoading] = useState(true);
     const [checking, setChecking] = useState(false);
     const [notice, setNotice] = useState<string>('');
     const [status, setStatus] = useState<'WATCHING' | 'ALL'>('WATCHING');
+    const [transferringId, setTransferringId] = useState<number | null>(null);
 
     const fetchItems = async () => {
         setLoading(true);
@@ -35,6 +40,48 @@ export default function WatchlistView() {
         if (!confirm("确定删除该观察记录吗？")) return;
         await api.delete(`/api/watchlist/remove/${id}`);
         fetchItems();
+    };
+
+    const transferToPaper = async (item: any, force = false) => {
+        setTransferringId(item.id);
+        setNotice('');
+        try {
+            const res = await api.post('/api/paper/add', {
+                code: item.code,
+                name: item.name,
+                price: item.current_price || item.watch_price,
+                strategy_type: item.strategy_type || 'squeeze',
+                remark: item.reason || '观察池转入拟合实盘',
+                force,
+                trade_mode: 'SIMULATED',
+                entry_source: 'watchlist_current_price',
+                entry_signal_date: item.latest_date,
+                entry_reason_snapshot: `${item.reason || '观察池转入'} / ${item.pa_trade_action || 'WATCH'} / 观察价 ${item.watch_price}`,
+                pa_trade_action: item.pa_trade_action,
+                pa_trade_setup: item.pa_trade_setup,
+                pa_entry_condition: item.pa_entry_condition,
+                pa_invalidation: item.pa_invalidation || item.invalidation,
+                pa_risk_pct: item.pa_risk_pct,
+            });
+            if (res.data?.status === 'warning') {
+                if (confirm(res.data.detail || '组合风险预算触发，是否继续转入拟合实盘？')) {
+                    await transferToPaper(item, true);
+                }
+                return;
+            }
+            if (res.data?.status !== 'success') {
+                setNotice(res.data?.detail || '转入拟合实盘失败');
+                return;
+            }
+            await api.post(`/api/watchlist/archive/${item.id}`);
+            setNotice(`${item.name} 已转入拟合实盘，观察记录已归档`);
+            await fetchItems();
+        } catch (err: any) {
+            console.error("Transfer watchlist to paper error:", err);
+            setNotice(err.response?.data?.detail || '转入拟合实盘失败');
+        } finally {
+            setTransferringId(null);
+        }
     };
 
     const checkTriggers = async () => {
@@ -101,10 +148,14 @@ export default function WatchlistView() {
                                     <td className="px-6 py-5">
                                         <div className="flex items-center gap-3">
                                             <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center"><Star size={18} /></div>
-                                            <div>
-                                                <p className="font-black text-slate-800">{item.name}</p>
+                                            <button
+                                                onClick={() => onOpenStock?.({ code: item.code, name: item.name })}
+                                                className="text-left min-w-0 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                                                title="查看K线走势"
+                                            >
+                                                <p className="font-black text-slate-800 hover:text-indigo-600 transition-colors">{item.name}</p>
                                                 <p className="text-[10px] font-mono font-bold text-slate-400">{item.code} · {item.industry}</p>
-                                            </div>
+                                            </button>
                                         </div>
                                     </td>
                                     <td className="px-4 py-5 text-center">
@@ -147,6 +198,23 @@ export default function WatchlistView() {
                                     </td>
                                     <td className="px-6 py-5 text-right">
                                         <div className="flex items-center justify-end gap-2">
+                                            <button
+                                                onClick={() => onOpenStock?.({ code: item.code, name: item.name })}
+                                                className="inline-flex items-center gap-1.5 rounded-xl bg-slate-50 px-3 py-2 text-xs font-black text-slate-600 hover:bg-slate-100"
+                                                title="查看K线走势"
+                                            >
+                                                <LineChart size={14} />
+                                                走势
+                                            </button>
+                                            <button
+                                                onClick={() => transferToPaper(item)}
+                                                disabled={transferringId === item.id}
+                                                className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-50 px-3 py-2 text-xs font-black text-indigo-600 hover:bg-indigo-100 disabled:opacity-60"
+                                                title="转入拟合实盘"
+                                            >
+                                                {transferringId === item.id ? <Loader2 size={14} className="animate-spin" /> : <PlusCircle size={14} />}
+                                                拟合实盘
+                                            </button>
                                             <button onClick={() => archive(item.id)} className="p-2 text-slate-400 hover:text-amber-600 hover:bg-amber-50 rounded-xl" title="归档"><Archive size={16} /></button>
                                             <button onClick={() => remove(item.id)} className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-xl" title="删除"><Trash2 size={16} /></button>
                                         </div>

@@ -33,8 +33,24 @@ from core.strategy import (
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
 )
 from core.celery_app import celery_app
+from core.scan_preflight import build_scan_preflight
 
 router = APIRouter(prefix="/api", tags=["scan"])
+
+
+@router.get("/scan/preflight")
+def scan_preflight(
+    data_date: Optional[str] = None,
+    min_stock_count: int = 1000,
+    min_history_days: int = 120,
+):
+    """检查本地数据是否足够支撑一次专业扫描。"""
+    return build_scan_preflight(
+        get_db_engine(),
+        data_date=data_date,
+        min_stock_count=min_stock_count,
+        min_history_days=min_history_days,
+    )
 
 @celery_app.task(name="scan.run_market_scan_task")
 def run_market_scan_task(
@@ -42,16 +58,16 @@ def run_market_scan_task(
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
     use_macd_filter: bool = True,
-    use_bb_sqz: bool = True,
+    use_bb_sqz: bool = False,
     sqz_lookback: int = 10,
-    use_weekly: bool = True,
+    use_weekly: bool = False,
     market_range: str = "全市场(除科创)",
     turnover_min: float = 3.0,
     mkt_cap_min: float = 0.0,
-    use_rs_filter: bool = True,
+    use_rs_filter: bool = False,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "squeeze",
+    strategy_type: str = "tv_dual_strict",
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期 (10/20/30/60)
@@ -85,16 +101,16 @@ def scan_market(
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
     use_macd_filter: bool = True,
-    use_bb_sqz: bool = True,
+    use_bb_sqz: bool = False,
     sqz_lookback: int = 10,
-    use_weekly: bool = True,
+    use_weekly: bool = False,
     market_range: str = "全市场(除科创)",
     turnover_min: float = 3.0,
     mkt_cap_min: float = 0.0,
-    use_rs_filter: bool = True,
+    use_rs_filter: bool = False,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "squeeze",
+    strategy_type: str = "tv_dual_strict",
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期
@@ -210,7 +226,7 @@ def optimize_parameters(data: dict) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="No historical data for this stock")
 
     # Calculate indicators
-    enable_pine = strategy in ["pine", "both"]
+    enable_pine = strategy in ["pine", "both", "tv_zp"]
     df = calculate_indicators(df, enable_pine_indicators=enable_pine)
     if enable_pine and 'RF_Upward' not in df.columns:
         df = calculate_pine_indicators(df)

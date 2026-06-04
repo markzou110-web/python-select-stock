@@ -84,7 +84,7 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                     "position": "belowBar",
                     "color": "#2196F3", # Blue for Buy
                     "shape": "arrowUp",
-                    "text": "Buy"
+                    "text": "long" if strategy_type == "tv_zp" else "买点"
                 })
                 added_dates.add(time_str)
                 
@@ -93,12 +93,16 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             if time_str not in added_dates:
                 # 止损标记红色，止盈/超时标记绿色
                 color = "#e91e63" if "止损" in s["reason"] else "#4caf50"
+                reason = s.get("reason", "")
+                text_label = "short" if strategy_type == "tv_zp" else (
+                    "回测移动止盈" if "移动止盈" in reason else ("回测止损" if "止损" in reason else "回测卖点")
+                )
                 markers_data.append({
                     "time": time_str,
                     "position": "aboveBar",
                     "color": color,
                     "shape": "arrowDown",
-                    "text": s["reason"]
+                    "text": text_label
                 })
                 added_dates.add(time_str)
 

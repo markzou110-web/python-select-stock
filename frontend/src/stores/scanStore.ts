@@ -16,6 +16,18 @@ export interface ScanResult {
     信号次数: number;
     北向?: string;
     共振?: string;
+    signal?: string;
+    tv_ma_signal?: string;
+    tv_zp_signal?: string;
+    tv_match?: string;
+    early_watch_only?: boolean;
+    early_watch_reason?: string;
+    early_watch_quality_ok?: boolean;
+    early_watch_quality_reasons?: string[];
+    momentum_watch_only?: boolean;
+    momentum_watch_reason?: string;
+    sector_watch_only?: boolean;
+    sector_watch_reason?: string;
     影线比?: number;
     strategy_type?: string;
     warnings?: string[];
@@ -25,7 +37,7 @@ export interface ScanResult {
     体质?: string;
     回测统计?: BacktestStats;
     // SOP 等级系统
-    sop_grade?: 'A' | 'B' | 'C' | 'D';
+    sop_grade?: 'A' | 'B' | 'M' | 'C' | 'D';
     sop_vetoes?: string[];
     sop_checks?: string[];
     sop_bonuses?: string[];
@@ -43,6 +55,19 @@ export interface ScanResult {
     日期?: string;
     sector_trend?: string;
     sector_pct?: number;
+    sector_momentum_score?: number;
+    sector_breadth?: number;
+    sector_phase?: string;
+    sector_rank?: number;
+    sector_alignment_score?: number;
+    sector_relative_pct?: number;
+    sector_role?: 'LEADER' | 'CORE' | 'FOLLOWER' | 'LAGGARD' | string;
+    sector_3d_pct?: number;
+    sector_5d_pct?: number;
+    sector_consecutive_up_days?: number;
+    sector_trend_slope?: number;
+    brooks_rank_adjustment?: number;
+    final_rank_score?: number;
     price_action_score?: number;
     price_action_regime?: string;
     price_action_signal?: string;
@@ -57,6 +82,36 @@ export interface ScanResult {
     pa_target_price?: number;
     pa_risk_reward?: number;
     pa_tags?: string[];
+    pa_pullback_legs?: number;
+    pa_pullback_structure?: string;
+    pa_breakout_quality?: string;
+    pa_failure_risk?: number;
+    pa_entry_quality_score?: number;
+    pa_h2_quality?: string;
+    pa_range_rule?: string;
+    pa_failed_breakout_type?: string | null;
+    pa_trap_risk?: number;
+    pa_micro_channel?: string;
+    pa_always_in_strength?: number;
+    pa_trend_damage?: string;
+    pa_channel_state?: string;
+    pa_position_strategy?: string;
+    pa_weekly_context?: string;
+    pa_multi_timeframe_score?: number;
+    pa_multi_timeframe_note?: string;
+    pa_volume_pattern?: string;
+    pa_volume_confirmed?: boolean;
+    pa_volume_risk?: string;
+    pa_failed_second_entry?: string | null;
+    pa_second_entry_risk?: number;
+    pa_gap_type?: string;
+    pa_gap_risk?: number;
+    pa_range_width_quality?: string;
+    pa_range_center_risk?: number;
+    pa_range_failed_breakout_count?: number;
+    pa_trend_phase?: string;
+    pa_trend_phase_action?: string;
+    pa_decision_summary?: string;
     pa_trade_action?: 'READY' | 'WATCH' | 'WAIT' | 'AVOID' | string;
     pa_trade_setup?: string;
     pa_risk_pct?: number;
@@ -87,7 +142,7 @@ export interface BacktestStats {
 }
 
 export interface ScanParams {
-    strategy_type: 'squeeze' | 'pine' | 'both' | 'consensus';
+    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp';
     pine_min_signals: number;
     min_data_days: number;
     threshold: number;
@@ -105,6 +160,24 @@ export interface ScanParams {
     local_only: boolean;
     data_date: string;
     stop_loss_pct: number;
+}
+
+interface ScanPreflightCheck {
+    name: string;
+    status: 'ok' | 'warn' | 'error';
+    message: string;
+}
+
+interface ScanPreflightResult {
+    status: 'ok' | 'warn' | 'error';
+    blocking: boolean;
+    message: string;
+    checks: ScanPreflightCheck[];
+    summary: {
+        selected_date?: string;
+        stock_count?: number;
+        ready_history_count?: number;
+    };
 }
 
 export interface ScanProgress {
@@ -143,21 +216,21 @@ interface ScanStore {
 }
 
 const DEFAULT_PARAMS: ScanParams = {
-    strategy_type: 'squeeze',
+    strategy_type: 'tv_dual_strict',
     pine_min_signals: 3,
-    min_data_days: 60,
+    min_data_days: 120,
     threshold: 0.12,
     vol_multiplier: 1.5,
     rsi_min: 55,
     use_macd_filter: true,
-    use_bb_sqz: true,
+    use_bb_sqz: false,
     sqz_lookback: 10,
     use_weekly: false,
     weekly_ma_period: 20,
     market_range: '全市场(除科创)',
     turnover_min: 3.0,
     mkt_cap_min: 0,
-    use_rs_filter: true,
+    use_rs_filter: false,
     local_only: true,
     data_date: '',
     stop_loss_pct: -8,
@@ -185,10 +258,43 @@ export const useScanStore = create<ScanStore>((set, get) => ({
 
     startScan: async () => {
         let ws: WebSocket | null = null;
-        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在向后台提交扫描任务..." } });
+        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在执行扫描预检..." } });
         const startTime = Date.now();
 
         try {
+            const cleanParams: Partial<ScanParams> = { ...get().params };
+            Object.keys(cleanParams).forEach(key => {
+                const paramKey = key as keyof ScanParams;
+                const val = cleanParams[paramKey];
+                if (typeof val === 'number' && isNaN(val)) {
+                    delete cleanParams[paramKey];
+                }
+            });
+
+            const preflightRes = await api.get<ScanPreflightResult>('/api/scan/preflight', {
+                params: {
+                    data_date: cleanParams.data_date || undefined,
+                    min_history_days: cleanParams.min_data_days || 120,
+                }
+            });
+            const preflight = preflightRes.data;
+            if (preflight.blocking) {
+                alert(`扫描预检未通过\n\n${preflight.checks.map(item => item.message).join('\n')}`);
+                set({ isScanning: false, scanProgress: null });
+                return;
+            }
+            if (preflight.status === 'warn') {
+                const shouldContinue = window.confirm(
+                    `扫描预检存在风险：\n\n${preflight.checks.map(item => item.message).join('\n')}\n\n仍要继续扫描吗？`
+                );
+                if (!shouldContinue) {
+                    set({ isScanning: false, scanProgress: null });
+                    return;
+                }
+            }
+
+            set({ scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在向后台提交扫描任务..." } });
+
             ws = connectScanWebSocket((msg) => {
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
                 if (msg.type === 'scan_start') {
@@ -200,25 +306,18 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 }
             });
 
-            // Clean NaN params before sending
-            const cleanParams = { ...get().params } as any;
-            Object.keys(cleanParams).forEach(key => {
-                const val = cleanParams[key];
-                if (typeof val === 'number' && isNaN(val)) {
-                    delete cleanParams[key];
-                }
-            });
-
             const submitRes = await marketApi.scanMarket(cleanParams);
             
             if (submitRes.data.task_id) {
                 const taskId = submitRes.data.task_id;
+                let consecutivePollFailures = 0;
                 
                 // Poll for status
                 return new Promise<void>((resolve) => {
                     const pollInterval = setInterval(async () => {
                         try {
                             const statusRes = await api.get(`/api/scan/status/${taskId}`);
+                            consecutivePollFailures = 0;
                             const state = statusRes.data.status;
                             
                             if (state === 'SUCCESS') {
@@ -232,7 +331,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                                         scanProgress: null,
                                     });
                                     get().fetchHistory(); // Refresh date list
-                                    if (ws) { try { ws.close(); } catch (e) {} }
+                                    if (ws) { try { ws.close(); } catch {} }
                                     resolve();
                                 }, 1000);
                             } else if (state === 'FAILURE') {
@@ -240,12 +339,30 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                                 alert(`扫描失败 (耗时: ${elapsed}秒)\n\n${statusRes.data.message}`);
                                 set({ isScanning: false, scanProgress: null });
-                                if (ws) { try { ws.close(); } catch (e) {} }
+                                if (ws) { try { ws.close(); } catch {} }
                                 resolve();
                             }
                             // PENDING or STARTED: just wait
                         } catch (err) {
-                            console.error("Error polling task status", err);
+                            consecutivePollFailures += 1;
+                            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                            set({
+                                scanProgress: {
+                                    current: 0,
+                                    total: 100,
+                                    matches: 0,
+                                    elapsed,
+                                    message: `后端连接恢复中... (${consecutivePollFailures}/10)`,
+                                },
+                            });
+                            console.warn("Scan status polling failed; will retry", err);
+                            if (consecutivePollFailures >= 10) {
+                                clearInterval(pollInterval);
+                                alert("扫描状态连接中断，请确认后端服务正常后重新扫描。");
+                                set({ isScanning: false, scanProgress: null });
+                                if (ws) { try { ws.close(); } catch {} }
+                                resolve();
+                            }
                         }
                     }, 1000);
                 });
@@ -259,27 +376,32 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                         scanProgress: null,
                     });
                     get().fetchHistory();
-                    if (ws) { try { ws.close(); } catch (e) {} }
+                    if (ws) { try { ws.close(); } catch {} }
                 }, 1000);
             }
-        } catch (e: any) {
+        } catch (e: unknown) {
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             console.error("Scan Error Detail:", e);
-            const errorMsg = e.response?.data?.detail || e.message;
+            const scanError = e as {
+                code?: string;
+                message?: string;
+                response?: { status?: number; data?: { detail?: string } };
+            };
+            const errorMsg = scanError.response?.data?.detail || scanError.message || "未知错误";
 
             let fullMessage = `请求失败 (耗时: ${elapsed}秒)\n\n`;
-            if (e.code === 'ECONNABORTED' || e.message?.includes('timeout')) {
+            if (scanError.code === 'ECONNABORTED' || scanError.message?.includes('timeout')) {
                 fullMessage += `错误类型: 请求超时\n\n请检查网络并重试`;
-            } else if (e.response?.status === 503) {
+            } else if (scanError.response?.status === 503) {
                 fullMessage += `错误类型: 服务不可用\n\n${errorMsg}`;
-            } else if (e.response?.status === 400) {
+            } else if (scanError.response?.status === 400) {
                 fullMessage += `错误类型: 参数错误\n\n${errorMsg}`;
             } else {
                 fullMessage += `错误: ${errorMsg}`;
             }
             alert(fullMessage);
             set({ isScanning: false, scanProgress: null });
-            if (ws) { try { ws.close(); } catch (e) {} }
+            if (ws) { try { ws.close(); } catch {} }
         }
     },
 

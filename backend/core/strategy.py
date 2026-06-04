@@ -9,6 +9,10 @@ from core.risk_constants import (
 )
 from core.risk_engine import compute_paper_risk_levels
 
+STRATEGY_LOGIC_VERSION = "2026.05-brooks-pine5"
+BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
+EXIT_RULE_VERSION = "fixed-stop-atr-trailing-time-stop"
+
 
 def get_signal_details(
     df: pd.DataFrame,
@@ -32,6 +36,72 @@ def get_signal_details(
     sell_signals: List[Dict[str, Any]] = []
     if df.empty or len(df) < 120:
         return {"buy_signals": buy_signals, "sell_signals": sell_signals}
+
+    if strategy_type == "tv_zp":
+        long_indices, short_indices, _debug = _find_tv_zp_signal_indices(df)
+        for idx in long_indices:
+            buy_signals.append({
+                "time": str(df['日期'].iloc[idx])[:10],
+                "price": round(float(df['收盘'].iloc[idx]), 2),
+                "reason": _get_signal_reason(df, idx, strategy_type),
+            })
+        for idx in short_indices:
+            sell_signals.append({
+                "time": str(df['日期'].iloc[idx])[:10],
+                "price": round(float(df['收盘'].iloc[idx]), 2),
+                "reason": "TV-ZP short：Range Filter转空 + Volume/QQE确认",
+            })
+        return {
+            "buy_signals": buy_signals,
+            "sell_signals": sell_signals,
+            "trailing_stops": [],
+        }
+
+    if strategy_type == "squeeze":
+        signal_indices = _find_squeeze_signal_indices(df, threshold, vol_multiplier, rsi_min)
+        for seq, idx in enumerate(signal_indices):
+            entry_price = float(df['收盘'].iloc[idx])
+            if entry_price <= 0:
+                continue
+            buy_signals.append({
+                "time": str(df['日期'].iloc[idx])[:10],
+                "price": round(entry_price, 2),
+                "reason": _get_signal_reason(df, idx, strategy_type),
+            })
+
+            next_idx = signal_indices[seq + 1] if seq + 1 < len(signal_indices) else len(df)
+            hit_profit = False
+            hit_breakdown = False
+            target_price = entry_price * 1.15
+            for future_idx in range(idx + 1, min(next_idx, len(df))):
+                row = df.iloc[future_idx]
+                if not hit_profit and float(row.get('最高', 0)) >= target_price:
+                    sell_signals.append({
+                        "time": str(row['日期'])[:10],
+                        "price": round(target_price, 2),
+                        "reason": "止盈50%",
+                        "pnl_pct": 15.0,
+                        "hold_days": future_idx - idx,
+                    })
+                    hit_profit = True
+                if not hit_breakdown and float(row.get('收盘', 0)) < float(row.get('EMA20', 0)):
+                    exit_price = float(row.get('收盘', 0))
+                    sell_signals.append({
+                        "time": str(row['日期'])[:10],
+                        "price": round(exit_price, 2),
+                        "reason": "破位",
+                        "pnl_pct": round((exit_price - entry_price) / entry_price * 100, 2),
+                        "hold_days": future_idx - idx,
+                    })
+                    hit_breakdown = True
+                if hit_profit and hit_breakdown:
+                    break
+
+        return {
+            "buy_signals": buy_signals,
+            "sell_signals": sell_signals,
+            "trailing_stops": [],
+        }
 
     close_vals = df['收盘'].values
     high_vals = df['最高'].values
@@ -133,6 +203,9 @@ def _find_all_signal_indices(
 ) -> List[int]:
     """找到历史中所有触发信号的索引（排除最后5天，留给回测）"""
     try:
+        if strategy_type == "tv_zp":
+            long_indices, _short_indices, _debug = _find_tv_zp_signal_indices(df)
+            return long_indices
         if strategy_type == "pine":
             return _find_pine_signal_indices(df, min_signals)
         elif strategy_type == "consensus":
@@ -143,36 +216,300 @@ def _find_all_signal_indices(
         return []
 
 
-def _find_squeeze_signal_indices(df: pd.DataFrame, threshold: float, vol_multiplier: float, rsi_min: int) -> List[int]:
-    """均线粘合策略的信号索引"""
-    ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
+def _squeeze_tv_macd(df: pd.DataFrame) -> pd.DataFrame:
+    close = df['收盘']
+    dif = close.ewm(span=8, adjust=False).mean() - close.ewm(span=15, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
+    hist = (dif - dea) * 2
+    return pd.DataFrame({"dif": dif, "dea": dea, "hist": hist}, index=df.index)
+
+
+def _squeeze_tv_rsi(df: pd.DataFrame) -> pd.Series:
+    if 'RSI_WILDER' in df.columns:
+        return df['RSI_WILDER']
+    delta = df['收盘'].diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs.fillna(0)))
+    rsi.loc[(avg_loss == 0) & (avg_gain > 0)] = 100
+    return rsi
+
+
+def _find_squeeze_signal_indices(
+    df: pd.DataFrame,
+    threshold: float,
+    vol_multiplier: float,
+    rsi_min: int,
+    use_macd_filter: bool = True,
+    use_bb_sqz: bool = False,
+    sqz_lookback: int = 10,
+    use_rs_filter: bool = False,
+) -> List[int]:
+    """均线粘合策略的信号索引，对齐 TradingView MACD 优化版。"""
+    ma_cols = ['EMA5', 'EMA20', 'EMA60']
     if not all(c in df.columns for c in ma_cols):
         return []
 
     ma_max = df[ma_cols].max(axis=1)
     c_breakout = (df['收盘'] >= ma_max) & (df['收盘'] > df['开盘'])
     c_volume = (df['成交量'] / df['Vol_MA20'].replace(0, np.nan)) >= vol_multiplier
-    c_rsi = df['RSI'] >= rsi_min
-    c_macd = df['MACD_DIF'] > df['MACD_DEA']
-    c_sqz = df['Sqz_Ratio'].rolling(10).min() < threshold if 'Sqz_Ratio' in df.columns else pd.Series(False, index=df.index)
+    c_rsi = _squeeze_tv_rsi(df) >= rsi_min
+    macd = _squeeze_tv_macd(df)
+    c_macd = ((macd['hist'] > 0) & (macd['hist'].shift(1) <= 0)) if use_macd_filter else pd.Series(True, index=df.index)
+    sqz_ratio = (df[ma_cols].max(axis=1) - df[ma_cols].min(axis=1)) / df[ma_cols].min(axis=1).replace(0, np.nan)
+    c_sqz = sqz_ratio.rolling(sqz_lookback).min() < threshold
+    c_bb = pd.Series(True, index=df.index)
+    if use_bb_sqz and 'BB_Width' in df.columns:
+        c_bb = df['BB_Width'] <= df['BB_Width'].rolling(120).quantile(0.2)
+    c_rs = pd.Series(True, index=df.index)
+    if use_rs_filter and 'RS' in df.columns and 'RS_MA50' in df.columns:
+        c_rs = df['RS'] > df['RS_MA50']
 
-    mask = c_breakout & c_volume & c_rsi & c_macd & c_sqz
+    mask = c_breakout & c_volume & c_rsi & c_macd & c_sqz & c_bb & c_rs
     valid = df.index[mask & (df.index >= 120)]
     return valid.tolist()
 
 
+def _pine_bullish_signal_series(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    """返回 Pine 五指标看涨序列，成交量作为单独确认条件。"""
+    false_series = pd.Series(False, index=df.index)
+    rf_up = df.get('RF_Upward', false_series).fillna(False).astype(bool)
+    rf_down = df.get('RF_Downward', false_series).fillna(False).astype(bool)
+    return {
+        "rf": rf_up & ~rf_down,
+        "st": df.get('ST_Signal', false_series).fillna(False).astype(bool),
+        "rqk": df.get('RQK_Up', false_series).fillna(False).astype(bool),
+        "half": df.get('HalfTrend_Up', false_series).fillna(False).astype(bool),
+        "qqe": df.get('QQE_Long', false_series).fillna(False).astype(bool),
+    }
+
+
+def _pine_volume_confirm_series(df: pd.DataFrame) -> pd.Series:
+    vol_ma = df.get('Vol_MA20', df['成交量'].rolling(20).mean()).replace(0, np.nan)
+    return (df['成交量'] > vol_ma * 1.2).fillna(False)
+
+
 def _find_pine_signal_indices(df: pd.DataFrame, min_signals: int) -> List[int]:
     """Pine Script 共振策略的信号索引"""
-    rf_bullish = (df.get('RF_Upward', pd.Series(False, index=df.index)) & ~df.get('RF_Downward', pd.Series(False, index=df.index))).astype(int)
-    qqe_bullish = df.get('QQE_Long', pd.Series(False, index=df.index)).astype(int)
-    vol_bullish = (df['成交量'] > df.get('Vol_MA20', df['成交量'].rolling(20).mean()) * 1.2).astype(int)
-
-    bullish_count = rf_bullish + qqe_bullish + vol_bullish
+    min_signals = max(1, min(int(min_signals), 5))
+    signals = _pine_bullish_signal_series(df)
+    bullish_count = sum(s.astype(int) for s in signals.values())
+    vol_bullish = _pine_volume_confirm_series(df)
     is_bull_candle = df['收盘'] > df['开盘']
+    body = (df['收盘'] - df['开盘']).abs()
+    upper_shadow = df['最高'] - df[['收盘', '开盘']].max(axis=1)
+    shadow_ratio = upper_shadow / body.replace(0, np.nan)
+    is_shadow_ok = (shadow_ratio < 0.5).fillna(True)
 
-    mask = (bullish_count >= min_signals) & is_bull_candle
-    valid = df.index[mask & (df.index >= 50)]
+    mask = (bullish_count >= min_signals) & vol_bullish & is_bull_candle & is_shadow_ok
+    valid = df.index[mask & (df.index >= 120)]
     return valid.tolist()
+
+
+def _tv_rma(series: pd.Series, length: int) -> pd.Series:
+    return series.astype(float).ewm(alpha=1 / length, adjust=False).mean()
+
+
+def _tv_rsi(close: pd.Series, length: int) -> pd.Series:
+    delta = close.astype(float).diff()
+    gain = delta.clip(lower=0).fillna(0)
+    loss = (-delta.clip(upper=0)).fillna(0)
+    avg_gain = _tv_rma(gain, length)
+    avg_loss = _tv_rma(loss, length).replace(0, np.nan)
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
+def _tv_zp_range_filter_default(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """TradingView ZP 默认 Range Filter: per=100, mult=3."""
+    close = df["收盘"].astype(float).reset_index(drop=True)
+    abs_diff = close.diff().abs().fillna(0)
+    smooth_range = (
+        abs_diff.ewm(span=100, adjust=False).mean()
+        .ewm(span=199, adjust=False).mean()
+        * 3.0
+    )
+
+    filt = np.zeros(len(close), dtype=float)
+    upward = np.zeros(len(close), dtype=int)
+    downward = np.zeros(len(close), dtype=int)
+    if len(close) == 0:
+        empty = pd.Series(dtype=bool, index=df.index)
+        return empty, empty, pd.Series(dtype=float, index=df.index)
+
+    filt[0] = close.iloc[0]
+    for i in range(1, len(close)):
+        prev = filt[i - 1]
+        price = close.iloc[i]
+        rng = smooth_range.iloc[i] if np.isfinite(smooth_range.iloc[i]) else 0.0
+        if price > prev:
+            filt[i] = prev if price - rng < prev else price - rng
+        else:
+            filt[i] = prev if price + rng > prev else price + rng
+
+        if filt[i] > filt[i - 1]:
+            upward[i] = upward[i - 1] + 1
+            downward[i] = 0
+        elif filt[i] < filt[i - 1]:
+            downward[i] = downward[i - 1] + 1
+            upward[i] = 0
+        else:
+            upward[i] = upward[i - 1]
+            downward[i] = downward[i - 1]
+
+    rf_up = (close > filt) & (pd.Series(upward) > 0)
+    rf_down = (close < filt) & (pd.Series(downward) > 0)
+    return (
+        pd.Series(rf_up.to_numpy(), index=df.index).fillna(False),
+        pd.Series(rf_down.to_numpy(), index=df.index).fillna(False),
+        pd.Series(filt, index=df.index),
+    )
+
+
+def _tv_zp_qqe_trailing_line(rsi_ma: pd.Series, factor: float, rsi_period: int = 6) -> pd.Series:
+    wilders = rsi_period * 2 - 1
+    atr_rsi = (rsi_ma.shift(1) - rsi_ma).abs().fillna(0)
+    dar = (
+        atr_rsi.ewm(span=wilders, adjust=False).mean()
+        .ewm(span=wilders, adjust=False).mean()
+        * factor
+    )
+
+    longband = np.zeros(len(rsi_ma), dtype=float)
+    shortband = np.zeros(len(rsi_ma), dtype=float)
+    trend = np.ones(len(rsi_ma), dtype=int)
+    fast = np.zeros(len(rsi_ma), dtype=float)
+    values = rsi_ma.fillna(50).to_numpy(dtype=float)
+    ranges = dar.fillna(0).to_numpy(dtype=float)
+
+    for i in range(len(values)):
+        rs = values[i]
+        new_long = rs - ranges[i]
+        new_short = rs + ranges[i]
+        if i == 0:
+            longband[i] = new_long
+            shortband[i] = new_short
+            fast[i] = longband[i]
+            continue
+
+        prev_rs = values[i - 1]
+        prev_long = longband[i - 1]
+        prev_short = shortband[i - 1]
+        longband[i] = max(prev_long, new_long) if prev_rs > prev_long and rs > prev_long else new_long
+        shortband[i] = min(prev_short, new_short) if prev_rs < prev_short and rs < prev_short else new_short
+
+        cross_above_short = prev_rs <= prev_short and rs > prev_short
+        cross_below_long = prev_rs >= prev_long and rs < prev_long
+        if cross_above_short:
+            trend[i] = 1
+        elif cross_below_long:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i - 1]
+
+        fast[i] = longband[i] if trend[i] == 1 else shortband[i]
+
+    return pd.Series(fast, index=rsi_ma.index)
+
+
+def _tv_zp_qqe_line_bar_series(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """QQE Mod Line & Bar confirmation from the TradingView ZP settings."""
+    close = df["收盘"].astype(float)
+    rsi_ma = _tv_rsi(close, 6).ewm(span=5, adjust=False).mean()
+    fast_atr_rsi_tl = _tv_zp_qqe_trailing_line(rsi_ma, factor=3.0)
+    bb_source = fast_atr_rsi_tl - 50
+    basis = bb_source.rolling(50, min_periods=50).mean()
+    dev = bb_source.rolling(50, min_periods=50).std() * 0.35
+    upper = basis + dev
+    lower = basis - dev
+
+    rsi_ma2 = _tv_rsi(close, 6).ewm(span=5, adjust=False).mean()
+    fast_atr_rsi2_tl = _tv_zp_qqe_trailing_line(rsi_ma2, factor=1.61)
+    qqe_line = fast_atr_rsi2_tl - 50
+
+    greenbar1 = (rsi_ma2 - 50) > 3
+    greenbar2 = (rsi_ma - 50) > upper
+    redbar1 = (rsi_ma2 - 50) < -3
+    redbar2 = (rsi_ma - 50) < lower
+
+    qqe_long = ((rsi_ma2 - 50) > 0) & greenbar1 & greenbar2 & (qqe_line > 0)
+    qqe_short = ((rsi_ma2 - 50) < 0) & redbar1 & redbar2 & (qqe_line < 0)
+    return qqe_long.fillna(False), qqe_short.fillna(False)
+
+
+def _count_consecutive_true(series: pd.Series) -> pd.Series:
+    counts = []
+    current = 0
+    for value in series.fillna(False).astype(bool):
+        current = current + 1 if value else 0
+        counts.append(current)
+    return pd.Series(counts, index=series.index)
+
+
+def _apply_tv_zp_expiry_and_alternate(
+    leading_long: pd.Series,
+    leading_short: pd.Series,
+    long_cond: pd.Series,
+    short_cond: pd.Series,
+    expiry: int = 3,
+) -> tuple[List[int], List[int]]:
+    long_count = _count_consecutive_true(leading_long)
+    short_count = _count_consecutive_true(leading_short)
+    long_with_expiry = long_cond.fillna(False).astype(bool) & (long_count <= expiry)
+    short_with_expiry = short_cond.fillna(False).astype(bool) & (short_count <= expiry)
+
+    long_indices: List[int] = []
+    short_indices: List[int] = []
+    state = 0
+    for idx, (is_long, is_short) in enumerate(zip(long_with_expiry, short_with_expiry)):
+        if is_long and state != 1:
+            long_indices.append(int(long_with_expiry.index[idx]))
+            state = 1
+        elif is_short and state != -1:
+            short_indices.append(int(short_with_expiry.index[idx]))
+            state = -1
+
+    return long_indices, short_indices
+
+
+def _find_tv_zp_signal_indices(df: pd.DataFrame) -> tuple[List[int], List[int], Dict[str, pd.Series]]:
+    """
+    TradingView DIY Custom Strategy Builder [ZP] 当前确认配置：
+    Leading=Range Filter(Default 100/3), Confirmation=Volume above MA + QQE Line&Bar,
+    Signal Expiry=3, Alternate Signal=true.
+    """
+    if df is None or df.empty or not {"收盘", "成交量"}.issubset(df.columns):
+        return [], [], {}
+
+    leading_long, leading_short, rf_filter = _tv_zp_range_filter_default(df)
+    vol_ma = df.get("Vol_MA20", df["成交量"].rolling(20).mean()).replace(0, np.nan)
+    volume_confirm = (df["成交量"] > vol_ma).fillna(False)
+    qqe_long, qqe_short = _tv_zp_qqe_line_bar_series(df)
+
+    long_cond = leading_long & volume_confirm & qqe_long
+    short_cond = leading_short & volume_confirm & qqe_short
+    long_indices, short_indices = _apply_tv_zp_expiry_and_alternate(
+        leading_long=leading_long,
+        leading_short=leading_short,
+        long_cond=long_cond,
+        short_cond=short_cond,
+        expiry=3,
+    )
+
+    long_indices = [idx for idx in long_indices if idx >= 120]
+    short_indices = [idx for idx in short_indices if idx >= 120]
+    return long_indices, short_indices, {
+        "rf_filter": rf_filter,
+        "leading_long": leading_long,
+        "leading_short": leading_short,
+        "volume_confirm": volume_confirm,
+        "qqe_long": qqe_long,
+        "qqe_short": qqe_short,
+    }
 
 
 def _find_consensus_signal_indices(df: pd.DataFrame) -> List[int]:
@@ -201,9 +538,14 @@ def _find_consensus_signal_indices(df: pd.DataFrame) -> List[int]:
 def _get_signal_reason(df: pd.DataFrame, idx: int, strategy_type: str) -> str:
     """生成信号触发原因描述"""
     row = df.iloc[idx]
+    if strategy_type == "tv_zp":
+        return "TV-ZP long：Range Filter转多 + Volume/QQE确认"
     if strategy_type == "pine":
         parts = []
         if row.get('RF_Upward', False): parts.append("RF看涨")
+        if row.get('ST_Signal', False): parts.append("ST看涨")
+        if row.get('RQK_Up', False): parts.append("RQK看涨")
+        if row.get('HalfTrend_Up', False): parts.append("HalfTrend看涨")
         if row.get('QQE_Long', False): parts.append("QQE看涨")
         vol_ma = row.get('Vol_MA20', 0)
         if vol_ma > 0 and row['成交量'] > vol_ma * 1.2: parts.append("放量")
@@ -216,7 +558,8 @@ def _get_signal_reason(df: pd.DataFrame, idx: int, strategy_type: str) -> str:
         if vol_ma > 0:
             vr = row['成交量'] / vol_ma
             parts.append(f"量比{vr:.1f}")
-        parts.append(f"RSI={row.get('RSI', 0):.0f}")
+        parts.append(f"RSI={row.get('RSI_WILDER', row.get('RSI', 0)):.0f}")
+        parts.append("MACD共振")
         return "+".join(parts)
 
 
@@ -282,8 +625,11 @@ def run_optimization_grid(
 def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param_name: str, param_value: Any) -> List[int]:
     """根据指定参数值找信号索引"""
     try:
+        if strategy_type == "tv_zp":
+            long_indices, _short_indices, _debug = _find_tv_zp_signal_indices(df)
+            return long_indices
         if strategy_type == "pine":
-            min_signals = int(param_value) if param_name == "min_signals" else 3
+            min_signals = int(param_value) if param_name in {"min_signals", "pine_min_signals"} else 3
             return _find_pine_signal_indices(df, min_signals)
         elif strategy_type == "consensus":
             return _find_consensus_signal_indices(df)
@@ -520,25 +866,24 @@ def _calculate_fundamental_score(fund_data: Optional[Dict[str, Any]]) -> tuple[f
     }
 
 
-def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=True, sqz_lookback=10, use_rs_filter=True, fund_data: dict = None):
+def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10, use_rs_filter=False, fund_data: dict = None):
     """执行无门问禅：A股均线粘合战法 (Optimized)"""
     if len(df) < 120: return False, {"reason": f"历史数据不足 ({len(df)}天)"}
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # --- 1. 均线系统 (使用预计算的 Sqz_Ratio) ---
-    if 'Sqz_Ratio' not in df.columns:
-        ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
-        ma_max = df[ma_cols].max(axis=1)
-        ma_min = df[ma_cols].min(axis=1)
-        df['Sqz_Ratio'] = (ma_max - ma_min) / ma_min
+    # --- 1. 均线系统：对齐 TradingView 图例 EMA5/EMA20/EMA60 ---
+    ma_cols = ['EMA5', 'EMA20', 'EMA60']
+    ma_max_series = df[ma_cols].max(axis=1)
+    ma_min_series = df[ma_cols].min(axis=1).replace(0, np.nan)
+    sqz_ratio = (ma_max_series - ma_min_series) / ma_min_series
     
     # 粘合判断 (最近 N 天内出现过粘合)
-    was_squeeze_recent = df['Sqz_Ratio'].iloc[-sqz_lookback:].min() < threshold
+    was_squeeze_recent = sqz_ratio.iloc[-sqz_lookback:].min() < threshold
     
     # --- 2. 突破动作 ---
-    curr_ma_max = df[['EMA5', 'EMA10', 'EMA20', 'EMA60']].iloc[-1].max()
+    curr_ma_max = ma_max_series.iloc[-1]
     is_breakout = (curr['收盘'] >= curr_ma_max) and (curr['收盘'] > curr['开盘'])
     
     # --- 3. 趋势与量能 ---
@@ -546,10 +891,13 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     is_volume = (vol_ratio >= vol_multiplier)
     
     # --- 5. RSI 强度 ---
-    is_rsi_ok = curr['RSI'] >= rsi_min
+    tv_rsi = _squeeze_tv_rsi(df)
+    curr_rsi = float(tv_rsi.iloc[-1])
+    is_rsi_ok = curr_rsi >= rsi_min
     
     # --- 6. MACD ---
-    is_macd_ok = curr['MACD_DIF'] > curr['MACD_DEA'] if use_macd_filter else True
+    tv_macd = _squeeze_tv_macd(df)
+    is_macd_ok = (tv_macd['hist'].iloc[-1] > 0 and tv_macd['hist'].iloc[-2] <= 0) if use_macd_filter else True
     
     # --- 7. 相对强度 ---
     is_rs_ok = True
@@ -563,9 +911,9 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         is_bb_ok = curr['BB_Width'] <= bb_quantile_20
 
     debug_info = {
-        "squeeze": round(df['Sqz_Ratio'].iloc[-1], 4),
+        "squeeze": round(sqz_ratio.iloc[-1], 4),
         "vol_ratio": round(vol_ratio, 2),
-        "rsi": round(curr['RSI'], 1),
+        "rsi": round(curr_rsi, 1),
         "is_breakout": is_breakout,
         "is_volume": is_volume,
         "is_rsi_ok": is_rsi_ok,
@@ -585,8 +933,13 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         upper_shadow = curr['最高'] - max(curr['收盘'], curr['开盘'])
         shadow_ratio = round(upper_shadow / body, 2) if body > 0 else 0
         
-        # 技术评分
-        tech_score = (vol_ratio * 25) + ((threshold - df['Sqz_Ratio'].iloc[-1]) * 100 * 50) + (curr['RSI'] * 0.4)
+        # 技术评分：使用近期最深粘合度，避免突破当天均线发散后被反向扣分；量比封顶，避免极端成交量吞没其他维度。
+        recent_sqz_min = float(sqz_ratio.iloc[-sqz_lookback:].min())
+        sqz_depth = max(0.0, threshold - recent_sqz_min)
+        vol_score = min(vol_ratio, 3.0) * 25
+        sqz_score = sqz_depth * 100 * 50
+        rsi_score = min(curr_rsi, 80.0) * 0.4
+        tech_score = vol_score + sqz_score + rsi_score
         
         # 基本面加权
         fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
@@ -598,9 +951,9 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
             "现价": curr['收盘'],
             "代码": curr.get('code', 'N/A'),
             "名称": curr.get('name', 'N/A'),
-            "粘合度": round(df['Sqz_Ratio'].iloc[-1], 4),
-            "RSI": round(curr['RSI'], 1),
-            "DIF": round(curr['MACD_DIF'], 3),
+            "粘合度": round(sqz_ratio.iloc[-1], 4),
+            "RSI": round(curr_rsi, 1),
+            "DIF": round(tv_macd['dif'].iloc[-1], 3),
             "BB": round(curr['BB_Width'], 4),
             "影线比": shadow_ratio
         }
@@ -618,37 +971,38 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     debug_info["reason"] = ",".join(reasons) if reasons else "多因子未共振"
     return False, debug_info
 
-def calculate_historical_win_rate(df, stop_loss_pct=-8.0):
+def calculate_historical_win_rate(
+    df,
+    stop_loss_pct=-8.0,
+    threshold=0.12,
+    vol_multiplier=1.5,
+    rsi_min=55,
+    use_macd_filter=True,
+    use_bb_sqz=False,
+    sqz_lookback=10,
+    use_rs_filter=False,
+):
     """向量化计算回测统计 (Enhanced v6.0 - 含止损/回撤/盈亏比)"""
     empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
     if df.empty or len(df) < 130:
         return empty_result
 
     try:
-        # 1. 预计算所有行的共振信号 (向量化)
-        ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
-        ma_max = df[ma_cols].max(axis=1)
+        final_signal_indices = [
+            idx for idx in _find_squeeze_signal_indices(
+                df,
+                threshold=threshold,
+                vol_multiplier=vol_multiplier,
+                rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter,
+                use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback,
+                use_rs_filter=use_rs_filter,
+            )
+            if idx < len(df) - 5
+        ]
 
-        c_breakout = (df['收盘'] >= ma_max) & (df['收盘'] > df['开盘'])
-        c_volume = (df['成交量'] / df['Vol_MA20']) >= 1.5
-        c_rsi = df['RSI'] >= 55
-        c_macd = df['MACD_DIF'] > df['MACD_DEA']
-        c_sqz = df['Sqz_Ratio'].rolling(10).min() < 0.12
-
-        pre_signals = c_breakout & c_volume & c_rsi & c_macd & c_sqz
-        valid_indices = df.index[120:-5]
-        candidate_indices = df.index[pre_signals & (df.index.isin(valid_indices))]
-
-        if len(candidate_indices) == 0:
-            return empty_result
-
-        final_signal_indices = []
-        for idx in candidate_indices:
-            bb_limit = df['BB_Width'].iloc[idx-119 : idx+1].quantile(0.2)
-            if df.loc[idx, 'BB_Width'] <= bb_limit:
-                final_signal_indices.append(idx)
-
-        if not final_signal_indices:
+        if len(final_signal_indices) == 0:
             return empty_result
 
         return _simulate_backtest(
@@ -667,24 +1021,23 @@ def calculate_historical_win_rate(df, stop_loss_pct=-8.0):
 
 def check_pine_strategy(df, min_signals=3, fund_data: dict = None):
     """
-    Pine Script 多指标共振策略 (基于用户截图优化的 3 指标核心版)
-    核心指标：Range Filter, Volume, QQE Mod
+    Pine Script 多指标共振策略
+    五指标：Range Filter, SuperTrend, RQK, HalfTrend, QQE Mod
+    成交量、阳线和上影线作为交易确认过滤。
     """
     if df is None or df.empty:
         return False, {"reason": "数据为空"}
 
     # 1. 基础指标计算
     curr = df.iloc[-1]
+    min_signals = max(1, min(int(min_signals), 5))
     
-    # --- 指标 1: Range Filter (必选) ---
-    rf_bullish = False
-    if 'RF_Upward' in df.columns:
-        rf_bullish = curr['RF_Upward'] and not df.iloc[-1].get('RF_Downward', False)
-    
-    # --- 指标 2: QQE Mod (核心共振) ---
-    qqe_bullish = False
-    if 'QQE_Long' in df.columns:
-        qqe_bullish = curr['QQE_Long']
+    # --- 五指标共振 ---
+    rf_bullish = bool(curr.get('RF_Upward', False)) and not bool(curr.get('RF_Downward', False))
+    st_bullish = bool(curr.get('ST_Signal', False))
+    rqk_bullish = bool(curr.get('RQK_Up', False))
+    half_bullish = bool(curr.get('HalfTrend_Up', False))
+    qqe_bullish = bool(curr.get('QQE_Long', False))
 
     # --- 指标 3: Volume (量能确认) ---
     vol_bullish = False
@@ -702,28 +1055,27 @@ def check_pine_strategy(df, min_signals=3, fund_data: dict = None):
     shadow_ratio = round(upper_shadow / body, 2) if body > 0 else 0
     is_shadow_ok = shadow_ratio < 0.5
 
-    # 统计核心 3 指标看涨数量
-    core_signals = sum([rf_bullish, qqe_bullish, vol_bullish])
+    signal_flags = [rf_bullish, st_bullish, rqk_bullish, half_bullish, qqe_bullish]
+    signal_count = sum(signal_flags)
     
     # 最终判断：共振信号足 + 是阳线 + 影线可接受
-    is_match = (core_signals >= min_signals) and is_bull_candle and is_shadow_ok
+    is_match = (signal_count >= min_signals) and vol_bullish and is_bull_candle and is_shadow_ok
 
     debug_info = {
         "RangeFilter": "✅" if rf_bullish else "❌",
+        "SuperTrend": "✅" if st_bullish else "❌",
+        "RQK": "✅" if rqk_bullish else "❌",
+        "HalfTrend": "✅" if half_bullish else "❌",
         "QQE_Mod": "✅" if qqe_bullish else "❌",
         "Volume": "✅" if vol_bullish else "❌",
-        "core_signals": f"{core_signals}/3",
+        "core_signals": f"{signal_count}/5",
         "is_bull": "✅" if is_bull_candle else "❌",
         "shadow_ok": "✅" if is_shadow_ok else "❌"
     }
 
-    # 辅助判断 (用于加分)
-    st_bullish = curr.get('ST_Signal', False)
-    rqk_bullish = curr.get('RQK_Up', False)
-
     if is_match:
         # 计算评分 (基于信号数量和一致性)
-        tech_score = core_signals * 30 + (10 if st_bullish else 0) + (10 if rqk_bullish else 0)
+        tech_score = signal_count * 20 + (10 if vol_bullish else 0)
         
         # 基本面加分与高管背书
         fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
@@ -743,7 +1095,7 @@ def check_pine_strategy(df, min_signals=3, fund_data: dict = None):
             "代码": curr.get('code', 'N/A'),
             "名称": curr.get('name', 'N/A'),
             "涨幅%": round(pct_change, 2),
-            "信号数": f"{core_signals}/3",
+            "信号数": f"{signal_count}/5",
             "3日涨幅%": round(pct_change_3d, 2),
             "RSI": round(curr.get('RSI', 0), 1),
             "DIF": round(curr.get('MACD_DIF', 0), 3),
@@ -751,6 +1103,9 @@ def check_pine_strategy(df, min_signals=3, fund_data: dict = None):
             "粘合度": round(curr.get('Sqz_Ratio', 0), 4),
             "影线比": shadow_ratio,
             "RF": "看涨" if rf_bullish else "看跌",
+            "ST": "看涨" if st_bullish else "看跌",
+            "RQK": "看涨" if rqk_bullish else "看跌",
+            "HalfTrend": "看涨" if half_bullish else "看跌",
             "QQE": "看涨" if qqe_bullish else "看跌",
             "成交量": "放量" if vol_bullish else "缩量"
         }
@@ -758,11 +1113,222 @@ def check_pine_strategy(df, min_signals=3, fund_data: dict = None):
         return True, res
     else:
         reasons = []
-        if core_signals < min_signals: reasons.append(f"信号不足({core_signals}/3)")
+        if signal_count < min_signals: reasons.append(f"信号不足({signal_count}/5)")
+        if not vol_bullish: reasons.append("量能未确认")
         if not is_bull_candle: reasons.append("非阳线")
         if not is_shadow_ok: reasons.append(f"影线过长({shadow_ratio})")
         debug_info["reason"] = ",".join(reasons) if reasons else "条件冲突"
         return False, debug_info
+
+
+def check_tv_zp_strategy(df, fund_data: dict = None):
+    """
+    TradingView ZP 当前实盘配置策略。
+    只在最新K线出现 long 信号时入选，short 信号作为风险提示返回。
+    """
+    if df is None or df.empty or len(df) < 130:
+        return False, {"reason": f"历史数据不足({0 if df is None else len(df)})"}
+
+    long_indices, short_indices, debug = _find_tv_zp_signal_indices(df)
+    curr_idx = len(df) - 1
+    is_long_now = curr_idx in long_indices
+    is_short_now = curr_idx in short_indices
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100 if prev['收盘'] else 0
+
+    volume_confirm = bool(debug.get("volume_confirm", pd.Series(False, index=df.index)).iloc[-1])
+    qqe_long = bool(debug.get("qqe_long", pd.Series(False, index=df.index)).iloc[-1])
+    qqe_short = bool(debug.get("qqe_short", pd.Series(False, index=df.index)).iloc[-1])
+    leading_long = bool(debug.get("leading_long", pd.Series(False, index=df.index)).iloc[-1])
+    leading_short = bool(debug.get("leading_short", pd.Series(False, index=df.index)).iloc[-1])
+
+    debug_info = {
+        "RangeFilter": "多" if leading_long else ("空" if leading_short else "中性"),
+        "Volume": "✅" if volume_confirm else "❌",
+        "QQE_Long": "✅" if qqe_long else "❌",
+        "QQE_Short": "✅" if qqe_short else "❌",
+        "signal": "short" if is_short_now else ("long" if is_long_now else "none"),
+    }
+
+    if not is_long_now:
+        reasons = []
+        if not leading_long: reasons.append("Range Filter未转多")
+        if not volume_confirm: reasons.append("量能未过20日均量")
+        if not qqe_long: reasons.append("QQE Line&Bar未确认")
+        if is_short_now: reasons.append("出现short信号")
+        debug_info["reason"] = ",".join(reasons) if reasons else "最新K线无long信号"
+        return False, debug_info
+
+    fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
+    res = {
+        "Score": round(75 + fund_score, 1),
+        "现价": curr['收盘'],
+        "涨幅%": round(pct_change, 2),
+        "RSI": round(curr.get('RSI', 0), 1),
+        "DIF": round(curr.get('MACD_DIF', 0), 3),
+        "BB": round(curr.get('BB_Width', 0), 4),
+        "粘合度": round(curr.get('Sqz_Ratio', 0), 4),
+        "影线比": 0,
+        "signal": "long",
+        "reason": "TV-ZP long：Range Filter转多 + Volume/QQE确认",
+        "signal_count": len(long_indices),
+    }
+    res.update(fund_ui_data)
+    return True, res
+
+
+def check_tv_dual_strategy(
+    df,
+    threshold=0.12,
+    vol_multiplier=1.5,
+    rsi_min=55,
+    use_macd_filter=True,
+    sqz_lookback=10,
+    signal_window=3,
+    require_both=False,
+    fund_data: dict = None,
+):
+    """TradingView 对齐扫描：最近 N 根K线出现均线 B 共振和/或 TV-ZP long 即入选。"""
+    if df is None or df.empty or len(df) < 130:
+        return False, {"reason": f"历史数据不足({0 if df is None else len(df)})"}
+
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    start_idx = max(0, len(df) - max(1, int(signal_window)))
+
+    ma_indices = _find_squeeze_signal_indices(
+        df,
+        threshold=threshold,
+        vol_multiplier=vol_multiplier,
+        rsi_min=rsi_min,
+        use_macd_filter=use_macd_filter,
+        use_bb_sqz=False,
+        sqz_lookback=sqz_lookback,
+        use_rs_filter=False,
+    )
+    zp_long_indices, zp_short_indices, _debug = _find_tv_zp_signal_indices(df)
+
+    recent_ma = [idx for idx in ma_indices if idx >= start_idx]
+    recent_zp = [idx for idx in zp_long_indices if idx >= start_idx]
+    latest_long = max(recent_ma + recent_zp) if (recent_ma or recent_zp) else None
+    latest_short = max(zp_short_indices) if zp_short_indices else None
+
+    if require_both and (not recent_ma or not recent_zp):
+        return False, {
+            "reason": f"最近{signal_window}根K线未同时出现均线B共振和TV-ZP long",
+            "tv_ma_signal": "B共振" if recent_ma else "无",
+            "tv_zp_signal": "long" if recent_zp else "无",
+            "tv_match": "未双命中",
+        }
+    if latest_long is None:
+        return False, {"reason": f"最近{signal_window}根K线无均线B共振或TV-ZP long"}
+    if latest_short is not None and latest_short > latest_long:
+        return False, {"reason": "最近TV-ZP short晚于long，暂不入选", "signal": "short"}
+
+    fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
+    ma_hit = bool(recent_ma)
+    zp_hit = bool(recent_zp)
+    pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100 if prev['收盘'] else 0
+    score = 88 if ma_hit and zp_hit else 75
+
+    res = {
+        "Score": round(score + fund_score, 1),
+        "现价": curr['收盘'],
+        "涨幅%": round(pct_change, 2),
+        "RSI": round(curr.get('RSI_WILDER', curr.get('RSI', 0)), 1),
+        "DIF": round(_squeeze_tv_macd(df)['dif'].iloc[-1], 3),
+        "BB": round(curr.get('BB_Width', 0), 4),
+        "粘合度": round(curr.get('Sqz_Ratio', 0), 4),
+        "影线比": 0,
+        "signal": "强共振" if require_both and ma_hit and zp_hit else ("双策略" if ma_hit and zp_hit else ("B共振" if ma_hit else "long")),
+        "tv_ma_signal": "B共振" if ma_hit else "无",
+        "tv_zp_signal": "long" if zp_hit else "无",
+        "tv_match": "双命中" if ma_hit and zp_hit else "单命中",
+        "reason": ("TV双策略强共振：" if require_both else "TV双策略对齐：") + " + ".join(
+            part for part in [
+                "均线B共振" if ma_hit else "",
+                "TV-ZP long" if zp_hit else "",
+            ] if part
+        ),
+        "signal_count": len(set(ma_indices + zp_long_indices)),
+    }
+    res.update(fund_ui_data)
+    return True, res
+
+
+def calculate_tv_zp_win_rate(df, stop_loss_pct=-8.0):
+    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    if df.empty or len(df) < 130:
+        return empty_result
+
+    try:
+        long_indices, _short_indices, _debug = _find_tv_zp_signal_indices(df)
+        signal_indices = [idx for idx in long_indices if idx < len(df) - 5]
+        if len(signal_indices) == 0:
+            return empty_result
+        return _simulate_backtest(
+            close_vals=df['收盘'].values,
+            high_vals=df['最高'].values,
+            low_vals=df['最低'].values,
+            signal_indices=signal_indices,
+            stop_loss_pct=stop_loss_pct,
+            atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+        )
+    except Exception:
+        return empty_result
+
+
+def calculate_tv_dual_win_rate(
+    df,
+    stop_loss_pct=-8.0,
+    threshold=0.12,
+    vol_multiplier=1.5,
+    rsi_min=55,
+    use_macd_filter=True,
+    sqz_lookback=10,
+    require_both=False,
+    signal_window=3,
+):
+    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    if df.empty or len(df) < 130:
+        return empty_result
+
+    try:
+        ma_indices = _find_squeeze_signal_indices(
+            df,
+            threshold=threshold,
+            vol_multiplier=vol_multiplier,
+            rsi_min=rsi_min,
+            use_macd_filter=use_macd_filter,
+            use_bb_sqz=False,
+            sqz_lookback=sqz_lookback,
+            use_rs_filter=False,
+        )
+        zp_indices, _short_indices, _debug = _find_tv_zp_signal_indices(df)
+        if require_both:
+            signal_indices = sorted({
+                max(ma_idx, zp_idx)
+                for ma_idx in ma_indices
+                for zp_idx in zp_indices
+                if abs(ma_idx - zp_idx) < max(1, int(signal_window)) and max(ma_idx, zp_idx) < len(df) - 5
+            })
+        else:
+            signal_indices = sorted({idx for idx in ma_indices + zp_indices if idx < len(df) - 5})
+        if len(signal_indices) == 0:
+            return empty_result
+        return _simulate_backtest(
+            close_vals=df['收盘'].values,
+            high_vals=df['最高'].values,
+            low_vals=df['最低'].values,
+            signal_indices=signal_indices,
+            stop_loss_pct=stop_loss_pct,
+            atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+        )
+    except Exception:
+        return empty_result
 
 
 def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
@@ -770,19 +1336,14 @@ def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
     计算 Pine Script 策略的回测统计 (Enhanced v6.0)
     """
     empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
-    if df.empty or len(df) < 60:
+    if df.empty or len(df) < 130:
         return empty_result
 
     try:
-        rf_bullish = (df['RF_Upward'] & ~df.get('RF_Downward', False)).astype(int)
-        qqe_bullish = df.get('QQE_Long', False).astype(int)
-        vol_bullish = (df['成交量'] > df.get('Vol_MA20', df['成交量'].rolling(20).mean())).astype(int)
-
-        bullish_count = rf_bullish + qqe_bullish + vol_bullish
-
-        valid_range = df.index < len(df) - 5
-        signal_mask = (bullish_count >= min_signals) & valid_range
-        signal_indices = df.index[signal_mask].tolist()
+        signal_indices = [
+            idx for idx in _find_pine_signal_indices(df, min_signals)
+            if idx < len(df) - 5
+        ]
 
         if len(signal_indices) == 0:
             return empty_result

@@ -19,6 +19,31 @@ from core.risk_engine import compute_paper_risk_levels, safe_float
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
 
+def _get_live_snapshot_price(code: str) -> dict | None:
+    try:
+        from core.data import get_market_snapshot
+
+        snapshot = get_market_snapshot()
+        if snapshot.empty:
+            return None
+        match = snapshot[snapshot["code"] == code]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        price = safe_float(row.get("price"))
+        if price <= 0:
+            return None
+        return {
+            "price": price,
+            "high": safe_float(row.get("high"), price) or price,
+            "source": "realtime_snapshot",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    except Exception as exc:
+        logger.warning(f"Live snapshot unavailable for {code}: {exc}")
+        return None
+
+
 @router.get("/{code}/kline")
 async def get_stock_kline(code: str, local_only: bool = False):
     """
@@ -104,6 +129,36 @@ def fetch_stock_data_with_indicators(code: str):
 
     df = calculate_indicators(df, periods=[5, 10, 20, 60])
     return df
+
+
+def _resolve_chart_strategy(code: str, engine) -> str:
+    """Use the stock's actual workflow strategy for chart signals."""
+    if not engine:
+        return "squeeze"
+    try:
+        with engine.connect() as conn:
+            paper_res = conn.execute(text("""
+                SELECT strategy_type
+                FROM paper_trading
+                WHERE code = :code AND status = 'OPEN'
+                ORDER BY entry_date DESC
+                LIMIT 1
+            """), {"code": code}).fetchone()
+            if paper_res and paper_res[0]:
+                return str(paper_res[0])
+
+            scan_res = conn.execute(text("""
+                SELECT strategy_type
+                FROM scan_history
+                WHERE code = :code AND strategy_type IS NOT NULL
+                ORDER BY date DESC
+                LIMIT 1
+            """), {"code": code}).fetchone()
+            if scan_res and scan_res[0]:
+                return str(scan_res[0])
+    except Exception as exc:
+        logger.warning(f"Resolve chart strategy for {code} failed: {exc}")
+    return "squeeze"
 
 
 @router.get("/detail")
@@ -512,7 +567,7 @@ def _generate_ai_suggestion(df, stock_info: dict, risk: dict) -> dict:
         suggestion["reasoning"] = ["该股不在拟合实盘持仓中或数据不足，暂无操作建议"]
         return suggestion
 
-    close = float(df.iloc[-1]['收盘'])
+    close = safe_float(stock_info.get("current_price"), float(df.iloc[-1]['收盘']))
     buy_price = stock_info.get("buy_price", close)
     stop_price = stock_info.get("stop_price", buy_price * 0.91)
     tp_price = stock_info.get("take_profit_price", buy_price * 1.15)
@@ -679,10 +734,23 @@ def get_stock_full_analysis(code: str):
                 "MACD": float(row.get('MACD_HIST', 0))
             })
 
-        # 2. 买卖信号
+        # 2. 基础信息 + 拟合实盘数据
+        engine = get_db_engine()
+        from core.strategy import check_strategy, calculate_historical_win_rate
+        price_action = build_price_action_annotations(df)
+        chart_strategy = _resolve_chart_strategy(code, engine)
+        signal_strategy = "pine" if chart_strategy == "both" else chart_strategy
+        if chart_strategy in ["pine", "both", "tv_zp"] and 'RF_Upward' not in df.columns:
+            df = calculate_pine_indicators(df)
+
+        # 3. 买卖信号：按该股票实际策略类型生成，而不是固定 squeeze
         signals = {}
         try:
-            signals = get_signal_details(df, strategy_type="squeeze")
+            signals = get_signal_details(df, strategy_type=signal_strategy)
+            signals["strategy_type"] = chart_strategy
+            signals["signal_strategy_type"] = signal_strategy
+            signals["buy_count"] = len(signals.get("buy_signals", []))
+            signals["sell_count"] = len(signals.get("sell_signals", []))
             if "trailing_stops" in signals:
                 ts_dict = {}
                 for ts in signals["trailing_stops"]:
@@ -691,13 +759,38 @@ def get_stock_full_analysis(code: str):
                     if t not in ts_dict or val < ts_dict[t]:
                         ts_dict[t] = val
                 signals["trailing_stops"] = [{"time": t, "value": v} for t, v in sorted(ts_dict.items())]
-        except Exception as e:
-            logger.warning(f"Signal generation for {code}: {e}")
 
-        # 3. 基础信息 + 拟合实盘数据
-        engine = get_db_engine()
-        from core.strategy import check_strategy, calculate_historical_win_rate
-        price_action = build_price_action_annotations(df)
+            strategy_sets = {}
+            for overlay_strategy in ["squeeze", "tv_zp"]:
+                try:
+                    overlay_signals = get_signal_details(df, strategy_type=overlay_strategy)
+                    overlay_signals["strategy_type"] = overlay_strategy
+                    overlay_signals["buy_count"] = len(overlay_signals.get("buy_signals", []))
+                    overlay_signals["sell_count"] = len(overlay_signals.get("sell_signals", []))
+                    strategy_sets[overlay_strategy] = overlay_signals
+                except Exception as overlay_exc:
+                    logger.warning(f"Overlay signal generation for {code} with {overlay_strategy}: {overlay_exc}")
+                    strategy_sets[overlay_strategy] = {
+                        "buy_signals": [],
+                        "sell_signals": [],
+                        "trailing_stops": [],
+                        "strategy_type": overlay_strategy,
+                        "buy_count": 0,
+                        "sell_count": 0,
+                    }
+            signals["strategy_sets"] = strategy_sets
+        except Exception as e:
+            logger.warning(f"Signal generation for {code} with {signal_strategy}: {e}")
+            signals = {
+                "buy_signals": [],
+                "sell_signals": [],
+                "trailing_stops": [],
+                "strategy_sets": {},
+                "strategy_type": chart_strategy,
+                "signal_strategy_type": signal_strategy,
+                "buy_count": 0,
+                "sell_count": 0,
+            }
 
         is_paper_trade = False
         buy_price = 0.0
@@ -718,6 +811,9 @@ def get_stock_full_analysis(code: str):
         entry_reason_snapshot = None
         hold_days = 0
         pl_pct = 0.0
+        current_price = safe_float(df.iloc[-1]['收盘'])
+        price_source = "daily_k"
+        price_updated_at = str(df.iloc[-1]['日期']) if '日期' in df.columns else None
 
         with engine.connect() as conn:
             basic_res = conn.execute(text("SELECT name, industry FROM stock_basic WHERE code = :code"), {"code": code}).fetchone()
@@ -726,7 +822,7 @@ def get_stock_full_analysis(code: str):
 
             paper_res = conn.execute(text("""
                 SELECT entry_price, high_since_entry, status, remark, entry_date, current_price,
-                       entry_source, entry_signal_date, entry_reason_snapshot
+                       entry_source, entry_signal_date, entry_reason_snapshot, strategy_type
                 FROM paper_trading
                 WHERE code = :code AND status = 'OPEN'
                 LIMIT 1
@@ -736,7 +832,30 @@ def get_stock_full_analysis(code: str):
                 entry_price = safe_float(paper_res[0])
                 high_since_entry = safe_float(paper_res[1], entry_price)
                 is_paper_trade = True
-                curr_price = safe_float(paper_res[5], float(df.iloc[-1]['收盘']))
+                live_price = _get_live_snapshot_price(code)
+                if live_price:
+                    curr_price = live_price["price"]
+                    curr_high = live_price["high"]
+                    high_since_entry = max(high_since_entry, curr_high, curr_price)
+                    price_source = live_price["source"]
+                    price_updated_at = live_price["updated_at"]
+                    try:
+                        conn.execute(text("""
+                            UPDATE paper_trading
+                            SET current_price = :price, high_since_entry = :high, updated_at = :updated_at
+                            WHERE code = :code AND status = 'OPEN'
+                        """), {
+                            "price": curr_price,
+                            "high": high_since_entry,
+                            "updated_at": datetime.now(),
+                            "code": code,
+                        })
+                        conn.commit()
+                    except Exception as exc:
+                        logger.warning(f"Failed to update live paper price for {code}: {exc}")
+                else:
+                    curr_price = safe_float(paper_res[5], current_price)
+                    price_source = "paper_cached_price" if curr_price > 0 else "daily_k"
                 risk_levels = compute_paper_risk_levels(
                     entry_price,
                     high_since_entry,
@@ -765,8 +884,10 @@ def get_stock_full_analysis(code: str):
                     entry_date_str = str(entry_date)
                     hold_days = (datetime.now().date() - entry_date).days
                 pl_pct = round(((curr_price - entry_price) / entry_price) * 100, 2)
+                current_price = curr_price
 
-        close = float(df.iloc[-1]['收盘'])
+        close = current_price
+        prev_close = float(df.iloc[-2]['收盘']) if len(df) > 1 else close
         _, stats = check_strategy(df)
         bt = calculate_historical_win_rate(df)
 
@@ -775,10 +896,17 @@ def get_stock_full_analysis(code: str):
             "名称": name,
             "行业": industry,
             "现价": round(close, 2),
-            "涨幅%": round(float((df.iloc[-1]['收盘'] - df.iloc[-2]['收盘']) / df.iloc[-2]['收盘'] * 100), 2) if len(df) > 1 else 0.0,
+            "current_price": round(close, 2),
+            "price_source": price_source,
+            "price_updated_at": price_updated_at,
+            "涨幅%": round(float((close - prev_close) / prev_close * 100), 2) if prev_close > 0 else 0.0,
             "Score": round(float(stats.get('Score', 50.0)), 1),
             "RSI": round(float(df.iloc[-1].get('RSI', 50.0)), 1),
             "历史胜率": f"{bt['win_rate']}%",
+            "strategy_type": chart_strategy,
+            "chart_strategy_type": chart_strategy,
+            "chart_buy_count": signals.get("buy_count", 0),
+            "chart_sell_count": signals.get("sell_count", 0),
             "is_paper_trade": is_paper_trade,
             "buy_price": buy_price,
             "stop_price": stop_price,

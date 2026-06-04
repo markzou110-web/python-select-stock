@@ -43,8 +43,12 @@ TAKE_PROFIT_PCT = 15.0
 TAKE_PROFIT_RATIO = 1.0 + TAKE_PROFIT_PCT / 100.0  # 1.15
 
 # ── 时间止损 (Time Stop) ──
-# 持仓超过 N 天且未盈利，自动平仓
-TIME_STOP_DAYS = 5
+# 分层时间风控：先预警，再复核，最后才升级为确认平仓
+TIME_STOP_DAYS = 5                 # legacy baseline, keep for compatibility
+TIME_STOP_WARNING_DAYS = 5         # 5 个交易日未盈利：预警
+TIME_STOP_REVIEW_DAYS = 7          # 7 个交易日未盈利：复核/减仓候选
+TIME_STOP_FORCE_DAYS = 10          # 10 个交易日仍未盈利：确认平仓候选
+TIME_STOP_REVIEW_LOSS_PCT = -2.0   # 复核档亏损加重阈值
 
 # ── 回测引擎参数 (Backtest Engine Defaults) ──
 BACKTEST_MAX_HOLD_DAYS = 10         # 最大持有天数 (从 5 改为 10，更适合均线粘合中线策略)

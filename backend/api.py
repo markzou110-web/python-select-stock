@@ -33,6 +33,7 @@ socket.setdefaulttimeout(config.AKSHARE_TIMEOUT)  # 防止网络请求无限挂�
 
 
 from core.sentinel import sentinel
+from core.sync_scheduler import market_sync_scheduler
 
 
 # --- App Lifespan ---
@@ -47,6 +48,9 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Intraday Sentinel...")
     sentinel.start()
 
+    logger.info("Starting Market Sync Scheduler...")
+    market_sync_scheduler.start()
+
     # 异步预热核心缓存
     from core.data import get_index_data, get_hot_sectors, get_sector_map
     from routers.market import fetch_mine_sweeper_data
@@ -58,6 +62,7 @@ async def lifespan(app: FastAPI):
     loop.run_in_executor(None, fetch_mine_sweeper_data)
 
     yield
+    market_sync_scheduler.stop()
 
 
 # --- FastAPI App ---
@@ -127,6 +132,8 @@ from routers.kline import router as kline_router
 from routers.review import router as review_router
 from routers.watchlist import router as watchlist_router
 from routers.strategy_templates import router as strategy_templates_router
+from routers.system import router as system_router
+from routers.backtest import router as backtest_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -139,6 +146,8 @@ app.include_router(kline_router)
 app.include_router(review_router)
 app.include_router(watchlist_router)
 app.include_router(strategy_templates_router)
+app.include_router(system_router)
+app.include_router(backtest_router)
 
 @app.get("/api/market/pulse")
 async def get_market_pulse():

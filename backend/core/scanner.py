@@ -17,7 +17,7 @@ from core.logging_config import logger
 from core.config import config
 from core.ws_manager import manager as ws_manager
 from core.db import (
-    get_db_engine, save_scan_results, load_from_db
+    get_db_engine, save_scan_results, load_from_db, save_scan_audit_log
 )
 from core.data import (
     get_market_snapshot, get_index_hist, get_sector_map, get_sector_trends, get_market_regime
@@ -27,12 +27,72 @@ from core.indicators import (
     get_weekly_indicators, batch_calculate_indicators
 )
 from core.strategy import (
-    check_strategy, check_pine_strategy, check_consensus_strategy,
-    calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
+    check_strategy, check_pine_strategy, check_tv_zp_strategy, check_tv_dual_strategy, check_consensus_strategy,
+    calculate_historical_win_rate, calculate_pine_win_rate, calculate_tv_zp_win_rate, calculate_tv_dual_win_rate, calculate_consensus_win_rate,
+    STRATEGY_LOGIC_VERSION, BACKTEST_ENGINE_VERSION, EXIT_RULE_VERSION
 )
 from core.price_action import analyze_price_action
 from core.risk_engine import compute_paper_risk_levels
+from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from routers.market import fetch_mine_sweeper_data
+
+
+def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
+    """Translate Brooks price-action context into a bounded scan ranking adjustment."""
+    adjustment = 0.0
+    if (res.get('pa_trade_plan') or {}).get('action') == 'READY':
+        adjustment += 6
+    if res.get('pa_h2_quality') == '强':
+        adjustment += 5
+    elif res.get('pa_h2_quality') == '中':
+        adjustment += 2
+    if res.get('pa_volume_confirmed'):
+        adjustment += 4
+    if (res.get('pa_multi_timeframe_score') or 0) >= 25:
+        adjustment += 4
+    if (res.get('pa_always_in_strength') or 0) >= 70:
+        adjustment += 3
+    if res.get('pa_micro_channel') == '多头微型通道':
+        adjustment += 2
+
+    if (res.get('pa_trap_risk') or 0) >= 75:
+        adjustment -= 8
+    if (res.get('pa_failure_risk') or 0) >= 70:
+        adjustment -= 6
+    if res.get('pa_trend_damage') in {'跌破EMA20', '跌破EMA60', '短线低点破坏'}:
+        adjustment -= 8
+    if res.get('pa_failed_second_entry') == '失败H2':
+        adjustment -= 6
+    if (res.get('pa_gap_risk') or 0) >= 70:
+        adjustment -= 4
+    if (res.get('pa_multi_timeframe_score') or 0) <= -25:
+        adjustment -= 4
+    return max(-20.0, min(20.0, adjustment))
+
+
+def _is_momentum_watch_candidate(res: Dict[str, Any], vetoes: List[str]) -> bool:
+    """Keep strong movers visible without promoting them to executable A/B candidates."""
+    if not vetoes:
+        return False
+    fatal_vetoes = {"地雷预警", "市值<30亿", "板块下跌", "上影线过长", "Brooks风险偏高"}
+    if any(v in fatal_vetoes for v in vetoes):
+        return False
+    has_momentum_veto = any(v in {"涨幅>7%", "5日涨>15%"} for v in vetoes)
+    if not has_momentum_veto:
+        return False
+
+    pa_score = float(res.get('price_action_score') or 0)
+    plan_action = (res.get('pa_trade_plan') or {}).get('action')
+    structure_ok = (
+        plan_action == 'READY'
+        or pa_score >= 65
+        or res.get('pa_h2_quality') == '强'
+        or res.get('pa_breakout_quality') == '强突破'
+        or res.get('price_action_signal') == '强多头趋势K'
+    )
+    volume_ok = bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') == '放量突破'
+    trend_ok = res.get('price_action_regime') in {'向上突破', '多头趋势'} or res.get('pa_weekly_context') == '周线多头'
+    return structure_ok and (volume_ok or trend_ok)
 
 
 def _apply_sop_filter(results, market_regime, sector_trends):
@@ -61,6 +121,8 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         sector_info = sector_trends.get(sector, {})
         if sector_info.get('trend') == 'DOWN':
             vetoes.append("板块下跌")
+        if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
+            vetoes.append("板块扩散转弱")
 
         # ── 硬性条件 ──
         win_rate_str = res.get('历史胜率', '0%')
@@ -90,6 +152,12 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             bonuses.append("业绩增长")
         if sector_info.get('trend') == 'LEAD':
             bonuses.append("板块领涨")
+        if (res.get('sector_momentum_score') or 0) >= 75:
+            bonuses.append("板块强共振")
+        elif (res.get('sector_momentum_score') or 0) >= 58:
+            bonuses.append("板块早期启动")
+        if (res.get('sector_alignment_score') or 0) >= 75:
+            bonuses.append("个股强于板块")
         if regime_status == "OFFENSIVE":
             bonuses.append("大盘进攻")
 
@@ -107,6 +175,151 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         res['sop_vetoes'] = vetoes
         res['sop_checks'] = checks
         res['sop_bonuses'] = bonuses
+        brooks_adjustment = _brooks_rank_adjustment(res)
+        res['brooks_rank_adjustment'] = brooks_adjustment
+        res['final_rank_score'] = round(float(res.get('Score') or 0) + brooks_adjustment, 2)
+        res['final_rank_score'] = round(res['final_rank_score'] + min(12, max(0, float(res.get('sector_alignment_score') or 0) - 50) * 0.24), 2)
+        if brooks_adjustment >= 6:
+            bonuses.append("Brooks结构加分")
+        if brooks_adjustment <= -6:
+            vetoes.append("Brooks风险偏高")
+            res['sop_grade'] = "D" if grade in {"C", "D"} else "C"
+        if res.get('early_watch_only'):
+            res['sop_grade'] = "D" if vetoes else "C"
+            res['sop_checks'].append("等待TV-ZP确认")
+            res['sop_bonuses'].append("早期异动观察")
+        elif res.get('sector_watch_only'):
+            fatal_vetoes = {"地雷预警", "板块下跌", "板块扩散转弱", "Brooks风险偏高"}
+            res['sop_grade'] = "D" if any(v in fatal_vetoes for v in vetoes) else "C"
+            res['sop_checks'].append("等待TV买点")
+            res['sop_bonuses'].append("板块趋势确认观察")
+        elif _is_momentum_watch_candidate(res, vetoes):
+            res['sop_grade'] = "M"
+            res['sop_checks'].append("动量观察")
+            res['sop_bonuses'].append("强势动量观察")
+            res['momentum_watch_only'] = True
+            res['momentum_watch_reason'] = "涨幅/短线涨幅偏高，不追买；保留观察回踩或次日确认"
+
+
+def _early_watch_quality(res: Dict[str, Any]) -> tuple[bool, List[str]]:
+    """Quality gate for MA-led early watch candidates under TV strict mode."""
+    reasons = []
+    if res.get('tv_ma_signal') != 'B共振' or res.get('tv_zp_signal') != '无':
+        reasons.append("不是均线领先信号")
+
+    has_brooks = (
+        res.get('pa_h2_quality') == '强'
+        or bool(res.get('pa_volume_confirmed'))
+        or res.get('pa_volume_pattern') == '放量突破'
+        or res.get('pa_breakout_quality') == '强突破'
+    )
+    if not has_brooks:
+        reasons.append("Brooks/H2/放量质量不足")
+
+    has_fundamental = (res.get('ROE') or 0) >= 8 or (res.get('净利YOY') or 0) >= 15
+    if not has_fundamental:
+        reasons.append("缺少基本面加分")
+
+    if (res.get('pa_trade_plan') or {}).get('action') == 'AVOID':
+        reasons.append("价格行为建议暂不参与")
+
+    return len(reasons) == 0, reasons
+
+
+def _build_sector_watch_candidates(
+    candidates: pd.DataFrame,
+    existing_codes: set,
+    hist_map: Dict[str, pd.DataFrame],
+    sector_map: Dict[str, str],
+    sector_strength: Dict[str, Dict[str, Any]],
+    max_per_sector: int = 5,
+) -> List[Dict[str, Any]]:
+    """Add strong-sector leaders to observation only, even when no TV buy signal fired."""
+    if candidates is None or candidates.empty or not sector_strength:
+        return []
+
+    df = candidates.copy()
+    df['code'] = df['code'].astype(str).str.zfill(6)
+    df['industry'] = df['code'].map(sector_map).fillna('未知')
+    df['pct_chg'] = pd.to_numeric(df['pct_chg'], errors='coerce').fillna(0)
+    df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0)
+    df = df[(df['pct_chg'] > 0) & (df['price'] > 0) & (df['industry'] != '未知')]
+
+    watch: List[Dict[str, Any]] = []
+    for industry, group in df.groupby('industry'):
+        strength = sector_strength.get(industry, {})
+        if strength.get('sector_phase') != 'SECTOR_CONFIRM':
+            continue
+        sector_avg = float(strength.get('sector_avg_pct') or group['pct_chg'].mean() or 0)
+        leaders = group.sort_values('pct_chg', ascending=False).head(max_per_sector)
+        for rank, (_, row) in enumerate(leaders.iterrows(), start=1):
+            code = str(row.get('code', '')).zfill(6)
+            if code in existing_codes:
+                continue
+            stock_pct = float(row.get('pct_chg') or 0)
+            role = classify_sector_role(stock_pct, sector_avg, rank_in_sector=rank)
+            if role not in {'LEADER', 'CORE'}:
+                continue
+
+            df_hist = hist_map.get(code)
+            if df_hist is None or df_hist.empty:
+                continue
+            df_hist = df_hist.copy().reset_index(drop=True)
+            pa = analyze_price_action(df_hist)
+            plan = pa.get('pa_trade_plan') or {}
+            if plan.get('action') == 'AVOID':
+                continue
+
+            latest = df_hist.iloc[-1]
+            current_price = float(row.get('price') or latest.get('收盘') or 0)
+            entry_price = float(pa.get('pa_entry_price') or latest.get('最高') or current_price)
+            risk = compute_paper_risk_levels(entry_price, entry_price, current_price, pa)
+            pct_5d = 0.0
+            if len(df_hist) >= 6:
+                close_now = float(df_hist['收盘'].iloc[-1])
+                close_5d_ago = float(df_hist['收盘'].iloc[-6])
+                if close_5d_ago > 0:
+                    pct_5d = round((close_now - close_5d_ago) / close_5d_ago * 100, 2)
+
+            item: Dict[str, Any] = {
+                '代码': code,
+                '名称': str(row.get('name') or code),
+                '行业': industry,
+                '现价': round(current_price, 2),
+                '涨幅%': round(stock_pct, 2),
+                'Score': 58.0,
+                'RSI': round(float(latest.get('RSI') or 0), 1),
+                'DIF': round(float(latest.get('DIF') or 0), 3),
+                'BB': round(float(latest.get('BB') or 0), 4),
+                '粘合度': round(float(latest.get('粘合度') or 0), 4),
+                '历史胜率': '0%',
+                '信号次数': 0,
+                '北向': '---',
+                '共振': '板块强势观察',
+                '影线比': 0,
+                'strategy_type': 'sector_watch',
+                'signal': '板块强势观察',
+                'reason': f'{industry}趋势确认，{role}进入观察；等待TV买点或回踩确认',
+                'sector_watch_only': True,
+                'sector_watch_reason': f'{industry}趋势确认，个股为{role}，但TV双策略买点未触发',
+                'tv_ma_signal': '未触发',
+                'tv_zp_signal': '未触发',
+                'tv_match': '板块观察',
+                'pct_5d': pct_5d,
+                'entry_price': round(entry_price, 2),
+                'stop_price': risk['active_stop_price'],
+                'plan_stop_price': risk['active_stop_price'],
+                'initial_stop_price': risk['initial_stop_price'],
+                'structure_stop_price': risk['structure_stop_price'],
+                'target_price': risk['take_profit_price'],
+                'risk_reward': risk['risk_reward'],
+                'risk_notes': risk['risk_notes'],
+            }
+            item.update(pa)
+            watch.append(item)
+            existing_codes.add(code)
+
+    return watch
 
 
 def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20, fund_data=None):
@@ -133,8 +346,8 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
 
     # 根据策略类型设置最小数据要求
     if min_data_days is None:
-        if strategy_type == "pine":
-            min_days = 50
+        if strategy_type in {"pine", "tv_zp", "tv_dual", "tv_dual_strict"}:
+            min_days = 120
         elif strategy_type == "consensus":
             min_days = 130 # 需要 60 周或足够长的日线来模拟
         else: # squeeze or both
@@ -146,15 +359,14 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         return {"reason": f"样本不足({len(df)})"}
 
     try:
-        # 技术指标计算 - 如果预加载的数据已经包含指标，则跳过
+        # 技术指标计算 - 预加载数据可能已有通用指标，但仍缺少 Pine 专属指标。
+        enable_pine = (strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"])
         if 'RSI' not in df.columns:
-            # Pine Script 策略或 同时启用 需要额外的指标
-            enable_pine = (strategy_type in ["pine", "both"])
             df = calculate_indicators(df, current_price=price, current_vol=vol, current_open=open_price, bench_df=bench_df, enable_pine_indicators=enable_pine)
 
-            # 如果包含 Pine 策略且指标已计算但缺少 Pine 特定指标，需要补充计算
-            if enable_pine and 'RF_Upward' not in df.columns:
-                df = calculate_pine_indicators(df)
+        pine_cols = {'RF_Upward', 'ST_Signal', 'RQK_Up', 'HalfTrend_Up', 'QQE_Long'}
+        if enable_pine and not pine_cols.issubset(df.columns):
+            df = calculate_pine_indicators(df)
 
         # 根据策略类型选择不同的筛选逻辑
         if strategy_type == "pine":
@@ -164,6 +376,57 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 stats['代码'] = code
                 stats['名称'] = name
                 stats['strategy_type'] = "pine"
+                return stats
+            else:
+                return stats
+        elif strategy_type == "tv_zp":
+            match, stats = check_tv_zp_strategy(df, fund_data=fund_data)
+            if match:
+                stats['代码'] = code
+                stats['名称'] = name
+                stats['strategy_type'] = "tv_zp"
+                return stats
+            else:
+                return stats
+        elif strategy_type in {"tv_dual", "tv_dual_strict"}:
+            match, stats = check_tv_dual_strategy(
+                df,
+                threshold=threshold,
+                vol_multiplier=vol_multiplier,
+                rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter,
+                sqz_lookback=sqz_lookback,
+                require_both=(strategy_type == "tv_dual_strict"),
+                fund_data=fund_data,
+            )
+            if not match and strategy_type == "tv_dual_strict":
+                relaxed_match, relaxed_stats = check_tv_dual_strategy(
+                    df,
+                    threshold=threshold,
+                    vol_multiplier=vol_multiplier,
+                    rsi_min=rsi_min,
+                    use_macd_filter=use_macd_filter,
+                    sqz_lookback=sqz_lookback,
+                    require_both=False,
+                    fund_data=fund_data,
+                )
+                if (
+                    relaxed_match
+                    and relaxed_stats.get('tv_ma_signal') == 'B共振'
+                    and relaxed_stats.get('tv_zp_signal') == '无'
+                ):
+                    relaxed_stats['代码'] = code
+                    relaxed_stats['名称'] = name
+                    relaxed_stats['strategy_type'] = strategy_type
+                    relaxed_stats['early_watch_only'] = True
+                    relaxed_stats['early_watch_reason'] = "均线B共振领先，等待TV-ZP long确认"
+                    relaxed_stats['signal'] = "早期观察"
+                    relaxed_stats['reason'] = "早期观察：均线B共振领先，等待TV-ZP long确认"
+                    return relaxed_stats
+            if match:
+                stats['代码'] = code
+                stats['名称'] = name
+                stats['strategy_type'] = strategy_type
                 return stats
             else:
                 return stats
@@ -248,16 +511,16 @@ def perform_market_scan(
     vol_multiplier: float = 1.5,
     rsi_min: int = 55,
     use_macd_filter: bool = True,
-    use_bb_sqz: bool = True,
+    use_bb_sqz: bool = False,
     sqz_lookback: int = 10,
-    use_weekly: bool = True,
+    use_weekly: bool = False,
     market_range: str = "全市场(除科创)",
     turnover_min: float = 3.0,
     mkt_cap_min: float = 0.0,
-    use_rs_filter: bool = True,
+    use_rs_filter: bool = False,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "squeeze",
+    strategy_type: str = "tv_dual_strict",
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,
@@ -268,6 +531,36 @@ def perform_market_scan(
     """
     logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
     max_date = None
+    scan_started_at = datetime.now()
+    audit_payload: Dict[str, Any] = {
+        "started_at": scan_started_at,
+        "status": "SUCCESS",
+        "strategy_type": strategy_type,
+        "params_snapshot": {
+            "threshold": threshold,
+            "vol_multiplier": vol_multiplier,
+            "rsi_min": rsi_min,
+            "use_macd_filter": use_macd_filter,
+            "use_bb_sqz": use_bb_sqz,
+            "sqz_lookback": sqz_lookback,
+            "use_weekly": use_weekly,
+            "market_range": market_range,
+            "turnover_min": turnover_min,
+            "mkt_cap_min": mkt_cap_min,
+            "use_rs_filter": use_rs_filter,
+            "local_only": local_only,
+            "data_date": data_date,
+            "pine_min_signals": pine_min_signals,
+            "min_data_days": min_data_days,
+            "weekly_ma_period": weekly_ma_period,
+            "stop_loss_pct": stop_loss_pct,
+        },
+        "version_snapshot": {
+            "strategy_logic_version": STRATEGY_LOGIC_VERSION,
+            "backtest_engine_version": BACKTEST_ENGINE_VERSION,
+            "exit_rule_version": EXIT_RULE_VERSION,
+        },
+    }
 
     try:
         # 获取大盘环境以动态调整参数
@@ -379,6 +672,7 @@ def perform_market_scan(
 
         # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
         total_snapshot = len(snapshot_df)
+        audit_payload["total_snapshot"] = total_snapshot
 
         # SOP: 仅保留 沪深主板(60, 00)、创业板(30)、科创板(688)；剔除 ST、退市整理
         snapshot_df['code_str'] = snapshot_df['code'].astype(str)
@@ -397,6 +691,7 @@ def perform_market_scan(
             (~has_mkt_cap | (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)) &
             (~has_turnover | (snapshot_df['turnover'] >= turnover_min))
         ].copy()
+        audit_payload["candidate_count"] = len(candidates)
 
         logger.info(f"Snapshot: {total_snapshot} stocks")
         logger.info(f"After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
@@ -529,7 +824,7 @@ def perform_market_scan(
             master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
 
             # Pine Script 策略或 同时启用 策略需要额外的指标计算
-            if strategy_type in ["pine", "both"]:
+            if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
                 logger.info("Calculating Pine Script indicators in parallel...")
                 # 对每只股票单独计算 Pine 指标 (使用并行加速)
                 groups = [group.copy() for _, group in master_df.groupby('code')]
@@ -615,11 +910,12 @@ def perform_market_scan(
                     fail_reasons[f"异常: {str(e)[:30]}"] = fail_reasons.get(f"异常: {str(e)[:30]}", 0) + 1
 
             logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
+            audit_payload["fail_reasons"] = fail_reasons
             if fail_reasons:
                 logger.info(f"Rejection Summary: {fail_reasons}")
 
             # Pine 策略或 同时启用 策略额外统计
-            if strategy_type in ["pine", "both"]:
+            if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
                 pine_stats = {}
                 for reason, count in fail_reasons.items():
                     if "信号不足" in reason:
@@ -636,12 +932,30 @@ def perform_market_scan(
         # 排序并取 Top 100
         results = sorted(results, key=lambda x: x['Score'], reverse=True)[:100]
 
-        # 补充增强 data (行业, 胜率) - 并发处理 Top 100
-        logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
         sector_map = get_sector_map()
+        sector_trends = get_sector_trends()
+        market_regime = get_market_regime()
+        sector_history = build_sector_history_context(engine, sector_map)
+        sector_strength = build_sector_strength(snapshot_df, sector_map, sector_trends, sector_history)
+
+        sector_watch = _build_sector_watch_candidates(
+            candidates,
+            {str(r.get('代码')) for r in results},
+            hist_map,
+            sector_map,
+            sector_strength,
+        )
+        if sector_watch:
+            logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
+            results.extend(sector_watch)
+
+        # 补充增强 data (行业, 胜率) - 并发处理 Top 100 + 板块观察
+        logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
 
         def process_supplement(res):
             try:
+                if res.get('sector_watch_only'):
+                    return res
                 code = res['代码']
                 # 1. 计算回测统计
                 # 直接使用 hist_map 中已计算好指标的数据，避免重复计算
@@ -657,13 +971,36 @@ def perform_market_scan(
                     sl_pct = -8.0
                 
                 if strategy_type == "pine":
-                    bt = calculate_pine_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                    bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
+                elif strategy_type == "tv_zp":
+                    bt = calculate_tv_zp_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                elif strategy_type in {"tv_dual", "tv_dual_strict"}:
+                    bt = calculate_tv_dual_win_rate(
+                        df_labeled,
+                        stop_loss_pct=sl_pct,
+                        threshold=threshold,
+                        vol_multiplier=vol_multiplier,
+                        rsi_min=rsi_min,
+                        use_macd_filter=use_macd_filter,
+                        sqz_lookback=sqz_lookback,
+                        require_both=(strategy_type == "tv_dual_strict"),
+                    )
                 elif strategy_type == "both":
-                    bt = calculate_pine_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                    bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
                 elif strategy_type == "consensus":
                     bt = calculate_consensus_win_rate(df_labeled, stop_loss_pct=sl_pct)
                 else:
-                    bt = calculate_historical_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                    bt = calculate_historical_win_rate(
+                        df_labeled,
+                        stop_loss_pct=sl_pct,
+                        threshold=threshold,
+                        vol_multiplier=vol_multiplier,
+                        rsi_min=rsi_min,
+                        use_macd_filter=use_macd_filter,
+                        use_bb_sqz=use_bb_sqz,
+                        sqz_lookback=sqz_lookback,
+                        use_rs_filter=use_rs_filter,
+                    )
                 
                 res['历史胜率'] = f"{bt['win_rate']}%"
                 res['信号次数'] = bt['signal_count']
@@ -673,7 +1010,12 @@ def perform_market_scan(
                     "profit_factor": bt['profit_factor'],
                     "avg_hold_days": bt['avg_hold_days'],
                     "stop_loss_hits": bt['stop_loss_hits'],
+                    "backtest_engine_version": BACKTEST_ENGINE_VERSION,
+                    "exit_rule_version": EXIT_RULE_VERSION,
                 }
+                res['strategy_logic_version'] = STRATEGY_LOGIC_VERSION
+                res['backtest_engine_version'] = BACKTEST_ENGINE_VERSION
+                res['exit_rule_version'] = EXIT_RULE_VERSION
 
                 # 2. 获取行业
                 industry = sector_map.get(code, "未知")
@@ -728,6 +1070,19 @@ def perform_market_scan(
         with ThreadPoolExecutor(max_workers=15) as executor:
             list(executor.map(process_supplement, results))
 
+        early_drop_count = 0
+        for res in results:
+            if res.get('early_watch_only'):
+                ok, reasons = _early_watch_quality(res)
+                res['early_watch_quality_ok'] = ok
+                res['early_watch_quality_reasons'] = reasons
+                if not ok:
+                    early_drop_count += 1
+                    res['_drop_early_watch'] = True
+        if early_drop_count:
+            logger.info(f"Early watch quality filter dropped {early_drop_count} candidates.")
+            results = [r for r in results if not r.get('_drop_early_watch')]
+
         # --- SOP: 板块共振 (Sector Resonance) 计算 ---
         industry_counts = {}
         for res in results:
@@ -760,35 +1115,54 @@ def perform_market_scan(
             mkt_raw = snap_mkt_map.get(res['代码'], 0)
             res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
 
-        # --- SOP: 大盘-板块-个股联动过滤 ---
-        sector_trends = get_sector_trends()
-        market_regime = get_market_regime()
-
         # 注入板块走势到每个结果
         for res in results:
             sector = res.get('行业', '')
             s_info = sector_trends.get(sector, {})
             res['sector_trend'] = s_info.get('trend', 'UNKNOWN')
             res['sector_pct'] = s_info.get('pct', 0)
+            strength = sector_strength.get(sector, {})
+            res.update(strength)
+            stock_pct = float(res.get('涨幅%', 0) or 0)
+            sector_avg = float(strength.get('sector_avg_pct', res.get('sector_pct', 0)) or 0)
+            relative_pct = round(stock_pct - sector_avg, 2)
+            res['sector_relative_pct'] = relative_pct
+            momentum = float(strength.get('sector_momentum_score', 0) or 0)
+            breadth = float(strength.get('sector_breadth', 0) or 0)
+            leader_bonus = 15 if relative_pct >= 3 else 8 if relative_pct >= 1 else 0
+            res['sector_alignment_score'] = round(min(100, momentum * 0.45 + breadth * 0.25 + leader_bonus + min(15, max(0, stock_pct) * 1.5)), 1)
+            res['sector_role'] = classify_sector_role(
+                stock_pct,
+                sector_avg,
+                alignment_score=res['sector_alignment_score'],
+            )
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)
         logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
                     f"B={sum(1 for r in results if r.get('sop_grade')=='B')}, "
+                    f"M={sum(1 for r in results if r.get('sop_grade')=='M')}, "
                     f"C={sum(1 for r in results if r.get('sop_grade')=='C')}, "
                     f"D={sum(1 for r in results if r.get('sop_grade')=='D')}")
 
-        # 按 SOP 等级排序: A > B > C > D, 同等级内按 Score 排序
-        grade_order = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
-        results = sorted(results, key=lambda x: (grade_order.get(x.get('sop_grade', 'D'), 3), -x.get('Score', 0)))
+        # 按 SOP 等级排序: A > B > M > C > D, 同等级内按 Brooks/板块调整后的 Score 排序
+        grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4}
+        results = sorted(results, key=lambda x: (grade_order.get(x.get('sop_grade', 'D'), 4), -x.get('final_rank_score', x.get('Score', 0))))
 
         # Update Sentinel memory (仅 A/B 级)
-        from core.sentinel import sentinel
+        from core.sentinel import sentinel, _select_intraday_push_stocks
         ab_results = [r for r in results if r.get('sop_grade') in ('A', 'B')]
-        sentinel.last_top_5 = ab_results[:5] if ab_results else results[:5]
+        sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else ab_results[:5]
 
         # --- 持久化保存 ---
         save_scan_results(results, engine)
+        audit_payload.update({
+            "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
+            "finished_at": datetime.now(),
+            "duration_sec": round(time.time() - start_time, 2),
+            "result_count": len(results),
+        })
+        save_scan_audit_log(audit_payload, engine)
 
         ws_manager.broadcast_threadsafe({
             "type": "scan_end",
@@ -803,9 +1177,27 @@ def perform_market_scan(
 
         return results
     except HTTPException as he:
+        engine = get_db_engine()
+        audit_payload.update({
+            "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
+            "finished_at": datetime.now(),
+            "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
+            "status": "FAILED",
+            "error_message": str(he.detail),
+        })
+        save_scan_audit_log(audit_payload, engine)
         raise he
     except Exception as e:
         logger.error(f"Scanner fatal error: {e}")
         import traceback
         traceback.print_exc()
+        engine = get_db_engine()
+        audit_payload.update({
+            "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
+            "finished_at": datetime.now(),
+            "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
+            "status": "FAILED",
+            "error_message": str(e)[:500],
+        })
+        save_scan_audit_log(audit_payload, engine)
         raise HTTPException(status_code=500, detail=f"扫描执行失败: {str(e)}")

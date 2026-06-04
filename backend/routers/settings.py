@@ -8,6 +8,7 @@ from typing import Dict, Any
 
 from core.config import config
 from core.db import save_setting, get_setting
+from core.sync_scheduler import SYNC_SCHEDULE_DEFAULT
 
 router = APIRouter(prefix="/api", tags=["settings"])
 
@@ -18,7 +19,8 @@ def get_settings_api() -> Dict[str, Any]:
     return {
         "configured": config.is_bark_configured(),
         "bark_key": get_setting("bark_key", ""),
-        "sentinel_schedule_times": get_setting("sentinel_schedule_times", "14:20")
+        "sentinel_schedule_times": get_setting("sentinel_schedule_times", "14:20"),
+        "market_sync_schedule_times": get_setting("market_sync_schedule_times", SYNC_SCHEDULE_DEFAULT),
     }
 
 
@@ -34,6 +36,13 @@ def save_settings_api(data: dict):
         try:
             from api import sentinel
             sentinel.update_schedule(data["sentinel_schedule_times"])
+        except Exception:
+            pass
+    if "market_sync_schedule_times" in data:
+        save_setting("market_sync_schedule_times", data["market_sync_schedule_times"])
+        try:
+            from core.sync_scheduler import market_sync_scheduler
+            market_sync_scheduler.update_schedule(data["market_sync_schedule_times"])
         except Exception:
             pass
     return {"status": "success"}

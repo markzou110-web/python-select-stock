@@ -347,7 +347,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                                 riskLevels={stockInfo}
                                 paperLines={stockInfo?.is_paper_trade ? [
                                     { price: stockInfo.buy_price, label: '买入价', color: '#6366f1', date: stockInfo.entry_date },
-                                    { price: stockInfo.active_stop_price || stockInfo.stop_price, label: '止损价', color: '#f43f5e' },
+                                    { price: stockInfo.active_stop_price || stockInfo.stop_price, label: '实时持仓风控线', color: '#f43f5e' },
                                     { price: stockInfo.take_profit_price, label: '止盈价', color: '#10b981' },
                                 ] : []}
                                 height={stockInfo?.is_paper_trade ? 220 : 190}

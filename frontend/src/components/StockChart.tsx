@@ -73,6 +73,39 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     <span className="font-bold text-slate-500">入场 {priceAction.pa_entry_price || '--'}</span>
                     <span className="font-bold text-rose-600">失效 {priceAction.pa_stop_price || '--'}</span>
                     <span className="font-bold text-emerald-700">目标 {priceAction.pa_target_price || '--'}</span>
+                    {priceAction.pa_pullback_structure && (
+                        <span className="font-bold text-blue-700">{priceAction.pa_pullback_structure}</span>
+                    )}
+                    {priceAction.pa_breakout_quality && (
+                        <span className="font-bold text-slate-500">突破 {priceAction.pa_breakout_quality}</span>
+                    )}
+                    {priceAction.pa_failure_risk != null && (
+                        <span className="font-bold text-amber-700">失败风险 {priceAction.pa_failure_risk}%</span>
+                    )}
+                    {priceAction.pa_h2_quality && priceAction.pa_h2_quality !== '不适用' && (
+                        <span className="font-bold text-blue-700">H2 {priceAction.pa_h2_quality}</span>
+                    )}
+                    {priceAction.pa_failed_breakout_type && (
+                        <span className="font-bold text-rose-600">{priceAction.pa_failed_breakout_type}</span>
+                    )}
+                    {priceAction.pa_micro_channel && priceAction.pa_micro_channel !== '无' && (
+                        <span className="font-bold text-blue-700">{priceAction.pa_micro_channel}</span>
+                    )}
+                    {priceAction.pa_trend_damage && priceAction.pa_trend_damage !== '无' && (
+                        <span className="font-bold text-rose-600">{priceAction.pa_trend_damage}</span>
+                    )}
+                    {priceAction.pa_always_in_strength != null && (
+                        <span className="font-bold text-slate-500">AI强度 {priceAction.pa_always_in_strength}</span>
+                    )}
+                    {priceAction.pa_weekly_context && (
+                        <span className="font-bold text-slate-500">{priceAction.pa_weekly_context}</span>
+                    )}
+                    {priceAction.pa_volume_pattern && priceAction.pa_volume_pattern !== '量能中性' && (
+                        <span className="font-bold text-emerald-700">{priceAction.pa_volume_pattern}</span>
+                    )}
+                    {priceAction.pa_gap_type && priceAction.pa_gap_type !== '无缺口' && (
+                        <span className="font-bold text-amber-700">{priceAction.pa_gap_type}</span>
+                    )}
                     <span className="font-bold text-slate-400">评分 {priceAction.price_action_score ?? '--'}</span>
                 </div>
             )}

@@ -10,19 +10,47 @@ import {
     Cpu,
     Database,
     CheckCircle2,
-    Loader2
+    Loader2,
+    Activity,
+    AlertTriangle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
 
+interface SystemHealthCheck {
+    name: string;
+    status: 'ok' | 'warn' | 'error';
+    message: string;
+}
+
+interface SystemHealth {
+    status: 'ok' | 'warn' | 'error';
+    time: string;
+    score: number;
+    checks: SystemHealthCheck[];
+    summary: {
+        stock_count?: number;
+        daily_k_count?: number;
+        scan_history_count?: number;
+        open_positions?: number;
+        watchlist_count?: number;
+        strategy_template_count?: number;
+        latest_daily_date?: string | null;
+        latest_scan_date?: string | null;
+    };
+    recommendations: string[];
+}
+
 export default function SettingsView() {
     const [settings, setSettings] = useState({
         sentinel_schedule_times: "14:20",
+        market_sync_schedule_times: "08:30,12:10,18:00",
         bark_key: ""
     });
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
+    const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
 
     useEffect(() => {
         fetchSettings();
@@ -30,8 +58,13 @@ export default function SettingsView() {
 
     const fetchSettings = async () => {
         try {
-            const res = await api.get('/api/settings');
+            const [settingsRes, healthRes] = await Promise.all([
+                api.get('/api/settings'),
+                api.get('/api/system/health')
+            ]);
+            const res = settingsRes;
             setSettings(res.data);
+            setSystemHealth(healthRes.data);
         } catch (err) {
             console.error("Fetch Settings Error:", err);
         } finally {
@@ -115,6 +148,23 @@ export default function SettingsView() {
                             </p>
                         </div>
 
+                        <div className="space-y-3">
+                            <label className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                                <Database size={16} className="text-emerald-500" />
+                                行情自动同步时间点
+                            </label>
+                            <input
+                                type="text"
+                                value={settings.market_sync_schedule_times || ""}
+                                onChange={(e) => setSettings({ ...settings, market_sync_schedule_times: e.target.value })}
+                                placeholder="例如: 08:30, 12:10, 18:00"
+                                className="w-full bg-slate-50 border border-slate-100 text-slate-600 font-mono font-bold rounded-xl px-4 py-3 outline-none focus:ring-4 focus:ring-emerald-500/10 focus:bg-white transition-all"
+                            />
+                            <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
+                                默认盘前、中午、晚上各同步一次行情数据，用于板块雷达、选股和次日跟踪。请保持后端服务运行。
+                            </p>
+                        </div>
+
                         <div className="p-4 bg-amber-50 rounded-2xl border border-amber-100/50 flex gap-3">
                             <span className="text-xl">⚠️</span>
                             <div className="text-[10px] text-amber-700 font-medium leading-tight">
@@ -152,6 +202,77 @@ export default function SettingsView() {
                 </div>
             </div>
 
+            {systemHealth && (
+                <div className="glass-card p-6 space-y-5">
+                    <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className={cn(
+                                "w-11 h-11 rounded-2xl flex items-center justify-center",
+                                systemHealth.status === 'ok' ? "bg-emerald-100 text-emerald-600" :
+                                    systemHealth.status === 'warn' ? "bg-amber-100 text-amber-600" :
+                                        "bg-rose-100 text-rose-600"
+                            )}>
+                                <Activity size={22} />
+                            </div>
+                            <div>
+                                <h3 className="font-black text-slate-900">系统专业度自检</h3>
+                                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">
+                                    Operational Readiness Snapshot
+                                </p>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <div className="text-right">
+                                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">成熟度评分</p>
+                                <p className="text-3xl font-black text-slate-900">{systemHealth.score}</p>
+                            </div>
+                            <div className="h-12 w-2 rounded-full bg-slate-100 overflow-hidden">
+                                <div
+                                    className={cn(
+                                        "w-full rounded-full",
+                                        systemHealth.score >= 80 ? "bg-emerald-500" :
+                                            systemHealth.score >= 60 ? "bg-amber-500" : "bg-rose-500"
+                                    )}
+                                    style={{ height: `${Math.max(6, systemHealth.score)}%`, marginTop: `${100 - Math.max(6, systemHealth.score)}%` }}
+                                />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                        <HealthMetric label="股票池" value={systemHealth.summary.stock_count ?? 0} />
+                        <HealthMetric label="日线记录" value={systemHealth.summary.daily_k_count ?? 0} />
+                        <HealthMetric label="最近扫描" value={systemHealth.summary.latest_scan_date || '--'} />
+                        <HealthMetric label="策略模板" value={systemHealth.summary.strategy_template_count ?? 0} />
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {systemHealth.checks.map(check => (
+                            <div key={check.name} className="flex items-start gap-3 rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3">
+                                {check.status === 'ok'
+                                    ? <CheckCircle2 size={16} className="mt-0.5 text-emerald-500 shrink-0" />
+                                    : <AlertTriangle size={16} className={cn("mt-0.5 shrink-0", check.status === 'warn' ? "text-amber-500" : "text-rose-500")} />}
+                                <div>
+                                    <p className="text-xs font-black text-slate-700">{check.message}</p>
+                                    <p className="text-[9px] font-bold uppercase tracking-wider text-slate-400">{check.name}</p>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    {systemHealth.recommendations.length > 0 && (
+                        <div className="rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-3">
+                            <p className="text-xs font-black text-indigo-700 mb-2">下一步建议</p>
+                            <div className="space-y-1">
+                                {systemHealth.recommendations.slice(0, 4).map(item => (
+                                    <p key={item} className="text-[11px] font-medium text-indigo-600">{item}</p>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Performance Hints */}
             <div className="glass-card p-8 bg-slate-900 text-slate-300 relative overflow-hidden">
                 <div className="relative z-10 flex gap-6">
@@ -169,6 +290,15 @@ export default function SettingsView() {
                 </div>
                 <div className="absolute top-0 right-0 w-64 h-64 bg-indigo-500/10 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
             </div>
+        </div>
+    );
+}
+
+function HealthMetric({ label, value }: { label: string; value: string | number }) {
+    return (
+        <div className="rounded-2xl border border-slate-100 bg-white px-4 py-3">
+            <p className="text-[10px] text-slate-400 font-bold">{label}</p>
+            <p className="text-sm font-black text-slate-800 truncate">{value}</p>
         </div>
     );
 }

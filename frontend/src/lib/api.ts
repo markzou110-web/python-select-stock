@@ -28,7 +28,13 @@ api.interceptors.response.use(
     (error) => {
         if (error.config) {
             const duration = Date.now() - (error.config.metadata?.startTime || 0);
-            console.error(`API ${error.config.url?.split('?')[0]} failed after ${duration}ms:`, error.message);
+            const url = error.config.url?.split('?')[0] || '';
+            const isPollingNetworkError = (
+                error.message === 'Network Error' &&
+                (url.startsWith('/api/scan/status/') || url === '/api/sync/status')
+            );
+            const log = isPollingNetworkError ? console.warn : console.error;
+            log(`API ${url} failed after ${duration}ms:`, error.message);
         }
         return Promise.reject(error);
     }

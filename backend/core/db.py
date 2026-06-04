@@ -35,6 +35,51 @@ def validate_table_name(name: str) -> bool:
     return bool(re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', str(name)))
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if pd.isna(value) if not isinstance(value, (dict, list, tuple, set)) else False:
+        return None
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (datetime,)):
+        return value.isoformat()
+    return value
+
+
+PRICE_ACTION_DETAIL_KEYS = [
+    "price_action_score", "price_action_regime", "price_action_signal", "price_action_pattern",
+    "price_action_entry_quality", "price_action_summary", "price_action_risks",
+    "pa_market_cycle", "pa_range_location", "pa_entry_price", "pa_stop_price",
+    "pa_target_price", "pa_risk_reward", "pa_tags", "pa_pullback_legs",
+    "pa_pullback_structure", "pa_breakout_quality", "pa_failure_risk",
+    "pa_entry_quality_score", "pa_h2_quality", "pa_range_rule",
+    "pa_failed_breakout_type", "pa_trap_risk", "pa_micro_channel",
+    "pa_always_in_strength", "pa_trend_damage", "pa_channel_state",
+    "pa_position_strategy", "pa_weekly_context", "pa_multi_timeframe_score",
+    "pa_multi_timeframe_note", "pa_volume_pattern", "pa_volume_confirmed",
+    "pa_volume_risk", "pa_failed_second_entry", "pa_second_entry_risk",
+    "pa_gap_type", "pa_gap_risk", "pa_range_width_quality",
+    "pa_range_center_risk", "pa_range_failed_breakout_count",
+    "pa_trend_phase", "pa_trend_phase_action", "pa_decision_summary",
+    "pa_trade_plan",
+    "sop_grade", "sop_action", "sector_momentum_score", "sector_breadth",
+    "sector_phase", "sector_rank", "sector_alignment_score", "sector_relative_pct",
+    "sector_3d_pct", "sector_5d_pct", "sector_consecutive_up_days", "sector_role",
+    "sector_watch_only", "sector_watch_reason",
+]
+
+
+def _price_action_detail_snapshot(row: Dict[str, Any]) -> str:
+    detail = {key: row.get(key) for key in PRICE_ACTION_DETAIL_KEYS if key in row}
+    return json.dumps(_json_safe(detail), ensure_ascii=False)
+
+
 def load_db_config() -> Dict[str, Any]:
     """从本地文件加载数据库配置"""
     if os.path.exists(CONFIG_FILE):
@@ -118,6 +163,8 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_status ON watchlist(status);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_code_status ON watchlist(code, status);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_strategy_templates_type ON strategy_templates(strategy_type);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_audit_date ON scan_audit_log(scan_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_samples_code_date ON failure_samples(code, sample_date DESC);"))
                 logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
@@ -175,7 +222,8 @@ def init_db(engine=None):
                     ADD COLUMN IF NOT EXISTS pa_risk_reward FLOAT,
                     ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
                     ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
-                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT
+                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT,
+                    ADD COLUMN IF NOT EXISTS price_action_detail JSONB
                 """))
                 logger.info("Migration: price action columns ensured.")
             except Exception as e:
@@ -208,6 +256,96 @@ def init_db(engine=None):
             conn.commit()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
+
+
+def save_scan_audit_log(audit: Dict[str, Any], engine=None) -> bool:
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
+        return False
+
+    payload = {
+        "scan_date": audit.get("scan_date"),
+        "started_at": audit.get("started_at"),
+        "finished_at": audit.get("finished_at"),
+        "duration_sec": audit.get("duration_sec"),
+        "status": audit.get("status") or "SUCCESS",
+        "strategy_type": audit.get("strategy_type"),
+        "params_snapshot": json.dumps(_json_safe(audit.get("params_snapshot") or {}), ensure_ascii=False),
+        "version_snapshot": json.dumps(_json_safe(audit.get("version_snapshot") or {}), ensure_ascii=False),
+        "total_snapshot": int(audit.get("total_snapshot") or 0),
+        "candidate_count": int(audit.get("candidate_count") or 0),
+        "result_count": int(audit.get("result_count") or 0),
+        "fail_reasons": json.dumps(_json_safe(audit.get("fail_reasons") or {}), ensure_ascii=False),
+        "error_message": audit.get("error_message"),
+    }
+
+    try:
+        with engine.connect() as conn:
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("""
+                    INSERT INTO scan_audit_log (
+                        scan_date, started_at, finished_at, duration_sec, status, strategy_type,
+                        params_snapshot, version_snapshot, total_snapshot, candidate_count,
+                        result_count, fail_reasons, error_message
+                    ) VALUES (
+                        :scan_date, :started_at, :finished_at, :duration_sec, :status, :strategy_type,
+                        :params_snapshot, :version_snapshot, :total_snapshot, :candidate_count,
+                        :result_count, :fail_reasons, :error_message
+                    )
+                """), payload)
+            else:
+                conn.execute(text("""
+                    INSERT INTO scan_audit_log (
+                        scan_date, started_at, finished_at, duration_sec, status, strategy_type,
+                        params_snapshot, version_snapshot, total_snapshot, candidate_count,
+                        result_count, fail_reasons, error_message
+                    ) VALUES (
+                        CAST(:scan_date AS DATE), :started_at, :finished_at, :duration_sec, :status, :strategy_type,
+                        CAST(:params_snapshot AS JSONB), CAST(:version_snapshot AS JSONB), :total_snapshot, :candidate_count,
+                        :result_count, CAST(:fail_reasons AS JSONB), :error_message
+                    )
+                """), payload)
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.error(f"Failed to save scan audit log: {exc}")
+        return False
+
+
+def save_failure_sample(sample: Dict[str, Any], engine=None) -> bool:
+    if engine is None:
+        engine = get_db_engine()
+    if not engine:
+        return False
+
+    try:
+        with engine.connect() as conn:
+            date_expr = ":sample_date" if engine.dialect.name == "sqlite" else "CAST(:sample_date AS DATE)"
+            conn.execute(text(f"""
+                INSERT INTO failure_samples (
+                    code, name, sample_date, strategy_type, failure_type,
+                    reason, pnl_pct, source, created_at
+                ) VALUES (
+                    :code, :name, {date_expr}, :strategy_type, :failure_type,
+                    :reason, :pnl_pct, :source, :created_at
+                )
+            """), {
+                "code": sample.get("code"),
+                "name": sample.get("name"),
+                "sample_date": sample.get("sample_date") or datetime.now().strftime("%Y-%m-%d"),
+                "strategy_type": sample.get("strategy_type"),
+                "failure_type": sample.get("failure_type"),
+                "reason": sample.get("reason"),
+                "pnl_pct": sample.get("pnl_pct"),
+                "source": sample.get("source") or "paper_trade",
+                "created_at": datetime.now(),
+            })
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.error(f"Failed to save failure sample: {exc}")
+        return False
 
 def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
     """
@@ -351,7 +489,8 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                     "pa_risk_reward": float(r.get('pa_risk_reward', 0)) if r.get('pa_risk_reward') is not None else None,
                     "pa_trade_action": pa_plan.get("action"),
                     "pa_trade_setup": pa_plan.get("setup"),
-                    "pa_risk_pct": float(pa_plan.get("risk_pct", 0)) if pa_plan.get("risk_pct") is not None else None
+                    "pa_risk_pct": float(pa_plan.get("risk_pct", 0)) if pa_plan.get("risk_pct") is not None else None,
+                    "price_action_detail": _price_action_detail_snapshot(r)
                 })
 
             # 一次性批量插入 (executemany)
@@ -359,10 +498,10 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                 conn.execute(text('''
                     INSERT INTO scan_history (
                         code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
-                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct
+                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct, price_action_detail
                     ) VALUES (
                         :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
-                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct
+                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct, CAST(:price_action_detail AS JSONB)
                     ) ON CONFLICT (code, date) DO UPDATE SET
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
@@ -392,7 +531,8 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         pa_risk_reward = EXCLUDED.pa_risk_reward,
                         pa_trade_action = EXCLUDED.pa_trade_action,
                         pa_trade_setup = EXCLUDED.pa_trade_setup,
-                        pa_risk_pct = EXCLUDED.pa_risk_pct
+                        pa_risk_pct = EXCLUDED.pa_risk_pct,
+                        price_action_detail = EXCLUDED.price_action_detail
                 '''), rows)
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
@@ -456,7 +596,8 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
             "pa_risk_reward": "pa_risk_reward",
             "pa_trade_action": "pa_trade_action",
             "pa_trade_setup": "pa_trade_setup",
-            "pa_risk_pct": "pa_risk_pct"
+            "pa_risk_pct": "pa_risk_pct",
+            "price_action_detail": "price_action_detail"
         }
         
         # 仅过滤并重命名 DataFrame 中存在的列，以防结构字段缺失
@@ -469,8 +610,17 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
             
         records = df_mapped.to_dict('records')
         for record in records:
+            detail = record.pop("price_action_detail", None)
+            if detail:
+                if isinstance(detail, str):
+                    try:
+                        detail = json.loads(detail)
+                    except json.JSONDecodeError:
+                        detail = {}
+                if isinstance(detail, dict):
+                    record.update({k: v for k, v in detail.items() if v is not None})
             if record.get("pa_trade_action") or record.get("pa_trade_setup"):
-                record["pa_trade_plan"] = {
+                record["pa_trade_plan"] = record.get("pa_trade_plan") or {
                     "action": record.get("pa_trade_action") or "WAIT",
                     "action_label": record.get("pa_trade_action") or "历史计划",
                     "setup": record.get("pa_trade_setup") or record.get("price_action_pattern") or "历史结构",

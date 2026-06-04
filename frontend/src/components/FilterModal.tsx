@@ -4,18 +4,19 @@ import React, { useState } from 'react';
 import { X, Check, Zap, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useMarketStore } from '@/stores/marketStore';
+import type { ScanParams } from '@/stores/scanStore';
 
 interface FilterModalProps {
     isOpen: boolean;
     onClose: () => void;
-    params: any;
-    setParams: (params: any) => void;
+    params: ScanParams;
+    setParams: (params: ScanParams) => void;
     onScan: () => void;
     availableDates?: Array<{ date: string; stock_count: number }>;
 }
 
 export default function FilterModal({ isOpen, onClose, params, setParams, onScan, availableDates = [] }: FilterModalProps) {
-    const showSqueezeParams = params.strategy_type === "squeeze" || params.strategy_type === "both";
+    const showSqueezeParams = params.strategy_type === "tv_dual_strict" || params.strategy_type === "tv_dual" || params.strategy_type === "squeeze" || params.strategy_type === "both";
     const showPineParams = params.strategy_type === "pine" || params.strategy_type === "both";
     const showConsensusParams = params.strategy_type === "consensus";
     const [recommending, setRecommending] = useState(false);
@@ -32,12 +33,15 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
         setRecommending(true);
         const data = await fetchMarketRegime(params.strategy_type);
         if (data && data.recommended_params) {
-            const recommendedParams = data.recommended_params;
+            const rawRecommendedParams = data.recommended_params as Partial<ScanParams> & { description?: string };
+            const recommendedParams = Object.fromEntries(
+                Object.entries(rawRecommendedParams).filter(([key]) => key !== 'description')
+            ) as Partial<ScanParams>;
             
             // Find which keys are actually changed
             const changes: string[] = [];
             const changedKeys: string[] = [];
-            const newParams = { ...params, ...recommendedParams };
+            const newParams: ScanParams = { ...params, ...recommendedParams };
             
             // Map parameter keys to friendly Chinese names
             const paramNames: Record<string, string> = {
@@ -51,10 +55,11 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
             };
             
             Object.keys(recommendedParams).forEach(key => {
-                if (key !== 'description' && params[key] !== recommendedParams[key]) {
+                const paramKey = key as keyof ScanParams;
+                if (params[paramKey] !== recommendedParams[paramKey]) {
                     const name = paramNames[key] || key;
-                    const oldVal = params[key];
-                    const newVal = recommendedParams[key];
+                    const oldVal = params[paramKey];
+                    const newVal = recommendedParams[paramKey];
                     changedKeys.push(key);
                     if (oldVal !== undefined) {
                         changes.push(`${name}(${oldVal} ➡️ ${newVal})`);
@@ -72,7 +77,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
             }
             
             const regime = data.regime;
-            const desc = recommendedParams.description || regime.description;
+            const desc = rawRecommendedParams.description || regime.description;
             
             let msg = `检测到当前大盘为【${regime.label}】。${desc}`;
             if (changes.length > 0) {
@@ -91,9 +96,9 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
     if (!isOpen) return null;
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4 text-slate-800">
-            <div className="bg-white rounded-3xl w-full max-w-4xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
-                <div className="flex items-center justify-between px-8 py-6 border-b border-slate-100 bg-slate-50/50">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-3 sm:p-4 text-slate-800">
+            <div className="bg-white rounded-3xl w-full max-w-5xl max-h-[calc(100dvh-2rem)] shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200 flex flex-col">
+                <div className="flex shrink-0 items-center justify-between px-5 sm:px-8 py-4 sm:py-5 border-b border-slate-100 bg-slate-50/50">
                     <div>
                         <h3 className="text-xl font-bold text-slate-800">🔬 高级策略筛选</h3>
                         <p className="text-xs text-slate-400 font-medium mt-0.5 uppercase tracking-wider">TradingView Pro Logic Configuration</p>
@@ -114,42 +119,76 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 </div>
 
                 {/* 策略选择器 */}
-                <div className="px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
-                    <FilterItem label="🎯 选择选股策略">
-                        <div className="grid grid-cols-4 gap-2">
-                            <StrategyOption
-                                title="均线粘合策略"
-                                description="传统均线粘合突破战法"
-                                active={params.strategy_type === "squeeze"}
-                                onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
-                                icon="📊"
-                            />
-                            <StrategyOption
-                                title="Pine Script 多指标"
-                                description="Range Filter/QQE 等共振"
-                                active={params.strategy_type === "pine"}
-                                onClick={() => setParams({ ...params, strategy_type: "pine" })}
-                                icon="🚀"
-                            />
-                            <StrategyOption
-                                title="双重强力共振"
-                                description="均线粘合 + Pine 信号"
-                                active={params.strategy_type === "both"}
-                                onClick={() => setParams({ ...params, strategy_type: "both" })}
-                                icon="🔥"
-                            />
-                            <StrategyOption
-                                title="Azul 共识策略"
-                                description="放量突破+高低点结构"
-                                active={params.strategy_type === "consensus"}
-                                onClick={() => setParams({ ...params, strategy_type: "consensus" })}
-                                icon="💎"
-                            />
-                        </div>
-                    </FilterItem>
-                </div>
+                <div className="flex-1 min-h-0 overflow-y-auto">
+                    <div className="px-5 sm:px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
+                        <FilterItem label="🎯 选择选股策略">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-2">
+                                <StrategyOption
+                                    title="TV双策略强共振"
+                                    description="均线B共振 + TV-ZP long"
+                                    active={params.strategy_type === "tv_dual_strict"}
+                                    onClick={() => setParams({
+                                        ...params,
+                                        strategy_type: "tv_dual_strict",
+                                        use_bb_sqz: false,
+                                        use_rs_filter: false,
+                                        use_weekly: false,
+                                    })}
+                                    icon="TV+"
+                                />
+                                <StrategyOption
+                                    title="TV双策略对齐"
+                                    description="均线B共振 或 TV-ZP long"
+                                    active={params.strategy_type === "tv_dual"}
+                                    onClick={() => setParams({
+                                        ...params,
+                                        strategy_type: "tv_dual",
+                                        use_bb_sqz: false,
+                                        use_rs_filter: false,
+                                        use_weekly: false,
+                                    })}
+                                    icon="TV"
+                                />
+                                <StrategyOption
+                                    title="均线粘合策略"
+                                    description="TV均线B共振"
+                                    active={params.strategy_type === "squeeze"}
+                                    onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
+                                    icon="📊"
+                                />
+                                <StrategyOption
+                                    title="Pine Script 多指标"
+                                    description="五指标趋势共振"
+                                    active={params.strategy_type === "pine"}
+                                    onClick={() => setParams({ ...params, strategy_type: "pine" })}
+                                    icon="🚀"
+                                />
+                                <StrategyOption
+                                    title="TradingView ZP"
+                                    description="RF主导+Volume/QQE确认"
+                                    active={params.strategy_type === "tv_zp"}
+                                    onClick={() => setParams({ ...params, strategy_type: "tv_zp" })}
+                                    icon="ZP"
+                                />
+                                <StrategyOption
+                                    title="双重强力共振"
+                                    description="均线粘合 + Pine 信号"
+                                    active={params.strategy_type === "both"}
+                                    onClick={() => setParams({ ...params, strategy_type: "both" })}
+                                    icon="🔥"
+                                />
+                                <StrategyOption
+                                    title="Azul 共识策略"
+                                    description="放量突破+高低点结构"
+                                    active={params.strategy_type === "consensus"}
+                                    onClick={() => setParams({ ...params, strategy_type: "consensus" })}
+                                    icon="💎"
+                                />
+                            </div>
+                        </FilterItem>
+                    </div>
 
-                <div className="p-8 grid grid-cols-2 gap-8">
+                <div className="p-5 sm:p-8 grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-8">
                     {/* Column 1 */}
                     <div className="space-y-6">
                         {/* 均线粘合策略专用参数 */}
@@ -183,7 +222,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         onClick={() => setParams({ ...params, use_weekly: !params.use_weekly })}
                                     />
                                     <ToggleItem
-                                        label="🔥 MACD 必须处于金叉 (红柱)"
+                                        label="🔥 MACD 优化版柱线翻红"
                                         active={params.use_macd_filter}
                                         onClick={() => setParams({ ...params, use_macd_filter: !params.use_macd_filter })}
                                     />
@@ -230,27 +269,27 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         <span>严格 (5)</span>
                                     </div>
                                     <p className="text-[10px] text-purple-500 mt-2">
-                                        至少需要多少个指标(Range Filter/SuperTrend/RQK/Half Trend/QQE)同时看涨才触发信号
+                                        Range Filter/SuperTrend/RQK/Half Trend/QQE 至少同时看涨的数量
                                     </p>
                                 </FilterItem>
 
                                 <FilterItem label="📅 最小数据天数">
                                     <div className="flex items-center gap-4">
                                         <input
-                                            type="range" min="30" max="250" step="10" value={params.min_data_days || 60}
+                                            type="range" min="120" max="250" step="10" value={params.min_data_days || 120}
                                             onChange={e => setParams({ ...params, min_data_days: parseInt(e.target.value) })}
                                             className="flex-1 accent-purple-600"
                                         />
                                         <div className="w-16 h-12 rounded-xl bg-purple-100 flex items-center justify-center">
-                                            <span className="text-sm font-bold text-purple-600">{params.min_data_days || 60}天</span>
+                                            <span className="text-sm font-bold text-purple-600">{params.min_data_days || 120}天</span>
                                         </div>
                                     </div>
                                     <div className="flex justify-between text-[10px] font-bold text-slate-400 mt-1">
-                                        <span>30天</span>
+                                        <span>120天</span>
                                         <span>250天</span>
                                     </div>
                                     <p className="text-[10px] text-purple-500 mt-2">
-                                        股票至少需要有多少天的历史数据才会被扫描，天数越多被排除的股票越多
+                                        Range Filter 和 RQK 需要较长预热，低于 120 天容易产生不稳定信号
                                     </p>
                                 </FilterItem>
 
@@ -352,14 +391,14 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                 </FilterItem>
 
                                 <ToggleItem
-                                    label="极致波动率收缩 (BB)"
+                                    label="极致波动率收缩 (BB，额外严格过滤)"
                                     active={params.use_bb_sqz}
                                     onClick={() => setParams({ ...params, use_bb_sqz: !params.use_bb_sqz })}
                                     highlighted={highlightedFields.includes('use_bb_sqz')}
                                 />
 
                                 <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-slate-100 cursor-pointer transition-all hover:bg-slate-50">
-                                    <span className="flex-1 font-semibold text-slate-600">相对强度过滤 (RS)</span>
+                                    <span className="flex-1 font-semibold text-slate-600">相对强度过滤 (RS，额外严格过滤)</span>
                                     <input
                                         type="checkbox" checked={params.use_rs_filter}
                                         onChange={e => setParams({ ...params, use_rs_filter: e.target.checked })}
@@ -461,13 +500,16 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         </div>
                     </div>
                 </div>
+                </div>
 
-                <div className="px-8 py-6 bg-slate-50 flex justify-end gap-3">
+                <div className="shrink-0 px-5 sm:px-8 py-4 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
                     <button onClick={onClose} className="px-6 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-200 transition-all">取消</button>
                     <button
                         onClick={() => { onScan(); onClose(); }}
                         className={cn(
                             "px-8 py-2.5 text-white rounded-xl font-bold shadow-lg transition-all hover:scale-105 active:scale-95",
+                            params.strategy_type === "tv_dual_strict" ? "bg-gradient-to-r from-emerald-600 to-teal-600 shadow-emerald-100" :
+                            params.strategy_type === "tv_dual" ? "bg-gradient-to-r from-sky-600 to-emerald-600 shadow-emerald-100" :
                             params.strategy_type === "pine" ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : 
                             params.strategy_type === "both" ? "bg-gradient-to-r from-indigo-600 to-emerald-600 shadow-emerald-100" :
                             params.strategy_type === "consensus" ? "bg-gradient-to-r from-blue-600 to-cyan-600 shadow-blue-100" :

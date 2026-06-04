@@ -48,7 +48,7 @@ export default function ResultsTable({
     const [sectorSortKey, setSectorSortKey] = useState<'count' | 'avgScore'>('count');
     const [collapsedSectors, setCollapsedSectors] = useState<Set<string>>(new Set());
     const [sopFilterOnly, setSopFilterOnly] = useState(false);
-    const [brooksFilter, setBrooksFilter] = useState<'ALL' | 'READY' | 'NO_AVOID' | 'LOW_RISK' | 'PULLBACK'>('ALL');
+    const [brooksFilter, setBrooksFilter] = useState<'ALL' | 'READY' | 'NO_AVOID' | 'LOW_RISK' | 'PULLBACK' | 'LOW_FAILURE' | 'H2_STRONG' | 'STRONG_TREND'>('ALL');
 
     const applyBrooksFilter = (rows: ScanResult[]) => {
         if (brooksFilter === 'READY') {
@@ -63,10 +63,19 @@ export default function ResultsTable({
                 return risk > 0 && risk <= 8;
             });
         }
+        if (brooksFilter === 'LOW_FAILURE') {
+            return rows.filter(r => (r.pa_failure_risk ?? 100) <= 55);
+        }
+        if (brooksFilter === 'H2_STRONG') {
+            return rows.filter(r => r.pa_h2_quality === '强' || (r.pa_entry_quality_score ?? 0) >= 75);
+        }
+        if (brooksFilter === 'STRONG_TREND') {
+            return rows.filter(r => (r.pa_always_in_strength ?? 0) >= 70 && r.pa_trend_damage !== '跌破EMA20' && r.pa_trend_damage !== '跌破EMA60');
+        }
         if (brooksFilter === 'PULLBACK') {
             return rows.filter(r => {
                 const setup = r.pa_trade_plan?.setup || r.pa_trade_setup || r.price_action_pattern || '';
-                return setup.includes('H2') || setup.includes('回踩');
+                return setup.includes('H2') || setup.includes('回踩') || r.pa_pullback_structure === '双腿回调';
             });
         }
         return rows;
@@ -143,6 +152,18 @@ export default function ResultsTable({
         return '风险收益偏低';
     };
 
+    const explainFailureRisk = (risk?: number) => {
+        if (risk == null) return '--';
+        if (risk >= 70) return `${risk}% 偏高`;
+        if (risk >= 45) return `${risk}% 中等`;
+        return `${risk}% 较低`;
+    };
+
+    const explainH2Quality = (quality?: string, score?: number) => {
+        if (!quality || quality === '不适用') return score ? `${score}分` : '--';
+        return score ? `${quality} · ${score}分` : quality;
+    };
+
     const toggleRow = (code: string) => {
         setExpandedRow(expandedRow === code ? null : code);
     };
@@ -153,10 +174,11 @@ export default function ResultsTable({
     };
 
     const handleExport = () => {
-        const headers = ['代码', '名称', '行业', '现价', '涨幅%', 'Score', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', '影线比', 'strategy_type'];
+        const headers = ['代码', '名称', '行业', '现价', '涨幅%', 'Score', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', 'TV均线', 'TV-ZP', 'TV命中', '影线比', 'strategy_type'];
         const rows = results.map(r => [
             r.代码, r.名称, r.行业, r.现价, r['涨幅%'], r.Score, r.RSI, r.DIF, r.BB,
             r.粘合度, r.ROE || '', r.净利YOY || '', r.历史胜率, r.信号次数, r.北向 || '', r.共振 || '',
+            r.tv_ma_signal || '', r.tv_zp_signal || '', r.tv_match || '',
             r.影线比 || '', r.strategy_type || ''
         ]);
 
@@ -277,6 +299,34 @@ export default function ResultsTable({
                                 )}
                             </div>
                             <span className={cn("text-[10px] font-mono font-bold text-slate-400 tracking-tighter", isVetoed && "line-through")}>{res.代码}</span>
+                            {(res.strategy_type === 'tv_dual' || res.strategy_type === 'tv_dual_strict' || res.strategy_type === 'sector_watch') && (
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                    <span className="rounded border border-rose-100 bg-rose-50 px-1.5 py-0.5 text-[8px] font-black text-rose-600">
+                                        均线 {res.tv_ma_signal || '--'}
+                                    </span>
+                                    <span className="rounded border border-emerald-100 bg-emerald-50 px-1.5 py-0.5 text-[8px] font-black text-emerald-700">
+                                        ZP {res.tv_zp_signal || '--'}
+                                    </span>
+                                    <span className="rounded border border-sky-100 bg-sky-50 px-1.5 py-0.5 text-[8px] font-black text-sky-700">
+                                        {res.tv_match || res.signal || 'TV命中'}
+                                    </span>
+                                    {res.early_watch_only && (
+                                        <span className="rounded border border-amber-100 bg-amber-50 px-1.5 py-0.5 text-[8px] font-black text-amber-700">
+                                            早期观察
+                                        </span>
+                                    )}
+                                    {res.momentum_watch_only && (
+                                        <span className="rounded border border-orange-100 bg-orange-50 px-1.5 py-0.5 text-[8px] font-black text-orange-700">
+                                            动量观察
+                                        </span>
+                                    )}
+                                    {res.sector_watch_only && (
+                                        <span className="rounded border border-indigo-100 bg-indigo-50 px-1.5 py-0.5 text-[8px] font-black text-indigo-700">
+                                            板块观察
+                                        </span>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     </div>
                 </td>
@@ -384,6 +434,16 @@ export default function ResultsTable({
                             </div>
                         )}
                         <SectorTrendBadge trend={res.sector_trend} pct={res.sector_pct} />
+                        <SectorMomentumBadge
+                            score={res.sector_momentum_score}
+                            breadth={res.sector_breadth}
+                            phase={res.sector_phase}
+                            rank={res.sector_rank}
+                            alignment={res.sector_alignment_score}
+                            role={res.sector_role}
+                            pct3d={res.sector_3d_pct}
+                            pct5d={res.sector_5d_pct}
+                        />
                     </div>
                 </td>
 
@@ -546,18 +606,59 @@ export default function ResultsTable({
                                                     PA {res.price_action_score ?? '--'} · {explainBrooksScore(res.price_action_score)}
                                                 </span>
                                             </div>
-                                            <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
-                                                <BrooksInfo label="市场结构" value={res.pa_market_cycle || res.price_action_regime || '--'} note="判断趋势/区间环境" />
-                                                <BrooksInfo label="信号K" value={res.price_action_signal || '--'} note="最后一根K的多空主动性" />
-                                                <BrooksInfo label="形态" value={res.price_action_pattern || res.结构 || '--'} note="当前可交易结构" />
-                                                <BrooksInfo label="区间位置" value={res.pa_range_location || '--'} note="追价或低吸的位置判断" />
-                                            </div>
+                                            {(res.pa_decision_summary || res.pa_multi_timeframe_note) && (
+                                                <div className="mt-3 p-3 bg-white/80 border border-blue-100 rounded-xl">
+                                                    <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">综合判断</div>
+                                                    <p className="text-xs font-bold text-slate-700 leading-relaxed">{res.pa_decision_summary || res.pa_multi_timeframe_note}</p>
+                                                </div>
+                                            )}
                                             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-3 text-xs">
                                                 <BrooksInfo label="触发价" value={res.pa_entry_price ? `¥${res.pa_entry_price}` : '--'} note="有效突破后才算入场" tone="blue" />
                                                 <BrooksInfo label="失效位" value={res.pa_stop_price ? `¥${res.pa_stop_price}` : '--'} note="跌破则结构失效" tone="rose" />
                                                 <BrooksInfo label="目标价" value={res.pa_target_price ? `¥${res.pa_target_price}` : '--'} note="按结构风险测算" tone="emerald" />
-                                                <BrooksInfo label="风险收益" value={res.pa_risk_reward ? `${res.pa_risk_reward}R` : '--'} note={explainRiskReward(res.pa_risk_reward)} />
+                                                <BrooksInfo label="策略倾向" value={res.pa_position_strategy || '--'} note={res.final_rank_score != null ? `排序分 ${res.final_rank_score} / Brooks ${res.brooks_rank_adjustment || 0}` : (res.pa_risk_reward ? `${res.pa_risk_reward}R · ${explainRiskReward(res.pa_risk_reward)}` : '等待结构确认')} />
                                             </div>
+                                            <details className="mt-3 group">
+                                                <summary className="cursor-pointer select-none text-[10px] font-black text-blue-600 uppercase tracking-widest hover:text-blue-700">展开 Brooks 细节</summary>
+                                                <div className="mt-3 space-y-3">
+                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                        <BrooksInfo label="市场结构" value={res.pa_market_cycle || res.price_action_regime || '--'} note="判断趋势/区间环境" />
+                                                        <BrooksInfo label="信号K" value={res.price_action_signal || '--'} note="最后一根K的多空主动性" />
+                                                        <BrooksInfo label="形态" value={res.price_action_pattern || res.结构 || '--'} note="当前可交易结构" />
+                                                        <BrooksInfo label="区间位置" value={res.pa_range_location || '--'} note="追价或低吸的位置判断" />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                        <BrooksInfo label="回调结构" value={res.pa_pullback_structure || '--'} note={res.pa_pullback_legs != null ? `${res.pa_pullback_legs} 腿回调` : '等待结构确认'} />
+                                                        <BrooksInfo label="突破质量" value={res.pa_breakout_quality || '--'} note="K线实体与收盘位置" tone="blue" />
+                                                        <BrooksInfo label="失败风险" value={explainFailureRisk(res.pa_failure_risk)} note="假突破/上影/位置风险" tone={(res.pa_failure_risk || 0) >= 70 ? "rose" : undefined} />
+                                                        <BrooksInfo label="陷阱风险" value={explainFailureRisk(res.pa_trap_risk)} note={res.pa_failed_breakout_type || '多头陷阱风险'} tone={(res.pa_trap_risk || 0) >= 70 ? "rose" : undefined} />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                        <BrooksInfo label="H2质量" value={explainH2Quality(res.pa_h2_quality, res.pa_entry_quality_score)} note="回踩位置与信号K质量" tone={(res.pa_entry_quality_score || 0) >= 75 ? "emerald" : "slate"} />
+                                                        <BrooksInfo label="区间规则" value={res.pa_range_rule || '--'} note="Brooks区间交易原则" />
+                                                        <BrooksInfo label="假突破" value={res.pa_failed_breakout_type || '--'} note="突破后是否失去延续" tone={res.pa_failed_breakout_type ? "rose" : "slate"} />
+                                                        <BrooksInfo label="区间位置" value={res.pa_range_location || '--'} note="上沿谨慎，下沿看反转" />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                        <BrooksInfo label="微型通道" value={res.pa_micro_channel || '--'} note="连续高低点方向" tone={res.pa_micro_channel === '多头微型通道' ? "emerald" : "slate"} />
+                                                        <BrooksInfo label="Always In" value={res.pa_always_in_strength != null ? `${res.pa_always_in_strength}分` : '--'} note="趋势持续强度" tone={(res.pa_always_in_strength || 0) >= 70 ? "emerald" : "slate"} />
+                                                        <BrooksInfo label="趋势破坏" value={res.pa_trend_damage || '--'} note="EMA/短线结构破坏" tone={res.pa_trend_damage && res.pa_trend_damage !== '无' ? "rose" : "slate"} />
+                                                        <BrooksInfo label="通道状态" value={res.pa_channel_state || '--'} note="延续、过冲或假破" />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                        <BrooksInfo label="多周期" value={res.pa_weekly_context || '--'} note={res.pa_multi_timeframe_score != null ? `${res.pa_multi_timeframe_score > 0 ? '+' : ''}${res.pa_multi_timeframe_score}分` : '周线确认'} tone={(res.pa_multi_timeframe_score || 0) < 0 ? "rose" : "slate"} />
+                                                        <BrooksInfo label="量能行为" value={res.pa_volume_pattern || '--'} note={res.pa_volume_confirmed ? '量能确认' : (res.pa_volume_risk || '等待确认')} tone={res.pa_volume_confirmed ? "emerald" : "slate"} />
+                                                        <BrooksInfo label="缺口行为" value={res.pa_gap_type || '--'} note={res.pa_gap_risk != null ? `风险 ${res.pa_gap_risk}%` : '无明显缺口'} tone={(res.pa_gap_risk || 0) >= 70 ? "rose" : "slate"} />
+                                                        <BrooksInfo label="趋势阶段" value={res.pa_trend_phase || '--'} note={res.pa_trend_phase_action || '等待结构确认'} />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                        <BrooksInfo label="失败二次入场" value={res.pa_failed_second_entry || '--'} note={res.pa_second_entry_risk ? `风险 ${res.pa_second_entry_risk}%` : '未触发'} tone={res.pa_failed_second_entry === '失败H2' ? "rose" : "slate"} />
+                                                        <BrooksInfo label="区间宽度" value={res.pa_range_width_quality || '--'} note={res.pa_range_center_risk != null ? `中轴风险 ${res.pa_range_center_risk}%` : '等待判断'} />
+                                                        <BrooksInfo label="区间假突破数" value={res.pa_range_failed_breakout_count ?? '--'} note="近20根上沿失败次数" tone={(res.pa_range_failed_breakout_count || 0) >= 2 ? "rose" : "slate"} />
+                                                        <BrooksInfo label="周线说明" value={res.pa_multi_timeframe_note || '--'} note="多周期确认细节" />
+                                                    </div>
+                                                </div>
+                                            </details>
                                             <div className="mt-3 p-3 bg-white/80 border border-blue-100 rounded-xl">
                                                 <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">建议操作</div>
                                                 <p className="text-xs font-bold text-slate-700 leading-relaxed">{explainBrooksAction(res)}</p>
@@ -775,6 +876,9 @@ export default function ResultsTable({
                         <option value="READY">仅 READY</option>
                         <option value="NO_AVOID">排除 AVOID</option>
                         <option value="LOW_RISK">风险≤8%</option>
+                        <option value="LOW_FAILURE">低失败风险</option>
+                        <option value="H2_STRONG">强H2质量</option>
+                        <option value="STRONG_TREND">强趋势</option>
                         <option value="PULLBACK">H2/回踩</option>
                     </select>
                     <button
@@ -968,6 +1072,12 @@ function SopGradeBadge({ grade }: { grade?: string }) {
                     🔵 B
                 </div>
             );
+        case 'M':
+            return (
+                <div className="flex items-center gap-1 px-2.5 py-1 bg-orange-100 text-orange-600 rounded-lg font-black text-xs border border-orange-200">
+                    🟠 M
+                </div>
+            );
         case 'C':
             return (
                 <div className="flex items-center gap-1 px-2.5 py-1 bg-slate-200 text-slate-500 rounded-lg font-black text-xs">
@@ -1025,6 +1135,61 @@ function SectorTrendBadge({ trend, pct }: { trend?: string; pct?: number }) {
     return (
         <div className={cn("flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] font-bold border mt-1", c.color, c.bg, c.border)}>
             {c.icon} {pctStr}
+        </div>
+    );
+}
+
+function SectorMomentumBadge({
+    score,
+    breadth,
+    phase,
+    rank,
+    alignment,
+    role,
+    pct3d,
+    pct5d
+}: {
+    score?: number;
+    breadth?: number;
+    phase?: string;
+    rank?: number;
+    alignment?: number;
+    role?: string;
+    pct3d?: number;
+    pct5d?: number;
+}) {
+    if (score === undefined || score === null) return null;
+    const phaseMap: Record<string, string> = {
+        SECTOR_EARLY: '早期',
+        SECTOR_CONFIRM: '确认',
+        SECTOR_CLIMAX: '高潮',
+        SECTOR_FADE: '衰退',
+        SECTOR_NEUTRAL: '中性',
+    };
+    const roleMap: Record<string, string> = {
+        LEADER: '龙头',
+        CORE: '中军',
+        FOLLOWER: '后排',
+        LAGGARD: '掉队',
+    };
+    const strong = score >= 75;
+    const warming = score >= 58;
+    return (
+        <div className={cn(
+            "flex flex-col items-center gap-0.5 rounded-md border px-2 py-1 text-[9px] font-black",
+            strong ? "border-rose-100 bg-rose-50 text-rose-600" :
+                warming ? "border-amber-100 bg-amber-50 text-amber-700" :
+                    "border-slate-100 bg-slate-50 text-slate-500"
+        )}>
+            <span>板块{score.toFixed(0)} · {phaseMap[phase || ''] || '中性'}</span>
+            <span className="font-bold opacity-80">
+                扩散{breadth?.toFixed(0) ?? '--'}% · 联动{alignment?.toFixed(0) ?? '--'}{rank ? ` · #${rank}` : ''}{role ? ` · ${roleMap[role] || role}` : ''}
+            </span>
+            {(pct3d !== undefined || pct5d !== undefined) && (
+                <span className="font-bold opacity-80">
+                    3日{pct3d !== undefined ? `${pct3d >= 0 ? '+' : ''}${pct3d.toFixed(1)}%` : '--'} · 5日{pct5d !== undefined ? `${pct5d >= 0 ? '+' : ''}${pct5d.toFixed(1)}%` : '--'}
+                </span>
+            )}
         </div>
     );
 }

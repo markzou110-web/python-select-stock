@@ -1,15 +1,19 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, Download, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
+import { Activity, BarChart3, CalendarDays, Download, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 export default function ReviewCenter() {
     const [data, setData] = useState<any>(null);
+    const [followup, setFollowup] = useState<any>(null);
     const [loading, setLoading] = useState(true);
+    const [followupLoading, setFollowupLoading] = useState(false);
     const [days, setDays] = useState(120);
+    const [historyDates, setHistoryDates] = useState<string[]>([]);
+    const [followupDate, setFollowupDate] = useState('');
 
     const fetchData = async () => {
         setLoading(true);
@@ -23,9 +27,41 @@ export default function ReviewCenter() {
 
     useEffect(() => { fetchData(); }, [days]);
 
+    useEffect(() => {
+        const loadDates = async () => {
+            const res = await api.get('/api/scan/dates');
+            const dates = Array.isArray(res.data) ? res.data : [];
+            setHistoryDates(dates);
+            if (!followupDate && dates.length > 0) {
+                const today = new Date().toISOString().slice(0, 10);
+                setFollowupDate(dates[0] === today && dates.length > 1 ? dates[1] : dates[0]);
+            }
+        };
+        loadDates().catch(() => setHistoryDates([]));
+    }, []);
+
+    const fetchFollowup = async (date: string) => {
+        if (!date) return;
+        setFollowupLoading(true);
+        try {
+            const res = await api.get(`/api/review/next-day-followup?date=${date}&limit=60`);
+            setFollowup(res.data);
+        } finally {
+            setFollowupLoading(false);
+        }
+    };
+
+    useEffect(() => { fetchFollowup(followupDate); }, [followupDate]);
+
     const exportCsv = () => {
         const baseUrl = api.defaults.baseURL || 'http://127.0.0.1:8000';
         window.open(`${baseUrl}/api/review/scan-performance/export?days=${days}`, '_blank');
+    };
+
+    const exportFollowupCsv = () => {
+        if (!followupDate) return;
+        const baseUrl = api.defaults.baseURL || 'http://127.0.0.1:8000';
+        window.open(`${baseUrl}/api/review/next-day-followup/export?date=${followupDate}&limit=300`, '_blank');
     };
 
     if (loading && !data) {
@@ -57,6 +93,16 @@ export default function ReviewCenter() {
                 <Stat label="薄弱板块" value={summary.worst_bucket || "暂无"} sub="建议降低权重" icon={<Activity size={20} />} />
             </div>
 
+            <NextDayFollowupCard
+                data={followup}
+                dates={historyDates}
+                selectedDate={followupDate}
+                loading={followupLoading}
+                onDateChange={setFollowupDate}
+                onRefresh={() => fetchFollowup(followupDate)}
+                onExport={exportFollowupCsv}
+            />
+
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <ChartCard title="不同持有周期表现" data={data?.horizons || []} xKey="horizon" barKey="avg_return" />
                 <ChartCard title="策略模板表现" data={data?.by_strategy || []} xKey="strategy" barKey="win_rate" suffix="%" />
@@ -68,11 +114,158 @@ export default function ReviewCenter() {
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <ChartCard title="H2质量表现" data={data?.by_pa_h2_quality || []} xKey="quality" barKey="win_rate" suffix="%" />
+                <TableCard title="量能行为表现" rows={data?.by_pa_volume_pattern || []} nameKey="pattern" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="趋势阶段表现" rows={data?.by_pa_trend_phase || []} nameKey="phase" />
+                <TableCard title="周线环境表现" rows={data?.by_pa_weekly_context || []} nameKey="context" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="陷阱风险分桶" rows={data?.by_pa_trap_risk || []} nameKey="risk" />
+                <TableCard title="Brooks 独立策略回测" rows={data?.brooks_backtests || []} nameKey="strategy" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <TableCard title="板块表现 Top" rows={data?.by_industry || []} nameKey="industry" />
                 <TableCard title="最近扫描日期表现" rows={data?.recent_dates || []} nameKey="date" />
             </div>
         </div>
     );
+}
+
+function NextDayFollowupCard({
+    data,
+    dates,
+    selectedDate,
+    loading,
+    onDateChange,
+    onRefresh,
+    onExport,
+}: {
+    data: any;
+    dates: string[];
+    selectedDate: string;
+    loading: boolean;
+    onDateChange: (date: string) => void;
+    onRefresh: () => void;
+    onExport: () => void;
+}) {
+    const items = data?.items || [];
+    const summary = data?.summary || {};
+    const counts = summary.status_counts || {};
+    const statusTone: Record<string, string> = {
+        涨停验证: 'bg-rose-50 text-rose-600 border-rose-100',
+        大涨验证: 'bg-orange-50 text-orange-600 border-orange-100',
+        触发入场线: 'bg-indigo-50 text-indigo-600 border-indigo-100',
+        触发观察: 'bg-sky-50 text-sky-600 border-sky-100',
+        冲高回落: 'bg-amber-50 text-amber-700 border-amber-100',
+        风控触发: 'bg-slate-100 text-slate-700 border-slate-200',
+        未触发: 'bg-slate-50 text-slate-500 border-slate-100',
+        待跟踪: 'bg-slate-50 text-slate-400 border-slate-100',
+    };
+
+    return (
+        <div className="glass-card p-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between mb-5">
+                <div>
+                    <h3 className="font-black text-slate-800 flex items-center gap-2">
+                        <CalendarDays size={18} className="text-indigo-600" />
+                        次日跟踪
+                    </h3>
+                    <p className="text-xs font-bold text-slate-400 mt-1">验证上一交易日选股是否触发入场、大涨或冲高回落</p>
+                </div>
+                <div className="flex items-center gap-2">
+                    <select
+                        value={selectedDate}
+                        onChange={(e) => onDateChange(e.target.value)}
+                        className="h-9 rounded-md border border-slate-200 bg-white px-3 text-xs font-bold text-slate-600 outline-none"
+                    >
+                        {dates.map(date => <option key={date} value={date}>{date}</option>)}
+                    </select>
+                    <button onClick={onRefresh} className="h-9 w-9 rounded-md border border-slate-100 bg-white text-indigo-600 flex items-center justify-center">
+                        {loading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+                    </button>
+                    <button onClick={onExport} className="h-9 w-9 rounded-md border border-slate-100 bg-white text-slate-600 hover:text-indigo-600 flex items-center justify-center" title="导出次日跟踪">
+                        <Download size={15} />
+                    </button>
+                </div>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+                <MiniStat label="跟踪信号" value={`${summary.signals || 0}`} />
+                <MiniStat label="已验证" value={`${summary.tracked || 0}`} />
+                <MiniStat label="平均最高涨幅" value={`${summary.avg_max_gain_pct >= 0 ? '+' : ''}${summary.avg_max_gain_pct || 0}%`} hot />
+                <MiniStat label="大涨/涨停" value={`${(counts['大涨验证'] || 0) + (counts['涨停验证'] || 0)}`} />
+            </div>
+
+            <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                    <thead>
+                        <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                            <th className="py-2 pr-3">股票</th>
+                            <th className="py-2 pr-3">状态</th>
+                            <th className="py-2 pr-3">信号价</th>
+                            <th className="py-2 pr-3">入场线</th>
+                            <th className="py-2 pr-3">最高涨幅</th>
+                            <th className="py-2 pr-3">最新表现</th>
+                            <th className="py-2 pr-3">形态</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {items.slice(0, 12).map((item: any) => (
+                            <tr key={`${item.code}-${item.signal_date}`} className="border-b border-slate-50 last:border-b-0 text-xs">
+                                <td className="py-3 pr-3">
+                                    <div className="font-black text-slate-800">{item.name}</div>
+                                    <div className="font-mono text-[10px] text-slate-400">{item.code} · {item.industry || '--'}</div>
+                                </td>
+                                <td className="py-3 pr-3">
+                                    <span className={cn("px-2 py-1 rounded-md border text-[10px] font-black", statusTone[item.followup_status] || statusTone['未触发'])}>
+                                        {item.followup_status}
+                                    </span>
+                                </td>
+                                <td className="py-3 pr-3 font-bold text-slate-600">{formatPrice(item.signal_price)}</td>
+                                <td className="py-3 pr-3 font-bold text-slate-600">{formatPrice(item.entry_line)}</td>
+                                <td className={cn("py-3 pr-3 font-black", (item.max_gain_pct || 0) >= 5 ? "text-rose-600" : "text-slate-600")}>
+                                    {formatSignedPct(item.max_gain_pct)}
+                                </td>
+                                <td className={cn("py-3 pr-3 font-black", (item.latest_gain_pct || 0) >= 0 ? "text-rose-500" : "text-emerald-600")}>
+                                    {formatSignedPct(item.latest_gain_pct)}
+                                </td>
+                                <td className="py-3 pr-3 font-bold text-slate-500">{item.setup || '--'}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+                {items.length === 0 && (
+                    <div className="py-12 text-center text-slate-400 font-bold">
+                        {loading ? '正在加载次日跟踪...' : '暂无次日跟踪数据'}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function MiniStat({ label, value, hot = false }: { label: string; value: string; hot?: boolean }) {
+    return (
+        <div className="rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2">
+            <div className="text-[10px] font-black text-slate-400">{label}</div>
+            <div className={cn("mt-1 text-lg font-black", hot ? "text-rose-600" : "text-slate-800")}>{value}</div>
+        </div>
+    );
+}
+
+function formatPrice(value?: number | null) {
+    if (value === undefined || value === null) return '--';
+    return Number(value).toFixed(2);
+}
+
+function formatSignedPct(value?: number | null) {
+    if (value === undefined || value === null) return '--';
+    return `${value >= 0 ? '+' : ''}${Number(value).toFixed(2)}%`;
 }
 
 function Stat({ label, value, sub, icon, hot = false }: { label: string; value: string; sub: string; icon: React.ReactNode; hot?: boolean }) {

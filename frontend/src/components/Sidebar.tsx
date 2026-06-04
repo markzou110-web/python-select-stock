@@ -14,13 +14,16 @@ import {
     Square,
     Star,
     ClipboardList,
-    SlidersHorizontal
+    SlidersHorizontal,
+    ServerCog,
+    BarChart3
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAlertStore } from '@/stores/alertStore';
+import type { SyncProgress } from '@/stores/marketStore';
 
 interface SidebarProps {
-    syncProgress: any;
+    syncProgress: SyncProgress | null;
     onStartSync: () => void;
     onStartSyncFundamentals?: () => void;
     onStopSync: () => void;
@@ -30,7 +33,7 @@ interface SidebarProps {
 
 export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamentals, onStopSync, activeView, onNavigate }: SidebarProps) {
     const isRunning = syncProgress?.is_running;
-    const progress = syncProgress?.total > 0 ? (syncProgress.current / syncProgress.total) * 100 : 0;
+    const progress = (syncProgress?.total || 0) > 0 ? ((syncProgress?.current || 0) / (syncProgress?.total || 1)) * 100 : 0;
     const unreadCount = useAlertStore(s => s.unreadCount);
 
     return (
@@ -65,6 +68,12 @@ export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamen
                         onClick={() => onNavigate('scanner')}
                     />
                     <NavItem
+                        icon={<LayoutDashboard size={20} />}
+                        label="板块雷达"
+                        active={activeView === 'sector-radar'}
+                        onClick={() => onNavigate('sector-radar')}
+                    />
+                    <NavItem
                         icon={<PieChart size={20} />}
                         label="拟合实盘"
                         active={activeView === 'paper'}
@@ -83,11 +92,23 @@ export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamen
                         onClick={() => onNavigate('review')}
                     />
                     <NavItem
+                        icon={<BarChart3 size={20} />}
+                        label="策略回测"
+                        active={activeView === 'backtest'}
+                        onClick={() => onNavigate('backtest')}
+                    />
+                    <NavItem
                         icon={<Bell size={20} />}
                         label="实时告警"
                         active={activeView === 'alerts'}
                         onClick={() => onNavigate('alerts')}
                         badge={unreadCount}
+                    />
+                    <NavItem
+                        icon={<ServerCog size={20} />}
+                        label="专业驾驶舱"
+                        active={activeView === 'ops'}
+                        onClick={() => onNavigate('ops')}
                     />
                 </nav>
             </div>

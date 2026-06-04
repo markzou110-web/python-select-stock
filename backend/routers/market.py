@@ -6,7 +6,17 @@ import akshare as ak
 import pandas as pd
 
 from core.logging_config import logger
-from core.data import get_index_data, get_hot_sectors
+from core.data import (
+    get_index_data,
+    get_hot_sectors,
+    get_market_snapshot,
+    get_sector_map,
+    get_sector_trends,
+    get_cached_data,
+    set_cached_data,
+)
+from core.db import get_db_engine
+from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 
 router = APIRouter(prefix="/api", tags=["market"])
 
@@ -100,6 +110,79 @@ def get_sectors():
     """获取热门行业板块"""
     logger.debug("Request: GET /api/market/sectors")
     return get_hot_sectors()
+
+
+@router.get("/market/sector-strength")
+def get_sector_strength(limit: int = 20, force: bool = False):
+    """获取实时板块强度榜：动量、扩散率、阶段、前排个股。"""
+    try:
+        safe_limit = max(1, min(limit, 100))
+        cache_key = f"sector_strength:{safe_limit}"
+        if not force:
+            cached = get_cached_data(cache_key, 300)
+            if cached:
+                return {**cached, "cache_hit": True}
+
+        snapshot = get_market_snapshot()
+        sector_map = get_sector_map()
+        sector_trends = get_sector_trends()
+        history_context = build_sector_history_context(get_db_engine(), sector_map)
+        strength = build_sector_strength(snapshot, sector_map, sector_trends, history_context)
+        if not strength:
+            return {"items": [], "updated_at": datetime.now().isoformat()}
+
+        lead_map: Dict[str, List[Dict[str, Any]]] = {}
+        if snapshot is not None and not snapshot.empty:
+            df = snapshot.copy()
+            df['code'] = df['code'].astype(str).str.zfill(6)
+            df['industry'] = df['code'].map(sector_map).fillna('未知')
+            df['pct_chg'] = pd.to_numeric(df['pct_chg'], errors='coerce').fillna(0)
+            if 'price' in df.columns:
+                df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0)
+            for industry, group in df[df['industry'] != '未知'].groupby('industry'):
+                sector_avg = float(strength.get(industry, {}).get('sector_avg_pct', group['pct_chg'].mean()) or 0)
+                leaders = group.sort_values('pct_chg', ascending=False).head(5)
+                lead_map[industry] = [
+                    {
+                        "code": str(row.get('code', '')),
+                        "name": str(row.get('name', '')),
+                        "price": round(float(row.get('price', 0) or 0), 2),
+                        "pct": round(float(row.get('pct_chg', 0) or 0), 2),
+                        "role": classify_sector_role(
+                            float(row.get('pct_chg', 0) or 0),
+                            sector_avg,
+                            rank_in_sector=idx + 1,
+                        ),
+                    }
+                    for idx, (_, row) in enumerate(leaders.iterrows())
+                ]
+
+        items = []
+        phase_order = {
+            "SECTOR_CONFIRM": 0,
+            "SECTOR_EARLY": 1,
+            "SECTOR_CLIMAX": 2,
+            "SECTOR_NEUTRAL": 3,
+            "SECTOR_FADE": 4,
+        }
+        for industry, data in strength.items():
+            item = {"industry": industry, **data, "leaders": lead_map.get(industry, [])}
+            items.append(item)
+        items = sorted(
+            items,
+            key=lambda x: (phase_order.get(x.get("sector_phase"), 9), -float(x.get("sector_momentum_score", 0))),
+        )[:safe_limit]
+        payload = {
+            "items": items,
+            "updated_at": datetime.now().isoformat(),
+            "cache_hit": False,
+            "cache_ttl_sec": 300,
+        }
+        set_cached_data(cache_key, payload)
+        return payload
+    except Exception as e:
+        logger.error(f"Error fetching sector strength: {e}")
+        return {"items": [], "updated_at": datetime.now().isoformat(), "error": str(e)}
 
 
 @router.get("/market/regime")

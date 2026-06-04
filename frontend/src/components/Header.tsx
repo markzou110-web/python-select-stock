@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, User, Play, Loader2, Clock, X, ArrowRight } from 'lucide-react';
+import { Search, User, Play, Loader2, Clock, X, ArrowRight, Star } from 'lucide-react';
 import api from '@/lib/api';
 
 interface HeaderProps {
@@ -23,6 +23,8 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
     const [results, setResults] = useState<StockSearchResult[]>([]);
     const [isSearching, setIsSearching] = useState(false);
     const [showDropdown, setShowDropdown] = useState(false);
+    const [addingWatchCode, setAddingWatchCode] = useState<string | null>(null);
+    const [notice, setNotice] = useState<string>('');
     const dropdownRef = useRef<HTMLDivElement>(null);
     const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -69,33 +71,33 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
         };
     }, [searchQuery]);
 
-    const handleSelectStock = async (stock: StockSearchResult) => {
+    const handleSelectStock = (stock: StockSearchResult) => {
         setShowDropdown(false);
         setSearchQuery('');
-        
-        // Fetch full stock details dynamically so AI Deep Dive has complete computed indicators
+        onSelectStock(stock);
+    };
+
+    const addToWatchlist = async (stock: StockSearchResult) => {
+        setAddingWatchCode(stock.code);
+        setNotice('');
         try {
-            const detailRes = await api.get(`/api/stock/detail?code=${stock.code}`);
-            if (detailRes.data && detailRes.data.stock_info) {
-                // Pass full enriched stock object to dashboard selectedStock
-                onSelectStock(detailRes.data.stock_info);
-            } else {
-                // Fallback to basic object if endpoint returns nothing
-                onSelectStock({
-                    代码: stock.code,
-                    名称: stock.name,
-                    行业: stock.industry,
-                    现价: 0
-                });
-            }
-        } catch (err) {
-            console.error("Error fetching selected stock details:", err);
-            onSelectStock({
-                代码: stock.code,
-                名称: stock.name,
-                行业: stock.industry,
-                现价: 0
+            const detail = await api.get(`/api/stock/detail?code=${stock.code}`);
+            const info = detail.data?.stock_info || {};
+            await api.post('/api/watchlist/add', {
+                code: stock.code,
+                name: stock.name,
+                industry: stock.industry,
+                watch_price: info.现价 || info.current_price || 1,
+                strategy_type: info.strategy_type || info.chart_strategy_type || 'squeeze',
+                reason: '顶部搜索加入观察池',
+                source: 'header_search',
             });
+            setNotice(`${stock.name} 已加入观察池`);
+        } catch (err: any) {
+            console.error("Header add watchlist error:", err);
+            setNotice(err.response?.data?.detail || '加入观察池失败');
+        } finally {
+            setAddingWatchCode(null);
         }
     };
 
@@ -147,25 +149,51 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
                     </div>
 
                     {showDropdown && results.length > 0 && (
-                        <div className="absolute right-0 mt-2 w-80 bg-white border border-slate-200 rounded-lg shadow-xl max-h-80 overflow-y-auto z-50 p-2 space-y-1">
+                        <div className="absolute right-0 mt-2 w-96 bg-white border border-slate-200 rounded-lg shadow-xl max-h-96 overflow-y-auto z-50 p-2 space-y-1">
                             <div className="px-3 py-1.5 metric-label border-b border-slate-100">
                                 股票检索结果 ({results.length})
                             </div>
+                            {notice && (
+                                <div className="mx-1 rounded-md bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700">
+                                    {notice}
+                                </div>
+                            )}
                             {results.map((stock) => (
                                 <div
                                     key={stock.code}
-                                    onClick={() => handleSelectStock(stock)}
-                                    className="flex items-center justify-between px-3 py-2.5 hover:bg-blue-50 rounded-md cursor-pointer transition-colors group"
+                                    className="flex items-center gap-2 rounded-md px-2 py-2 hover:bg-blue-50 transition-colors group"
                                 >
-                                    <div>
+                                    <button
+                                        type="button"
+                                        onClick={() => handleSelectStock(stock)}
+                                        className="min-w-0 flex-1 text-left"
+                                    >
                                         <p className="text-sm font-bold text-slate-800 group-hover:text-blue-700 transition-colors">
                                             {stock.name}
                                         </p>
                                         <p className="text-[10px] text-slate-400 font-bold tracking-wider">
                                             {stock.code} · {stock.industry}
                                         </p>
-                                    </div>
-                                    <ArrowRight size={14} className="text-slate-300 opacity-0 group-hover:opacity-100 group-hover:text-blue-600 group-hover:translate-x-0.5 transition-all" />
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => addToWatchlist(stock)}
+                                        disabled={addingWatchCode === stock.code}
+                                        className="shrink-0 inline-flex items-center gap-1 rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] font-black text-amber-600 hover:bg-amber-100 disabled:opacity-60"
+                                        title="加入观察池"
+                                    >
+                                        {addingWatchCode === stock.code ? <Loader2 size={15} className="animate-spin" /> : <Star size={15} />}
+                                        观察
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => handleSelectStock(stock)}
+                                        className="shrink-0 inline-flex items-center gap-1 rounded-lg bg-blue-50 px-2.5 py-2 text-[11px] font-black text-blue-600 hover:bg-blue-100"
+                                        title="打开走势详情"
+                                    >
+                                        <ArrowRight size={15} />
+                                        走势
+                                    </button>
                                 </div>
                             ))}
                         </div>

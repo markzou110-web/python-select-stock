@@ -20,6 +20,7 @@ interface SplitKLineChartsProps {
     markers?: any[];
     buySignals?: any[];
     sellSignals?: any[];
+    strategySignalSets?: Record<string, any>;
     priceAction?: any;
     priceActionLines?: any[];
     paperLines?: { price: number; label: string; color: string; date?: string }[];
@@ -60,30 +61,56 @@ function normalizeLine(data: any[] | undefined, valueKey = 'value') {
         .sort((a, b) => a.time.localeCompare(b.time));
 }
 
-function buildSignalMarkers(buySignals?: any[], sellSignals?: any[]) {
+function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: string) {
     const markers: any[] = [];
     (buySignals || []).forEach((sig) => {
         if (!sig?.time) return;
+        const reason = String(sig.reason || '');
+        const isTv = source === 'tv_zp' || reason.includes('TV-ZP');
         markers.push({
             time: String(sig.time),
             position: 'belowBar',
-            color: '#ef4444',
+            color: isTv ? '#22c55e' : '#ef4444',
             shape: 'arrowUp',
-            text: 'B',
+            text: isTv ? 'long' : 'B 共振',
+            source: source || (isTv ? 'tv_zp' : 'active'),
         });
     });
     (sellSignals || []).forEach((sig) => {
         if (!sig?.time) return;
-        const pnl = validNumber(sig.pnl_pct);
+        const reason = String(sig.reason || '');
+        const isTv = source === 'tv_zp' || reason.includes('TV-ZP');
+        const text = isTv
+            ? 'short'
+            : reason.includes('止盈')
+            ? reason
+            : reason.includes('止损')
+                ? '回测止损'
+                : '破位';
         markers.push({
             time: String(sig.time),
             position: 'aboveBar',
-            color: pnl != null && pnl >= 0 ? '#22c55e' : '#f59e0b',
+            color: isTv ? '#ef4444' : (reason.includes('止损') ? '#f59e0b' : '#a855f7'),
             shape: 'arrowDown',
-            text: pnl != null ? `${pnl >= 0 ? '+' : ''}${pnl}%` : 'S',
+            text,
+            source: source || (isTv ? 'tv_zp' : 'active'),
         });
     });
     return markers.sort((a, b) => a.time.localeCompare(b.time));
+}
+
+function getSignalMarkerTone(marker: any) {
+    const text = String(marker?.text || '');
+    if (text.toLowerCase().includes('long')) return { badge: 'B', label: 'long', color: '#22c55e' };
+    if (text.toLowerCase().includes('short')) return { badge: 'S', label: 'short', color: '#ef4444' };
+    if (text.includes('共振')) return { badge: 'B', label: '共振', color: '#ef4444' };
+    if (text.includes('破位')) return { badge: '破', label: '破位', color: '#a855f7' };
+    if (text.includes('买入')) return { badge: 'B', label: '买入', color: '#4f46e5' };
+    if (text.includes('买')) return { badge: 'B', label: '买点', color: '#ef4444' };
+    if (text.includes('止损')) return { badge: '止', label: '止损', color: '#f59e0b' };
+    if (text.includes('止盈')) return { badge: '↓', label: text, color: '#a855f7' };
+    if (text.includes('卖')) return { badge: 'S', label: '卖点', color: '#16a34a' };
+    return { badge: '•', label: text || '信号', color: marker?.color || '#64748b' };
 }
 
 function buildStrategySummary(candles: any[], trailingStops?: any[], buySignals?: any[], sellSignals?: any[]) {
@@ -108,8 +135,8 @@ function buildStrategySummary(candles: any[], trailingStops?: any[], buySignals?
 
     if (stopGap != null && stopGap < 2) {
         return {
-            title: '风控距离偏近',
-            body: `现价距离移动风控线约 ${stopGap.toFixed(1)}%，后续以保护利润为先，跌破风控线不宜硬扛。`,
+            title: '策略风控线偏近',
+            body: `现价距离策略风控线约 ${stopGap.toFixed(1)}%，这是策略图生成的参考线，不等同于持仓表里的移动风控。后续以执行风控价和结构失效位为主。`,
             tone: 'risk' as const,
         };
     }
@@ -257,6 +284,7 @@ export default function SplitKLineCharts({
     markers,
     buySignals,
     sellSignals,
+    strategySignalSets,
     priceAction,
     priceActionLines,
     paperLines,
@@ -266,13 +294,22 @@ export default function SplitKLineCharts({
 }: SplitKLineChartsProps) {
     const strategyRef = useRef<HTMLDivElement>(null);
     const priceActionRef = useRef<HTMLDivElement>(null);
+    const strategyOverlayRef = useRef<HTMLDivElement>(null);
+    const priceActionOverlayRef = useRef<HTMLDivElement>(null);
     const strategyVisibleRangeRef = useRef<any>(null);
     const priceActionVisibleRangeRef = useRef<any>(null);
 
     const sortedCandles = useMemo(() => normalizeCandles(candles), [candles]);
     const buyDate = normalizeDate(riskLevels?.entry_date || getPaperLineDate(paperLines, '买入'));
     const signalMarkers = useMemo(() => {
-        const all = [...(markers || []), ...buildSignalMarkers(buySignals, sellSignals)];
+        const overlayMarkers = Object.entries(strategySignalSets || {}).flatMap(([strategy, set]) => (
+            buildSignalMarkers(set?.buy_signals || [], set?.sell_signals || [], strategy)
+        ));
+        const all = [
+            ...(markers || []),
+            ...overlayMarkers,
+            ...(overlayMarkers.length === 0 ? buildSignalMarkers(buySignals, sellSignals) : []),
+        ];
         if (buyDate && sortedCandles.some((c) => c.time === buyDate)) {
             all.push({
                 time: buyDate,
@@ -280,6 +317,7 @@ export default function SplitKLineCharts({
                 color: '#4f46e5',
                 shape: 'arrowUp',
                 text: `买入 ${formatDateLabel(buyDate)}`,
+                source: 'paper',
             });
         }
         const seen = new Set<string>();
@@ -292,7 +330,7 @@ export default function SplitKLineCharts({
                 seen.add(key);
                 return true;
             });
-    }, [markers, buySignals, sellSignals, buyDate, sortedCandles]);
+    }, [markers, buySignals, sellSignals, strategySignalSets, buyDate, sortedCandles]);
     const priceActionMarkers = useMemo(() => {
         return (markers || [])
             .filter((marker) => marker?.time && String(marker.text || '').startsWith('PA'))
@@ -352,6 +390,22 @@ export default function SplitKLineCharts({
             },
         ];
     }, [paperLines, priceAction, riskLevels, trailingStops, buyDate]);
+    const overlayCounts = useMemo(() => {
+        const maSignals = strategySignalSets?.squeeze;
+        const tvSignals = strategySignalSets?.tv_zp;
+        return [
+            {
+                label: '均线策略',
+                value: `${maSignals?.buy_count ?? maSignals?.buy_signals?.length ?? 0}买 / ${maSignals?.sell_count ?? maSignals?.sell_signals?.length ?? 0}卖`,
+                color: 'text-rose-600 bg-rose-50 border-rose-100',
+            },
+            {
+                label: 'TV策略',
+                value: `${tvSignals?.buy_count ?? tvSignals?.buy_signals?.length ?? 0} long / ${tvSignals?.sell_count ?? tvSignals?.sell_signals?.length ?? 0} short`,
+                color: 'text-emerald-700 bg-emerald-50 border-emerald-100',
+            },
+        ];
+    }, [strategySignalSets]);
 
     useEffect(() => {
         if (!strategyRef.current || !priceActionRef.current || sortedCandles.length === 0) return;
@@ -419,7 +473,7 @@ export default function SplitKLineCharts({
                 color: '#f97316',
                 lineWidth: 2,
                 lineStyle: 2,
-                title: '移动风控线',
+                title: '策略风控线',
                 lastValueVisible: false,
                 priceLineVisible: false,
             });
@@ -465,6 +519,75 @@ export default function SplitKLineCharts({
             series.setData(points);
         });
 
+        const renderTradeLabels = () => {
+            const overlay = strategyOverlayRef.current;
+            if (!overlay) return;
+            overlay.innerHTML = '';
+            const candleByTime = new Map(sortedCandles.map((c) => [String(c.time), c]));
+            signalMarkers.forEach((marker) => {
+                const candle = candleByTime.get(String(marker.time));
+                if (!candle) return;
+                const x = strategyChart.timeScale().timeToCoordinate(String(marker.time) as any);
+                const anchorPrice = marker.position === 'aboveBar' ? candle.high : candle.low;
+                const y = strategyCandles.priceToCoordinate(anchorPrice);
+                if (x == null || y == null) return;
+
+                const tone = getSignalMarkerTone(marker);
+                const isAbove = marker.position === 'aboveBar';
+                const label = document.createElement('div');
+                label.className = 'absolute z-20 flex flex-col items-center select-none';
+                label.style.left = `${x}px`;
+                label.style.top = `${Math.max(4, Math.min(height - 48, y + (isAbove ? -44 : 12)))}px`;
+                label.style.transform = 'translateX(-50%)';
+                label.style.pointerEvents = 'none';
+
+                const box = document.createElement('div');
+                box.className = 'min-w-[34px] rounded-md px-2 py-1 text-center text-[10px] font-black leading-tight text-white shadow-lg ring-1 ring-white/60';
+                box.style.background = tone.color;
+                box.innerHTML = `<div class="text-[11px]">${tone.badge}</div><div>${tone.label}</div>`;
+
+                const arrow = document.createElement('div');
+                arrow.style.width = '0';
+                arrow.style.height = '0';
+                arrow.style.borderLeft = '5px solid transparent';
+                arrow.style.borderRight = '5px solid transparent';
+                if (isAbove) {
+                    arrow.style.borderTop = `6px solid ${tone.color}`;
+                    label.appendChild(box);
+                    label.appendChild(arrow);
+                } else {
+                    arrow.style.borderBottom = `6px solid ${tone.color}`;
+                    label.appendChild(arrow);
+                    label.appendChild(box);
+                }
+                overlay.appendChild(label);
+            });
+        };
+
+        const renderPriceActionLabels = () => {
+            const overlay = priceActionOverlayRef.current;
+            if (!overlay) return;
+            overlay.innerHTML = '';
+            const candleByTime = new Map(sortedCandles.map((c) => [String(c.time), c]));
+            priceActionMarkers.forEach((marker) => {
+                const candle = candleByTime.get(String(marker.time));
+                if (!candle) return;
+                const x = paChart.timeScale().timeToCoordinate(String(marker.time) as any);
+                const anchorPrice = marker.position === 'aboveBar' ? candle.high : candle.low;
+                const y = paCandles.priceToCoordinate(anchorPrice);
+                if (x == null || y == null) return;
+                const label = document.createElement('div');
+                label.className = 'absolute z-20 rounded-md px-2 py-1 text-[10px] font-black text-white shadow-lg ring-1 ring-white/60 select-none';
+                label.style.left = `${x}px`;
+                label.style.top = `${Math.max(4, Math.min(height - 30, y + (marker.position === 'aboveBar' ? -34 : 10)))}px`;
+                label.style.transform = 'translateX(-50%)';
+                label.style.pointerEvents = 'none';
+                label.style.background = marker.color || '#2563eb';
+                label.textContent = String(marker.text || 'PA');
+                overlay.appendChild(label);
+            });
+        };
+
         if (strategyVisibleRangeRef.current) {
             strategyChart.timeScale().setVisibleLogicalRange(strategyVisibleRangeRef.current);
         } else {
@@ -476,11 +599,16 @@ export default function SplitKLineCharts({
             paChart.timeScale().fitContent();
         }
 
+        renderTradeLabels();
+        renderPriceActionLabels();
+
         const handleStrategyRangeChange = (range: any) => {
             if (range) strategyVisibleRangeRef.current = range;
+            renderTradeLabels();
         };
         const handlePriceActionRangeChange = (range: any) => {
             if (range) priceActionVisibleRangeRef.current = range;
+            renderPriceActionLabels();
         };
         strategyChart.timeScale().subscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
         paChart.timeScale().subscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
@@ -488,6 +616,8 @@ export default function SplitKLineCharts({
         const handleResize = () => {
             if (strategyRef.current) strategyChart.applyOptions({ width: strategyRef.current.clientWidth });
             if (priceActionRef.current) paChart.applyOptions({ width: priceActionRef.current.clientWidth });
+            renderTradeLabels();
+            renderPriceActionLabels();
         };
         window.addEventListener('resize', handleResize);
 
@@ -504,12 +634,22 @@ export default function SplitKLineCharts({
         <div className="grid grid-cols-1 divide-y divide-slate-200">
             <div className="min-w-0">
                 <div className="px-4 py-2 border-b border-slate-100 flex items-center justify-between gap-3">
-                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">K线与策略信号</span>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">K线与策略信号</span>
+                        {overlayCounts.map((item) => (
+                            <span key={item.label} className={cn("rounded-md border px-2 py-1 text-[10px] font-black", item.color)}>
+                                {item.label} {item.value}
+                            </span>
+                        ))}
+                    </div>
                     <span className="text-[10px] font-bold text-orange-600 flex items-center gap-1">
-                        <TrendingUp size={12} /> 趋势 / 均线 / 风控
+                        <TrendingUp size={12} /> 均线共振 + TV long/short
                     </span>
                 </div>
-                <div ref={strategyRef} className="w-full" style={{ height }} />
+                <div className="relative w-full" style={{ height }}>
+                    <div ref={strategyRef} className="absolute inset-0" />
+                    <div ref={strategyOverlayRef} className="absolute inset-0 z-10 pointer-events-none" />
+                </div>
                 <SummaryBox {...strategySummary} priceRows={priceRows} />
             </div>
             <div className="min-w-0">
@@ -517,7 +657,10 @@ export default function SplitKLineCharts({
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">价格行为结构</span>
                     <span className="text-[10px] font-bold text-blue-600">趋势线 / 入场 / 失效</span>
                 </div>
-                <div ref={priceActionRef} className="w-full" style={{ height }} />
+                <div className="relative w-full" style={{ height }}>
+                    <div ref={priceActionRef} className="absolute inset-0" />
+                    <div ref={priceActionOverlayRef} className="absolute inset-0 z-10 pointer-events-none" />
+                </div>
                 <SummaryBox {...paSummary} />
             </div>
         </div>

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, Integer, Date, DateTime, Text
+from sqlalchemy import Column, String, Float, Integer, Date, DateTime, Text, JSON
 from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime
 
@@ -55,6 +55,7 @@ class ScanHistory(Base):
     pa_trade_action = Column(String(20), nullable=True)
     pa_trade_setup = Column(String(80), nullable=True)
     pa_risk_pct = Column(Float, nullable=True)
+    price_action_detail = Column(JSON, nullable=True)
 
 class PaperTrading(Base):
     __tablename__ = "paper_trading"
@@ -132,3 +133,35 @@ class StrategyTemplate(Base):
     is_default = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ScanAuditLog(Base):
+    __tablename__ = "scan_audit_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scan_date = Column(Date, nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    duration_sec = Column(Float, nullable=True)
+    status = Column(String(20), default="SUCCESS")
+    strategy_type = Column(String(20), nullable=True)
+    params_snapshot = Column(JSON, nullable=True)
+    version_snapshot = Column(JSON, nullable=True)
+    total_snapshot = Column(Integer, default=0)
+    candidate_count = Column(Integer, default=0)
+    result_count = Column(Integer, default=0)
+    fail_reasons = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+
+class FailureSample(Base):
+    __tablename__ = "failure_samples"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(20))
+    name = Column(String(50))
+    sample_date = Column(Date)
+    strategy_type = Column(String(20), nullable=True)
+    failure_type = Column(String(50), nullable=True)
+    reason = Column(Text, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
+    source = Column(String(50), default="paper_trade")
+    created_at = Column(DateTime, default=datetime.utcnow)

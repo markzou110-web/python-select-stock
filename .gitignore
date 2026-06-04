@@ -1,30 +1,49 @@
 *.db
 *.log
+
+# Environment variables (contain secrets)
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.pyc
-venv/
-backend/venv_new/
-node_modules/
+*.so
+*.egg-info/
+dist/
+build/
 .venv/
-.env
-.backend_pid
-.frontend_pid
-.celery_pid
-.DS_Store
-.pytest_cache/
-.next/
-frontend/.next/
-frontend/out/
-frontend/tsconfig.tsbuildinfo
-coverage/
+venv/
 
-# Debug/utility scripts
-backend/debug_*
-backend/test_*
-backend/query_*.py
-backend/reset_*.py
-backend/check_*.py
-backend/repair_*.py
-backend/verify_schema.py
+# Database config (contains local credentials)
+backend/db_config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Profiler
+*.prof
+
+# Agent tools (not part of the open-source project)
+.agent/
+.celery_pid
+
+# Debug / temporary scripts
+diag.py
+debug_*.py
+verify_*.py
+check_*.py
+scan_today_signals.py

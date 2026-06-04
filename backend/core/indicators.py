@@ -35,6 +35,13 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs_raw = gain / loss.replace(0, np.nan) # Avoid division by zero
     df['RSI'] = 100 - (100 / (1 + rs_raw.fillna(0)))
+    tv_gain = delta.clip(lower=0)
+    tv_loss = (-delta).clip(lower=0)
+    avg_gain = tv_gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    avg_loss = tv_loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    rsi_wilder = avg_gain / avg_loss.replace(0, np.nan)
+    df['RSI_WILDER'] = 100 - (100 / (1 + rsi_wilder.fillna(0)))
+    df.loc[(avg_loss == 0) & (avg_gain > 0), 'RSI_WILDER'] = 100
     
     # MACD
     ema12 = df['收盘'].ewm(span=12, adjust=False).mean()
@@ -206,8 +213,7 @@ def calculate_pine_indicators(df):
 
     # --- 3. 其他辅助指标 ---
     # SuperTrend 保持默认 (10, 3.0)
-    # RQK 保持默认
-    # Half Trend 保持默认
+    # RQK/HalfTrend 使用轻量近似，保持与本地全市场扫描性能兼容。
 
     df['RF_Filter'] = rf_filter
     df['RF_Upward'] = rf_up
@@ -227,6 +233,24 @@ def calculate_pine_indicators(df):
         else: st_u[i] = min(st_u[i], st_u[i-1]) if not np.isnan(st_u[i-1]) else st_u[i]
     
     df['ST_Signal'] = st_trend == 1
+
+    # RQK 近似：高斯核加权平滑价格，核回归线抬升且价格在其上方视为看涨。
+    rqk_window = 20
+    x = np.arange(rqk_window)
+    weights = np.exp(-0.5 * ((x - (rqk_window - 1)) / 6.0) ** 2)
+    weights = weights / weights.sum()
+    rqk_line = df['收盘'].rolling(rqk_window).apply(lambda s: float(np.dot(s, weights)), raw=True)
+    df['RQK_Line'] = rqk_line
+    df['RQK_Up'] = (df['收盘'] > rqk_line) & (rqk_line > rqk_line.shift(1))
+
+    # HalfTrend 近似：短均线在长均线上方，且价格站上近期中轴。
+    half_window = 20
+    high_mid = df['最高'].rolling(half_window).max()
+    low_mid = df['最低'].rolling(half_window).min()
+    range_mid = (high_mid + low_mid) / 2
+    fast_ma = df['收盘'].rolling(6).mean()
+    slow_ma = df['收盘'].rolling(12).mean()
+    df['HalfTrend_Up'] = (fast_ma > slow_ma) & (df['收盘'] > range_mid)
     
     return df
 

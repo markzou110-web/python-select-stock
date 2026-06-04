@@ -208,8 +208,11 @@ def calculate_pnl_attribution(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         by_strategy.setdefault(st, []).append(t['pl_pct'])
     
     strategy_labels = {
+        "tv_dual_strict": "TV强共振",
+        "tv_dual": "TV双策略",
         "squeeze": "均线粘合",
         "pine": "Pine共振",
+        "tv_zp": "TV-ZP",
         "both": "双重共振",
         "consensus": "共识策略",
         "unknown": "未知"

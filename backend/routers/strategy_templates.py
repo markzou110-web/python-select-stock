@@ -11,21 +11,21 @@ router = APIRouter(prefix="/api/strategy-templates", tags=["strategy-templates"]
 
 
 DEFAULT_TEMPLATE_PARAMS = {
-    "strategy_type": "squeeze",
+    "strategy_type": "tv_dual_strict",
     "pine_min_signals": 3,
-    "min_data_days": 60,
+    "min_data_days": 120,
     "threshold": 0.12,
     "vol_multiplier": 1.5,
     "rsi_min": 55,
     "use_macd_filter": True,
-    "use_bb_sqz": True,
+    "use_bb_sqz": False,
     "sqz_lookback": 10,
     "use_weekly": False,
     "weekly_ma_period": 20,
     "market_range": "全市场(除科创)",
     "turnover_min": 3.0,
     "mkt_cap_min": 0,
-    "use_rs_filter": True,
+    "use_rs_filter": False,
     "local_only": True,
     "data_date": "",
     "stop_loss_pct": -8,
@@ -57,10 +57,10 @@ def _ensure_seed_templates(engine) -> None:
             return
         seeds = [
             {
-                "name": "稳健均线粘合",
-                "strategy_type": "squeeze",
+                "name": "TV双策略强共振",
+                "strategy_type": "tv_dual_strict",
                 "params": DEFAULT_TEMPLATE_PARAMS,
-                "description": "默认均线粘合突破，适合日常全市场扫描。",
+                "description": "尾盘买入候选：最近窗口内均线B共振和 TV-ZP long 同时出现。",
                 "is_default": 1,
             },
             {
