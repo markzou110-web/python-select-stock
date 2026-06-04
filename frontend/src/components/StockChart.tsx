@@ -117,6 +117,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     markers={chartData.markers || []}
                     priceAction={chartData.price_action || null}
                     priceActionLines={chartData.price_action_lines || []}
+                    riskLevels={chartData.chart_context || {}}
                     height={400}
                 />
             )}

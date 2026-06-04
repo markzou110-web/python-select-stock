@@ -123,6 +123,38 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                 trailing_stops_dict[t] = val
         
         trailing_stops_data = [{"time": t, "value": v} for t, v in sorted(trailing_stops_dict.items())]
+        chart_context: Dict[str, Any] = {}
+        try:
+            with engine.connect() as conn:
+                scan_res = conn.execute(text("""
+                    SELECT date, strategy_type, score, pa_trade_action, pa_trade_setup,
+                           price_action_detail
+                    FROM scan_history
+                    WHERE code = :code
+                    ORDER BY date DESC
+                    LIMIT 1
+                """), {"code": code}).fetchone()
+                if scan_res:
+                    detail = scan_res[5] or {}
+                    if isinstance(detail, str):
+                        try:
+                            import json
+                            detail = json.loads(detail)
+                        except Exception:
+                            detail = {}
+                    chart_context = {
+                        "bark_recommendation_date": str(scan_res[0]) if scan_res[0] else None,
+                        "latest_scan_date": str(scan_res[0]) if scan_res[0] else None,
+                        "latest_scan_strategy": scan_res[1],
+                        "latest_scan_score": float(scan_res[2]) if scan_res[2] is not None else None,
+                        "latest_scan_pa_action": scan_res[3],
+                        "latest_scan_pa_setup": scan_res[4],
+                        "sector_phase": detail.get("sector_phase"),
+                        "sector_momentum_score": detail.get("sector_momentum_score"),
+                        "sector_alignment_score": detail.get("sector_alignment_score"),
+                    }
+        except Exception as exc:
+            logger.warning(f"Chart context fetch for {code} failed: {exc}")
 
         return {
             "code": code,
@@ -131,7 +163,8 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             "markers": markers_data,
             "trailing_stops": trailing_stops_data,
             "price_action": price_action.get("summary", {}),
-            "price_action_lines": price_action.get("lines", [])
+            "price_action_lines": price_action.get("lines", []),
+            "chart_context": chart_context,
         }
         
     except Exception as e:

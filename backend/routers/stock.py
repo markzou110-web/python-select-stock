@@ -809,6 +809,14 @@ def get_stock_full_analysis(code: str):
         entry_source = None
         entry_signal_date = None
         entry_reason_snapshot = None
+        latest_scan_date = None
+        latest_scan_strategy = None
+        latest_scan_score = None
+        latest_scan_pa_action = None
+        latest_scan_pa_setup = None
+        latest_sector_phase = None
+        latest_sector_momentum_score = None
+        latest_sector_alignment_score = None
         hold_days = 0
         pl_pct = 0.0
         current_price = safe_float(df.iloc[-1]['收盘'])
@@ -886,6 +894,31 @@ def get_stock_full_analysis(code: str):
                 pl_pct = round(((curr_price - entry_price) / entry_price) * 100, 2)
                 current_price = curr_price
 
+            scan_res = conn.execute(text("""
+                SELECT date, strategy_type, score, pa_trade_action, pa_trade_setup,
+                       price_action_detail
+                FROM scan_history
+                WHERE code = :code
+                ORDER BY date DESC
+                LIMIT 1
+            """), {"code": code}).fetchone()
+            if scan_res:
+                latest_scan_date = str(scan_res[0]) if scan_res[0] else None
+                latest_scan_strategy = scan_res[1]
+                latest_scan_score = safe_float(scan_res[2])
+                latest_scan_pa_action = scan_res[3]
+                latest_scan_pa_setup = scan_res[4]
+                detail = scan_res[5] or {}
+                if isinstance(detail, str):
+                    try:
+                        import json
+                        detail = json.loads(detail)
+                    except Exception:
+                        detail = {}
+                latest_sector_phase = detail.get("sector_phase")
+                latest_sector_momentum_score = detail.get("sector_momentum_score")
+                latest_sector_alignment_score = detail.get("sector_alignment_score")
+
         close = current_price
         prev_close = float(df.iloc[-2]['收盘']) if len(df) > 1 else close
         _, stats = check_strategy(df)
@@ -927,6 +960,15 @@ def get_stock_full_analysis(code: str):
             "entry_source": entry_source,
             "entry_signal_date": entry_signal_date,
             "entry_reason_snapshot": entry_reason_snapshot,
+            "latest_scan_date": latest_scan_date,
+            "bark_recommendation_date": entry_signal_date or latest_scan_date,
+            "latest_scan_strategy": latest_scan_strategy,
+            "latest_scan_score": latest_scan_score,
+            "latest_scan_pa_action": latest_scan_pa_action,
+            "latest_scan_pa_setup": latest_scan_pa_setup,
+            "sector_phase": latest_sector_phase,
+            "sector_momentum_score": latest_sector_momentum_score,
+            "sector_alignment_score": latest_sector_alignment_score,
         }
 
         # 4. 概念板块 (异步友好 + 24小时缓存)

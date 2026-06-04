@@ -101,6 +101,8 @@ function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: st
 
 function getSignalMarkerTone(marker: any) {
     const text = String(marker?.text || '');
+    if (text.includes('Bark')) return { badge: 'Bark', label: '推荐日', color: '#0ea5e9' };
+    if (text.includes('冲高回落')) return { badge: '警', label: '冲高回落', color: '#f59e0b' };
     if (text.toLowerCase().includes('long')) return { badge: 'B', label: 'long', color: '#22c55e' };
     if (text.toLowerCase().includes('short')) return { badge: 'S', label: 'short', color: '#ef4444' };
     if (text.includes('共振')) return { badge: 'B', label: '共振', color: '#ef4444' };
@@ -224,6 +226,59 @@ function getPaperLineDate(paperLines: { price: number; label: string; color: str
     return normalizeDate((paperLines || []).find((line) => line.label.includes(label))?.date);
 }
 
+function sectorPhaseTone(phase?: string) {
+    const map: Record<string, { label: string; bg: string; text: string }> = {
+        SECTOR_CONFIRM: { label: '板块确认', bg: 'rgba(16, 185, 129, 0.055)', text: 'text-emerald-700' },
+        SECTOR_WARMUP: { label: '板块预热', bg: 'rgba(245, 158, 11, 0.06)', text: 'text-amber-700' },
+        SECTOR_FADE: { label: '板块退潮', bg: 'rgba(244, 63, 94, 0.055)', text: 'text-rose-700' },
+        SECTOR_NEUTRAL: { label: '板块中性', bg: 'rgba(100, 116, 139, 0.04)', text: 'text-slate-500' },
+    };
+    return map[phase || ''] || map.SECTOR_NEUTRAL;
+}
+
+function buildRiskPriceLines(riskLevels: any, paperLines?: { price: number; label: string; color: string; date?: string }[]) {
+    const lines = [...(paperLines || [])];
+    const pushLine = (price: any, label: string, color: string) => {
+        const value = validNumber(price);
+        if (value == null || value <= 0) return;
+        if (lines.some((line) => Math.abs(Number(line.price) - value) < 0.001 && line.label === label)) return;
+        lines.push({ price: value, label, color });
+    };
+
+    pushLine(riskLevels?.buy_price, '成本线', '#4f46e5');
+    pushLine(riskLevels?.initial_stop_price, '主动止损线', '#dc2626');
+    pushLine(riskLevels?.structure_stop_price, '结构失效线', '#2563eb');
+    pushLine(riskLevels?.capital_protect_price || riskLevels?.reduce_price, '减仓线', '#d97706');
+    pushLine(riskLevels?.active_stop_price || riskLevels?.stop_price, '执行风控线', '#e11d48');
+    pushLine(riskLevels?.take_profit_price, '止盈线', '#059669');
+    return lines;
+}
+
+function buildPullbackWarningMarkers(candles: any[]) {
+    const recent = candles.slice(-80);
+    const markers: any[] = [];
+    recent.forEach((candle, index) => {
+        const range = candle.high - candle.low;
+        if (range <= 0) return;
+        const upperShadow = candle.high - Math.max(candle.open, candle.close);
+        const shadowRatio = upperShadow / range;
+        const closePosition = (candle.close - candle.low) / range;
+        const prev = recent[index - 1];
+        const wasStrong = prev ? candle.high >= prev.high * 1.03 : candle.high >= candle.open * 1.04;
+        if (wasStrong && shadowRatio >= 0.45 && closePosition <= 0.55) {
+            markers.push({
+                time: candle.time,
+                position: 'aboveBar',
+                color: '#f59e0b',
+                shape: 'circle',
+                text: '冲高回落',
+                source: 'warning',
+            });
+        }
+    });
+    return markers;
+}
+
 function SummaryBox({
     title,
     body,
@@ -301,6 +356,9 @@ export default function SplitKLineCharts({
 
     const sortedCandles = useMemo(() => normalizeCandles(candles), [candles]);
     const buyDate = normalizeDate(riskLevels?.entry_date || getPaperLineDate(paperLines, '买入'));
+    const barkDate = normalizeDate(riskLevels?.bark_recommendation_date || riskLevels?.latest_scan_date || riskLevels?.entry_signal_date);
+    const riskPriceLines = useMemo(() => buildRiskPriceLines(riskLevels, paperLines), [paperLines, riskLevels]);
+    const sectorTone = useMemo(() => sectorPhaseTone(riskLevels?.sector_phase), [riskLevels]);
     const signalMarkers = useMemo(() => {
         const overlayMarkers = Object.entries(strategySignalSets || {}).flatMap(([strategy, set]) => (
             buildSignalMarkers(set?.buy_signals || [], set?.sell_signals || [], strategy)
@@ -309,6 +367,7 @@ export default function SplitKLineCharts({
             ...(markers || []),
             ...overlayMarkers,
             ...(overlayMarkers.length === 0 ? buildSignalMarkers(buySignals, sellSignals) : []),
+            ...buildPullbackWarningMarkers(sortedCandles),
         ];
         if (buyDate && sortedCandles.some((c) => c.time === buyDate)) {
             all.push({
@@ -318,6 +377,16 @@ export default function SplitKLineCharts({
                 shape: 'arrowUp',
                 text: `买入 ${formatDateLabel(buyDate)}`,
                 source: 'paper',
+            });
+        }
+        if (barkDate && sortedCandles.some((c) => c.time === barkDate)) {
+            all.push({
+                time: barkDate,
+                position: 'belowBar',
+                color: '#0ea5e9',
+                shape: 'circle',
+                text: `Bark ${formatDateLabel(barkDate)}`,
+                source: 'bark',
             });
         }
         const seen = new Set<string>();
@@ -330,7 +399,7 @@ export default function SplitKLineCharts({
                 seen.add(key);
                 return true;
             });
-    }, [markers, buySignals, sellSignals, strategySignalSets, buyDate, sortedCandles]);
+    }, [markers, buySignals, sellSignals, strategySignalSets, buyDate, barkDate, sortedCandles]);
     const priceActionMarkers = useMemo(() => {
         return (markers || [])
             .filter((marker) => marker?.time && String(marker.text || '').startsWith('PA'))
@@ -480,7 +549,7 @@ export default function SplitKLineCharts({
             series.setData(normalizeLine(trailingStops));
         }
 
-        (paperLines || []).forEach((line) => {
+        riskPriceLines.forEach((line) => {
             const price = validNumber(line.price);
             if (price == null || price <= 0) return;
             strategyCandles.createPriceLine({
@@ -523,6 +592,19 @@ export default function SplitKLineCharts({
             const overlay = strategyOverlayRef.current;
             if (!overlay) return;
             overlay.innerHTML = '';
+            const barkX = barkDate ? strategyChart.timeScale().timeToCoordinate(barkDate as any) : null;
+            if (barkX != null) {
+                const line = document.createElement('div');
+                line.className = 'absolute top-0 bottom-0 z-10 border-l border-dashed border-sky-500/70';
+                line.style.left = `${barkX}px`;
+                line.style.pointerEvents = 'none';
+                const tag = document.createElement('div');
+                tag.className = 'absolute top-2 -translate-x-1/2 rounded bg-sky-500 px-2 py-1 text-[10px] font-black text-white shadow';
+                tag.style.left = `${barkX}px`;
+                tag.textContent = 'Bark推荐日';
+                overlay.appendChild(line);
+                overlay.appendChild(tag);
+            }
             const candleByTime = new Map(sortedCandles.map((c) => [String(c.time), c]));
             signalMarkers.forEach((marker) => {
                 const candle = candleByTime.get(String(marker.time));
@@ -628,7 +710,7 @@ export default function SplitKLineCharts({
             strategyChart.remove();
             paChart.remove();
         };
-    }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, paperLines, height, compact]);
+    }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, riskPriceLines, barkDate, height, compact]);
 
     return (
         <div className="grid grid-cols-1 divide-y divide-slate-200">
@@ -646,7 +728,13 @@ export default function SplitKLineCharts({
                         <TrendingUp size={12} /> 均线共振 + TV long/short
                     </span>
                 </div>
-                <div className="relative w-full" style={{ height }}>
+                <div className="relative w-full" style={{ height, background: sectorTone.bg }}>
+                    {riskLevels?.sector_phase && (
+                        <div className={cn("absolute left-3 top-3 z-10 rounded-md border border-white/70 bg-white/80 px-2 py-1 text-[10px] font-black shadow-sm", sectorTone.text)}>
+                            {sectorTone.label}
+                            {riskLevels?.sector_momentum_score != null ? ` · 强度${Number(riskLevels.sector_momentum_score).toFixed(0)}` : ''}
+                        </div>
+                    )}
                     <div ref={strategyRef} className="absolute inset-0" />
                     <div ref={strategyOverlayRef} className="absolute inset-0 z-10 pointer-events-none" />
                 </div>
