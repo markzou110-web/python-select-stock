@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.operation_plan import evaluate_operation_trigger, operation_bands, price_instruction, watch_exit_decision, watch_instruction
+from core.operation_plan import alert_priority, evaluate_operation_trigger, operation_bands, pre_trade_check, price_instruction, watch_exit_decision, watch_instruction
 
 
 def test_price_instruction_has_action_ranges():
@@ -92,4 +92,36 @@ def test_evaluate_operation_trigger_prioritizes_structure_exit():
 
     assert trigger["triggered"] is True
     assert trigger["level"] == "critical"
+    assert trigger["priority"] == "P0"
     assert trigger["kind"] == "STRUCTURE_EXIT"
+
+
+def test_alert_priority_maps_operation_levels():
+    assert alert_priority("critical", "STRUCTURE_EXIT")["priority"] == "P0"
+    assert alert_priority("opportunity", "ADD_TRIGGER")["priority"] == "P1"
+    assert alert_priority("notice", "CANCEL_ADD")["priority"] == "P2"
+
+
+def test_pre_trade_check_blocks_unconfirmed_add():
+    result = pre_trade_check(
+        current_price=22.6,
+        plan={"add_trigger_price": 22.5, "add_guard_price": 22.16},
+        volume_confirmed=False,
+        close_confirmed=True,
+    )
+
+    assert result["passed"] is False
+    assert result["action"] == "继续观察，等待价量收齐"
+    assert "量能未确认" in result["blockers"]
+
+
+def test_pre_trade_check_passes_when_all_confirmed():
+    result = pre_trade_check(
+        current_price=22.6,
+        plan={"add_trigger_price": 22.5, "add_guard_price": 22.16},
+        volume_confirmed=True,
+        close_confirmed=True,
+    )
+
+    assert result["passed"] is True
+    assert result["action"] == "允许小仓执行"

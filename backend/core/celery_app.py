@@ -43,6 +43,31 @@ celery_app.conf.update(
             'task': 'tasks.check_realtime_alerts',
             'schedule': 300.0, # 每 5 分钟检查一次
         },
+        'intraday-open-risk-0935': {
+            'task': 'tasks.intraday_monitor_checkpoint',
+            'schedule': crontab(hour=9, minute=35),
+            'kwargs': {'slot': 'open_risk'},
+        },
+        'intraday-morning-confirm-1030': {
+            'task': 'tasks.intraday_monitor_checkpoint',
+            'schedule': crontab(hour=10, minute=30),
+            'kwargs': {'slot': 'morning_confirm'},
+        },
+        'intraday-candidate-scan-1420': {
+            'task': 'tasks.intraday_monitor_checkpoint',
+            'schedule': crontab(hour=14, minute=20),
+            'kwargs': {'slot': 'candidate_scan'},
+        },
+        'intraday-late-decision-1450': {
+            'task': 'tasks.intraday_monitor_checkpoint',
+            'schedule': crontab(hour=14, minute=50),
+            'kwargs': {'slot': 'late_decision'},
+        },
+        'intraday-after-close-review-1510': {
+            'task': 'tasks.intraday_monitor_checkpoint',
+            'schedule': crontab(hour=15, minute=10),
+            'kwargs': {'slot': 'after_close_review'},
+        },
         'market-sync-before-open': {
             'task': 'tasks.daily_sync',
             'schedule': crontab(hour=8, minute=30),

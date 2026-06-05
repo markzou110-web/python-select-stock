@@ -154,6 +154,39 @@ def check_realtime_alerts():
         return str(e)
 
 
+@celery_app.task(name="tasks.intraday_monitor_checkpoint")
+def intraday_monitor_checkpoint(slot: str = "price_watch"):
+    """Professional intraday workflow checkpoints for real trading operations."""
+    now = datetime.now()
+    if not is_a_share_intraday_session(now) and slot not in {"after_close_review"}:
+        logger.info(f"Checkpoint {slot} skipped: market closed.")
+        return "Market closed"
+
+    summary = {"slot": slot, "operation_alerts": 0, "watch_alerts": 0, "pruned": 0}
+    try:
+        from routers.paper_trade import check_operation_triggers
+        from routers.watchlist import auto_prune_watchlist, check_watchlist_triggers, refresh_watchlist_decisions
+
+        if slot in {"open_risk", "morning_confirm", "late_decision", "price_watch"}:
+            operation = check_operation_triggers(notify=True, trade_mode="REAL")
+            summary["operation_alerts"] = len(operation.get("alerts") or [])
+
+        if slot in {"morning_confirm", "candidate_scan", "late_decision"}:
+            watch = check_watchlist_triggers(notify=True)
+            summary["watch_alerts"] = int(watch.get("count") or 0)
+
+        if slot in {"candidate_scan", "after_close_review"}:
+            refresh_watchlist_decisions()
+            pruned = auto_prune_watchlist(max_watch_days=15)
+            summary["pruned"] = int(pruned.get("updated") or 0)
+
+        logger.info(f"Intraday checkpoint completed: {summary}")
+        return summary
+    except Exception as exc:
+        logger.error(f"Intraday checkpoint {slot} error: {exc}")
+        return {"slot": slot, "error": str(exc)}
+
+
 @celery_app.task(name="tasks.daily_sync")
 def daily_sync(slot: str = "晚上"):
     """

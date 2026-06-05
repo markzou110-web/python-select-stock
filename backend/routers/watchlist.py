@@ -313,6 +313,34 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
         })
 
     notification = _send_trigger_notification(alerts) if notify and alerts else {}
+    if alerts:
+        try:
+            engine = get_db_engine()
+            if engine:
+                updates = []
+                for alert in alerts:
+                    is_stop = any("失效" in reason for reason in alert.get("reasons", []))
+                    updates.append({
+                        "id": alert["id"],
+                        "status": "INVALIDATED" if is_stop else "TRIGGERED",
+                        "decision": "INVALIDATE" if is_stop else "TRIGGERED",
+                        "action": "触发失效价，移出观察池" if is_stop else "已触发目标价，等待尾盘确认是否转实盘",
+                        "review_date": datetime.now().strftime("%Y-%m-%d"),
+                        "updated_at": datetime.now(),
+                    })
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        UPDATE watchlist
+                        SET status = :status,
+                            watch_decision = :decision,
+                            watch_action = :action,
+                            last_review_date = :review_date,
+                            updated_at = :updated_at
+                        WHERE id = :id
+                    """), updates)
+                    conn.commit()
+        except Exception as exc:
+            logger.warning(f"Watchlist lifecycle update failed: {exc}")
     return {
         "status": "success",
         "count": len(alerts),

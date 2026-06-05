@@ -21,7 +21,7 @@ from core.risk_constants import (
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
-from core.operation_plan import evaluate_operation_trigger, operation_bands, position_health_score, price_instruction, safe_num
+from core.operation_plan import alert_priority, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -202,16 +202,10 @@ def _send_operation_trigger_notification(alerts: List[Dict[str, Any]]) -> None:
         return
     title = f"Alpha Vision 实盘价位触发 {len(alerts)} 条"
     lines = []
-    icon_map = {
-        "critical": "🚨",
-        "warning": "⚠️",
-        "notice": "🟠",
-        "opportunity": "🟢",
-    }
     for alert in alerts[:8]:
         trigger = alert.get("trigger") or {}
-        icon = icon_map.get(trigger.get("level"), "•")
-        lines.append(f"{icon} {alert['name']}({alert['code']}) 现价 {alert['current_price']:.2f}")
+        priority = alert_priority(trigger.get("level"), trigger.get("kind"))
+        lines.append(f"{priority['emoji']} [{priority['priority']} {priority['label']}] {alert['name']}({alert['code']}) 现价 {alert['current_price']:.2f}")
         lines.append(f"   └ {trigger.get('action')}")
         if alert.get("instruction"):
             lines.append(f"   └ 指令: {alert['instruction']}")
@@ -405,6 +399,7 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                 "current_price": round(current, 2),
                 "plan": plan,
                 "trigger": trigger,
+                "priority": alert_priority(trigger.get("level"), trigger.get("kind")),
                 "instruction": plan.get("instruction"),
             }
             alerts.append(alert)
@@ -449,6 +444,42 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
     except Exception as exc:
         logger.error(f"Check operation triggers error: {exc}")
         return {"status": "error", "alerts": [], "detail": str(exc)}
+
+
+@router.post("/pre-trade-check")
+def run_pre_trade_check(payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = safe_num(payload.get("current_price"))
+    plan = payload.get("plan") or {}
+    if not plan and payload.get("trade_id"):
+        engine = get_db_engine()
+        if not engine:
+            return {"status": "error", "detail": "Database error"}
+        try:
+            df = pd.read_sql(text("SELECT * FROM paper_trading WHERE id = :id"), engine, params={"id": int(payload["trade_id"])})
+            if df.empty:
+                return {"status": "error", "detail": "Trade not found"}
+            row = df.iloc[0]
+            entry = safe_float(row.get("entry_price"))
+            current = current or safe_float(row.get("current_price"), entry)
+            high = max(safe_float(row.get("high_since_entry"), entry), current)
+            risk = compute_paper_risk_levels(entry, high, current)
+            plan = _build_trade_plan(row.to_dict(), current, high, risk)
+        except Exception as exc:
+            logger.error(f"Pre-trade plan resolve error: {exc}")
+            return {"status": "error", "detail": str(exc)}
+
+    result = pre_trade_check(
+        current_price=current,
+        plan=plan,
+        market_status=str(payload.get("market_status") or ""),
+        sector_phase=str(payload.get("sector_phase") or ""),
+        volume_confirmed=bool(payload.get("volume_confirmed")),
+        close_confirmed=bool(payload.get("close_confirmed")),
+        high_open_pct=safe_num(payload.get("high_open_pct")),
+        pullback_warning=bool(payload.get("pullback_warning")),
+        portfolio_warnings=payload.get("portfolio_warnings") or [],
+    )
+    return {"status": "success", "check": result}
 
 
 @router.post("/journal")
@@ -503,6 +534,31 @@ def list_trade_journal_events(limit: int = 100) -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"List trade journal events error: {exc}")
         return {"items": [], "error": str(exc)}
+
+
+@router.post("/journal/{event_id}/feedback")
+def update_trade_journal_feedback(event_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error", "detail": "Database error"}
+    try:
+        _ensure_trade_journal_table(engine)
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE trade_journal_events
+                SET action_taken = :action_taken,
+                    result_note = :result_note
+                WHERE id = :id
+            """), {
+                "id": int(event_id),
+                "action_taken": payload.get("action_taken"),
+                "result_note": payload.get("result_note"),
+            })
+            conn.commit()
+        return {"status": "success"}
+    except Exception as exc:
+        logger.error(f"Update trade journal feedback error: {exc}")
+        return {"status": "error", "detail": str(exc)}
 
 
 @router.get("/list")

@@ -176,6 +176,7 @@ def evaluate_operation_trigger(current_price: float, plan: Dict[str, Any]) -> Di
         return {
             "triggered": True,
             "level": "critical",
+            "priority": "P0",
             "action": f"现价 {current:.2f} 跌破结构失效线 {structure_stop:.2f}，优先退出复核",
             "price": current,
             "threshold": round(structure_stop, 2),
@@ -185,6 +186,7 @@ def evaluate_operation_trigger(current_price: float, plan: Dict[str, Any]) -> Di
         return {
             "triggered": True,
             "level": "warning",
+            "priority": "P1",
             "action": f"现价 {current:.2f} 跌破减仓线 {active_stop:.2f}，减仓或收紧风控",
             "price": current,
             "threshold": round(active_stop, 2),
@@ -194,6 +196,7 @@ def evaluate_operation_trigger(current_price: float, plan: Dict[str, Any]) -> Di
         return {
             "triggered": True,
             "level": "notice",
+            "priority": "P2",
             "action": f"现价 {current:.2f} 跌破加仓撤退线 {guard:.2f}，撤回加仓计划",
             "price": current,
             "threshold": round(guard, 2),
@@ -203,6 +206,7 @@ def evaluate_operation_trigger(current_price: float, plan: Dict[str, Any]) -> Di
         return {
             "triggered": True,
             "level": "opportunity",
+            "priority": "P1",
             "action": f"现价 {current:.2f} 突破加仓触发线 {trigger:.2f}，等待量能与收盘确认后小幅加仓",
             "price": current,
             "threshold": round(trigger, 2),
@@ -211,7 +215,67 @@ def evaluate_operation_trigger(current_price: float, plan: Dict[str, Any]) -> Di
     return {
         "triggered": False,
         "level": "none",
+        "priority": "P3",
         "action": "未触发操作价位",
         "price": current,
         "kind": "HOLD",
+    }
+
+
+def alert_priority(level: str = "", kind: str = "") -> Dict[str, Any]:
+    if kind == "STRUCTURE_EXIT" or level == "critical":
+        return {"priority": "P0", "label": "必须立即处理", "emoji": "🚨"}
+    if kind in {"REDUCE", "ADD_TRIGGER"} or level in {"warning", "opportunity"}:
+        return {"priority": "P1", "label": "需要盘中决策", "emoji": "⚠️" if kind == "REDUCE" else "🟢"}
+    if kind == "CANCEL_ADD" or level == "notice":
+        return {"priority": "P2", "label": "观察提醒", "emoji": "🟠"}
+    return {"priority": "P3", "label": "复盘信息", "emoji": "ℹ️"}
+
+
+def pre_trade_check(
+    current_price: float,
+    plan: Dict[str, Any],
+    market_status: str = "",
+    sector_phase: str = "",
+    volume_confirmed: bool = False,
+    close_confirmed: bool = False,
+    high_open_pct: float = 0.0,
+    pullback_warning: bool = False,
+    portfolio_warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    current = safe_num(current_price)
+    trigger = safe_num(plan.get("add_trigger_price") or plan.get("trigger_price"))
+    guard = safe_num(plan.get("add_guard_price") or plan.get("guard_price"))
+    blockers: List[str] = []
+    warnings = portfolio_warnings or []
+
+    if trigger > 0 and current < trigger:
+        blockers.append(f"未站上触发价 {trigger:.2f}")
+    if guard > 0 and current <= guard:
+        blockers.append(f"跌破撤退线 {guard:.2f}")
+    if high_open_pct > 3:
+        blockers.append(f"高开 {high_open_pct:.1f}% 超过追价阈值")
+    if pullback_warning:
+        blockers.append("出现冲高回落警告")
+    if market_status in {"DEFENSIVE", "CRITICAL"}:
+        blockers.append(f"市场处于{market_status}模式")
+    if sector_phase in {"SECTOR_FADE"}:
+        blockers.append("板块退潮")
+    if not volume_confirmed:
+        blockers.append("量能未确认")
+    if not close_confirmed:
+        blockers.append("收盘/站稳未确认")
+    if warnings:
+        blockers.extend(warnings[:2])
+
+    passed = len(blockers) == 0
+    action = "允许小仓执行" if passed else "禁止买入/加仓"
+    if not passed and trigger > 0 and guard > 0 and current > guard:
+        action = "继续观察，等待价量收齐"
+    return {
+        "passed": passed,
+        "action": action,
+        "blockers": blockers,
+        "trigger_price": round(trigger, 2) if trigger > 0 else None,
+        "guard_price": round(guard, 2) if guard > 0 else None,
     }
