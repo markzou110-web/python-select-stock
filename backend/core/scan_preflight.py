@@ -4,6 +4,8 @@ from typing import Any, Dict, Optional
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from core.data_source_quality import build_local_data_quality_report
+
 
 def _date_str(value: Any) -> Optional[str]:
     if value is None:
@@ -37,6 +39,16 @@ def build_scan_preflight(
     }
 
     try:
+        local_quality = build_local_data_quality_report(
+            engine,
+            target_date=data_date,
+            min_stock_count=min_stock_count,
+        )
+        for item in local_quality.get("checks", []):
+            if item.get("name") not in {"latest_coverage"}:
+                checks.append(item)
+        summary["local_data_quality"] = local_quality.get("summary", {})
+
         with engine.connect() as conn:
             if data_date:
                 row = conn.execute(

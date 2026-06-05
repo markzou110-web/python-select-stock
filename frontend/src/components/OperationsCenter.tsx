@@ -21,6 +21,23 @@ interface DataSourceReport {
     sources: Record<string, DataSourceInfo>;
     message: string;
     recommendations: string[];
+    local_data?: {
+        status: 'ok' | 'warn' | 'error';
+        blocking: boolean;
+        checks: Array<{ name: string; status: 'ok' | 'warn' | 'error'; message: string }>;
+        summary: {
+            selected_date?: string;
+            stock_count?: number;
+            previous_date?: string | null;
+            previous_stock_count?: number;
+            missing_vs_previous?: number;
+            coverage_ratio?: number;
+            missing_industry_count?: number;
+            abnormal_move_count?: number;
+            invalid_price_count?: number;
+        };
+        recommendations: string[];
+    };
 }
 
 interface ScanAudit {
@@ -298,6 +315,34 @@ export default function OperationsCenter() {
                 </section>
 
                 <section className="glass-card p-5 space-y-4 xl:col-span-2">
+                    <SectionTitle
+                        icon={<FileWarning size={18} />}
+                        title="本地行情体检"
+                        subtitle={`最新 ${dataSources?.local_data?.summary?.selected_date || '--'} · 覆盖率 ${dataSources?.local_data?.summary?.coverage_ratio ?? '--'}%`}
+                    />
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+                        <TinyStat label="最新覆盖" value={dataSources?.local_data?.summary?.stock_count ?? 0} />
+                        <TinyStat label="较前缺失" value={dataSources?.local_data?.summary?.missing_vs_previous ?? 0} />
+                        <TinyStat label="行业缺失" value={dataSources?.local_data?.summary?.missing_industry_count ?? 0} />
+                        <TinyStat label="异常跳变" value={dataSources?.local_data?.summary?.abnormal_move_count ?? 0} />
+                        <TinyStat label="无效K线" value={dataSources?.local_data?.summary?.invalid_price_count ?? 0} />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        {(dataSources?.local_data?.checks || []).map(check => (
+                            <div key={check.name} className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 flex items-start justify-between gap-3">
+                                <p className="text-xs font-bold text-slate-600 leading-relaxed">{check.message}</p>
+                                <StatusPill status={check.status} label={check.status} />
+                            </div>
+                        ))}
+                    </div>
+                    {(dataSources?.local_data?.recommendations || []).length > 0 && (
+                        <div className="rounded-xl bg-amber-50 border border-amber-100 px-3 py-2 text-[11px] font-bold text-amber-700">
+                            {dataSources?.local_data?.recommendations?.slice(0, 3).join('；')}
+                        </div>
+                    )}
+                </section>
+
+                <section className="glass-card p-5 space-y-4 xl:col-span-3">
                     <SectionTitle icon={<Activity size={18} />} title="扫描审计日志" subtitle="最近任务、耗时、候选与失败原因" />
                     <div className="overflow-hidden rounded-xl border border-slate-100">
                         <table className="w-full text-left text-xs">

@@ -19,7 +19,7 @@ def get_system_health():
 @router.get("/data-sources")
 def get_data_source_quality():
     """Return multi-source availability and quality diagnostics."""
-    return build_data_source_quality_report()
+    return build_data_source_quality_report(get_db_engine())
 
 
 @router.get("/ops-summary")
