@@ -84,6 +84,12 @@ def test_real_position_action_explains_breakout_confirmation_before_add():
     assert "加仓确认" in suggestion
     assert "站上22.50" in suggestion
     assert "守22.16" in suggestion
+    assert "指令" in suggestion
+    assert ">22.50: 只确认不追，等价量收齐" in suggestion
+    assert "22.16-22.50: 持有观察，不加仓" in suggestion
+    assert "<22.16: 撤回加仓计划" in suggestion
+    assert "<21.28: 减仓/收紧风控" in suggestion
+    assert "<19.17: 结构失效，退出复核" in suggestion
 
 
 def test_real_position_action_marks_confirmed_volume_breakout():
@@ -102,3 +108,5 @@ def test_real_position_action_marks_confirmed_volume_breakout():
     assert "价✓" in suggestion
     assert "量✓" in suggestion
     assert "收✓" in suggestion
+    assert ">22.50: 可小幅加仓" in suggestion
+    assert "<22.16: 撤回加仓计划" in suggestion

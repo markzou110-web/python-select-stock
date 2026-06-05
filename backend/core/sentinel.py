@@ -196,6 +196,31 @@ def _position_breakout_confirmation(
     }
 
 
+def _position_price_instruction(
+    active_stop: float,
+    structure_stop: float,
+    breakout_plan: Dict[str, Any],
+    pl_pct: float,
+) -> str:
+    trigger = float(breakout_plan.get("trigger") or 0)
+    guard = float(breakout_plan.get("guard") or 0)
+    confirmed = bool(breakout_plan.get("confirmed"))
+
+    actions = []
+    if trigger > 0:
+        add_action = "可小幅加仓" if confirmed and pl_pct > 0 else "只确认不追，等价量收齐"
+        actions.append(f">{trigger:.2f}: {add_action}")
+    if trigger > 0 and guard > 0 and guard < trigger:
+        actions.append(f"{guard:.2f}-{trigger:.2f}: 持有观察，不加仓")
+    if guard > 0:
+        actions.append(f"<{guard:.2f}: 撤回加仓计划")
+    if active_stop > 0:
+        actions.append(f"<{active_stop:.2f}: 减仓/收紧风控")
+    if structure_stop > 0 and structure_stop != active_stop:
+        actions.append(f"<{structure_stop:.2f}: 结构失效，退出复核")
+    return "；".join(actions)
+
+
 def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_limit: int = 5, sector_watch_limit: int = 3) -> List[Dict[str, Any]]:
     """
     Keep executable candidates and sector-confirmed observation candidates in Bark.
@@ -353,9 +378,12 @@ def _real_position_action(
         extras.append(f"陷阱风险{trap_risk:.0f}%")
     if volume_pattern in {"放量失败突破", "缩量阴跌"}:
         extras.append(volume_pattern)
+    instruction = _position_price_instruction(active_stop, structure_stop, breakout_plan, pl_pct)
+    if instruction:
+        extras.append(f"指令: {instruction}")
 
     tail = f" | 关键价: {' / '.join(key_prices)}" if key_prices else ""
-    extra_text = f" | {' / '.join(extras[:2])}" if extras else ""
+    extra_text = f" | {' / '.join(extras[:3])}" if extras else ""
     return f"{icon} {action}{tail}{extra_text}"
 
 
