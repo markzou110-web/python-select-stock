@@ -71,6 +71,7 @@ export default function ReviewCenter() {
     const summary = data?.summary || {};
     const execution = data?.execution_summary || {};
     const portfolio = data?.portfolio_sim || {};
+    const dataQuality = data?.data_quality || {};
 
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -115,6 +116,20 @@ export default function ReviewCenter() {
                 <MiniStat label="复利估算" value={`${(portfolio.total_compound_return || 0) >= 0 ? '+' : ''}${portfolio.total_compound_return || 0}%`} hot={(portfolio.total_compound_return || 0) >= 0} />
             </div>
 
+            <div className="glass-card p-5">
+                <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-black text-slate-800">数据质量过滤</h3>
+                    <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Adjustment gap guard</span>
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                    <MiniStat label="已剔除异常收益" value={`${dataQuality.excluded_adjustment_gap_returns || 0}`} hot={(dataQuality.excluded_adjustment_gap_returns || 0) > 0} />
+                    <div className="lg:col-span-2 rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2">
+                        <div className="text-[10px] font-black text-slate-400">过滤规则</div>
+                        <div className="mt-1 text-xs font-bold text-slate-600">{dataQuality.rule || '暂无异常收益剔除'}</div>
+                    </div>
+                </div>
+            </div>
+
             <NextDayFollowupCard
                 data={followup}
                 dates={historyDates}
@@ -148,6 +163,12 @@ export default function ReviewCenter() {
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <TableCard title="交易桶表现" rows={data?.by_trade_bucket || []} nameKey="bucket" />
                 <TableCard title="市场环境表现" rows={data?.by_market_regime || []} nameKey="regime" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                <TableCard title="板块阶段表现" rows={data?.by_sector_phase || []} nameKey="phase" />
+                <TableCard title="板块角色表现" rows={data?.by_sector_role || []} nameKey="role" />
+                <TableCard title="板块联动表现" rows={data?.by_sector_alignment || []} nameKey="bucket" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">

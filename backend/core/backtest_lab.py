@@ -28,6 +28,8 @@ def _empty_result(reason: str = "无有效信号") -> Dict[str, Any]:
             "final_equity": 100000,
             "skipped_high_open": 0,
             "skipped_limit_up": 0,
+            "skipped_adjustment_gap": 0,
+            "skipped_capital": 0,
         },
         "trades": [],
         "equity_curve": [],
@@ -38,6 +40,20 @@ def _empty_result(reason: str = "无有效信号") -> Dict[str, Any]:
             "exit_rule_version": EXIT_RULE_VERSION,
         },
     }
+
+
+def _is_suspected_adjustment_gap(
+    prev_close: float,
+    open_price: float,
+    close_price: float,
+    threshold_pct: float,
+) -> bool:
+    if prev_close <= 0 or open_price <= 0 or close_price <= 0:
+        return False
+    close_gap = (close_price - prev_close) / prev_close * 100
+    open_gap = (open_price - prev_close) / prev_close * 100
+    intraday_move = abs((close_price - open_price) / open_price * 100)
+    return abs(close_gap) >= threshold_pct and abs(open_gap) >= threshold_pct * 0.7 and intraday_move <= 8
 
 
 def _signal_indices(df: pd.DataFrame, strategy_type: str, params: Dict[str, Any]) -> List[int]:
@@ -92,6 +108,11 @@ def run_single_stock_backtest(
     limit_up_gap_pct = float(params.get("limit_up_gap_pct", 9.5))
     time_stop_days = params.get("time_stop_days")
     time_stop_days = int(time_stop_days) if time_stop_days else None
+    slippage_bps = max(0.0, float(params.get("slippage_bps", 5.0)))
+    position_pct = min(1.0, max(0.05, float(params.get("position_pct", 1.0))))
+    lot_size = max(1, int(params.get("lot_size", 100)))
+    skip_adjustment_gaps = bool(params.get("skip_adjustment_gaps", True))
+    adjustment_gap_pct = max(10.0, float(params.get("adjustment_gap_pct", 20.0)))
 
     raw_signals = [idx for idx in _signal_indices(df, strategy_type, params) if idx < len(df) - 1]
     if not raw_signals:
@@ -116,6 +137,8 @@ def run_single_stock_backtest(
     max_drawdown = 0.0
     skipped_high_open = 0
     skipped_limit_up = 0
+    skipped_adjustment_gap = 0
+    skipped_capital = 0
 
     for idx in raw_signals:
         if idx < next_allowed_idx:
@@ -143,6 +166,19 @@ def run_single_stock_backtest(
 
         if entry_price <= 0:
             continue
+        if (
+            skip_adjustment_gaps
+            and entry_idx > 0
+            and _is_suspected_adjustment_gap(
+                close_vals[entry_idx - 1],
+                open_vals[entry_idx],
+                close_vals[entry_idx],
+                adjustment_gap_pct,
+            )
+        ):
+            skipped_adjustment_gap += 1
+            next_allowed_idx = entry_idx + 1
+            continue
 
         atr = atr_vals[entry_idx] if atr_vals is not None and not np.isnan(atr_vals[entry_idx]) else entry_price * 0.03
         stop_ratio = stop_loss_pct / 100.0
@@ -152,6 +188,7 @@ def run_single_stock_backtest(
         hold_days = 0
         hit_stop = False
         time_stopped = False
+        invalid_adjustment_gap = False
 
         for day in range(1, max_hold_days + 1):
             future_idx = entry_idx + day
@@ -159,6 +196,20 @@ def run_single_stock_backtest(
                 hold_days = max(day - 1, 0)
                 exit_price = close_vals[min(entry_idx + hold_days, len(df) - 1)]
                 exit_reason = "数据结束"
+                break
+
+            if (
+                skip_adjustment_gaps
+                and _is_suspected_adjustment_gap(
+                    close_vals[future_idx - 1],
+                    open_vals[future_idx],
+                    close_vals[future_idx],
+                    adjustment_gap_pct,
+                )
+            ):
+                skipped_adjustment_gap += 1
+                invalid_adjustment_gap = True
+                next_allowed_idx = future_idx + 1
                 break
 
             day_close = close_vals[future_idx]
@@ -188,10 +239,21 @@ def run_single_stock_backtest(
             if day == max_hold_days:
                 exit_price = day_close
 
+        if invalid_adjustment_gap:
+            continue
+
         exit_idx = min(entry_idx + hold_days, len(df) - 1)
-        shares = max(int(equity / entry_price / 100) * 100, 100)
-        buy_cost = entry_price * shares
-        sell_cost = exit_price * shares
+        entry_exec_price = entry_price * (1 + slippage_bps / 10000)
+        exit_exec_price = exit_price * (1 - slippage_bps / 10000)
+        cash_to_use = equity * position_pct
+        shares = int(cash_to_use / entry_exec_price / lot_size) * lot_size
+        if shares <= 0:
+            skipped_capital += 1
+            next_allowed_idx = exit_idx + 1
+            continue
+
+        buy_cost = entry_exec_price * shares
+        sell_cost = exit_exec_price * shares
         buy_commission = max(buy_cost * commission_rate, commission_min)
         sell_commission = max(sell_cost * commission_rate, commission_min)
         stamp_tax = sell_cost * stamp_tax_rate
@@ -207,8 +269,11 @@ def run_single_stock_backtest(
             "signal_date": dates[idx],
             "entry_date": dates[entry_idx],
             "exit_date": dates[exit_idx],
-            "entry_price": round(float(entry_price), 2),
-            "exit_price": round(float(exit_price), 2),
+            "entry_price": round(float(entry_exec_price), 2),
+            "exit_price": round(float(exit_exec_price), 2),
+            "raw_entry_price": round(float(entry_price), 2),
+            "raw_exit_price": round(float(exit_price), 2),
+            "shares": int(shares),
             "return_pct": round(float(return_pct), 2),
             "hold_days": hold_days,
             "exit_reason": exit_reason,
@@ -218,12 +283,25 @@ def run_single_stock_backtest(
             "time_stopped": time_stopped,
             "entry_mode": entry_mode,
             "open_gap_pct": round(float(open_gap_pct), 2) if open_gap_pct is not None else None,
+            "slippage_bps": slippage_bps,
+            "position_pct": position_pct,
         })
         equity_curve.append({"date": dates[exit_idx], "equity": round(float(equity), 2)})
         next_allowed_idx = exit_idx + 1
 
     if not trades:
-        return _empty_result("信号因流动性或仓位约束未成交")
+        result = _empty_result("信号因流动性、复权断点或仓位约束未成交")
+        result["summary"].update({
+            "skipped_high_open": skipped_high_open,
+            "skipped_limit_up": skipped_limit_up,
+            "skipped_adjustment_gap": skipped_adjustment_gap,
+            "skipped_capital": skipped_capital,
+            "entry_mode": entry_mode,
+            "slippage_bps": slippage_bps,
+            "position_pct": position_pct,
+            "lot_size": lot_size,
+        })
+        return result
 
     returns = [trade["return_pct"] for trade in trades]
     wins = [ret for ret in returns if ret > 0]
@@ -246,7 +324,12 @@ def run_single_stock_backtest(
             "time_stopped": sum(1 for trade in trades if trade["time_stopped"]),
             "skipped_high_open": skipped_high_open,
             "skipped_limit_up": skipped_limit_up,
+            "skipped_adjustment_gap": skipped_adjustment_gap,
+            "skipped_capital": skipped_capital,
             "entry_mode": entry_mode,
+            "slippage_bps": slippage_bps,
+            "position_pct": position_pct,
+            "lot_size": lot_size,
         },
         "trades": trades,
         "equity_curve": equity_curve,

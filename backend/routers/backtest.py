@@ -60,6 +60,11 @@ def run_single_backtest(payload: Dict[str, Any]):
             "entry_mode": payload.get("entry_mode", "signal_close"),
             "max_open_gap_pct": payload.get("max_open_gap_pct", 3.0),
             "limit_up_gap_pct": payload.get("limit_up_gap_pct", 9.5),
+            "slippage_bps": payload.get("slippage_bps", 5.0),
+            "position_pct": payload.get("position_pct", 1.0),
+            "lot_size": payload.get("lot_size", 100),
+            "skip_adjustment_gaps": payload.get("skip_adjustment_gaps", True),
+            "adjustment_gap_pct": payload.get("adjustment_gap_pct", 20.0),
         },
     )
     result["meta"] = {

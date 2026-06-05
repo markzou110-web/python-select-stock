@@ -78,3 +78,42 @@ def test_next_open_backtest_skips_high_open_signal():
     assert result["summary"]["skipped_high_open"] == 1
     assert result["trades"][0]["signal_date"] == "2025-05-19"
     assert result["trades"][0]["entry_date"] == "2025-05-20"
+
+
+def test_backtest_skips_suspected_adjustment_gap_trade():
+    df = _pine_fixture()
+    signal_idx = 125
+    df.loc[signal_idx + 1, "开盘"] = df.loc[signal_idx, "收盘"] * 0.68
+    df.loc[signal_idx + 1, "最高"] = df.loc[signal_idx, "收盘"] * 0.69
+    df.loc[signal_idx + 1, "最低"] = df.loc[signal_idx, "收盘"] * 0.66
+    df.loc[signal_idx + 1, "收盘"] = df.loc[signal_idx, "收盘"] * 0.67
+
+    result = run_single_stock_backtest(
+        df,
+        strategy_type="pine",
+        params={"pine_min_signals": 3, "max_hold_days": 5},
+    )
+
+    assert result["summary"]["skipped_adjustment_gap"] == 1
+    assert result["trades"][0]["signal_date"] == "2025-05-19"
+
+
+def test_backtest_applies_slippage_position_and_lot_size():
+    result = run_single_stock_backtest(
+        _pine_fixture(),
+        strategy_type="pine",
+        params={
+            "pine_min_signals": 3,
+            "max_hold_days": 5,
+            "slippage_bps": 10,
+            "position_pct": 0.5,
+            "lot_size": 100,
+        },
+    )
+
+    trade = result["trades"][0]
+    assert result["summary"]["slippage_bps"] == 10
+    assert result["summary"]["position_pct"] == 0.5
+    assert trade["shares"] % 100 == 0
+    assert trade["entry_price"] > trade["raw_entry_price"]
+    assert trade["exit_price"] < trade["raw_exit_price"]

@@ -33,6 +33,10 @@ def _empty_response() -> Dict[str, Any]:
         "execution_summary": {},
         "by_market_regime": [],
         "by_next_open_gap": [],
+        "by_sector_phase": [],
+        "by_sector_role": [],
+        "by_sector_alignment": [],
+        "data_quality": {},
         "recommendation_events": [],
         "portfolio_sim": {},
         "brooks_backtests": [],
@@ -61,6 +65,10 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE((price_action_detail->>'final_trade_score')::float, score, 0) AS final_trade_score,
                 COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers,
                 COALESCE(price_action_detail->>'market_regime', 'UNKNOWN') AS market_regime,
+                COALESCE(price_action_detail->>'sector_phase', 'UNKNOWN') AS sector_phase,
+                COALESCE(price_action_detail->>'sector_role', 'UNKNOWN') AS sector_role,
+                COALESCE((price_action_detail->>'sector_alignment_score')::float, 0) AS sector_alignment_score,
+                COALESCE((price_action_detail->>'sector_relative_pct')::float, 0) AS sector_relative_pct,
                 CASE
                     WHEN COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) >= 75 THEN '高陷阱风险'
                     WHEN COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) >= 45 THEN '中陷阱风险'
@@ -96,6 +104,10 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.final_trade_score,
                 s.trade_blockers,
                 s.market_regime,
+                s.sector_phase,
+                s.sector_role,
+                s.sector_alignment_score,
+                s.sector_relative_pct,
                 s.pa_trap_risk_bucket,
                 s.pa_trap_risk,
                 s.pa_always_in_strength,
@@ -135,6 +147,18 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
     for horizon in [1, 3, 5, 10, 20]:
         df[f"ret_{horizon}d"] = (df[f"close_{horizon}d"] - df["price"]) / df["price"] * 100
     df["next_open_gap_pct"] = (df["open_1d"] - df["price"]) / df["price"] * 100
+    df["data_quality_excluded"] = (
+        df["next_open_gap_pct"].abs().ge(14)
+        & df["ret_1d"].abs().ge(20)
+        & df["open_1d"].notna()
+    )
+    for horizon in [1, 3, 5, 10, 20]:
+        df.loc[df["data_quality_excluded"], f"ret_{horizon}d"] = pd.NA
+    df["sector_alignment_bucket"] = pd.cut(
+        pd.to_numeric(df["sector_alignment_score"], errors="coerce"),
+        bins=[-1, 50, 70, 100],
+        labels=["弱联动<50", "中联动50~70", "强联动>70"],
+    ).astype(str).replace("nan", "未知")
     df["next_open_gap_bucket"] = pd.cut(
         df["next_open_gap_pct"],
         bins=[-999, -2, 1, 3, 999],
@@ -200,6 +224,9 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         by_trade_bucket = metric_frame(df.groupby("trade_bucket", dropna=False), "bucket")
         by_market_regime = metric_frame(df.groupby("market_regime", dropna=False), "regime")
         by_next_open_gap = metric_frame(df.groupby("next_open_gap_bucket", dropna=False), "bucket")
+        by_sector_phase = metric_frame(df.groupby("sector_phase", dropna=False), "phase")
+        by_sector_role = metric_frame(df.groupby("sector_role", dropna=False), "role")
+        by_sector_alignment = metric_frame(df.groupby("sector_alignment_bucket", dropna=False), "bucket")
 
         ret_1d_all = df["ret_1d"].dropna()
         trade_ret_1d = df.loc[df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
@@ -214,6 +241,10 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "blocked_signals": int(len(blocked_ret_1d)),
             "blocked_avg_return_1d": round(float(blocked_ret_1d.mean()), 2) if not blocked_ret_1d.empty else 0,
             "filter_alpha_1d": round(float(trade_ret_1d.mean() - ret_1d_all.mean()), 2) if not trade_ret_1d.empty and not ret_1d_all.empty else 0,
+        }
+        data_quality = {
+            "excluded_adjustment_gap_returns": int(df["data_quality_excluded"].fillna(False).sum()),
+            "rule": "次日开盘跳空>=14%且1日收益跳变>=20%的样本不参与收益统计",
         }
 
         def strategy_backtest(name: str, mask: pd.Series) -> Dict[str, Any]:
@@ -274,6 +305,10 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_trade_bucket": by_trade_bucket,
             "by_market_regime": by_market_regime,
             "by_next_open_gap": by_next_open_gap,
+            "by_sector_phase": by_sector_phase,
+            "by_sector_role": by_sector_role,
+            "by_sector_alignment": by_sector_alignment,
+            "data_quality": data_quality,
             "execution_summary": execution_summary,
             "recommendation_events": get_recommendation_event_review(days=days, limit=12).get("items", []),
             "portfolio_sim": get_portfolio_simulation(days=days, max_daily=3, hold_days=5),
@@ -532,6 +567,8 @@ def export_scan_performance(days: int = 120):
             "pa_trade_action", "pa_trade_setup", "pa_risk_pct",
             "pa_h2_quality", "pa_volume_pattern", "pa_trend_phase", "pa_weekly_context", "pa_trap_risk_bucket",
             "trade_bucket", "trade_eligible", "final_trade_score", "trade_blockers",
+            "sector_phase", "sector_role", "sector_alignment_score", "sector_alignment_bucket",
+            "data_quality_excluded",
             "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
         ])
 
@@ -540,6 +577,8 @@ def export_scan_performance(days: int = 120):
         "pa_trade_action", "pa_trade_setup", "pa_risk_pct",
         "pa_h2_quality", "pa_volume_pattern", "pa_trend_phase", "pa_weekly_context", "pa_trap_risk_bucket",
         "trade_bucket", "trade_eligible", "final_trade_score", "trade_blockers",
+        "sector_phase", "sector_role", "sector_alignment_score", "sector_alignment_bucket",
+        "data_quality_excluded",
         "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
     ]
     export_df = df[[c for c in export_cols if c in df.columns]].copy()
@@ -562,6 +601,11 @@ def export_scan_performance(days: int = 120):
         "trade_eligible": "可交易",
         "final_trade_score": "最终交易分",
         "trade_blockers": "过滤原因",
+        "sector_phase": "板块阶段",
+        "sector_role": "板块角色",
+        "sector_alignment_score": "板块联动分",
+        "sector_alignment_bucket": "板块联动分桶",
+        "data_quality_excluded": "数据异常已剔除",
         "ret_1d": "1日收益%",
         "ret_3d": "3日收益%",
         "ret_5d": "5日收益%",
