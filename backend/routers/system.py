@@ -3,6 +3,7 @@ from sqlalchemy import text
 
 from core.db import get_db_engine
 from core.data_source_quality import build_data_source_quality_report
+from core.data_source_quality import build_local_data_quality_report
 from core.ops_summary import build_ops_summary
 from core.research_summary import build_research_summary
 from core.system_health import build_system_health_snapshot
@@ -20,6 +21,31 @@ def get_system_health():
 def get_data_source_quality():
     """Return multi-source availability and quality diagnostics."""
     return build_data_source_quality_report(get_db_engine())
+
+
+@router.get("/data-repair-candidates")
+def get_data_repair_candidates(target_date: str | None = None):
+    """Return suspected adjustment-gap repair candidates without mutating market data."""
+    engine = get_db_engine()
+    report = build_local_data_quality_report(engine, target_date=target_date)
+    summary = report.get("summary") or {}
+    samples = [
+        item for item in (summary.get("abnormal_move_samples") or [])
+        if item.get("likely_reason") == "suspected_corporate_action_gap"
+    ]
+    selected_date = summary.get("selected_date")
+    command = (
+        f"cd backend && source venv_new/bin/activate && "
+        f"python scripts/repair_adjustment_gaps.py --target-date {selected_date} --apply"
+        if selected_date and samples else ""
+    )
+    return {
+        "status": report.get("status"),
+        "selected_date": selected_date,
+        "count": len(samples),
+        "items": samples,
+        "recommended_command": command,
+    }
 
 
 @router.get("/ops-summary")

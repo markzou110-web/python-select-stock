@@ -251,6 +251,9 @@ function buildRiskPriceLines(riskLevels: any, paperLines?: { price: number; labe
     pushLine(riskLevels?.capital_protect_price || riskLevels?.reduce_price, '减仓线', '#d97706');
     pushLine(riskLevels?.active_stop_price || riskLevels?.stop_price, '执行风控线', '#e11d48');
     pushLine(riskLevels?.take_profit_price, '止盈线', '#059669');
+    (riskLevels?.operation_bands || []).forEach((band: any) => {
+        pushLine(band?.price, band?.label || '操作线', band?.color || '#64748b');
+    });
     return lines;
 }
 

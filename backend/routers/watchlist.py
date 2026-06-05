@@ -9,6 +9,7 @@ from core.db import get_db_engine, validate_stock_code
 from core.logging_config import logger
 from core.notifier import notifier
 from core.risk_constants import FIXED_STOP_LOSS_RATIO, TAKE_PROFIT_RATIO
+from core.operation_plan import watch_exit_decision, watch_instruction
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -74,9 +75,10 @@ def _send_trigger_notification(alerts) -> Dict[str, bool]:
     lines = []
     for alert in alerts[:8]:
         reasons = "、".join(alert["reasons"])
+        instruction = f"\n   └ 指令: {alert.get('instruction')}" if alert.get("instruction") else ""
         lines.append(
             f"{alert['name']}({alert['code']}) {reasons}: "
-            f"现价 {alert['current_price']}，观察收益 {alert['pl_pct']}%"
+            f"现价 {alert['current_price']}，观察收益 {alert['pl_pct']}%{instruction}"
         )
     if len(alerts) > 8:
         lines.append(f"另有 {len(alerts) - 8} 条触发记录，请打开观察池查看。")
@@ -160,8 +162,14 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
                 "latest_date": latest.get("date"),
             }
             decision = _watch_decision(item)
+            instruction = watch_instruction(item)
+            exit_check = watch_exit_decision({**item, "computed_decision": decision["decision"], "computed_action": decision["action"]})
             item["computed_decision"] = decision["decision"]
             item["computed_action"] = decision["action"]
+            item["operation_instruction"] = instruction["instruction"]
+            item["trigger_price"] = instruction["trigger_price"]
+            item["guard_price"] = instruction["guard_price"]
+            item["auto_exit_reason"] = exit_check["reason"] if exit_check["should_exit"] else ""
             if not item["watch_decision"]:
                 item["watch_decision"] = decision["decision"]
                 item["watch_action"] = decision["action"]
@@ -225,6 +233,58 @@ def refresh_watchlist_decisions() -> Dict[str, Any]:
         return {"status": "error", "updated": updated, "detail": str(exc)}
 
 
+@router.post("/auto-prune")
+def auto_prune_watchlist(max_watch_days: int = 15) -> Dict[str, Any]:
+    payload = list_watchlist(status="WATCHING")
+    items = payload.get("items", [])
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error", "updated": 0, "items": []}
+
+    prune_items = []
+    for item in items:
+        exit_check = watch_exit_decision(item, max_watch_days=max(3, int(max_watch_days)))
+        if exit_check["should_exit"]:
+            prune_items.append({**item, "exit_reason": exit_check["reason"]})
+
+    if not prune_items:
+        return {"status": "success", "updated": 0, "items": []}
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE watchlist
+                SET status = 'INVALIDATED',
+                    watch_decision = 'AUTO_PRUNE',
+                    watch_action = :action,
+                    exit_reason = :reason,
+                    last_review_date = :review_date,
+                    updated_at = :updated_at
+                WHERE id = :id
+            """), [
+                {
+                    "id": item["id"],
+                    "action": "自动淘汰：不再占用观察池",
+                    "reason": item["exit_reason"],
+                    "review_date": datetime.now().strftime("%Y-%m-%d"),
+                    "updated_at": datetime.now(),
+                }
+                for item in prune_items
+            ])
+            conn.commit()
+        return {
+            "status": "success",
+            "updated": len(prune_items),
+            "items": [
+                {"id": item["id"], "code": item["code"], "name": item["name"], "exit_reason": item["exit_reason"]}
+                for item in prune_items
+            ],
+        }
+    except Exception as exc:
+        logger.error(f"Auto prune watchlist error: {exc}")
+        return {"status": "error", "updated": 0, "items": [], "detail": str(exc)}
+
+
 @router.post("/check-triggers")
 def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
     payload = list_watchlist(status="WATCHING")
@@ -249,6 +309,7 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
             "stop_price": item.get("stop_price"),
             "pl_pct": item.get("pl_pct"),
             "reasons": reasons,
+            "instruction": item.get("operation_instruction") or "",
         })
 
     notification = _send_trigger_notification(alerts) if notify and alerts else {}

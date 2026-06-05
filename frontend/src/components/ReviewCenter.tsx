@@ -151,16 +151,17 @@ export default function ReviewCenter() {
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="次日开盘表现" rows={data?.by_next_open_gap || []} nameKey="bucket" />
                 <TableCard title="陷阱风险分桶" rows={data?.by_pa_trap_risk || []} nameKey="risk" />
-                <TableCard title="Brooks 独立策略回测" rows={data?.brooks_backtests || []} nameKey="strategy" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-                <RecommendationEventCard rows={data?.recommendation_events || []} />
+                <TableCard title="Brooks 独立策略回测" rows={data?.brooks_backtests || []} nameKey="strategy" />
                 <TableCard title="板块表现 Top" rows={data?.by_industry || []} nameKey="industry" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <RecommendationEventCard rows={data?.recommendation_events || []} />
                 <TableCard title="最近扫描日期表现" rows={data?.recent_dates || []} nameKey="date" />
             </div>
         </div>

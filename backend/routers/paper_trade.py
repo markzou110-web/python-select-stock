@@ -21,6 +21,7 @@ from core.risk_constants import (
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
+from core.operation_plan import operation_bands, position_health_score, price_instruction, safe_num
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -122,6 +123,80 @@ def send_paper_trade_notification(title: str, body: str):
         logger.error(f"Failed to send paper trading notification: {exc}")
 
 
+def _ensure_trade_journal_table(engine) -> None:
+    with engine.connect() as conn:
+        if engine.dialect.name == "sqlite":
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS trade_journal_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_time TIMESTAMP,
+                    source VARCHAR(50),
+                    code VARCHAR(20),
+                    name VARCHAR(50),
+                    trade_id INTEGER,
+                    advice TEXT,
+                    action_taken TEXT,
+                    trigger_price FLOAT,
+                    guard_price FLOAT,
+                    stop_price FLOAT,
+                    result_note TEXT
+                )
+            """))
+        else:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS trade_journal_events (
+                    id SERIAL PRIMARY KEY,
+                    event_time TIMESTAMP,
+                    source VARCHAR(50),
+                    code VARCHAR(20),
+                    name VARCHAR(50),
+                    trade_id INTEGER,
+                    advice TEXT,
+                    action_taken TEXT,
+                    trigger_price FLOAT,
+                    guard_price FLOAT,
+                    stop_price FLOAT,
+                    result_note TEXT
+                )
+            """))
+        conn.commit()
+
+
+def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entry: float, risk: Dict[str, Any]) -> Dict[str, Any]:
+    entry = safe_num(row.get("entry_price"))
+    active_stop = safe_num(risk.get("active_stop_price") or risk.get("stop_price"))
+    structure_stop = safe_num(risk.get("structure_stop_price") or risk.get("initial_stop_price"))
+    trigger = max(current_price * 1.02, high_since_entry)
+    guard = max(active_stop, trigger * 0.985)
+    entry_date = pd.to_datetime(row.get("entry_date") or datetime.now())
+    policy = _time_stop_policy(row.get("strategy_type"))
+    time_stop_date = (entry_date + pd.tseries.offsets.BDay(policy["force_days"])).date().isoformat()
+    stop_buffer = (current_price - active_stop) / current_price * 100 if current_price > 0 and active_stop > 0 else 0
+    pl_pct = (current_price - entry) / entry * 100 if entry > 0 else 0
+    health = position_health_score(pl_pct=pl_pct, stop_buffer_pct=stop_buffer)
+    instruction = price_instruction(
+        trigger=trigger,
+        guard=guard,
+        active_stop=active_stop,
+        structure_stop=structure_stop,
+        confirmed=False,
+        profitable=pl_pct > 0,
+        trigger_action="放量突破后小幅加仓",
+    )
+    return {
+        "entry_price": round(entry, 2),
+        "current_price": round(current_price, 2),
+        "add_trigger_price": round(trigger, 2),
+        "add_guard_price": round(guard, 2),
+        "active_stop_price": round(active_stop, 2) if active_stop > 0 else None,
+        "structure_stop_price": round(structure_stop, 2) if structure_stop > 0 else None,
+        "time_stop_date": time_stop_date,
+        "health": health,
+        "instruction": instruction,
+        "bands": operation_bands(trigger=trigger, guard=guard, active_stop=active_stop, structure_stop=structure_stop),
+    }
+
+
 @router.post("/add")
 def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     """Add a paper trade entry with sector concentration check"""
@@ -212,12 +287,100 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
             f"目标止盈：¥{tp_price:.2f} (+{TAKE_PROFIT_PCT}%)\n"
             f"交易备注：{trade.remark or '无'}"
         )
+        body += (
+            f"\n操作指令：>{tp_price:.2f}: 分批止盈/不追加；"
+            f"<{stop_price:.2f}: 固定止损复核"
+        )
         send_paper_trade_notification(title, body)
 
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Error adding paper trade: {e}")
         return {"status": "error", "detail": "Internal server error"}
+
+
+@router.get("/plans")
+def get_open_trade_plans() -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"items": []}
+    try:
+        df = pd.read_sql(text("SELECT * FROM paper_trading WHERE status = 'OPEN' ORDER BY trade_mode DESC, entry_date DESC"), engine)
+        if df.empty:
+            return {"items": []}
+        items = []
+        for _, row in df.iterrows():
+            entry = safe_float(row.get("entry_price"))
+            current = safe_float(row.get("current_price"), entry)
+            high = max(safe_float(row.get("high_since_entry"), entry), current)
+            risk = compute_paper_risk_levels(entry, high, current)
+            plan = _build_trade_plan(row.to_dict(), current, high, risk)
+            items.append({
+                "id": int(row["id"]),
+                "code": row["code"],
+                "name": row["name"],
+                "trade_mode": row.get("trade_mode") or "SIMULATED",
+                "strategy_type": row.get("strategy_type"),
+                "plan": plan,
+            })
+        return {"items": items}
+    except Exception as exc:
+        logger.error(f"Open trade plans error: {exc}")
+        return {"items": [], "error": str(exc)}
+
+
+@router.post("/journal")
+def add_trade_journal_event(payload: Dict[str, Any]) -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error", "detail": "Database error"}
+    try:
+        _ensure_trade_journal_table(engine)
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO trade_journal_events (
+                    event_time, source, code, name, trade_id, advice, action_taken,
+                    trigger_price, guard_price, stop_price, result_note
+                ) VALUES (
+                    :event_time, :source, :code, :name, :trade_id, :advice, :action_taken,
+                    :trigger_price, :guard_price, :stop_price, :result_note
+                )
+            """), {
+                "event_time": datetime.now(),
+                "source": payload.get("source") or "manual",
+                "code": payload.get("code"),
+                "name": payload.get("name"),
+                "trade_id": payload.get("trade_id"),
+                "advice": payload.get("advice"),
+                "action_taken": payload.get("action_taken"),
+                "trigger_price": payload.get("trigger_price"),
+                "guard_price": payload.get("guard_price"),
+                "stop_price": payload.get("stop_price"),
+                "result_note": payload.get("result_note"),
+            })
+            conn.commit()
+        return {"status": "success"}
+    except Exception as exc:
+        logger.error(f"Add trade journal event error: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+
+@router.get("/journal")
+def list_trade_journal_events(limit: int = 100) -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"items": []}
+    try:
+        _ensure_trade_journal_table(engine)
+        df = pd.read_sql(
+            text("SELECT * FROM trade_journal_events ORDER BY event_time DESC LIMIT :limit"),
+            engine,
+            params={"limit": max(1, min(int(limit), 500))},
+        )
+        return {"items": df.where(pd.notna(df), None).to_dict("records")}
+    except Exception as exc:
+        logger.error(f"List trade journal events error: {exc}")
+        return {"items": [], "error": str(exc)}
 
 
 @router.get("/list")

@@ -32,6 +32,7 @@ def _empty_response() -> Dict[str, Any]:
         "by_trade_bucket": [],
         "execution_summary": {},
         "by_market_regime": [],
+        "by_next_open_gap": [],
         "recommendation_events": [],
         "portfolio_sim": {},
         "brooks_backtests": [],
@@ -103,13 +104,14 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.signal_date,
                 s.price,
                 h1.close AS close_1d,
+                h1.open AS open_1d,
                 h3.close AS close_3d,
                 h5.close AS close_5d,
                 h10.close AS close_10d,
                 h20.close AS close_20d
             FROM signals s
             LEFT JOIN LATERAL (
-                SELECT close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '1 day' ORDER BY d.date DESC LIMIT 1
+                SELECT open, close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '1 day' ORDER BY d.date DESC LIMIT 1
             ) h1 ON true
             LEFT JOIN LATERAL (
                 SELECT close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '3 day' ORDER BY d.date DESC LIMIT 1
@@ -132,6 +134,12 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
         return df
     for horizon in [1, 3, 5, 10, 20]:
         df[f"ret_{horizon}d"] = (df[f"close_{horizon}d"] - df["price"]) / df["price"] * 100
+    df["next_open_gap_pct"] = (df["open_1d"] - df["price"]) / df["price"] * 100
+    df["next_open_gap_bucket"] = pd.cut(
+        df["next_open_gap_pct"],
+        bins=[-999, -2, 1, 3, 999],
+        labels=["低开<-2%", "平开-2~1%", "高开1~3%", "高开>3%"],
+    ).astype(str).replace("nan", "未知")
     return df
 
 
@@ -191,6 +199,7 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         by_pa_trap_risk = metric_frame(df.groupby("pa_trap_risk_bucket", dropna=False), "risk")
         by_trade_bucket = metric_frame(df.groupby("trade_bucket", dropna=False), "bucket")
         by_market_regime = metric_frame(df.groupby("market_regime", dropna=False), "regime")
+        by_next_open_gap = metric_frame(df.groupby("next_open_gap_bucket", dropna=False), "bucket")
 
         ret_1d_all = df["ret_1d"].dropna()
         trade_ret_1d = df.loc[df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
@@ -264,6 +273,7 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_pa_trap_risk": by_pa_trap_risk,
             "by_trade_bucket": by_trade_bucket,
             "by_market_regime": by_market_regime,
+            "by_next_open_gap": by_next_open_gap,
             "execution_summary": execution_summary,
             "recommendation_events": get_recommendation_event_review(days=days, limit=12).get("items", []),
             "portfolio_sim": get_portfolio_simulation(days=days, max_daily=3, hold_days=5),

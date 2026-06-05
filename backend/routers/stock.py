@@ -15,6 +15,7 @@ from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
 from core.price_action import build_price_action_annotations
 from core.risk_engine import compute_paper_risk_levels, safe_float
+from core.operation_plan import operation_bands, price_instruction
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -1090,6 +1091,24 @@ def get_stock_full_analysis(code: str):
             "sector_momentum_score": latest_sector_momentum_score,
             "sector_alignment_score": latest_sector_alignment_score,
         }
+        if is_paper_trade:
+            add_trigger = max(current_price * 1.02, safe_float(high_since_entry, current_price))
+            add_guard = max(stop_price or 0, add_trigger * 0.985)
+            stock_info["operation_bands"] = operation_bands(
+                trigger=add_trigger,
+                guard=add_guard,
+                active_stop=stop_price,
+                structure_stop=structure_stop_price or initial_stop_price,
+            )
+            stock_info["operation_instruction"] = price_instruction(
+                trigger=add_trigger,
+                guard=add_guard,
+                active_stop=stop_price,
+                structure_stop=structure_stop_price or initial_stop_price,
+                confirmed=False,
+                profitable=pl_pct > 0,
+                trigger_action="放量突破后小幅加仓",
+            )
 
         # 4. 概念板块 (异步友好 + 24小时缓存)
         concepts = _fetch_stock_concepts(code)

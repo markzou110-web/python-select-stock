@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from core.logging_config import logger
 from core.db import get_db_engine
+from core.operation_plan import operation_bands, safe_num
 from sqlalchemy import text
 
 router = APIRouter(prefix="/api", tags=["kline"])
@@ -153,6 +154,27 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                         "sector_momentum_score": detail.get("sector_momentum_score"),
                         "sector_alignment_score": detail.get("sector_alignment_score"),
                     }
+                paper_res = conn.execute(text("""
+                    SELECT entry_price, high_since_entry, current_price
+                    FROM paper_trading
+                    WHERE code = :code AND status = 'OPEN'
+                    LIMIT 1
+                """), {"code": code}).fetchone()
+                if paper_res:
+                    from core.risk_engine import compute_paper_risk_levels
+
+                    entry = safe_num(paper_res[0])
+                    current = safe_num(paper_res[2]) or safe_num(df.iloc[-1]["收盘"])
+                    high = max(safe_num(paper_res[1], entry), current)
+                    risk = compute_paper_risk_levels(entry, high, current)
+                    trigger = max(current * 1.02, high)
+                    guard = max(safe_num(risk.get("active_stop_price")), trigger * 0.985)
+                    chart_context["operation_bands"] = operation_bands(
+                        trigger=trigger,
+                        guard=guard,
+                        active_stop=safe_num(risk.get("active_stop_price") or risk.get("stop_price")),
+                        structure_stop=safe_num(risk.get("structure_stop_price") or risk.get("initial_stop_price")),
+                    )
         except Exception as exc:
             logger.warning(f"Chart context fetch for {code} failed: {exc}")
 
