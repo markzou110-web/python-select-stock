@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.db import save_failure_sample, save_scan_audit_log
+from core.db import save_failure_sample, save_recommendation_events, save_scan_audit_log
 from core.models import Base
 from core.portfolio_risk import evaluate_portfolio_risk_budget
 
@@ -57,6 +57,32 @@ def test_failure_sample_persists_on_sqlite():
     assert ok is True
     assert row[0] == "000001"
     assert row[1] == -3.2
+
+
+def test_recommendation_event_persists_on_sqlite():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+
+    ok = save_recommendation_events([{
+        "代码": "000001",
+        "名称": "平安银行",
+        "行业": "银行",
+        "现价": 10.5,
+        "Score": 82,
+        "strategy_type": "tv_dual",
+        "trade_bucket": "TRADE",
+        "trade_eligible": True,
+        "final_trade_score": 88,
+        "pa_trade_plan": {"action": "READY", "setup": "回踩确认"},
+    }], engine=engine, source="test", event_date="2025-05-31", market_regime="OFFENSIVE")
+
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT code, trade_bucket, market_regime FROM recommendation_events")).fetchone()
+
+    assert ok is True
+    assert row[0] == "000001"
+    assert row[1] == "TRADE"
+    assert row[2] == "OFFENSIVE"
 
 
 def test_portfolio_risk_budget_warns_on_exposure():

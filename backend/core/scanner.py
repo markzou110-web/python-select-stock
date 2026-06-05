@@ -1253,6 +1253,8 @@ def perform_market_scan(
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)
+        for res in results:
+            res['market_regime'] = market_regime.get('status', 'UNKNOWN')
         logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
                     f"B={sum(1 for r in results if r.get('sop_grade')=='B')}, "
                     f"M={sum(1 for r in results if r.get('sop_grade')=='M')}, "

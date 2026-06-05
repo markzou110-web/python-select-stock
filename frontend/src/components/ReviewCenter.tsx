@@ -70,6 +70,7 @@ export default function ReviewCenter() {
 
     const summary = data?.summary || {};
     const execution = data?.execution_summary || {};
+    const portfolio = data?.portfolio_sim || {};
 
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -107,6 +108,13 @@ export default function ReviewCenter() {
                 </div>
             </div>
 
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <MiniStat label="组合回测交易" value={`${portfolio.trades || 0}`} />
+                <MiniStat label="组合胜率" value={`${portfolio.win_rate || 0}%`} hot={(portfolio.win_rate || 0) >= 50} />
+                <MiniStat label="均笔收益" value={`${(portfolio.avg_return || 0) >= 0 ? '+' : ''}${portfolio.avg_return || 0}%`} hot={(portfolio.avg_return || 0) >= 0} />
+                <MiniStat label="复利估算" value={`${(portfolio.total_compound_return || 0) >= 0 ? '+' : ''}${portfolio.total_compound_return || 0}%`} hot={(portfolio.total_compound_return || 0) >= 0} />
+            </div>
+
             <NextDayFollowupCard
                 data={followup}
                 dates={historyDates}
@@ -139,16 +147,46 @@ export default function ReviewCenter() {
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <TableCard title="交易桶表现" rows={data?.by_trade_bucket || []} nameKey="bucket" />
-                <TableCard title="陷阱风险分桶" rows={data?.by_pa_trap_risk || []} nameKey="risk" />
+                <TableCard title="市场环境表现" rows={data?.by_market_regime || []} nameKey="regime" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="陷阱风险分桶" rows={data?.by_pa_trap_risk || []} nameKey="risk" />
                 <TableCard title="Brooks 独立策略回测" rows={data?.brooks_backtests || []} nameKey="strategy" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <RecommendationEventCard rows={data?.recommendation_events || []} />
                 <TableCard title="板块表现 Top" rows={data?.by_industry || []} nameKey="industry" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <TableCard title="最近扫描日期表现" rows={data?.recent_dates || []} nameKey="date" />
+            </div>
+        </div>
+    );
+}
+
+function RecommendationEventCard({ rows }: { rows: any[] }) {
+    return (
+        <div className="glass-card p-6">
+            <h3 className="font-black text-slate-800 mb-4">推荐事件追踪</h3>
+            <div className="space-y-2">
+                {rows.slice(0, 8).map((row, idx) => (
+                    <div key={`${row.code}-${row.event_date}-${idx}`} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-b-0">
+                        <div className="min-w-0">
+                            <p className="text-sm font-black text-slate-700 truncate">{row.name || row.code}</p>
+                            <p className="text-[10px] font-bold text-slate-400">{String(row.event_date || '').slice(0, 10)} · {row.trade_bucket || 'UNKNOWN'} · {row.strategy_type || '--'}</p>
+                        </div>
+                        <div className="text-right">
+                            <p className={cn("text-sm font-black", Number(row.ret_5d || 0) >= 0 ? "text-rose-600" : "text-emerald-600")}>
+                                {row.ret_5d == null ? '--' : `${Number(row.ret_5d) >= 0 ? '+' : ''}${Number(row.ret_5d).toFixed(2)}%`}
+                            </p>
+                            <p className="text-[10px] font-bold text-slate-400">5日</p>
+                        </div>
+                    </div>
+                ))}
+                {rows.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无推荐事件</div>}
             </div>
         </div>
     );

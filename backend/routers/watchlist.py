@@ -13,6 +13,38 @@ from core.risk_constants import FIXED_STOP_LOSS_RATIO, TAKE_PROFIT_RATIO
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
 
+def _watch_decision(item: Dict[str, Any]) -> Dict[str, str]:
+    target_hit = bool(item.get("target_hit"))
+    stop_hit = bool(item.get("stop_hit"))
+    pa_action = item.get("pa_trade_action") or ""
+    pl_pct = float(item.get("pl_pct") or 0)
+    current_price = float(item.get("current_price") or 0)
+    target_price = item.get("target_price")
+    stop_price = item.get("stop_price")
+
+    if stop_hit or pa_action == "AVOID":
+        return {
+            "decision": "INVALIDATE",
+            "action": "失效移除：已触发失效价或 Brooks 回避信号",
+        }
+    if target_hit or pa_action == "READY":
+        return {
+            "decision": "PROMOTE",
+            "action": "转可交易：尾盘确认未破失效线，可转入拟合实盘",
+        }
+    if target_price and current_price > 0:
+        distance = (float(target_price) - current_price) / current_price * 100
+        if 0 <= distance <= 2:
+            return {"decision": "NEAR_TRIGGER", "action": "接近触发：只等放量站稳，不提前追"}
+    if stop_price and current_price > 0:
+        buffer_pct = (current_price - float(stop_price)) / current_price * 100
+        if 0 <= buffer_pct < 2:
+            return {"decision": "RISK", "action": "贴近失效：不转入，跌破后归档"}
+    if pl_pct >= 5:
+        return {"decision": "WATCH_PULLBACK", "action": "已有涨幅：不追，等回踩确认"}
+    return {"decision": "KEEP_WATCH", "action": "继续观察：等待回踩/放量站稳或再次入选"}
+
+
 def _latest_prices(engine, codes):
     if not codes:
         return {}
@@ -98,7 +130,7 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
             if target_hit or stop_hit:
                 triggered += 1
             pl_values.append(pl_pct)
-            items.append({
+            item = {
                 "id": int(row["id"]),
                 "code": row["code"],
                 "name": row["name"],
@@ -120,9 +152,20 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
                 "pa_entry_condition": row.get("pa_entry_condition") or "",
                 "pa_invalidation": row.get("pa_invalidation") or "",
                 "pa_risk_pct": round(float(row.get("pa_risk_pct")), 2) if row.get("pa_risk_pct") is not None else None,
+                "last_review_date": str(row.get("last_review_date")) if row.get("last_review_date") is not None else None,
+                "watch_decision": row.get("watch_decision") or "",
+                "watch_action": row.get("watch_action") or "",
+                "exit_reason": row.get("exit_reason") or "",
                 "created_at": row["created_at"].isoformat() if row.get("created_at") is not None else "",
                 "latest_date": latest.get("date"),
-            })
+            }
+            decision = _watch_decision(item)
+            item["computed_decision"] = decision["decision"]
+            item["computed_action"] = decision["action"]
+            if not item["watch_decision"]:
+                item["watch_decision"] = decision["decision"]
+                item["watch_action"] = decision["action"]
+            items.append(item)
 
         return {
             "items": items,
@@ -135,6 +178,51 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"List watchlist error: {exc}")
         return {"items": [], "stats": {}}
+
+
+@router.post("/refresh-decisions")
+def refresh_watchlist_decisions() -> Dict[str, Any]:
+    payload = list_watchlist(status="WATCHING")
+    items = payload.get("items", [])
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error", "updated": 0}
+
+    updated = 0
+    try:
+        with engine.connect() as conn:
+            for item in items:
+                decision = item.get("computed_decision") or item.get("watch_decision") or "KEEP_WATCH"
+                action = item.get("computed_action") or item.get("watch_action") or ""
+                status = "WATCHING"
+                exit_reason = item.get("exit_reason") or ""
+                if decision == "INVALIDATE":
+                    status = "INVALIDATED"
+                    exit_reason = action
+                conn.execute(text("""
+                    UPDATE watchlist
+                    SET watch_decision = :decision,
+                        watch_action = :action,
+                        exit_reason = :exit_reason,
+                        last_review_date = :review_date,
+                        status = :status,
+                        updated_at = :updated_at
+                    WHERE id = :id
+                """), {
+                    "decision": decision,
+                    "action": action,
+                    "exit_reason": exit_reason,
+                    "review_date": datetime.now().strftime("%Y-%m-%d"),
+                    "status": status,
+                    "updated_at": datetime.now(),
+                    "id": item["id"],
+                })
+                updated += 1
+            conn.commit()
+        return {"status": "success", "updated": updated}
+    except Exception as exc:
+        logger.error(f"Refresh watchlist decisions error: {exc}")
+        return {"status": "error", "updated": updated, "detail": str(exc)}
 
 
 @router.post("/check-triggers")

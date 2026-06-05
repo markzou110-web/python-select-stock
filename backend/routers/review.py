@@ -31,6 +31,9 @@ def _empty_response() -> Dict[str, Any]:
         "by_pa_trap_risk": [],
         "by_trade_bucket": [],
         "execution_summary": {},
+        "by_market_regime": [],
+        "recommendation_events": [],
+        "portfolio_sim": {},
         "brooks_backtests": [],
         "by_industry": [],
         "recent_dates": [],
@@ -56,6 +59,7 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
                 COALESCE((price_action_detail->>'final_trade_score')::float, score, 0) AS final_trade_score,
                 COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers,
+                COALESCE(price_action_detail->>'market_regime', 'UNKNOWN') AS market_regime,
                 CASE
                     WHEN COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) >= 75 THEN '高陷阱风险'
                     WHEN COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) >= 45 THEN '中陷阱风险'
@@ -90,6 +94,7 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.trade_eligible,
                 s.final_trade_score,
                 s.trade_blockers,
+                s.market_regime,
                 s.pa_trap_risk_bucket,
                 s.pa_trap_risk,
                 s.pa_always_in_strength,
@@ -185,6 +190,7 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         by_pa_weekly_context = metric_frame(df.groupby("pa_weekly_context", dropna=False), "context")
         by_pa_trap_risk = metric_frame(df.groupby("pa_trap_risk_bucket", dropna=False), "risk")
         by_trade_bucket = metric_frame(df.groupby("trade_bucket", dropna=False), "bucket")
+        by_market_regime = metric_frame(df.groupby("market_regime", dropna=False), "regime")
 
         ret_1d_all = df["ret_1d"].dropna()
         trade_ret_1d = df.loc[df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
@@ -257,7 +263,10 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_pa_weekly_context": by_pa_weekly_context,
             "by_pa_trap_risk": by_pa_trap_risk,
             "by_trade_bucket": by_trade_bucket,
+            "by_market_regime": by_market_regime,
             "execution_summary": execution_summary,
+            "recommendation_events": get_recommendation_event_review(days=days, limit=12).get("items", []),
+            "portfolio_sim": get_portfolio_simulation(days=days, max_daily=3, hold_days=5),
             "brooks_backtests": brooks_backtests,
             "by_industry": by_industry,
             "recent_dates": recent[:20],
@@ -265,6 +274,92 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"Review performance error: {exc}")
         return _empty_response()
+
+
+@router.get("/recommendation-events")
+def get_recommendation_event_review(days: int = 120, limit: int = 50) -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"items": [], "summary": {}}
+    try:
+        df = pd.read_sql(text("""
+            SELECT
+                e.*,
+                h1.close AS close_1d,
+                h3.close AS close_3d,
+                h5.close AS close_5d,
+                h10.close AS close_10d
+            FROM recommendation_events e
+            LEFT JOIN LATERAL (
+                SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 0 LIMIT 1
+            ) h1 ON true
+            LEFT JOIN LATERAL (
+                SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 2 LIMIT 1
+            ) h3 ON true
+            LEFT JOIN LATERAL (
+                SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 4 LIMIT 1
+            ) h5 ON true
+            LEFT JOIN LATERAL (
+                SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 9 LIMIT 1
+            ) h10 ON true
+            WHERE e.event_date >= CURRENT_DATE - (:days || ' days')::interval
+            ORDER BY e.event_date DESC, e.final_trade_score DESC NULLS LAST
+            LIMIT :limit
+        """), engine, params={"days": int(days), "limit": max(1, min(int(limit), 300))})
+        if df.empty:
+            return {"items": [], "summary": {}}
+        for horizon in [1, 3, 5, 10]:
+            df[f"ret_{horizon}d"] = (pd.to_numeric(df[f"close_{horizon}d"], errors="coerce") - df["recommendation_price"]) / df["recommendation_price"] * 100
+        ret_5d = df["ret_5d"].dropna()
+        return {
+            "items": df.where(pd.notna(df), None).to_dict("records"),
+            "summary": {
+                "events": int(len(df)),
+                "win_rate_5d": round(float((ret_5d > 0).mean() * 100), 1) if not ret_5d.empty else 0,
+                "avg_return_5d": round(float(ret_5d.mean()), 2) if not ret_5d.empty else 0,
+            },
+        }
+    except Exception as exc:
+        logger.error(f"Recommendation event review error: {exc}")
+        return {"items": [], "summary": {}, "error": str(exc)}
+
+
+@router.get("/portfolio-sim")
+def get_portfolio_simulation(days: int = 120, max_daily: int = 3, hold_days: int = 5) -> Dict[str, Any]:
+    """Simple portfolio-level scan simulation: take top N TRADE events per day, equal-weight by trade."""
+    engine = get_db_engine()
+    if not engine:
+        return {}
+    try:
+        df = _load_scan_performance_df(days)
+        if df.empty:
+            return {"trades": 0, "avg_return": 0, "win_rate": 0}
+        ret_col = f"ret_{hold_days}d" if f"ret_{hold_days}d" in df.columns else "ret_5d"
+        eligible = df[df["trade_bucket"].isin(["TRADE", "UNKNOWN"])].copy()
+        eligible["rank_score"] = pd.to_numeric(eligible.get("final_trade_score", eligible.get("score", 0)), errors="coerce").fillna(0)
+        picks = []
+        for date_value, group in eligible.groupby("signal_date"):
+            picks.append(group.sort_values("rank_score", ascending=False).head(max(1, int(max_daily))))
+        if not picks:
+            return {"trades": 0, "avg_return": 0, "win_rate": 0}
+        picked = pd.concat(picks, ignore_index=True)
+        returns = picked[ret_col].dropna()
+        if returns.empty:
+            return {"trades": 0, "avg_return": 0, "win_rate": 0}
+        daily = picked.groupby("signal_date")[ret_col].mean().dropna()
+        return {
+            "trades": int(len(returns)),
+            "days": int(len(daily)),
+            "max_daily": int(max_daily),
+            "hold_days": int(hold_days),
+            "avg_return": round(float(returns.mean()), 2),
+            "daily_avg_return": round(float(daily.mean()), 2),
+            "win_rate": round(float((returns > 0).mean() * 100), 1),
+            "total_compound_return": round(float(((1 + daily / 100).prod() - 1) * 100), 2) if not daily.empty else 0,
+        }
+    except Exception as exc:
+        logger.error(f"Portfolio simulation error: {exc}")
+        return {"trades": 0, "avg_return": 0, "win_rate": 0, "error": str(exc)}
 
 
 @router.get("/next-day-followup")

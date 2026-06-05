@@ -97,6 +97,18 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
         }
     };
 
+    const refreshDecisions = async () => {
+        setChecking(true);
+        setNotice('');
+        try {
+            const res = await api.post('/api/watchlist/refresh-decisions');
+            setNotice(`已刷新 ${res.data?.updated || 0} 条观察池决策`);
+            await fetchItems();
+        } finally {
+            setChecking(false);
+        }
+    };
+
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="flex items-center justify-between">
@@ -111,6 +123,10 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                     <button onClick={checkTriggers} disabled={checking} className="px-4 py-2 rounded-xl bg-amber-50 text-amber-700 text-xs font-black flex items-center gap-2 disabled:opacity-60">
                         {checking ? <Loader2 size={14} className="animate-spin" /> : <BellRing size={14} />}
                         检查触发
+                    </button>
+                    <button onClick={refreshDecisions} disabled={checking} className="px-4 py-2 rounded-xl bg-indigo-50 text-indigo-700 text-xs font-black flex items-center gap-2 disabled:opacity-60">
+                        {checking ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                        刷新决策
                     </button>
                     <button onClick={fetchItems} className="p-2.5 rounded-xl bg-indigo-50 text-indigo-600"><RefreshCw size={16} /></button>
                 </div>
@@ -177,6 +193,18 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                                     <td className="px-6 py-5">
                                         <p className="text-sm font-bold text-slate-600 line-clamp-2">{item.reason || "未填写"}</p>
                                         {item.invalidation && <p className="text-[10px] font-bold text-slate-400 mt-1">失效条件：{item.invalidation}</p>}
+                                        <div className="mt-2 rounded-md border border-slate-100 bg-slate-50 px-3 py-2">
+                                            <p className={cn(
+                                                "text-[10px] font-black",
+                                                item.watch_decision === 'PROMOTE' ? "text-emerald-700" :
+                                                    item.watch_decision === 'INVALIDATE' ? "text-rose-700" :
+                                                        item.watch_decision === 'NEAR_TRIGGER' ? "text-amber-700" :
+                                                            "text-slate-600"
+                                            )}>
+                                                {decisionLabel(item.watch_decision)}
+                                            </p>
+                                            <p className="mt-1 text-[10px] font-bold text-slate-500">{item.watch_action || item.computed_action || '等待系统刷新'}</p>
+                                        </div>
                                         {item.pa_trade_action && (
                                             <div className="mt-2 flex flex-wrap gap-1.5">
                                                 <span className={cn(
@@ -230,6 +258,18 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
             </div>
         </div>
     );
+}
+
+function decisionLabel(decision?: string) {
+    const labels: Record<string, string> = {
+        PROMOTE: '转可交易',
+        INVALIDATE: '失效移除',
+        NEAR_TRIGGER: '接近触发',
+        RISK: '贴近失效',
+        WATCH_PULLBACK: '等回踩',
+        KEEP_WATCH: '继续观察',
+    };
+    return labels[decision || ''] || '继续观察';
 }
 
 function Summary({ label, value, hot = false }: { label: string; value: React.ReactNode; hot?: boolean }) {

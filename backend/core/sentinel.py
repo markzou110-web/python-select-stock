@@ -427,6 +427,16 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     from core.data import get_market_regime
     regime = get_market_regime()
     regime_str = regime_emoji.get(regime.get('status', ''), '❓ 未知')
+    try:
+        from core.db import get_db_engine, save_recommendation_events
+        save_recommendation_events(
+            push_stocks,
+            engine=get_db_engine(),
+            source="bark",
+            market_regime=regime.get("status", "UNKNOWN"),
+        )
+    except Exception as exc:
+        logger.warning(f"Sentinel recommendation event persistence skipped: {exc}")
 
     now_str = datetime.now().strftime("%H:%M")
     current_time = datetime.now().time()

@@ -69,6 +69,7 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_trend_phase", "pa_trend_phase_action", "pa_decision_summary",
     "pa_trade_plan", "trade_eligible", "trade_bucket", "trade_blockers",
     "final_trade_score", "trade_timeframe", "exit_hint",
+    "market_regime",
     "sop_grade", "sop_action", "sector_momentum_score", "sector_breadth",
     "sector_phase", "sector_rank", "sector_alignment_score", "sector_relative_pct",
     "sector_3d_pct", "sector_5d_pct", "sector_consecutive_up_days", "sector_role",
@@ -246,13 +247,80 @@ def init_db(engine=None):
                     ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
                     ADD COLUMN IF NOT EXISTS pa_entry_condition TEXT,
                     ADD COLUMN IF NOT EXISTS pa_invalidation TEXT,
-                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT
+                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT,
+                    ADD COLUMN IF NOT EXISTS last_review_date DATE,
+                    ADD COLUMN IF NOT EXISTS watch_decision VARCHAR(30),
+                    ADD COLUMN IF NOT EXISTS watch_action TEXT,
+                    ADD COLUMN IF NOT EXISTS exit_reason TEXT
                 """))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_pa_action ON scan_history(pa_trade_action);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_pa_action ON watchlist(pa_trade_action);"))
                 logger.info("Migration: Brooks trade-plan snapshot columns ensured.")
             except Exception as e:
                 logger.debug(f"Brooks trade-plan migration skipped: {e}")
+
+            # --- Recommendation event log for Bark/scan lifecycle review ---
+            try:
+                if engine.dialect.name == "sqlite":
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS recommendation_events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            event_date DATE,
+                            event_time TIMESTAMP,
+                            source VARCHAR(50),
+                            code VARCHAR(20),
+                            name VARCHAR(50),
+                            industry VARCHAR(100),
+                            strategy_type VARCHAR(30),
+                            recommendation_price FLOAT,
+                            score FLOAT,
+                            trade_bucket VARCHAR(20),
+                            trade_eligible INTEGER,
+                            final_trade_score FLOAT,
+                            pa_trade_action VARCHAR(20),
+                            pa_trade_setup VARCHAR(80),
+                            pa_entry_price FLOAT,
+                            pa_stop_price FLOAT,
+                            sector_phase VARCHAR(40),
+                            market_regime VARCHAR(30),
+                            blockers JSON,
+                            status VARCHAR(30),
+                            created_at TIMESTAMP
+                        )
+                    """))
+                else:
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS recommendation_events (
+                            id SERIAL PRIMARY KEY,
+                            event_date DATE,
+                            event_time TIMESTAMP,
+                            source VARCHAR(50),
+                            code VARCHAR(20),
+                            name VARCHAR(50),
+                            industry VARCHAR(100),
+                            strategy_type VARCHAR(30),
+                            recommendation_price FLOAT,
+                            score FLOAT,
+                            trade_bucket VARCHAR(20),
+                            trade_eligible INTEGER,
+                            final_trade_score FLOAT,
+                            pa_trade_action VARCHAR(20),
+                            pa_trade_setup VARCHAR(80),
+                            pa_entry_price FLOAT,
+                            pa_stop_price FLOAT,
+                            sector_phase VARCHAR(40),
+                            market_regime VARCHAR(30),
+                            blockers JSONB,
+                            status VARCHAR(30),
+                            created_at TIMESTAMP,
+                            UNIQUE(event_date, source, code, strategy_type)
+                        )
+                    """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recommendation_events_date ON recommendation_events(event_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recommendation_events_code_date ON recommendation_events(code, event_date DESC);"))
+                logger.info("Migration: recommendation event log ensured.")
+            except Exception as e:
+                logger.debug(f"recommendation event migration skipped: {e}")
 
             conn.commit()
     except Exception as e:
@@ -346,6 +414,100 @@ def save_failure_sample(sample: Dict[str, Any], engine=None) -> bool:
         return True
     except Exception as exc:
         logger.error(f"Failed to save failure sample: {exc}")
+        return False
+
+
+def save_recommendation_events(
+    results: List[Dict[str, Any]],
+    engine=None,
+    source: str = "scan",
+    event_date: Optional[str] = None,
+    market_regime: Optional[str] = None,
+) -> bool:
+    """Persist scan/Bark recommendations as event records for lifecycle review."""
+    if engine is None:
+        engine = get_db_engine()
+    if not engine or not results:
+        return False
+
+    event_date = event_date or datetime.now().strftime("%Y-%m-%d")
+    rows = []
+    for r in results:
+        detail = r.get("price_action_detail") or {}
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except Exception:
+                detail = {}
+        pa_plan = r.get("pa_trade_plan") or detail.get("pa_trade_plan") or {}
+        trade_bucket = r.get("trade_bucket") or detail.get("trade_bucket") or "UNKNOWN"
+        blockers = r.get("trade_blockers") or detail.get("trade_blockers") or []
+        rows.append({
+            "event_date": event_date,
+            "event_time": datetime.now(),
+            "source": source,
+            "code": r.get("代码") or r.get("code"),
+            "name": r.get("名称") or r.get("name"),
+            "industry": r.get("行业") or r.get("industry") or "未知",
+            "strategy_type": r.get("strategy_type") or "squeeze",
+            "recommendation_price": float(r.get("现价") or r.get("price") or 0),
+            "score": float(r.get("Score") or r.get("score") or 0),
+            "trade_bucket": trade_bucket,
+            "trade_eligible": 1 if (r.get("trade_eligible") or detail.get("trade_eligible")) else 0,
+            "final_trade_score": float(r.get("final_trade_score") or detail.get("final_trade_score") or 0),
+            "pa_trade_action": pa_plan.get("action") or r.get("pa_trade_action"),
+            "pa_trade_setup": pa_plan.get("setup") or r.get("pa_trade_setup"),
+            "pa_entry_price": float(r.get("pa_entry_price") or detail.get("pa_entry_price") or 0) or None,
+            "pa_stop_price": float(r.get("pa_stop_price") or detail.get("pa_stop_price") or 0) or None,
+            "sector_phase": r.get("sector_phase") or detail.get("sector_phase"),
+            "market_regime": market_regime,
+            "blockers": json.dumps(_json_safe(blockers), ensure_ascii=False),
+            "status": "OPEN" if trade_bucket in {"TRADE", "WATCH"} else "FILTERED",
+            "created_at": datetime.now(),
+        })
+
+    try:
+        with engine.connect() as conn:
+            if engine.dialect.name == "sqlite":
+                conn.execute(text("""
+                    INSERT INTO recommendation_events (
+                        event_date, event_time, source, code, name, industry, strategy_type,
+                        recommendation_price, score, trade_bucket, trade_eligible, final_trade_score,
+                        pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
+                        sector_phase, market_regime, blockers, status, created_at
+                    ) VALUES (
+                        :event_date, :event_time, :source, :code, :name, :industry, :strategy_type,
+                        :recommendation_price, :score, :trade_bucket, :trade_eligible, :final_trade_score,
+                        :pa_trade_action, :pa_trade_setup, :pa_entry_price, :pa_stop_price,
+                        :sector_phase, :market_regime, :blockers, :status, :created_at
+                    )
+                """), rows)
+            else:
+                conn.execute(text("""
+                    INSERT INTO recommendation_events (
+                        event_date, event_time, source, code, name, industry, strategy_type,
+                        recommendation_price, score, trade_bucket, trade_eligible, final_trade_score,
+                        pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
+                        sector_phase, market_regime, blockers, status, created_at
+                    ) VALUES (
+                        CAST(:event_date AS DATE), :event_time, :source, :code, :name, :industry, :strategy_type,
+                        :recommendation_price, :score, :trade_bucket, :trade_eligible, :final_trade_score,
+                        :pa_trade_action, :pa_trade_setup, :pa_entry_price, :pa_stop_price,
+                        :sector_phase, :market_regime, CAST(:blockers AS JSONB), :status, :created_at
+                    )
+                    ON CONFLICT (event_date, source, code, strategy_type) DO UPDATE SET
+                        event_time = EXCLUDED.event_time,
+                        recommendation_price = EXCLUDED.recommendation_price,
+                        score = EXCLUDED.score,
+                        trade_bucket = EXCLUDED.trade_bucket,
+                        final_trade_score = EXCLUDED.final_trade_score,
+                        blockers = EXCLUDED.blockers,
+                        status = EXCLUDED.status
+                """), rows)
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.error(f"Failed to save recommendation events: {exc}")
         return False
 
 def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
@@ -537,6 +699,10 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                 '''), rows)
             conn.commit()
             logger.info(f"Saved {len(results)} scan records to database ({current_date})")
+        try:
+            save_recommendation_events(results, engine=engine, source="scan", event_date=current_date)
+        except Exception as event_exc:
+            logger.warning(f"Recommendation event persistence skipped: {event_exc}")
         return True
     except Exception as e:
         logger.error(f"Failed to save scan results: {e}")

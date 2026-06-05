@@ -575,7 +575,87 @@ def _compute_risk_assessment(df, code: str, financials: dict) -> dict:
     return risk
 
 
-def _generate_ai_suggestion(df, stock_info: dict, risk: dict) -> dict:
+def _generate_watch_suggestion(df, stock_info: dict, risk: dict, price_action: dict | None = None) -> dict:
+    """Generate actionable advice for scan/watchlist candidates without an open position."""
+    price_action = price_action or {}
+    close = safe_float(stock_info.get("current_price") or stock_info.get("现价"), float(df.iloc[-1]['收盘']))
+    rsi = float(df.iloc[-1].get('RSI', 50))
+    ema5 = float(df.iloc[-1].get('EMA5', close))
+    ema20 = float(df.iloc[-1].get('EMA20', close))
+    ema60 = float(df.iloc[-1].get('EMA60', close))
+    trade_bucket = stock_info.get("trade_bucket")
+    trade_eligible = stock_info.get("trade_eligible")
+    final_score = safe_float(stock_info.get("final_trade_score"))
+    blockers = stock_info.get("trade_blockers") or []
+    if isinstance(blockers, str):
+        blockers = [blockers] if blockers else []
+
+    plan = price_action.get("pa_trade_plan") or {}
+    plan_action = plan.get("action") or stock_info.get("latest_scan_pa_action") or ""
+    setup = plan.get("setup") or stock_info.get("latest_scan_pa_setup") or "观察池候选"
+    entry = safe_float(plan.get("entry_price") or price_action.get("pa_entry_price"))
+    stop = safe_float(plan.get("stop_price") or price_action.get("pa_stop_price"))
+
+    reasons = []
+    reasons.append(f"📌 状态：{setup}")
+    if stock_info.get("latest_scan_date"):
+        reasons.append(f"📅 最近入选：{stock_info.get('latest_scan_date')} / {stock_info.get('latest_scan_strategy') or '系统策略'}")
+    if final_score:
+        reasons.append(f"🧮 交易评分：{final_score:.0f}")
+    if entry:
+        reasons.append(f"🎯 触发价：{entry:.2f}，现价 {close:.2f}")
+    if stop:
+        invalidation_pct = (close - stop) / close * 100 if close > 0 else 0
+        reasons.append(f"🛡️ 失效线：{stop:.2f}，安全垫 {invalidation_pct:.1f}%")
+    if ema5 > ema20 > ema60:
+        reasons.append("✅ 趋势：短中期均线多头排列")
+    elif ema5 < ema20:
+        reasons.append("⚠️ 趋势：短线仍在 EMA20 下方，等待重新站稳")
+    else:
+        reasons.append("➖ 趋势：结构未完全展开，适合观察确认")
+    if rsi > 78:
+        reasons.append(f"⚠️ 动能：RSI {rsi:.1f} 偏热，避免追高")
+    elif 45 <= rsi <= 70:
+        reasons.append(f"✅ 动能：RSI {rsi:.1f} 处于可跟踪区间")
+
+    regime = risk.get("market_regime", "UNKNOWN")
+    if regime == "CRITICAL":
+        reasons.append("🌍 大盘：严格防守，新开仓需降级")
+
+    if trade_bucket == "BLOCK" or trade_eligible is False or plan_action == "AVOID":
+        if blockers:
+            reasons.append(f"🚫 过滤原因：{' / '.join(str(x) for x in blockers[:3])}")
+        return {
+            "action": "HOLD",
+            "confidence": 0.72,
+            "reasoning": reasons,
+            "action_label": "🚫 回避 — 观察池风险样本，不买入"
+        }
+
+    if trade_bucket == "TRADE" or plan_action == "READY":
+        label = "🟢 观察买点 — 尾盘确认后可小仓"
+        confidence = 0.78 if final_score >= 75 else 0.68
+        reasons.append("⏱️ 执行：只在 14:40-14:55 确认，贴近触发价且未破失效线才考虑")
+        if regime == "CRITICAL":
+            label = "🟡 降级观察 — 大盘防守，不主动开仓"
+            confidence = 0.58
+        return {
+            "action": "ADD" if regime != "CRITICAL" else "HOLD",
+            "confidence": confidence,
+            "reasoning": reasons,
+            "action_label": label
+        }
+
+    reasons.append("⏱️ 执行：先放观察池，等待回踩不破或再次被系统选出")
+    return {
+        "action": "HOLD",
+        "confidence": 0.62,
+        "reasoning": reasons,
+        "action_label": "📊 观察 — 等回踩/放量站稳"
+    }
+
+
+def _generate_ai_suggestion(df, stock_info: dict, risk: dict, price_action: dict | None = None) -> dict:
     """基于规则引擎生成 AI 操作建议"""
     suggestion = {
         "action": "HOLD",
@@ -584,8 +664,14 @@ def _generate_ai_suggestion(df, stock_info: dict, risk: dict) -> dict:
         "action_label": "📊 等待 — 数据不足"
     }
 
-    if not stock_info.get("is_paper_trade") or len(df) < 20:
-        suggestion["reasoning"] = ["该股不在拟合实盘持仓中或数据不足，暂无操作建议"]
+    if len(df) < 20:
+        suggestion["reasoning"] = ["历史K线不足20根，暂不生成操作建议"]
+        return suggestion
+
+    if not stock_info.get("is_paper_trade"):
+        if stock_info.get("trade_bucket") or stock_info.get("latest_scan_date") or price_action:
+            return _generate_watch_suggestion(df, stock_info, risk, price_action)
+        suggestion["reasoning"] = ["该股暂无持仓记录，也没有近期观察池/扫描信号，建议先加入观察池跟踪"]
         return suggestion
 
     close = safe_float(stock_info.get("current_price"), float(df.iloc[-1]['收盘']))
@@ -1015,7 +1101,7 @@ def get_stock_full_analysis(code: str):
         risk_assessment = _compute_risk_assessment(df, code, financials)
 
         # 7. AI 操作建议
-        ai_suggestion = _generate_ai_suggestion(df, stock_info, risk_assessment)
+        ai_suggestion = _generate_ai_suggestion(df, stock_info, risk_assessment, price_action.get("summary", {}))
 
         return {
             "code": code,
