@@ -16,6 +16,7 @@ from core.strategy import get_signal_details, run_optimization_grid
 from core.price_action import build_price_action_annotations
 from core.risk_engine import compute_paper_risk_levels, safe_float
 from core.operation_plan import operation_bands, price_instruction
+from core.money_flow import get_stock_money_flow
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
@@ -1119,7 +1120,17 @@ def get_stock_full_analysis(code: str):
         # 6. 风险评估
         risk_assessment = _compute_risk_assessment(df, code, financials)
 
-        # 7. AI 操作建议
+        # 7. 资金流向，低频缓存，避免对外部数据源高频请求
+        money_flow = get_stock_money_flow(code)
+        if money_flow.get("summary"):
+            stock_info["money_flow_bias"] = money_flow["summary"].get("bias")
+            stock_info["money_flow_5d_yi"] = money_flow["summary"].get("main_net_5d_yi")
+            stock_info["money_flow_consecutive"] = {
+                "direction": money_flow["summary"].get("consecutive_direction"),
+                "days": money_flow["summary"].get("consecutive_days"),
+            }
+
+        # 8. AI 操作建议
         ai_suggestion = _generate_ai_suggestion(df, stock_info, risk_assessment, price_action.get("summary", {}))
 
         return {
@@ -1131,6 +1142,7 @@ def get_stock_full_analysis(code: str):
             "stock_info": stock_info,
             "concepts": concepts,
             "financials": financials,
+            "money_flow": money_flow,
             "risk_assessment": risk_assessment,
             "ai_suggestion": ai_suggestion,
         }

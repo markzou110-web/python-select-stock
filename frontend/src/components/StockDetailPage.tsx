@@ -67,6 +67,25 @@ interface FullAnalysisData {
     };
     price_action?: any;
     price_action_lines?: any[];
+    money_flow?: MoneyFlowData;
+}
+
+interface MoneyFlowData {
+    status?: string;
+    cache_hit?: boolean;
+    updated_at?: string;
+    latest?: {
+        main_net_inflow_yi?: number;
+        main_net_ratio?: number;
+        super_net_inflow_yi?: number;
+        big_net_inflow_yi?: number;
+    };
+    summary?: {
+        bias?: 'inflow' | 'outflow' | 'neutral' | string;
+        main_net_5d_yi?: number;
+        consecutive_direction?: 'inflow' | 'outflow' | 'flat' | string;
+        consecutive_days?: number;
+    };
 }
 
 export default function StockDetailPage({ code, name, onBack }: StockDetailPageProps) {
@@ -162,6 +181,10 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const suggestion = data.ai_suggestion;
     const risk = data.risk_assessment;
     const fin = data.financials;
+    const moneyFlow = data.money_flow || {};
+    const moneyLatest = moneyFlow.latest || {};
+    const moneySummary = moneyFlow.summary || {};
+    const moneyBias = moneySummary.bias || 'neutral';
     const activeStopPrice = info.active_stop_price || info.stop_price || 0;
     const chartStrategy = data.signals?.strategy_type || info.chart_strategy_type || info.strategy_type || 'squeeze';
     const strategyLabels: Record<string, string> = {
@@ -597,6 +620,52 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 </div>
             )}
 
+            {/* ═══ Money Flow Confirmation ═══ */}
+            <div className="glass-card p-5 border border-slate-200">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div className="flex items-start gap-3">
+                        <div className={cn(
+                            "w-10 h-10 rounded-xl flex items-center justify-center",
+                            moneyBias === 'inflow' ? "bg-rose-50 text-rose-600" :
+                                moneyBias === 'outflow' ? "bg-emerald-50 text-emerald-600" :
+                                    "bg-slate-50 text-slate-500"
+                        )}>
+                            <DollarSign size={20} />
+                        </div>
+                        <div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">资金确认</h4>
+                                <span className={cn(
+                                    "px-2 py-0.5 rounded-md border text-[10px] font-black",
+                                    moneyFlow.status === 'ok' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                        moneyFlow.status === 'stale' ? "bg-amber-50 text-amber-700 border-amber-100" :
+                                            "bg-slate-50 text-slate-500 border-slate-100"
+                                )}>
+                                    {moneyFlow.status === 'ok' ? '已更新' : moneyFlow.status === 'stale' ? '缓存数据' : '暂不可用'}
+                                </span>
+                                {moneyFlow.cache_hit && <span className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-100 text-[10px] font-black text-slate-500">缓存</span>}
+                            </div>
+                            <div className="mt-1 text-base font-black text-slate-800">
+                                {moneyBias === 'inflow' ? '主力资金偏流入' : moneyBias === 'outflow' ? '主力资金偏流出' : '资金方向中性'}
+                            </div>
+                            <p className="mt-1 text-xs font-semibold text-slate-500">
+                                {moneySummary.consecutive_days
+                                    ? `${moneySummary.consecutive_days}日连续${moneySummary.consecutive_direction === 'inflow' ? '流入' : moneySummary.consecutive_direction === 'outflow' ? '流出' : '震荡'}`
+                                    : '等待资金流确认'}
+                                {moneyFlow.updated_at ? ` · ${String(moneyFlow.updated_at).slice(0, 19)}` : ''}
+                            </p>
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-2 min-w-0 lg:min-w-[620px]">
+                        <MoneyFlowItem label="今日主力" value={formatMoneyYi(moneyLatest.main_net_inflow_yi)} hot={Number(moneyLatest.main_net_inflow_yi || 0) > 0} />
+                        <MoneyFlowItem label="5日主力" value={formatMoneyYi(moneySummary.main_net_5d_yi)} hot={Number(moneySummary.main_net_5d_yi || 0) > 0} />
+                        <MoneyFlowItem label="净占比" value={moneyLatest.main_net_ratio == null ? '--' : `${Number(moneyLatest.main_net_ratio).toFixed(2)}%`} hot={Number(moneyLatest.main_net_ratio || 0) > 0} />
+                        <MoneyFlowItem label="超大单" value={formatMoneyYi(moneyLatest.super_net_inflow_yi)} hot={Number(moneyLatest.super_net_inflow_yi || 0) > 0} />
+                        <MoneyFlowItem label="大单" value={formatMoneyYi(moneyLatest.big_net_inflow_yi)} hot={Number(moneyLatest.big_net_inflow_yi || 0) > 0} />
+                    </div>
+                </div>
+            </div>
+
             {/* ═══ AI Operation Suggestion ═══ */}
             <div className={cn(
                 "glass-card p-6 border-2 shadow-xl transition-all",
@@ -786,6 +855,21 @@ function MetricCard({ label, value, color, icon }: { label: string; value: strin
                 <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider">{label}</p>
                 <p className={cn("text-lg font-black font-mono", color)}>{value}</p>
             </div>
+        </div>
+    );
+}
+
+function formatMoneyYi(value?: number | null) {
+    if (value === undefined || value === null || Number.isNaN(Number(value))) return '--';
+    const num = Number(value);
+    return `${num >= 0 ? '+' : ''}${num.toFixed(2)}亿`;
+}
+
+function MoneyFlowItem({ label, value, hot = false }: { label: string; value: string; hot?: boolean }) {
+    return (
+        <div className="rounded-md border border-slate-100 bg-slate-50 px-3 py-2">
+            <p className="text-[9px] font-black text-slate-400">{label}</p>
+            <p className={cn("mt-1 text-sm font-black", hot ? "text-rose-600" : value.startsWith('-') ? "text-emerald-600" : "text-slate-700")}>{value}</p>
         </div>
     );
 }

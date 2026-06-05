@@ -134,6 +134,7 @@ from routers.watchlist import router as watchlist_router
 from routers.strategy_templates import router as strategy_templates_router
 from routers.system import router as system_router
 from routers.backtest import router as backtest_router
+from routers.money_flow import router as money_flow_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -148,6 +149,7 @@ app.include_router(watchlist_router)
 app.include_router(strategy_templates_router)
 app.include_router(system_router)
 app.include_router(backtest_router)
+app.include_router(money_flow_router)
 
 @app.get("/api/market/pulse")
 async def get_market_pulse():
