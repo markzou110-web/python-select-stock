@@ -7,6 +7,7 @@ from datetime import datetime
 from core.logging_config import logger
 from core.db import get_db_engine
 from core.indicators import calculate_indicators
+from core.pro_workflow import build_alert_priority
 
 router = APIRouter(prefix="/api/alert", tags=["alert"])
 
@@ -90,6 +91,8 @@ def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
                     # 取第一个建议
                     suggestion = next((s['suggestion'] for s in exit_signals if s['level'] == top_level), exit_signals[0]['suggestion'])
 
+                    priority = build_alert_priority(top_level, pl_pct, reasons)
+                    dedup_key = f"{code}:{priority['priority']}:{'|'.join(reasons[:2])}"
                     alerts.append({
                         "id": trade_id,
                         "code": code,
@@ -98,8 +101,13 @@ def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
                         "current_price": current_price,
                         "pl_pct": round(pl_pct, 2),
                         "level": top_level,
+                        "priority": priority["priority"],
+                        "priority_label": priority["label"],
+                        "dedup_key": dedup_key,
+                        "dedup_minutes": priority["dedup_minutes"],
                         "reasons": reasons,
                         "suggestion": suggestion,
+                        "action_line": priority["action_line"],
                         "timestamp": datetime.now().isoformat()
                     })
                     
@@ -109,9 +117,16 @@ def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
                 
         # 按风险等级排序 (critical 优先于 warning)
         level_map = {"critical": 0, "warning": 1, "none": 2}
-        alerts.sort(key=lambda x: level_map.get(x['level'], 9))
+        priority_map = {"P0": 0, "P1": 1, "P2": 2}
+        alerts.sort(key=lambda x: (priority_map.get(x.get("priority"), 9), level_map.get(x['level'], 9)))
                 
-        return {"alerts": alerts}
+        summary = {
+            "total": len(alerts),
+            "p0": sum(1 for item in alerts if item.get("priority") == "P0"),
+            "p1": sum(1 for item in alerts if item.get("priority") == "P1"),
+            "p2": sum(1 for item in alerts if item.get("priority") == "P2"),
+        }
+        return {"alerts": alerts, "summary": summary}
         
     except Exception as e:
         logger.error(f"Error checking alerts: {e}")

@@ -8,8 +8,13 @@ export interface AlertItem {
     code: string;
     name: string;
     level: string; // 'critical' or 'warning'
+    priority?: 'P0' | 'P1' | 'P2' | string;
+    priority_label?: string;
+    dedup_key?: string;
+    dedup_minutes?: number;
     reasons: string[];
     suggestion: string;
+    action_line?: string;
     entry_price: number;
     current_price: number;
     pl_pct: number;
@@ -17,6 +22,8 @@ export interface AlertItem {
     timestamp: string;
     dismissed: boolean;
 }
+
+type AlertResponseItem = Omit<AlertItem, 'dismissed'> & { dismissed?: boolean };
 
 interface AlertStore {
     alerts: AlertItem[];
@@ -37,7 +44,7 @@ export const useAlertStore = create<AlertStore>((set, get) => ({
         set({ loading: true });
         try {
             const res = await api.get('/api/alert/list');
-            const alerts: AlertItem[] = (res.data.alerts || []).map((a: any) => ({
+            const alerts: AlertItem[] = ((res.data.alerts || []) as AlertResponseItem[]).map((a) => ({
                 ...a,
                 dismissed: false,
             }));

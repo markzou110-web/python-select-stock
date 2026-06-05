@@ -6,6 +6,7 @@ import json
 
 from core.db import get_db_engine
 from core.logging_config import logger
+from core.pro_workflow import recommend_strategy_template
 
 router = APIRouter(prefix="/api/strategy-templates", tags=["strategy-templates"])
 
@@ -111,6 +112,22 @@ def list_strategy_templates() -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"List strategy templates error: {exc}")
         return {"templates": []}
+
+
+@router.get("/recommendation")
+def get_strategy_template_recommendation(
+    market_regime: str = "UNKNOWN",
+    risk_status: str = "ok",
+    recent_win_rate: float = 0,
+) -> Dict[str, Any]:
+    return {
+        "status": "success",
+        "recommendation": recommend_strategy_template(
+            market_regime=market_regime,
+            risk_status=risk_status,
+            recent_win_rate=float(recent_win_rate or 0),
+        ),
+    }
 
 
 @router.post("/save")

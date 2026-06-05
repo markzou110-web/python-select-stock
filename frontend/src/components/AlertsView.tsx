@@ -26,6 +26,11 @@ export default function AlertsView() {
     }, [fetchAlerts]);
 
     const activeAlerts = alerts.filter(a => !a.dismissed);
+    const priorityCounts = {
+        P0: activeAlerts.filter(a => a.priority === 'P0').length,
+        P1: activeAlerts.filter(a => a.priority === 'P1').length,
+        P2: activeAlerts.filter(a => a.priority === 'P2').length,
+    };
 
     const handleClosePosition = async (id: number, currentPrice: number) => {
         if (!window.confirm("确定要按当前价平仓吗？平仓后该记录将移至已平仓列表。")) return;
@@ -93,6 +98,11 @@ export default function AlertsView() {
                     </div>
                 ) : (
                     <div className="grid grid-cols-1 gap-4 max-w-5xl mx-auto">
+                        <div className="grid grid-cols-3 gap-3">
+                            <AlertMetric label="P0 立即处理" value={priorityCounts.P0} hot={priorityCounts.P0 > 0} />
+                            <AlertMetric label="P1 盘中决策" value={priorityCounts.P1} hot={priorityCounts.P1 > 0} />
+                            <AlertMetric label="P2 观察提醒" value={priorityCounts.P2} />
+                        </div>
                         {activeAlerts.map(alert => (
                             <div 
                                 key={`${alert.id}-${alert.timestamp}`} 
@@ -119,6 +129,16 @@ export default function AlertsView() {
                                                 )}>
                                                     {alert.level === 'critical' ? '极度危险' : '注意预警'}
                                                 </span>
+                                                {alert.priority && (
+                                                    <span className={cn(
+                                                        "px-2 py-0.5 rounded-lg text-[10px] font-black",
+                                                        alert.priority === 'P0' ? "bg-rose-100 text-rose-700" :
+                                                        alert.priority === 'P1' ? "bg-amber-100 text-amber-700" :
+                                                        "bg-slate-100 text-slate-600"
+                                                    )}>
+                                                        {alert.priority} · {alert.priority_label || '提醒'}
+                                                    </span>
+                                                )}
                                             </div>
                                             
                                             <div className="mt-2 space-y-1">
@@ -133,6 +153,11 @@ export default function AlertsView() {
                                             <p className="text-xs font-bold mt-2 text-indigo-600 bg-indigo-50 inline-block px-3 py-1 rounded-lg">
                                                 💡 {alert.suggestion}
                                             </p>
+                                            {alert.action_line && (
+                                                <p className="text-xs font-black mt-2 text-slate-700 bg-white border border-slate-100 inline-block px-3 py-1 rounded-lg">
+                                                    {alert.action_line}
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
 
@@ -180,6 +205,15 @@ export default function AlertsView() {
                     </div>
                 )}
             </div>
+        </div>
+    );
+}
+
+function AlertMetric({ label, value, hot = false }: { label: string; value: number; hot?: boolean }) {
+    return (
+        <div className={cn("rounded-xl border px-4 py-3 bg-white", hot ? "border-rose-100" : "border-slate-100")}>
+            <p className="text-[10px] font-black text-slate-400">{label}</p>
+            <p className={cn("mt-1 text-xl font-black", hot ? "text-rose-600" : "text-slate-700")}>{value}</p>
         </div>
     );
 }

@@ -82,3 +82,76 @@ def evaluate_portfolio_risk_budget(
         status = "override" if force else "warning"
 
     return {"status": status, "warnings": warnings, "summary": summary, "budget": limits}
+
+
+def build_portfolio_exposure(engine: Optional[Engine], budget: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """Summarize open-position concentration against the same risk budget used at entry."""
+    if engine is None:
+        return {"status": "error", "items": [], "warnings": ["数据库不可用"], "budget": budget or DEFAULT_RISK_BUDGET}
+
+    limits = {**DEFAULT_RISK_BUDGET, **(budget or {})}
+    try:
+        open_df = pd.read_sql(text("SELECT * FROM paper_trading WHERE status = :status"), engine, params={"status": "OPEN"})
+        sector_df = pd.read_sql(text("SELECT code, industry FROM stock_basic WHERE industry IS NOT NULL"), engine)
+    except Exception as exc:
+        return {"status": "error", "items": [], "warnings": [f"组合暴露查询失败: {str(exc)[:80]}"], "budget": limits}
+
+    if open_df.empty:
+        return {
+            "status": "ok",
+            "items": [],
+            "warnings": [],
+            "summary": {"open_positions": 0, "real_positions": 0, "total_plan_risk_pct": 0},
+            "budget": limits,
+        }
+
+    sector_map = dict(zip(sector_df["code"].astype(str), sector_df["industry"])) if not sector_df.empty else {}
+    open_df["industry"] = open_df["code"].astype(str).map(sector_map).fillna("未知")
+    open_df["strategy_group"] = open_df.get("strategy_type", pd.Series(dtype=str)).fillna("unknown")
+    open_df["risk_pct_num"] = pd.to_numeric(open_df.get("pa_risk_pct", pd.Series(dtype=float)), errors="coerce").fillna(0)
+
+    def group_rows(column: str, kind: str, limit_key: str) -> list[Dict[str, Any]]:
+        rows = []
+        for value, group in open_df.groupby(column, dropna=False):
+            count = int(len(group))
+            risk_pct = round(float(group["risk_pct_num"].sum()), 2)
+            limit = int(limits[limit_key])
+            rows.append({
+                "kind": kind,
+                "name": str(value or "未知"),
+                "count": count,
+                "risk_pct": risk_pct,
+                "limit": limit,
+                "status": "warning" if count > limit else "ok",
+            })
+        rows.sort(key=lambda item: (item["status"] == "warning", item["count"], item["risk_pct"]), reverse=True)
+        return rows
+
+    real_positions = int((open_df.get("trade_mode", pd.Series(dtype=str)) == "REAL").sum())
+    total_plan_risk = round(float(open_df["risk_pct_num"].sum()), 2)
+    warnings = []
+    if len(open_df) > int(limits["max_open_positions"]):
+        warnings.append(f"总持仓 {len(open_df)} 个超过上限 {int(limits['max_open_positions'])}")
+    if real_positions > int(limits["max_real_positions"]):
+        warnings.append(f"实盘持仓 {real_positions} 个超过上限 {int(limits['max_real_positions'])}")
+    if total_plan_risk > float(limits["max_total_plan_risk_pct"]):
+        warnings.append(f"组合计划风险 {total_plan_risk:.1f}% 超过上限 {float(limits['max_total_plan_risk_pct']):.1f}%")
+
+    items = group_rows("industry", "sector", "max_sector_positions") + group_rows("strategy_group", "strategy", "max_strategy_positions")
+    warnings.extend(
+        f"{'行业' if item['kind'] == 'sector' else '策略'} {item['name']} 暴露 {item['count']} 个超过上限 {item['limit']}"
+        for item in items
+        if item["status"] == "warning"
+    )
+
+    return {
+        "status": "warning" if warnings else "ok",
+        "items": items,
+        "warnings": warnings,
+        "summary": {
+            "open_positions": int(len(open_df)),
+            "real_positions": real_positions,
+            "total_plan_risk_pct": total_plan_risk,
+        },
+        "budget": limits,
+    }

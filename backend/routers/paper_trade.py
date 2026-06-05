@@ -536,6 +536,54 @@ def list_trade_journal_events(limit: int = 100) -> Dict[str, Any]:
         return {"items": [], "error": str(exc)}
 
 
+@router.get("/journal/summary")
+def get_trade_journal_summary(days: int = 30) -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"summary": {}, "by_source": [], "pending_feedback": []}
+    try:
+        _ensure_trade_journal_table(engine)
+        start_time = datetime.now() - timedelta(days=max(1, min(int(days), 365)))
+        df = pd.read_sql(
+            text("""
+                SELECT *
+                FROM trade_journal_events
+                WHERE event_time >= :start_time
+                ORDER BY event_time DESC
+            """),
+            engine,
+            params={"start_time": start_time},
+        )
+        if df.empty:
+            return {"summary": {"events": 0, "feedback_rate": 0}, "by_source": [], "pending_feedback": []}
+
+        has_action = df["action_taken"].fillna("").astype(str).str.strip().ne("")
+        has_result = df["result_note"].fillna("").astype(str).str.strip().ne("")
+        by_source = []
+        for source, group in df.groupby("source", dropna=False):
+            group_has_action = group["action_taken"].fillna("").astype(str).str.strip().ne("")
+            by_source.append({
+                "source": source or "unknown",
+                "events": int(len(group)),
+                "feedback_rate": round(float(group_has_action.mean() * 100), 1) if len(group) else 0,
+            })
+        by_source.sort(key=lambda item: item["events"], reverse=True)
+        pending = df.loc[~has_action].head(10)
+        return {
+            "summary": {
+                "events": int(len(df)),
+                "feedback_rate": round(float(has_action.mean() * 100), 1),
+                "result_note_rate": round(float(has_result.mean() * 100), 1),
+                "pending_feedback": int((~has_action).sum()),
+            },
+            "by_source": by_source,
+            "pending_feedback": pending.where(pd.notna(pending), None).to_dict("records"),
+        }
+    except Exception as exc:
+        logger.error(f"Trade journal summary error: {exc}")
+        return {"summary": {}, "by_source": [], "pending_feedback": [], "error": str(exc)}
+
+
 @router.post("/journal/{event_id}/feedback")
 def update_trade_journal_feedback(event_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     engine = get_db_engine()

@@ -5,6 +5,8 @@ from core.db import get_db_engine
 from core.data_source_quality import build_data_source_quality_report
 from core.data_source_quality import build_local_data_quality_report
 from core.ops_summary import build_ops_summary
+from core.portfolio_risk import build_portfolio_exposure
+from core.pro_workflow import build_premarket_checklist, recommend_strategy_template
 from core.research_summary import build_research_summary
 from core.system_health import build_system_health_snapshot
 
@@ -45,6 +47,33 @@ def get_data_repair_candidates(target_date: str | None = None):
         "count": len(samples),
         "items": samples,
         "recommended_command": command,
+    }
+
+
+@router.get("/portfolio-exposure")
+def get_portfolio_exposure():
+    """Return open-position sector/strategy concentration against risk limits."""
+    return build_portfolio_exposure(get_db_engine())
+
+
+@router.get("/premarket-checklist")
+def get_premarket_checklist(market_regime: str = "UNKNOWN", recent_win_rate: float = 0):
+    """Return the daily pre-market checklist for scan and trading readiness."""
+    engine = get_db_engine()
+    health = build_system_health_snapshot(engine)
+    exposure = build_portfolio_exposure(engine)
+    data_quality = build_data_source_quality_report(engine)
+    template = recommend_strategy_template(
+        market_regime=market_regime,
+        risk_status=exposure.get("status", "ok"),
+        recent_win_rate=float(recent_win_rate or 0),
+    )
+    checklist = build_premarket_checklist(health, exposure, data_quality, template)
+    return {
+        **checklist,
+        "template_recommendation": template,
+        "exposure_summary": exposure.get("summary", {}),
+        "health_score": health.get("score", 0),
     }
 
 

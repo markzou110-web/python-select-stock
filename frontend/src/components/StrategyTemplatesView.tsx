@@ -1,25 +1,43 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Loader2, Save, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { CheckCircle2, Loader2, Save, SlidersHorizontal, Sparkles, Trash2 } from 'lucide-react';
 import api from '@/lib/api';
 import { useScanStore } from '@/stores/scanStore';
 import { cn } from '@/lib/utils';
 
+type StrategyTemplate = {
+    id: number;
+    name: string;
+    strategy_type: string;
+    params: Record<string, unknown>;
+    description?: string;
+    is_default?: boolean;
+};
+
+type TemplateRecommendation = {
+    profile: string;
+    reason: string;
+    params: Record<string, unknown>;
+};
+
 export default function StrategyTemplatesView() {
     const params = useScanStore(s => s.params);
     const setParams = useScanStore(s => s.setParams);
-    const [templates, setTemplates] = useState<any[]>([]);
+    const [templates, setTemplates] = useState<StrategyTemplate[]>([]);
     const [loading, setLoading] = useState(true);
     const [name, setName] = useState('');
     const [description, setDescription] = useState('');
     const [appliedId, setAppliedId] = useState<number | null>(null);
+    const [recommendation, setRecommendation] = useState<TemplateRecommendation | null>(null);
 
     const fetchTemplates = async () => {
         setLoading(true);
         try {
             const res = await api.get('/api/strategy-templates/list');
             setTemplates(res.data.templates || []);
+            const rec = await api.get('/api/strategy-templates/recommendation');
+            setRecommendation(rec.data.recommendation || null);
         } finally {
             setLoading(false);
         }
@@ -40,9 +58,16 @@ export default function StrategyTemplatesView() {
         fetchTemplates();
     };
 
-    const applyTemplate = (tpl: any) => {
-        setParams({ ...params, ...tpl.params });
+    const applyTemplate = (tpl: StrategyTemplate) => {
+        setParams({ ...params, ...tpl.params } as typeof params);
         setAppliedId(tpl.id);
+        setTimeout(() => setAppliedId(null), 2500);
+    };
+
+    const applyRecommendation = () => {
+        if (!recommendation?.params) return;
+        setParams({ ...params, ...recommendation.params } as typeof params);
+        setAppliedId(-1);
         setTimeout(() => setAppliedId(null), 2500);
     };
 
@@ -73,6 +98,30 @@ export default function StrategyTemplatesView() {
                     保存当前参数
                 </button>
             </div>
+
+            {recommendation && (
+                <div className="glass-card p-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div className="flex items-start gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center">
+                            <Sparkles size={18} />
+                        </div>
+                        <div>
+                            <h3 className="font-black text-slate-800">今日推荐：{recommendation.profile}</h3>
+                            <p className="mt-1 text-xs font-bold text-slate-500">{recommendation.reason}</p>
+                            <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-black text-slate-500">
+                                <span className="px-2 py-1 rounded-md bg-slate-50 border border-slate-100">策略 {recommendation.params?.strategy_type}</span>
+                                <span className="px-2 py-1 rounded-md bg-slate-50 border border-slate-100">量比 {recommendation.params?.vol_multiplier}</span>
+                                <span className="px-2 py-1 rounded-md bg-slate-50 border border-slate-100">RSI {recommendation.params?.rsi_min}</span>
+                                <span className="px-2 py-1 rounded-md bg-slate-50 border border-slate-100">高开 {recommendation.params?.max_open_gap_pct}%</span>
+                            </div>
+                        </div>
+                    </div>
+                    <button onClick={applyRecommendation} className={cn("px-5 py-3 rounded-xl text-sm font-black flex items-center justify-center gap-2", appliedId === -1 ? "bg-emerald-500 text-white" : "bg-amber-50 text-amber-700 hover:bg-amber-100")}>
+                        {appliedId === -1 ? <CheckCircle2 size={16} /> : <SlidersHorizontal size={16} />}
+                        {appliedId === -1 ? "已应用" : "应用推荐"}
+                    </button>
+                </div>
+            )}
 
             {loading ? (
                 <div className="p-20 text-center text-slate-400"><Loader2 className="animate-spin inline mr-2" /> 正在加载策略模板...</div>
