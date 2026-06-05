@@ -5,7 +5,7 @@ Extracted from api.py.
 """
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
-from typing import Dict, Any
+from typing import Dict, Any, List
 from datetime import datetime, timedelta
 import pandas as pd
 
@@ -21,7 +21,7 @@ from core.risk_constants import (
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
-from core.operation_plan import operation_bands, position_health_score, price_instruction, safe_num
+from core.operation_plan import evaluate_operation_trigger, operation_bands, position_health_score, price_instruction, safe_num
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
@@ -197,6 +197,29 @@ def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entr
     }
 
 
+def _send_operation_trigger_notification(alerts: List[Dict[str, Any]]) -> None:
+    if not alerts:
+        return
+    title = f"Alpha Vision 实盘价位触发 {len(alerts)} 条"
+    lines = []
+    icon_map = {
+        "critical": "🚨",
+        "warning": "⚠️",
+        "notice": "🟠",
+        "opportunity": "🟢",
+    }
+    for alert in alerts[:8]:
+        trigger = alert.get("trigger") or {}
+        icon = icon_map.get(trigger.get("level"), "•")
+        lines.append(f"{icon} {alert['name']}({alert['code']}) 现价 {alert['current_price']:.2f}")
+        lines.append(f"   └ {trigger.get('action')}")
+        if alert.get("instruction"):
+            lines.append(f"   └ 指令: {alert['instruction']}")
+    if len(alerts) > 8:
+        lines.append(f"另有 {len(alerts) - 8} 条触发，请打开实盘持仓查看。")
+    send_paper_trade_notification(title, "\n".join(lines))
+
+
 @router.post("/add")
 def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     """Add a paper trade entry with sector concentration check"""
@@ -327,6 +350,105 @@ def get_open_trade_plans() -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"Open trade plans error: {exc}")
         return {"items": [], "error": str(exc)}
+
+
+@router.post("/check-operation-triggers")
+def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"status": "error", "alerts": []}
+    try:
+        if trade_mode.upper() == "ALL":
+            df = pd.read_sql(text("SELECT * FROM paper_trading WHERE status = 'OPEN' ORDER BY trade_mode DESC, entry_date DESC"), engine)
+        else:
+            df = pd.read_sql(
+                text("SELECT * FROM paper_trading WHERE status = 'OPEN' AND trade_mode = :trade_mode ORDER BY entry_date DESC"),
+                engine,
+                params={"trade_mode": trade_mode.upper()},
+            )
+        if df.empty:
+            return {"status": "success", "alerts": [], "checked": 0, "notification": False}
+
+        snapshot_map: Dict[str, Dict[str, float]] = {}
+        try:
+            snapshot = get_market_snapshot()
+            if not snapshot.empty:
+                for _, row in snapshot.iterrows():
+                    code = str(row.get("code") or "")
+                    price = safe_float(row.get("price"))
+                    if code and price > 0:
+                        snapshot_map[code] = {
+                            "price": price,
+                            "high": safe_float(row.get("high"), price) or price,
+                        }
+        except Exception as exc:
+            logger.warning(f"Operation trigger snapshot unavailable: {exc}")
+
+        alerts: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            code = str(row.get("code") or "")
+            entry = safe_float(row.get("entry_price"))
+            cached_current = safe_float(row.get("current_price"), entry)
+            live = snapshot_map.get(code, {})
+            current = safe_float(live.get("price"), cached_current)
+            high = max(safe_float(row.get("high_since_entry"), entry), safe_float(live.get("high"), current), current)
+            risk = compute_paper_risk_levels(entry, high, current)
+            plan = _build_trade_plan(row.to_dict(), current, high, risk)
+            trigger = evaluate_operation_trigger(current, plan)
+            if not trigger.get("triggered"):
+                continue
+            alert = {
+                "id": int(row["id"]),
+                "code": code,
+                "name": row.get("name"),
+                "trade_mode": row.get("trade_mode") or "SIMULATED",
+                "current_price": round(current, 2),
+                "plan": plan,
+                "trigger": trigger,
+                "instruction": plan.get("instruction"),
+            }
+            alerts.append(alert)
+
+        if alerts and notify:
+            _send_operation_trigger_notification(alerts)
+            try:
+                _ensure_trade_journal_table(engine)
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        INSERT INTO trade_journal_events (
+                            event_time, source, code, name, trade_id, advice, action_taken,
+                            trigger_price, guard_price, stop_price, result_note
+                        ) VALUES (
+                            :event_time, 'operation_trigger', :code, :name, :trade_id, :advice, NULL,
+                            :trigger_price, :guard_price, :stop_price, :result_note
+                        )
+                    """), [
+                        {
+                            "event_time": datetime.now(),
+                            "code": alert["code"],
+                            "name": alert["name"],
+                            "trade_id": alert["id"],
+                            "advice": alert["trigger"].get("action"),
+                            "trigger_price": alert["plan"].get("add_trigger_price"),
+                            "guard_price": alert["plan"].get("add_guard_price"),
+                            "stop_price": alert["plan"].get("active_stop_price"),
+                            "result_note": alert["instruction"],
+                        }
+                        for alert in alerts
+                    ])
+                    conn.commit()
+            except Exception as exc:
+                logger.warning(f"Failed to journal operation triggers: {exc}")
+
+        return {
+            "status": "success",
+            "checked": int(len(df)),
+            "alerts": alerts,
+            "notification": bool(alerts and notify),
+        }
+    except Exception as exc:
+        logger.error(f"Check operation triggers error: {exc}")
+        return {"status": "error", "alerts": [], "detail": str(exc)}
 
 
 @router.post("/journal")

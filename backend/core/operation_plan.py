@@ -161,3 +161,57 @@ def operation_bands(trigger: float = 0.0, guard: float = 0.0, active_stop: float
     if structure_stop > 0 and abs(structure_stop - active_stop) > 0.001:
         rows.append({"price": round(structure_stop, 2), "label": "退出线", "color": "#2563eb", "action": f"<{structure_stop:.2f} 结构失效"})
     return rows
+
+
+def evaluate_operation_trigger(current_price: float, plan: Dict[str, Any]) -> Dict[str, Any]:
+    current = safe_num(current_price)
+    trigger = safe_num(plan.get("add_trigger_price"))
+    guard = safe_num(plan.get("add_guard_price"))
+    active_stop = safe_num(plan.get("active_stop_price"))
+    structure_stop = safe_num(plan.get("structure_stop_price"))
+    if current <= 0:
+        return {"triggered": False, "level": "none", "action": "暂无有效现价", "price": current}
+
+    if structure_stop > 0 and current <= structure_stop:
+        return {
+            "triggered": True,
+            "level": "critical",
+            "action": f"现价 {current:.2f} 跌破结构失效线 {structure_stop:.2f}，优先退出复核",
+            "price": current,
+            "threshold": round(structure_stop, 2),
+            "kind": "STRUCTURE_EXIT",
+        }
+    if active_stop > 0 and current <= active_stop:
+        return {
+            "triggered": True,
+            "level": "warning",
+            "action": f"现价 {current:.2f} 跌破减仓线 {active_stop:.2f}，减仓或收紧风控",
+            "price": current,
+            "threshold": round(active_stop, 2),
+            "kind": "REDUCE",
+        }
+    if guard > 0 and current <= guard:
+        return {
+            "triggered": True,
+            "level": "notice",
+            "action": f"现价 {current:.2f} 跌破加仓撤退线 {guard:.2f}，撤回加仓计划",
+            "price": current,
+            "threshold": round(guard, 2),
+            "kind": "CANCEL_ADD",
+        }
+    if trigger > 0 and current >= trigger:
+        return {
+            "triggered": True,
+            "level": "opportunity",
+            "action": f"现价 {current:.2f} 突破加仓触发线 {trigger:.2f}，等待量能与收盘确认后小幅加仓",
+            "price": current,
+            "threshold": round(trigger, 2),
+            "kind": "ADD_TRIGGER",
+        }
+    return {
+        "triggered": False,
+        "level": "none",
+        "action": "未触发操作价位",
+        "price": current,
+        "kind": "HOLD",
+    }
