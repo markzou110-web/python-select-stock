@@ -474,7 +474,7 @@ export default function ResultsTable({
                 <td className="px-6 py-5">
                     <div className="flex flex-col items-center gap-1">
                         <div className="flex items-center gap-1">
-                            <span className="text-[10px] font-bold text-slate-300">北向</span>
+                            <span className="text-[10px] font-bold text-slate-300">主力</span>
                             <span className={cn(
                                 "text-[10px] font-extrabold",
                                 res.北向?.includes("流入") ? "text-rose-500" :

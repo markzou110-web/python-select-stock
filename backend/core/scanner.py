@@ -34,11 +34,54 @@ from core.strategy import (
 from core.price_action import analyze_price_action
 from core.risk_engine import compute_paper_risk_levels
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
+from core.money_flow import get_money_flow_rank
 from routers.market import fetch_mine_sweeper_data
 
 
 EXECUTABLE_PA_ACTIONS = {"READY", "WATCH"}
 BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
+
+
+def _money_flow_label(item: Dict[str, Any]) -> str:
+    amount = float(item.get("main_net_inflow_yi") or 0)
+    if amount > 0:
+        return f"主力流入+{amount:.2f}亿"
+    if amount < 0:
+        return f"主力流出{amount:.2f}亿"
+    return "资金中性"
+
+
+def _build_scan_money_flow_map(limit: int = 500) -> Dict[str, Dict[str, Any]]:
+    try:
+        rank = get_money_flow_rank(indicator="今日", limit=limit, force_refresh=False)
+        items = rank.get("items") or []
+        flow_map = {str(item.get("code", "")).zfill(6): item for item in items if item.get("code")}
+        logger.info(f"Loaded money flow rank map: {len(flow_map)} items ({rank.get('status')}, cache={rank.get('cache_hit')})")
+        return flow_map
+    except Exception as exc:
+        logger.warning(f"Money flow rank map unavailable: {exc}")
+        return {}
+
+
+def _apply_money_flow_to_results(results: List[Dict[str, Any]], flow_map: Dict[str, Dict[str, Any]]) -> None:
+    if not results:
+        return
+    if not flow_map:
+        for res in results:
+            res.setdefault("北向", "---")
+        return
+    for res in results:
+        code = str(res.get("代码") or "").zfill(6)
+        item = flow_map.get(code)
+        if not item:
+            res.setdefault("北向", "---")
+            continue
+        res["北向"] = _money_flow_label(item)
+        res["money_flow"] = {
+            "main_net_inflow_yi": item.get("main_net_inflow_yi"),
+            "main_net_ratio": item.get("main_net_ratio"),
+            "pct": item.get("pct"),
+        }
 
 
 def _pa_plan_action(res: Dict[str, Any]) -> str:
@@ -979,6 +1022,8 @@ def perform_market_scan(
         except Exception as e:
             logger.error(f"Failed to load fundamentals: {e}")
 
+        money_flow_map = _build_scan_money_flow_map(limit=500)
+
         # 并发扫描逻辑 - 执行策略筛选和周线确认
         workers = 24  # 向量化后主压力在周线重采样，可提高并发
         logger.info(f"Starting strategy scan for {len(candidates)} stocks (workers={workers})...")
@@ -1255,6 +1300,7 @@ def perform_market_scan(
         _apply_sop_filter(results, market_regime, sector_trends)
         for res in results:
             res['market_regime'] = market_regime.get('status', 'UNKNOWN')
+        _apply_money_flow_to_results(results, money_flow_map)
         logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
                     f"B={sum(1 for r in results if r.get('sop_grade')=='B')}, "
                     f"M={sum(1 for r in results if r.get('sop_grade')=='M')}, "
