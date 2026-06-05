@@ -13,6 +13,25 @@ def _date_str(value: Any) -> Optional[str]:
     return str(value)[:10]
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_suspected_corporate_action_gap(name: str, close_jump_pct: Optional[float], open_gap_pct: Optional[float]) -> bool:
+    """Identify ex-right adjustment discontinuities without calling an external data source."""
+    normalized_name = (name or "").upper()
+    if normalized_name.startswith(("XR", "DR", "XD")):
+        return True
+    if close_jump_pct is None or open_gap_pct is None:
+        return False
+    return close_jump_pct <= -20 and open_gap_pct <= -15 and abs(close_jump_pct - open_gap_pct) <= 8
+
+
 def build_local_data_quality_report(
     engine: Optional[Engine],
     target_date: Optional[str] = None,
@@ -93,22 +112,52 @@ def build_local_data_quality_report(
             missing_industry = int(industry_row[0] or 0) if industry_row else 0
             summary["missing_industry_count"] = missing_industry
 
-            abnormal_row = conn.execute(text("""
+            abnormal_rows = conn.execute(text("""
                 WITH ranked AS (
-                    SELECT code, date, close,
+                    SELECT code, date, open, close,
                            LAG(close) OVER (PARTITION BY code ORDER BY date) AS prev_close
                     FROM daily_k
                     WHERE date <= :selected_date
                 )
-                SELECT COUNT(*) AS abnormal_count
-                FROM ranked
-                WHERE date = :selected_date
-                  AND prev_close IS NOT NULL
-                  AND prev_close > 0
-                  AND ABS((close - prev_close) / prev_close * 100) > :max_move
-            """), {"selected_date": selected_date, "max_move": float(max_abnormal_move_pct)}).fetchone()
-            abnormal_count = int(abnormal_row[0] or 0) if abnormal_row else 0
+                SELECT
+                    r.code,
+                    COALESCE(s.name, '') AS name,
+                    r.prev_close,
+                    r.open,
+                    r.close,
+                    (r.open - r.prev_close) / r.prev_close * 100 AS open_gap_pct,
+                    (r.close - r.prev_close) / r.prev_close * 100 AS close_jump_pct
+                FROM ranked r
+                LEFT JOIN stock_basic s ON s.code = r.code
+                WHERE r.date = :selected_date
+                  AND r.prev_close IS NOT NULL
+                  AND r.prev_close > 0
+                  AND ABS((r.close - r.prev_close) / r.prev_close * 100) > :max_move
+                ORDER BY ABS((r.close - r.prev_close) / r.prev_close * 100) DESC
+            """), {"selected_date": selected_date, "max_move": float(max_abnormal_move_pct)}).fetchall()
+            abnormal_samples = []
+            suspected_corporate_action_count = 0
+            for row in abnormal_rows:
+                open_gap_pct = _float_or_none(row[5])
+                close_jump_pct = _float_or_none(row[6])
+                suspected = _is_suspected_corporate_action_gap(row[1], close_jump_pct, open_gap_pct)
+                if suspected:
+                    suspected_corporate_action_count += 1
+                if len(abnormal_samples) < 10:
+                    abnormal_samples.append({
+                        "code": row[0],
+                        "name": row[1],
+                        "prev_close": round(float(row[2]), 3) if row[2] is not None else None,
+                        "open": round(float(row[3]), 3) if row[3] is not None else None,
+                        "close": round(float(row[4]), 3) if row[4] is not None else None,
+                        "open_gap_pct": round(open_gap_pct, 2) if open_gap_pct is not None else None,
+                        "close_jump_pct": round(close_jump_pct, 2) if close_jump_pct is not None else None,
+                        "likely_reason": "suspected_corporate_action_gap" if suspected else "abnormal_price_move",
+                    })
+            abnormal_count = len(abnormal_rows)
             summary["abnormal_move_count"] = abnormal_count
+            summary["suspected_corporate_action_gap_count"] = suspected_corporate_action_count
+            summary["abnormal_move_samples"] = abnormal_samples
 
             zero_row = conn.execute(text("""
                 SELECT COUNT(*) FROM daily_k
@@ -147,9 +196,26 @@ def build_local_data_quality_report(
     else:
         checks.append({"name": "industry_mapping", "status": "ok", "message": "行业映射覆盖正常"})
 
+    suspected_gap_count = int(summary.get("suspected_corporate_action_gap_count") or 0)
+    unresolved_abnormal_count = max(abnormal_count - suspected_gap_count, 0)
     if abnormal_count > 0:
-        checks.append({"name": "abnormal_move", "status": "warn", "message": f"{abnormal_count} 只股票出现超过 {max_abnormal_move_pct:.0f}% 的异常跳变"})
-        recommendations.append("检查复权/除权或数据源异常，避免假信号进入扫描")
+        if unresolved_abnormal_count == 0:
+            checks.append({
+                "name": "abnormal_move",
+                "status": "warn",
+                "message": f"{abnormal_count} 只股票疑似除权复权断点，需统一复权口径后再解读涨跌幅",
+            })
+        elif suspected_gap_count > 0:
+            checks.append({
+                "name": "abnormal_move",
+                "status": "warn",
+                "message": f"{abnormal_count} 只股票异常跳变，其中 {suspected_gap_count} 只疑似除权复权断点",
+            })
+        else:
+            checks.append({"name": "abnormal_move", "status": "warn", "message": f"{abnormal_count} 只股票出现超过 {max_abnormal_move_pct:.0f}% 的异常跳变"})
+        recommendations.append("对疑似除权复权断点股票补刷同一复权口径的历史K线，避免假信号进入扫描")
+        if unresolved_abnormal_count > 0:
+            recommendations.append("检查非除权类异常跳变是否来自数据源脏数据或停复牌特殊行情")
     else:
         checks.append({"name": "abnormal_move", "status": "ok", "message": "异常价格跳变数量可接受"})
 

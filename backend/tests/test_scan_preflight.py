@@ -98,3 +98,29 @@ def test_local_data_quality_warns_on_abnormal_jump_and_invalid_price():
     assert statuses["abnormal_move"] == "warn"
     assert statuses["invalid_price"] == "error"
     assert payload["summary"]["missing_industry_count"] == 1
+
+
+def test_local_data_quality_classifies_suspected_corporate_action_gap():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO stock_basic (code, name, industry) VALUES ('002831', '裕同科技', '包装')"))
+        conn.execute(text("INSERT INTO stock_basic (code, name, industry) VALUES ('688625', 'XR呈和科', '化工')"))
+        conn.execute(text("""
+            INSERT INTO daily_k (code, date, open, high, low, close, vol)
+            VALUES
+            ('002831', '2026-06-03', 41, 42, 40, 41, 100000),
+            ('688625', '2026-06-03', 109, 110, 108, 109, 100000),
+            ('002831', '2026-06-04', 28.7, 29, 28, 28.37, 100000),
+            ('688625', '2026-06-04', 77, 78, 76, 77.88, 100000)
+        """))
+
+    payload = build_local_data_quality_report(engine, target_date="2026-06-04", min_stock_count=2, max_abnormal_move_pct=25)
+    abnormal_check = next(item for item in payload["checks"] if item["name"] == "abnormal_move")
+
+    assert abnormal_check["status"] == "warn"
+    assert payload["summary"]["abnormal_move_count"] == 2
+    assert payload["summary"]["suspected_corporate_action_gap_count"] == 2
+    assert payload["summary"]["abnormal_move_samples"][0]["likely_reason"] == "suspected_corporate_action_gap"
+    assert "除权复权断点" in abnormal_check["message"]

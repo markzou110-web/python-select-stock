@@ -34,7 +34,18 @@ interface DataSourceReport {
             coverage_ratio?: number;
             missing_industry_count?: number;
             abnormal_move_count?: number;
+            suspected_corporate_action_gap_count?: number;
             invalid_price_count?: number;
+            abnormal_move_samples?: Array<{
+                code: string;
+                name?: string;
+                prev_close?: number | null;
+                open?: number | null;
+                close?: number | null;
+                open_gap_pct?: number | null;
+                close_jump_pct?: number | null;
+                likely_reason?: string;
+            }>;
         };
         recommendations: string[];
     };
@@ -320,11 +331,12 @@ export default function OperationsCenter() {
                         title="本地行情体检"
                         subtitle={`最新 ${dataSources?.local_data?.summary?.selected_date || '--'} · 覆盖率 ${dataSources?.local_data?.summary?.coverage_ratio ?? '--'}%`}
                     />
-                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+                    <div className="grid grid-cols-2 lg:grid-cols-6 gap-2">
                         <TinyStat label="最新覆盖" value={dataSources?.local_data?.summary?.stock_count ?? 0} />
                         <TinyStat label="较前缺失" value={dataSources?.local_data?.summary?.missing_vs_previous ?? 0} />
                         <TinyStat label="行业缺失" value={dataSources?.local_data?.summary?.missing_industry_count ?? 0} />
                         <TinyStat label="异常跳变" value={dataSources?.local_data?.summary?.abnormal_move_count ?? 0} />
+                        <TinyStat label="除权断点" value={dataSources?.local_data?.summary?.suspected_corporate_action_gap_count ?? 0} />
                         <TinyStat label="无效K线" value={dataSources?.local_data?.summary?.invalid_price_count ?? 0} />
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
@@ -338,6 +350,38 @@ export default function OperationsCenter() {
                     {(dataSources?.local_data?.recommendations || []).length > 0 && (
                         <div className="rounded-xl bg-amber-50 border border-amber-100 px-3 py-2 text-[11px] font-bold text-amber-700">
                             {dataSources?.local_data?.recommendations?.slice(0, 3).join('；')}
+                        </div>
+                    )}
+                    {(dataSources?.local_data?.summary?.abnormal_move_samples || []).length > 0 && (
+                        <div className="overflow-hidden rounded-xl border border-slate-100">
+                            <table className="w-full text-left text-[11px]">
+                                <thead className="bg-slate-50 text-slate-400 font-black">
+                                    <tr>
+                                        <th className="px-3 py-2">股票</th>
+                                        <th className="px-3 py-2">前收</th>
+                                        <th className="px-3 py-2">今开</th>
+                                        <th className="px-3 py-2">今收</th>
+                                        <th className="px-3 py-2">跳变</th>
+                                        <th className="px-3 py-2">归因</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100 bg-white">
+                                    {dataSources?.local_data?.summary?.abnormal_move_samples?.slice(0, 5).map(item => (
+                                        <tr key={item.code}>
+                                            <td className="px-3 py-2 font-black text-slate-700">{item.name || item.code}</td>
+                                            <td className="px-3 py-2 font-mono">{item.prev_close ?? '--'}</td>
+                                            <td className="px-3 py-2 font-mono">{item.open ?? '--'}</td>
+                                            <td className="px-3 py-2 font-mono">{item.close ?? '--'}</td>
+                                            <td className="px-3 py-2 font-mono text-rose-600">{item.close_jump_pct != null ? `${item.close_jump_pct}%` : '--'}</td>
+                                            <td className="px-3 py-2">
+                                                <span className="rounded-md bg-slate-50 px-2 py-1 font-black text-slate-500">
+                                                    {item.likely_reason === 'suspected_corporate_action_gap' ? '除权复权断点' : '待核查'}
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
                         </div>
                     )}
                 </section>
