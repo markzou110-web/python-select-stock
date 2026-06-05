@@ -150,6 +150,52 @@ def _position_action_label(signal: Dict[str, str] | None, pl_pct: float, stop_bu
     return "尾盘动作：弱势持有，不加仓，跌破执行风控需处理"
 
 
+def _position_breakout_confirmation(
+    curr: float,
+    entry: float,
+    active_stop: float,
+    pa: Dict[str, Any],
+    df_hist,
+) -> Dict[str, Any]:
+    """Build a concrete add-on checklist for profitable real positions."""
+    if df_hist is None or df_hist.empty or len(df_hist) < 21:
+        return {}
+
+    prior_high = float(df_hist["最高"].iloc[-21:-1].max())
+    avg_volume_20 = float(df_hist["成交量"].iloc[-21:-1].mean())
+    last = df_hist.iloc[-1]
+    open_price = float(last.get("开盘") or 0)
+    high_price = float(last.get("最高") or 0)
+    low_price = float(last.get("最低") or 0)
+    close_price = float(last.get("收盘") or curr)
+    last_volume = float(last.get("成交量") or 0)
+    trigger = float(pa.get("pa_entry_price") or prior_high or 0)
+    if trigger <= 0:
+        return {}
+
+    volume_threshold = avg_volume_20 * 1.4 if avg_volume_20 > 0 else 0
+    bar_range = max(high_price - low_price, 0.01)
+    close_position = (close_price - low_price) / bar_range
+    upper_shadow_pct = max(0.0, high_price - max(open_price, close_price)) / max(close_price, 0.01) * 100
+    guard = max(active_stop or 0, entry or 0, trigger * 0.985)
+
+    price_ok = curr >= trigger and close_price >= trigger
+    volume_ok = volume_threshold > 0 and last_volume >= volume_threshold
+    close_ok = close_price > open_price and close_position >= 0.6 and upper_shadow_pct < 3
+    confirmed = price_ok and volume_ok and close_ok
+
+    return {
+        "trigger": round(trigger, 2),
+        "guard": round(guard, 2),
+        "volume_threshold": int(volume_threshold) if volume_threshold > 0 else 0,
+        "volume_ratio": round(last_volume / volume_threshold, 2) if volume_threshold > 0 else 0,
+        "price_ok": price_ok,
+        "volume_ok": volume_ok,
+        "close_ok": close_ok,
+        "confirmed": confirmed,
+    }
+
+
 def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_limit: int = 5, sector_watch_limit: int = 3) -> List[Dict[str, Any]]:
     """
     Keep executable candidates and sector-confirmed observation candidates in Bark.
@@ -250,6 +296,7 @@ def _real_position_action(
     trend_damage = pa.get("pa_trend_damage") or ""
     plan = pa.get("pa_trade_plan") or {}
     pa_action = plan.get("action") or pa.get("pa_trade_action") or ""
+    breakout_plan = _position_breakout_confirmation(curr, entry, active_stop, pa, df_hist)
 
     if signals:
         sig = signals[0]
@@ -264,6 +311,9 @@ def _real_position_action(
     elif giveback_pct >= 5 and upper_shadow_pct >= 3:
         icon = "⚠️"
         action = "冲高回落明显，先锁定部分仓位，剩余按风控线持有"
+    elif breakout_plan.get("confirmed") and pl_pct > 0:
+        icon = "🟢"
+        action = "放量突破已确认，可小幅加仓；跌回突破价/动态线撤回加仓计划"
     elif pl_pct > 0 and stop_buffer is not None and stop_buffer >= 6:
         icon = "✅"
         action = "持有观察，盈利单用动态止盈线跟踪"
@@ -282,6 +332,19 @@ def _real_position_action(
         key_prices.append(f"结构线{structure_stop:.2f}")
 
     extras = []
+    if breakout_plan:
+        volume_text = f"量≥{breakout_plan['volume_threshold']}" if breakout_plan.get("volume_threshold") else "量≥20日均量1.4x"
+        status_bits = []
+        if breakout_plan.get("price_ok"):
+            status_bits.append("价✓")
+        if breakout_plan.get("volume_ok"):
+            status_bits.append("量✓")
+        if breakout_plan.get("close_ok"):
+            status_bits.append("收✓")
+        status_text = f"({','.join(status_bits)})" if status_bits else ""
+        extras.append(
+            f"加仓确认: 站上{breakout_plan['trigger']:.2f}/{volume_text}/守{breakout_plan['guard']:.2f}{status_text}"
+        )
     if trend_damage in {"跌破EMA20", "跌破EMA60", "短线低点破坏"}:
         extras.append(f"Brooks:{trend_damage}")
     elif pa.get("pa_failed_second_entry") == "失败H2":
