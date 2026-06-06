@@ -27,9 +27,57 @@ def test_ai_suggestion_uses_live_current_price_for_open_position():
 
     suggestion = _generate_ai_suggestion(df, stock_info, {"market_regime": "OFFENSIVE"})
 
-    assert suggestion["action"] == "CLOSE"
+    assert suggestion["action"] == "REDUCE"
     assert any("当前盈亏：-4.73%" in reason for reason in suggestion["reasoning"])
     assert any("距止损 1.3%" in reason for reason in suggestion["reasoning"])
+
+
+def test_ai_suggestion_does_not_close_healthy_position_only_for_critical_market():
+    df = pd.DataFrame({
+        "收盘": [21.99] * 25,
+        "RSI": [71.1] * 25,
+        "MACD_HIST": [0.1] * 24 + [0.2],
+        "EMA5": [22.5] * 25,
+        "EMA20": [21.5] * 25,
+        "EMA60": [20.5] * 25,
+    })
+    stock_info = {
+        "is_paper_trade": True,
+        "buy_price": 21.07,
+        "current_price": 21.99,
+        "stop_price": 21.28,
+        "structure_stop_price": 20.20,
+        "take_profit_price": 27.46,
+    }
+
+    suggestion = _generate_ai_suggestion(df, stock_info, {"market_regime": "CRITICAL"})
+
+    assert suggestion["action"] == "HOLD"
+    assert "保持仓位" in suggestion["action_label"]
+
+
+def test_ai_suggestion_closes_after_structure_invalidation():
+    df = pd.DataFrame({
+        "收盘": [20.0] * 25,
+        "RSI": [45.0] * 25,
+        "MACD_HIST": [-0.1] * 25,
+        "EMA5": [20.0] * 25,
+        "EMA20": [20.5] * 25,
+        "EMA60": [21.0] * 25,
+    })
+    stock_info = {
+        "is_paper_trade": True,
+        "buy_price": 21.07,
+        "current_price": 20.0,
+        "stop_price": 21.28,
+        "structure_stop_price": 20.20,
+        "take_profit_price": 27.46,
+    }
+
+    suggestion = _generate_ai_suggestion(df, stock_info, {"market_regime": "CRITICAL"})
+
+    assert suggestion["action"] == "CLOSE"
+    assert "跌破结构失效线 20.20" in suggestion["action_label"]
 
 
 def test_ai_suggestion_gives_trade_plan_for_watch_candidate():

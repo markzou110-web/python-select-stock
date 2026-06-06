@@ -679,6 +679,7 @@ def _generate_ai_suggestion(df, stock_info: dict, risk: dict, price_action: dict
     close = safe_float(stock_info.get("current_price"), float(df.iloc[-1]['收盘']))
     buy_price = stock_info.get("buy_price", close)
     stop_price = stock_info.get("stop_price", buy_price * 0.91)
+    structure_stop_price = safe_float(stock_info.get("structure_stop_price"))
     tp_price = stock_info.get("take_profit_price", buy_price * 1.15)
     rsi = float(df.iloc[-1].get('RSI', 50))
     macd_hist = float(df.iloc[-1].get('MACD_HIST', 0))
@@ -773,13 +774,19 @@ def _generate_ai_suggestion(df, stock_info: dict, risk: dict, price_action: dict
         "ADD": ("🟢 加仓", "text-emerald-600"),
     }
 
-    if stop_buffer < 2 or regime == "CRITICAL":
+    if structure_stop_price > 0 and close <= structure_stop_price:
         action = "CLOSE"
-        label_suffix = "风控触发，建议平仓保护本金"
+        label_suffix = f"跌破结构失效线 {structure_stop_price:.2f}，建议退出复核"
+    elif stop_buffer <= 0:
+        action = "REDUCE" if structure_stop_price > 0 else "CLOSE"
+        label_suffix = f"跌破执行风控线 {stop_price:.2f}，建议减仓并复核" if structure_stop_price > 0 else "跌破止损线，建议平仓保护本金"
+    elif stop_buffer < 2:
+        action = "REDUCE"
+        label_suffix = f"贴近执行风控线 {stop_price:.2f}，建议只减不加"
     elif score <= -3:
         action = "CLOSE"
         label_suffix = "多项指标转空，建议及时止盈止损"
-    elif score <= -1 or rsi > 80 or tp_distance <= 0:
+    elif score <= -1 or rsi > 80 or tp_distance <= 0 or (regime == "CRITICAL" and score < 0):
         action = "REDUCE"
         label_suffix = "动能减弱或目标达成，建议分批减仓"
     elif score >= 3 and stop_buffer > 10:
