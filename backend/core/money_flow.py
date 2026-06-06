@@ -237,7 +237,13 @@ def get_stock_money_flow(code: str, force_refresh: bool = False) -> Dict[str, An
         }
 
 
-def _normalise_rank_rows(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
+def _normalise_rank_rows(
+    df: pd.DataFrame,
+    limit: int,
+    source: str,
+    flow_metric: str,
+    metric_label: str,
+) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
     code_col = _pick_column(df, ["代码", "股票代码", "code"])
@@ -255,6 +261,9 @@ def _normalise_rank_rows(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
             "main_net_inflow": round(main_net, 2),
             "main_net_inflow_yi": _amount_yi(main_net),
             "main_net_ratio": round(_safe_float(row.get(ratio_col)), 2) if ratio_col else None,
+            "source": source,
+            "flow_metric": flow_metric,
+            "metric_label": metric_label,
         })
     return rows
 
@@ -274,7 +283,13 @@ def get_money_flow_rank(indicator: str = "今日", limit: int = 30, force_refres
             "indicator": indicator,
             "source": "eastmoney_akshare",
             "cache_hit": False,
-            "items": _normalise_rank_rows(raw, limit),
+            "items": _normalise_rank_rows(
+                raw,
+                limit,
+                source="eastmoney_akshare",
+                flow_metric="main_net_inflow",
+                metric_label="主力净流入",
+            ),
             "updated_at": datetime.now().isoformat(),
         }
         set_cached_data(cache_key, payload)
@@ -294,7 +309,13 @@ def get_money_flow_rank(indicator: str = "今日", limit: int = 30, force_refres
                 "indicator": indicator,
                 "source": "ths_akshare",
                 "cache_hit": False,
-                "items": _normalise_rank_rows(raw, limit),
+                "items": _normalise_rank_rows(
+                    raw,
+                    limit,
+                    source="ths_akshare",
+                    flow_metric="net_inflow",
+                    metric_label="资金净额",
+                ),
                 "updated_at": datetime.now().isoformat(),
             }
             set_cached_data(cache_key, payload)
@@ -329,7 +350,13 @@ def get_sector_money_flow_rank(
             "sector_type": sector_type,
             "source": "eastmoney_akshare",
             "cache_hit": False,
-            "items": _normalise_rank_rows(raw, limit),
+            "items": _normalise_rank_rows(
+                raw,
+                limit,
+                source="eastmoney_akshare",
+                flow_metric="sector_main_net_inflow",
+                metric_label="板块主力净流入",
+            ),
             "updated_at": datetime.now().isoformat(),
         }
         set_cached_data(cache_key, payload)

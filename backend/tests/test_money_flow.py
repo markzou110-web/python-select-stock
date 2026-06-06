@@ -77,8 +77,11 @@ def test_money_flow_rank_normalises_rows(monkeypatch):
     result = money_flow.get_money_flow_rank(indicator="5日", limit=5)
 
     assert result["status"] == "ok"
+    assert result["source"] == "eastmoney_akshare"
     assert result["items"][0]["code"] == "000001"
     assert result["items"][0]["main_net_inflow_yi"] == 3.0
+    assert result["items"][0]["flow_metric"] == "main_net_inflow"
+    assert result["items"][0]["metric_label"] == "主力净流入"
 
 
 def test_money_flow_rank_falls_back_to_ths(monkeypatch):
@@ -98,6 +101,8 @@ def test_money_flow_rank_falls_back_to_ths(monkeypatch):
     assert result["source"] == "ths_akshare"
     assert result["items"][0]["code"] == "301528"
     assert result["items"][0]["main_net_inflow_yi"] == 1.25
+    assert result["items"][0]["flow_metric"] == "net_inflow"
+    assert result["items"][0]["metric_label"] == "资金净额"
 
 
 def test_stock_money_flow_uses_rank_fallback(monkeypatch):

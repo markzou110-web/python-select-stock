@@ -44,10 +44,12 @@ BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
 
 def _money_flow_label(item: Dict[str, Any]) -> str:
     amount = float(item.get("main_net_inflow_yi") or 0)
+    is_main_metric = item.get("flow_metric") in (None, "main_net_inflow")
+    prefix = "主力" if is_main_metric else "资金净"
     if amount > 0:
-        return f"主力流入+{amount:.2f}亿"
+        return f"{prefix}流入+{amount:.2f}亿"
     if amount < 0:
-        return f"主力流出{amount:.2f}亿"
+        return f"{prefix}流出{amount:.2f}亿"
     return "资金中性"
 
 
@@ -81,6 +83,9 @@ def _apply_money_flow_to_results(results: List[Dict[str, Any]], flow_map: Dict[s
             "main_net_inflow_yi": item.get("main_net_inflow_yi"),
             "main_net_ratio": item.get("main_net_ratio"),
             "pct": item.get("pct"),
+            "source": item.get("source"),
+            "flow_metric": item.get("flow_metric"),
+            "metric_label": item.get("metric_label"),
         }
 
 
