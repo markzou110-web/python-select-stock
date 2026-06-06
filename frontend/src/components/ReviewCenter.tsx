@@ -375,15 +375,17 @@ function ChartCard({ title, data, xKey, barKey, suffix = "%" }: { title: string;
     return (
         <div className="glass-card p-6 h-[340px]">
             <h3 className="font-black text-slate-800 mb-4">{title}</h3>
-            <ResponsiveContainer width="100%" height="85%">
-                <BarChart data={data}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(148,163,184,0.18)" />
-                    <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: '#64748b', fontWeight: 700 }} />
-                    <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} />
-                    <Tooltip formatter={(v: any) => [`${v}${suffix}`, title]} />
-                    <Bar dataKey={barKey} fill="#6366f1" radius={[8, 8, 0, 0]} />
-                </BarChart>
-            </ResponsiveContainer>
+            <div className="h-[270px] min-w-0">
+                <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={data}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(148,163,184,0.18)" />
+                        <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: '#64748b', fontWeight: 700 }} />
+                        <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} />
+                        <Tooltip formatter={(v: any) => [`${v}${suffix}`, title]} />
+                        <Bar dataKey={barKey} fill="#6366f1" radius={[8, 8, 0, 0]} />
+                    </BarChart>
+                </ResponsiveContainer>
+            </div>
         </div>
     );
 }

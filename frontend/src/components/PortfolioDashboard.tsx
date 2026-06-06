@@ -49,7 +49,7 @@ const PortfolioDashboard: React.FC = () => {
     }, []);
 
     if (loading) return <div className="h-64 flex items-center justify-center"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div></div>;
-    if (!stats || !stats.risk_metrics.equity_curve) return <div className="p-8 text-center text-gray-500">暂无组合分析数据，请先进行模拟交易</div>;
+    if (!stats?.risk_metrics?.equity_curve) return <div className="p-8 text-center text-gray-500">暂无组合分析数据，请先进行模拟交易</div>;
 
     const metrics = stats.risk_metrics;
 

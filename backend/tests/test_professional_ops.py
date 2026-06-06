@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core.db import save_failure_sample, save_recommendation_events, save_scan_audit_log
 from core.models import Base
 from core.portfolio_risk import evaluate_portfolio_risk_budget
+from routers import paper_trade
 
 
 def test_scan_audit_log_persists_on_sqlite():
@@ -111,3 +112,25 @@ def test_portfolio_risk_budget_warns_on_exposure():
     assert result["status"] == "warning"
     assert any("行业" in item for item in result["warnings"])
     assert any("组合计划风险" in item for item in result["warnings"])
+
+
+def test_portfolio_stats_derives_pl_pct_from_trade_prices(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_trading (
+                code, name, entry_price, entry_date, current_price, close_price,
+                close_date, status, strategy_type, trade_mode
+            ) VALUES (
+                '000001', '平安银行', 10, '2025-05-30', 11, 11,
+                '2025-06-02', 'CLOSED', 'squeeze', 'SIMULATED'
+            )
+        """))
+
+    monkeypatch.setattr(paper_trade, "get_db_engine", lambda: engine)
+    result = paper_trade.get_portfolio_stats()
+
+    assert "error" not in result
+    assert result["risk_metrics"]["equity_curve"][-1]["equity"] == 110.0
+    assert result["attribution"]["by_industry"][0]["total_pnl"] == 10.0

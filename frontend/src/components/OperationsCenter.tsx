@@ -133,7 +133,7 @@ export default function OperationsCenter() {
         setLoadError(null);
         try {
             const [sourceRes, auditRes, failureRes, summaryRes, researchRes] = await Promise.allSettled([
-                api.get<DataSourceReport>('/api/system/data-sources', { timeout: 8000 }),
+                api.get<DataSourceReport>('/api/system/data-sources', { timeout: 20000 }),
                 api.get<ScanAudit[]>('/api/system/scan-audits', { params: { limit: 12 }, timeout: 8000 }),
                 api.get<FailureSample[]>('/api/system/failure-samples', { params: { limit: 12 }, timeout: 8000 }),
                 api.get<OpsSummary>('/api/system/ops-summary', { params: { limit: 60 }, timeout: 8000 }),

@@ -1131,7 +1131,12 @@ def get_portfolio_stats() -> Dict[str, Any]:
     
     try:
         # 1. 获取所有交易记录
-        df = pd.read_sql(text("SELECT * FROM paper_trading ORDER BY entry_date ASC"), engine)
+        df = pd.read_sql(text("""
+            SELECT p.*, COALESCE(s.industry, '未知') AS industry
+            FROM paper_trading p
+            LEFT JOIN stock_basic s ON s.code = p.code
+            ORDER BY p.entry_date ASC
+        """), engine)
         if df.empty:
             return {
                 "risk_metrics": {},
@@ -1140,6 +1145,13 @@ def get_portfolio_stats() -> Dict[str, Any]:
             }
         
         trades = df.to_dict('records')
+        for trade in trades:
+            entry_price = safe_float(trade.get("entry_price"))
+            exit_price = safe_float(
+                trade.get("close_price") if trade.get("status") == "CLOSED" else trade.get("current_price"),
+                entry_price,
+            )
+            trade["pl_pct"] = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
         
         # 2. 计算指标
         risk_metrics = calculate_risk_metrics(trades)
