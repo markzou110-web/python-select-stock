@@ -6,11 +6,13 @@ import api from '@/lib/api';
 import { useScanStore } from '@/stores/scanStore';
 import { cn } from '@/lib/utils';
 
+type StrategyParams = Record<string, string | number | boolean | null | undefined>;
+
 type StrategyTemplate = {
     id: number;
     name: string;
     strategy_type: string;
-    params: Record<string, unknown>;
+    params: StrategyParams;
     description?: string;
     is_default?: boolean;
 };
@@ -18,7 +20,7 @@ type StrategyTemplate = {
 type TemplateRecommendation = {
     profile: string;
     reason: string;
-    params: Record<string, unknown>;
+    params: StrategyParams;
 };
 
 export default function StrategyTemplatesView() {

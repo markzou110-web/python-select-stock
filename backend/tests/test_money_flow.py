@@ -44,6 +44,8 @@ def test_stock_money_flow_uses_cache(monkeypatch):
     assert second["cache_hit"] is True
     assert first["latest"]["main_net_inflow_yi"] == 1.0
     assert first["summary"]["bias"] == "inflow"
+    assert first["metric_label"] == "主力净流入"
+    assert first["supports_order_breakdown"] is True
 
 
 def test_stock_money_flow_returns_stale_cache_on_failure(monkeypatch):
@@ -121,3 +123,29 @@ def test_stock_money_flow_uses_rank_fallback(monkeypatch):
     assert result["status"] == "ok"
     assert result["rank_fallback"] is True
     assert result["latest"]["main_net_inflow_yi"] == 0.9
+    assert result["metric_label"] == "主力净流入"
+    assert result["supports_order_breakdown"] is True
+
+
+def test_stock_money_flow_marks_ths_rank_fallback_as_net_amount(monkeypatch):
+    monkeypatch.setattr(money_flow, "MIN_REQUEST_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(
+        money_flow.ak,
+        "stock_individual_fund_flow",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("stock endpoint blocked")),
+    )
+    monkeypatch.setattr(
+        money_flow.ak,
+        "stock_individual_fund_flow_rank",
+        lambda indicator: (_ for _ in ()).throw(RuntimeError("rank endpoint blocked")),
+    )
+    monkeypatch.setattr(money_flow.ak, "stock_fund_flow_individual", lambda symbol: pd.DataFrame([
+        {"股票代码": "000887", "股票简称": "中鼎股份", "净额": "4.35亿"}
+    ]))
+
+    result = money_flow.get_stock_money_flow("000887", force_refresh=True)
+
+    assert result["source"] == "ths_akshare_rank_fallback"
+    assert result["flow_metric"] == "net_inflow"
+    assert result["metric_label"] == "资金净额"
+    assert result["supports_order_breakdown"] is False

@@ -10,8 +10,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from core.logging_config import logger
-from core.db import get_db_engine, validate_stock_code, save_failure_sample
+from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db
 from core.data import get_market_snapshot, get_sector_map
+from core.indicators import calculate_indicators
+from core.price_action import analyze_price_action
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
 from core.risk_engine import compute_paper_risk_levels, safe_float
 from core.risk_constants import (
@@ -67,6 +69,18 @@ def _count_holding_trading_days(engine, code: str, entry_date: pd.Timestamp, now
     except Exception as exc:
         logger.warning(f"Failed to count trading hold days for {code}: {exc}")
     return _fallback_business_hold_days(entry_date, now)
+
+
+def _local_price_action_summary(engine, code: str) -> Dict[str, Any]:
+    try:
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        df = load_from_db(code, start_date, engine)
+        if df.empty:
+            return {}
+        return analyze_price_action(calculate_indicators(df, periods=[5, 10, 20, 60]))
+    except Exception as exc:
+        logger.warning(f"Local price action unavailable for {code}: {exc}")
+        return {}
 
 
 def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: str | None) -> Dict[str, Any] | None:
@@ -195,6 +209,21 @@ def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entr
         "instruction": instruction,
         "bands": operation_bands(trigger=trigger, guard=guard, active_stop=active_stop, structure_stop=structure_stop),
     }
+
+
+def _wind_control_decision(curr_price: float, risk_levels: Dict[str, Any], time_stop: Dict[str, Any] | None) -> Dict[str, Any]:
+    stop_level = safe_num(risk_levels.get("active_stop_price"))
+    if stop_level > 0 and curr_price <= stop_level:
+        return {
+            "reason": f"触发执行风控价 ¥{stop_level:.2f} ({risk_levels.get('risk_stage') or '风险控制'})",
+            "should_close": True,
+        }
+    if time_stop:
+        return {
+            "reason": str(time_stop.get("reason") or ""),
+            "should_close": bool(time_stop.get("should_close")),
+        }
+    return {"reason": "", "should_close": False}
 
 
 def _send_operation_trigger_notification(alerts: List[Dict[str, Any]]) -> None:
@@ -330,7 +359,7 @@ def get_open_trade_plans() -> Dict[str, Any]:
             entry = safe_float(row.get("entry_price"))
             current = safe_float(row.get("current_price"), entry)
             high = max(safe_float(row.get("high_since_entry"), entry), current)
-            risk = compute_paper_risk_levels(entry, high, current)
+            risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             items.append({
                 "id": int(row["id"]),
@@ -386,7 +415,7 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             live = snapshot_map.get(code, {})
             current = safe_float(live.get("price"), cached_current)
             high = max(safe_float(row.get("high_since_entry"), entry), safe_float(live.get("high"), current), current)
-            risk = compute_paper_risk_levels(entry, high, current)
+            risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, code))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             trigger = evaluate_operation_trigger(current, plan)
             if not trigger.get("triggered"):
@@ -462,7 +491,7 @@ def run_pre_trade_check(payload: Dict[str, Any]) -> Dict[str, Any]:
             entry = safe_float(row.get("entry_price"))
             current = current or safe_float(row.get("current_price"), entry)
             high = max(safe_float(row.get("high_since_entry"), entry), current)
-            risk = compute_paper_risk_levels(entry, high, current)
+            risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
         except Exception as exc:
             logger.error(f"Pre-trade plan resolve error: {exc}")
@@ -975,8 +1004,9 @@ def run_wind_control() -> Dict[str, Any]:
     
     止损规则优先级:
     1. 统一执行风控: 初始/结构/保本/移动风控取当前有效位
-    2. 大盘极端风控: 双指数破位时强制清仓
-    3. 时间风控: 按交易日分层预警/复核/确认平仓
+    2. 时间风控: 按交易日分层预警/复核/确认平仓
+
+    大盘环境用于限制新增仓位和辅助人工判断，不单独触发自动平仓。
     """
     engine = get_db_engine()
     if not engine: return {"status": "error"}
@@ -992,7 +1022,6 @@ def run_wind_control() -> Dict[str, Any]:
         # 获取当前大盘环境
         from core.data import get_market_regime
         regime = get_market_regime()
-        regime_status = regime.get("status", "UNKNOWN")
 
         closed_count = 0
         warned_real_count = 0
@@ -1018,24 +1047,15 @@ def run_wind_control() -> Dict[str, Any]:
             pl_pct = (curr_price - entry_price) / entry_price * 100
             
             # --- 风控逻辑判定 (按优先级, 使用统一风控引擎) ---
-            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price)
-            stop_level = risk_levels["active_stop_price"]
-            
-            reason = ""
-            should_close = True
-            if curr_price <= stop_level:
-                reason = f"触发执行风控价 ¥{stop_level:.2f} ({risk_levels['risk_stage']})"
-            elif regime_status == "CRITICAL":
-                reason = "大盘极度走弱 (双指数破位)，强制清仓避险"
-            else:
-                time_stop = _evaluate_time_stop(
-                    hold_trading_days,
-                    pl_pct,
-                    row.get("strategy_type"),
-                )
-                if time_stop:
-                    reason = time_stop["reason"]
-                    should_close = bool(time_stop["should_close"])
+            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, _local_price_action_summary(engine, str(code)))
+            time_stop = _evaluate_time_stop(
+                hold_trading_days,
+                pl_pct,
+                row.get("strategy_type"),
+            )
+            decision = _wind_control_decision(curr_price, risk_levels, time_stop)
+            reason = decision["reason"]
+            should_close = decision["should_close"]
 
             if reason:
                 # 生成更详细的智能备注

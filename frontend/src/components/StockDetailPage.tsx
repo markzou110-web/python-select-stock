@@ -72,8 +72,12 @@ interface FullAnalysisData {
 
 interface MoneyFlowData {
     status?: string;
+    source?: string;
     cache_hit?: boolean;
     updated_at?: string;
+    flow_metric?: string;
+    metric_label?: string;
+    supports_order_breakdown?: boolean;
     latest?: {
         main_net_inflow_yi?: number;
         main_net_ratio?: number;
@@ -185,6 +189,9 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const moneyLatest = moneyFlow.latest || {};
     const moneySummary = moneyFlow.summary || {};
     const moneyBias = moneySummary.bias || 'neutral';
+    const isMainMoneyFlow = moneyFlow.flow_metric === 'main_net_inflow'
+        || (!moneyFlow.flow_metric && !String(moneyFlow.source || '').startsWith('ths_'));
+    const moneyDirectionLabel = isMainMoneyFlow ? '主力资金' : '资金净额';
     const activeStopPrice = info.active_stop_price || info.stop_price || 0;
     const chartStrategy = data.signals?.strategy_type || info.chart_strategy_type || info.strategy_type || 'squeeze';
     const strategyLabels: Record<string, string> = {
@@ -646,7 +653,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                 {moneyFlow.cache_hit && <span className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-100 text-[10px] font-black text-slate-500">缓存</span>}
                             </div>
                             <div className="mt-1 text-base font-black text-slate-800">
-                                {moneyBias === 'inflow' ? '主力资金偏流入' : moneyBias === 'outflow' ? '主力资金偏流出' : '资金方向中性'}
+                                {moneyBias === 'inflow' ? `${moneyDirectionLabel}偏流入` : moneyBias === 'outflow' ? `${moneyDirectionLabel}偏流出` : '资金方向中性'}
                             </div>
                             <p className="mt-1 text-xs font-semibold text-slate-500">
                                 {moneySummary.consecutive_days
@@ -657,11 +664,11 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                         </div>
                     </div>
                     <div className="grid grid-cols-2 md:grid-cols-5 gap-2 min-w-0 lg:min-w-[620px]">
-                        <MoneyFlowItem label="今日主力" value={formatMoneyYi(moneyLatest.main_net_inflow_yi)} hot={Number(moneyLatest.main_net_inflow_yi || 0) > 0} />
-                        <MoneyFlowItem label="5日主力" value={formatMoneyYi(moneySummary.main_net_5d_yi)} hot={Number(moneySummary.main_net_5d_yi || 0) > 0} />
-                        <MoneyFlowItem label="净占比" value={moneyLatest.main_net_ratio == null ? '--' : `${Number(moneyLatest.main_net_ratio).toFixed(2)}%`} hot={Number(moneyLatest.main_net_ratio || 0) > 0} />
-                        <MoneyFlowItem label="超大单" value={formatMoneyYi(moneyLatest.super_net_inflow_yi)} hot={Number(moneyLatest.super_net_inflow_yi || 0) > 0} />
-                        <MoneyFlowItem label="大单" value={formatMoneyYi(moneyLatest.big_net_inflow_yi)} hot={Number(moneyLatest.big_net_inflow_yi || 0) > 0} />
+                        <MoneyFlowItem label={isMainMoneyFlow ? "今日主力" : "当前净额"} value={formatMoneyYi(moneyLatest.main_net_inflow_yi)} hot={Number(moneyLatest.main_net_inflow_yi || 0) > 0} />
+                        <MoneyFlowItem label={isMainMoneyFlow ? "5日主力" : "5日累计"} value={isMainMoneyFlow ? formatMoneyYi(moneySummary.main_net_5d_yi) : '--'} hot={isMainMoneyFlow && Number(moneySummary.main_net_5d_yi || 0) > 0} />
+                        <MoneyFlowItem label="净占比" value={isMainMoneyFlow && moneyLatest.main_net_ratio != null ? `${Number(moneyLatest.main_net_ratio).toFixed(2)}%` : '--'} hot={isMainMoneyFlow && Number(moneyLatest.main_net_ratio || 0) > 0} />
+                        <MoneyFlowItem label="超大单" value={isMainMoneyFlow ? formatMoneyYi(moneyLatest.super_net_inflow_yi) : '--'} hot={isMainMoneyFlow && Number(moneyLatest.super_net_inflow_yi || 0) > 0} />
+                        <MoneyFlowItem label="大单" value={isMainMoneyFlow ? formatMoneyYi(moneyLatest.big_net_inflow_yi) : '--'} hot={isMainMoneyFlow && Number(moneyLatest.big_net_inflow_yi || 0) > 0} />
                     </div>
                 </div>
             </div>

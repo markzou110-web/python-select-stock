@@ -197,6 +197,9 @@ def get_stock_money_flow(code: str, force_refresh: bool = False) -> Dict[str, An
         raw = _throttled_call(ak.stock_individual_fund_flow, stock=code, market=_market_for_code(code))
         df = _normalise_stock_flow(raw)
         payload = _summarise_stock_flow(code, df, "eastmoney_akshare", cache_hit=False)
+        payload["flow_metric"] = "main_net_inflow"
+        payload["metric_label"] = "主力净流入"
+        payload["supports_order_breakdown"] = True
         set_cached_data(cache_key, payload)
         return payload
     except Exception as exc:
@@ -219,6 +222,9 @@ def get_stock_money_flow(code: str, force_refresh: bool = False) -> Dict[str, An
             payload = _summarise_stock_flow(code, df, f"{rank.get('source', 'rank')}_rank_fallback", cache_hit=False)
             payload["rank_fallback"] = True
             payload["source_status"] = rank.get("status")
+            payload["flow_metric"] = match.get("flow_metric") or "main_net_inflow"
+            payload["metric_label"] = match.get("metric_label") or "主力净流入"
+            payload["supports_order_breakdown"] = payload["flow_metric"] == "main_net_inflow"
             set_cached_data(cache_key, payload)
             return payload
         stale = get_stale_cache(cache_key)

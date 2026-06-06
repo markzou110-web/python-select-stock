@@ -10,6 +10,7 @@ from core.models import Base
 from routers.paper_trade import (
     _count_holding_trading_days,
     _evaluate_time_stop,
+    _wind_control_decision,
 )
 
 
@@ -64,3 +65,20 @@ def test_squeeze_strategy_uses_slower_time_stop():
 
     assert result is not None
     assert result["severity"] == "warning"
+
+
+def test_wind_control_only_closes_on_price_or_confirmed_time_stop():
+    healthy_risk = {"active_stop_price": 21.28, "risk_stage": "保本保护"}
+
+    hold = _wind_control_decision(21.99, healthy_risk, None)
+    warning = _wind_control_decision(
+        21.99,
+        healthy_risk,
+        {"reason": "时间风控预警", "should_close": False},
+    )
+    stop = _wind_control_decision(21.20, healthy_risk, None)
+
+    assert hold == {"reason": "", "should_close": False}
+    assert warning == {"reason": "时间风控预警", "should_close": False}
+    assert stop["should_close"] is True
+    assert "21.28" in stop["reason"]
