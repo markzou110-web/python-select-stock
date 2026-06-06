@@ -41,6 +41,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _money_text_to_yuan(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace(",", "").strip()
+    if text in {"", "-", "--"}:
+        return default
+    multiplier = 1.0
+    if text.endswith("亿"):
+        multiplier = 100000000.0
+        text = text[:-1]
+    elif text.endswith("万"):
+        multiplier = 10000.0
+        text = text[:-1]
+    return _safe_float(text, default) * multiplier
+
+
 def _pick_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for col in candidates:
         if col in df.columns:
@@ -183,6 +201,26 @@ def get_stock_money_flow(code: str, force_refresh: bool = False) -> Dict[str, An
         return payload
     except Exception as exc:
         logger.warning(f"Money flow fetch failed for {code}: {exc}")
+        rank = get_money_flow_rank(indicator="今日", limit=6000, force_refresh=force_refresh)
+        match = next((item for item in rank.get("items", []) if str(item.get("code", "")).zfill(6) == code), None)
+        if match:
+            main_net = _money_text_to_yuan(match.get("main_net_inflow"))
+            df = pd.DataFrame([{
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "close": None,
+                "pct": match.get("pct"),
+                "main_net_inflow": main_net,
+                "main_net_ratio": match.get("main_net_ratio") or 0,
+                "super_net_inflow": 0.0,
+                "big_net_inflow": 0.0,
+                "medium_net_inflow": 0.0,
+                "small_net_inflow": 0.0,
+            }])
+            payload = _summarise_stock_flow(code, df, f"{rank.get('source', 'rank')}_rank_fallback", cache_hit=False)
+            payload["rank_fallback"] = True
+            payload["source_status"] = rank.get("status")
+            set_cached_data(cache_key, payload)
+            return payload
         stale = get_stale_cache(cache_key)
         if stale is not None:
             return {**stale, "status": "stale", "cache_hit": True, "error": str(exc)[:120]}
@@ -202,16 +240,16 @@ def get_stock_money_flow(code: str, force_refresh: bool = False) -> Dict[str, An
 def _normalise_rank_rows(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
-    code_col = _pick_column(df, ["代码", "code"])
-    name_col = _pick_column(df, ["名称", "name"])
+    code_col = _pick_column(df, ["代码", "股票代码", "code"])
+    name_col = _pick_column(df, ["名称", "股票简称", "name"])
     pct_col = _pick_column(df, ["涨跌幅", "涨跌幅%"])
-    main_col = _pick_column(df, ["主力净流入-净额", "主力净流入净额", "主力净流入"])
+    main_col = _pick_column(df, ["主力净流入-净额", "主力净流入净额", "主力净流入", "资金流入净额", "净额"])
     ratio_col = _pick_column(df, ["主力净流入-净占比", "主力净占比"])
     rows = []
     for _, row in df.head(limit).iterrows():
-        main_net = _safe_float(row.get(main_col)) if main_col else 0.0
+        main_net = _money_text_to_yuan(row.get(main_col)) if main_col else 0.0
         rows.append({
-            "code": str(row.get(code_col, "")) if code_col else "",
+            "code": str(row.get(code_col, "")).zfill(6) if code_col else "",
             "name": row.get(name_col, "") if name_col else "",
             "pct": round(_safe_float(row.get(pct_col)), 2) if pct_col else None,
             "main_net_inflow": round(main_net, 2),
@@ -223,7 +261,7 @@ def _normalise_rank_rows(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
 
 def get_money_flow_rank(indicator: str = "今日", limit: int = 30, force_refresh: bool = False) -> Dict[str, Any]:
     indicator = indicator if indicator in {"今日", "3日", "5日", "10日"} else "今日"
-    limit = max(1, min(int(limit), 100))
+    limit = max(1, min(int(limit), 6000))
     cache_key = f"money_flow_rank_{indicator}_{limit}"
     if not force_refresh:
         cached = get_cached_data(cache_key, RANK_FLOW_TTL_SECONDS)
@@ -242,6 +280,27 @@ def get_money_flow_rank(indicator: str = "今日", limit: int = 30, force_refres
         set_cached_data(cache_key, payload)
         return payload
     except Exception as exc:
+        logger.warning(f"Eastmoney money flow rank failed, trying THS fallback: {exc}")
+        try:
+            ths_symbol = {
+                "今日": "即时",
+                "3日": "3日排行",
+                "5日": "5日排行",
+                "10日": "10日排行",
+            }[indicator]
+            raw = _throttled_call(ak.stock_fund_flow_individual, symbol=ths_symbol)
+            payload = {
+                "status": "ok",
+                "indicator": indicator,
+                "source": "ths_akshare",
+                "cache_hit": False,
+                "items": _normalise_rank_rows(raw, limit),
+                "updated_at": datetime.now().isoformat(),
+            }
+            set_cached_data(cache_key, payload)
+            return payload
+        except Exception as fallback_exc:
+            logger.warning(f"THS money flow rank fallback failed: {fallback_exc}")
         stale = get_stale_cache(cache_key)
         if stale is not None:
             return {**stale, "status": "stale", "cache_hit": True, "error": str(exc)[:120]}

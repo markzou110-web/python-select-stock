@@ -51,7 +51,7 @@ def _money_flow_label(item: Dict[str, Any]) -> str:
     return "资金中性"
 
 
-def _build_scan_money_flow_map(limit: int = 500) -> Dict[str, Dict[str, Any]]:
+def _build_scan_money_flow_map(limit: int = 6000) -> Dict[str, Dict[str, Any]]:
     try:
         rank = get_money_flow_rank(indicator="今日", limit=limit, force_refresh=False)
         items = rank.get("items") or []
@@ -1022,7 +1022,7 @@ def perform_market_scan(
         except Exception as e:
             logger.error(f"Failed to load fundamentals: {e}")
 
-        money_flow_map = _build_scan_money_flow_map(limit=500)
+        money_flow_map = _build_scan_money_flow_map(limit=6000)
 
         # 并发扫描逻辑 - 执行策略筛选和周线确认
         workers = 24  # 向量化后主压力在周线重采样，可提高并发

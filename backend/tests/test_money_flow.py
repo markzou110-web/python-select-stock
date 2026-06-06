@@ -58,6 +58,8 @@ def test_stock_money_flow_returns_stale_cache_on_failure(monkeypatch):
         raise RuntimeError("rate limited")
 
     monkeypatch.setattr(money_flow.ak, "stock_individual_fund_flow", fail_flow)
+    monkeypatch.setattr(money_flow.ak, "stock_individual_fund_flow_rank", lambda indicator: (_ for _ in ()).throw(RuntimeError("rank blocked")))
+    monkeypatch.setattr(money_flow.ak, "stock_fund_flow_individual", lambda symbol: (_ for _ in ()).throw(RuntimeError("ths blocked")))
     stale = money_flow.get_stock_money_flow("600000", force_refresh=True)
 
     assert first["status"] == "ok"
@@ -77,3 +79,40 @@ def test_money_flow_rank_normalises_rows(monkeypatch):
     assert result["status"] == "ok"
     assert result["items"][0]["code"] == "000001"
     assert result["items"][0]["main_net_inflow_yi"] == 3.0
+
+
+def test_money_flow_rank_falls_back_to_ths(monkeypatch):
+    monkeypatch.setattr(money_flow, "MIN_REQUEST_INTERVAL_SECONDS", 0)
+
+    def fail_eastmoney(indicator):
+        raise RuntimeError("eastmoney blocked")
+
+    monkeypatch.setattr(money_flow.ak, "stock_individual_fund_flow_rank", fail_eastmoney)
+    monkeypatch.setattr(money_flow.ak, "stock_fund_flow_individual", lambda symbol: pd.DataFrame([
+        {"股票代码": "301528", "股票简称": "多浦乐", "涨跌幅": "13.62%", "净额": "1.25亿"}
+    ]))
+
+    result = money_flow.get_money_flow_rank(indicator="今日", limit=6000, force_refresh=True)
+
+    assert result["status"] == "ok"
+    assert result["source"] == "ths_akshare"
+    assert result["items"][0]["code"] == "301528"
+    assert result["items"][0]["main_net_inflow_yi"] == 1.25
+
+
+def test_stock_money_flow_uses_rank_fallback(monkeypatch):
+    monkeypatch.setattr(money_flow, "MIN_REQUEST_INTERVAL_SECONDS", 0)
+
+    def fail_stock(**_kwargs):
+        raise RuntimeError("stock endpoint blocked")
+
+    monkeypatch.setattr(money_flow.ak, "stock_individual_fund_flow", fail_stock)
+    monkeypatch.setattr(money_flow.ak, "stock_individual_fund_flow_rank", lambda indicator: pd.DataFrame([
+        {"代码": "301528", "名称": "多浦乐", "主力净流入-净额": 90000000, "主力净流入-净占比": 5.2}
+    ]))
+
+    result = money_flow.get_stock_money_flow("301528", force_refresh=True)
+
+    assert result["status"] == "ok"
+    assert result["rank_fallback"] is True
+    assert result["latest"]["main_net_inflow_yi"] == 0.9
