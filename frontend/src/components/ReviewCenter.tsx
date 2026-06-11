@@ -165,10 +165,20 @@ export default function ReviewCenter() {
                 <TableCard title="市场环境表现" rows={data?.by_market_regime || []} nameKey="regime" />
             </div>
 
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="情绪阶段表现" rows={data?.by_market_sentiment || []} nameKey="stage" />
+                <TableCard title="机会分区间表现" rows={data?.by_opportunity_bucket || []} nameKey="bucket" />
+            </div>
+
             <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
                 <TableCard title="板块阶段表现" rows={data?.by_sector_phase || []} nameKey="phase" />
                 <TableCard title="板块角色表现" rows={data?.by_sector_role || []} nameKey="role" />
                 <TableCard title="板块联动表现" rows={data?.by_sector_alignment || []} nameKey="bucket" />
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <TableCard title="主流级别表现" rows={data?.by_sector_mainline || []} nameKey="mainline" />
+                <TableCard title="交易状态表现" rows={data?.by_trade_state || []} nameKey="state" />
             </div>
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">

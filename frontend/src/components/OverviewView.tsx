@@ -5,6 +5,7 @@ import { Activity, Bell, Database, PieChart, Search, Target, TrendingUp } from '
 import { cn } from '@/lib/utils';
 import { useMarketStore } from '@/stores/marketStore';
 import { useScanStore } from '@/stores/scanStore';
+import MarketSentiment from '@/components/MarketSentiment';
 
 interface OverviewViewProps {
     onNavigate: (view: string) => void;
@@ -44,6 +45,8 @@ export default function OverviewView({ onNavigate }: OverviewViewProps) {
                 <OverviewCard icon={<TrendingUp size={20} />} label="大盘指数" value={`${Object.keys(indices || {}).length}`} sub={Object.entries(indices || {})[0]?.[0] || "等待加载"} color="text-emerald-600 bg-emerald-50" />
                 <OverviewCard icon={<PieChart size={20} />} label="领涨板块" value={topSector?.name || "暂无"} sub={topSector?.pct !== undefined ? `${topSector.pct >= 0 ? '+' : ''}${topSector.pct}%` : `${sectors?.length || 0} 个板块`} color="text-rose-600 bg-rose-50" />
             </div>
+
+            <MarketSentiment />
 
             <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
                 <QuickAction icon={<Search size={20} />} title="从个股开始" body="检索任意股票，直接进入深度分析与观察池。" onClick={() => onNavigate('search')} />

@@ -35,6 +35,7 @@ from core.price_action import analyze_price_action
 from core.risk_engine import compute_paper_risk_levels
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
+from core.decision_layer import apply_decision_layer
 from routers.market import fetch_mine_sweeper_data
 
 
@@ -94,13 +95,21 @@ def _pa_plan_action(res: Dict[str, Any]) -> str:
     return str(plan.get('action') or res.get('pa_trade_action') or "").upper()
 
 
-def _daily_limit_tolerance_pct(code: str) -> float:
+def _daily_limit_pct(code: str) -> float:
     code = str(code or "")
     if code.startswith(("43", "83", "87", "88", "92")):
-        return 30.5
+        return 30.0
     if code.startswith(("300", "301", "688", "689")):
-        return 20.5
-    return 10.5
+        return 20.0
+    return 10.0
+
+
+def _near_limit_pct(code: str) -> float:
+    return _daily_limit_pct(code) - 0.2
+
+
+def _daily_limit_tolerance_pct(code: str) -> float:
+    return _daily_limit_pct(code) + 0.5
 
 
 def _is_abnormal_price_move(code: str, pct: Any) -> bool:
@@ -141,6 +150,7 @@ def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
         adjustment -= 4
     if (res.get('pa_multi_timeframe_score') or 0) <= -25:
         adjustment -= 4
+    adjustment += float(res.get('pa_eight_rule_score_delta') or 0)
     return max(-20.0, min(20.0, adjustment))
 
 
@@ -189,11 +199,13 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("缺少价格行为交易计划")
     if setup in BLOCKED_PA_SETUPS:
         blockers.append(f"{setup}结构不进入交易池")
+    if res.get('pa_pullback_status') == 'INVALIDATED':
+        blockers.append("回踩结构失效")
     if res.get('sector_trend') == 'DOWN':
         blockers.append("板块下跌")
     if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
         blockers.append("板块扩散转弱")
-    if float(res.get('涨幅%', 0) or 0) >= 9.8:
+    if float(res.get('涨幅%', 0) or 0) >= _near_limit_pct(res.get('代码')):
         blockers.append("涨停/近涨停，等待隔日确认")
     elif float(res.get('涨幅%', 0) or 0) > 7:
         blockers.append("涨幅偏高，等待回踩确认")
@@ -247,14 +259,13 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         vetoes = []
         checks = []
         bonuses = []
+        risks = []
 
         # ── 一票否决 ──
-        if res.get('涨幅%', 0) > 7:
-            vetoes.append("涨幅>7%")
         if res.get('影线比', 0) > 0.5:
             vetoes.append("上影线过长")
         if res.get('pct_5d', 0) > 15:
-            vetoes.append("5日涨>15%")
+            risks.append("5日涨幅>15%，排序扣分")
         if res.get('warnings') and len(res['warnings']) > 0:
             vetoes.append("地雷预警")
         if 0 < res.get('mkt_cap_yi', 0) < 30:
@@ -325,10 +336,13 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         res['sop_vetoes'] = vetoes
         res['sop_checks'] = checks
         res['sop_bonuses'] = bonuses
+        res['sop_risks'] = risks
         brooks_adjustment = _brooks_rank_adjustment(res)
         res['brooks_rank_adjustment'] = brooks_adjustment
         res['final_rank_score'] = round(float(res.get('Score') or 0) + brooks_adjustment, 2)
         res['final_rank_score'] = round(res['final_rank_score'] + min(12, max(0, float(res.get('sector_alignment_score') or 0) - 50) * 0.24), 2)
+        if res.get('pct_5d', 0) > 15:
+            res['final_rank_score'] = round(res['final_rank_score'] - 6, 2)
         if brooks_adjustment >= 6:
             bonuses.append("Brooks结构加分")
         if brooks_adjustment <= -6:
@@ -1306,6 +1320,10 @@ def perform_market_scan(
         for res in results:
             res['market_regime'] = market_regime.get('status', 'UNKNOWN')
         _apply_money_flow_to_results(results, money_flow_map)
+        decision_context = apply_decision_layer(results, snapshot_df, market_regime)
+        audit_payload["version_snapshot"]["decision_layer"] = "market-mainline-leadership-v1"
+        audit_payload["params_snapshot"]["market_sentiment_stage"] = decision_context.get("market_sentiment_stage")
+        audit_payload["params_snapshot"]["portfolio_position_cap_pct"] = decision_context.get("portfolio_position_cap_pct")
         logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
                     f"B={sum(1 for r in results if r.get('sop_grade')=='B')}, "
                     f"M={sum(1 for r in results if r.get('sop_grade')=='M')}, "
@@ -1314,7 +1332,14 @@ def perform_market_scan(
 
         # 按 SOP 等级排序: A > B > M > C > D, 同等级内按 Brooks/板块调整后的 Score 排序
         grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4}
-        results = sorted(results, key=lambda x: (grade_order.get(x.get('sop_grade', 'D'), 4), -x.get('final_rank_score', x.get('Score', 0))))
+        results = sorted(
+            results,
+            key=lambda x: (
+                grade_order.get(x.get('sop_grade', 'D'), 4),
+                -float(x.get('trade_opportunity_score') or 0),
+                -float(x.get('final_rank_score', x.get('Score', 0)) or 0),
+            ),
+        )
 
         # Update Sentinel memory (仅 A/B 级)
         from core.sentinel import sentinel, _select_intraday_push_stocks

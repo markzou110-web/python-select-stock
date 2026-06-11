@@ -44,6 +44,24 @@ def classify_sector_role(
     return "LAGGARD"
 
 
+def classify_mainline_sector(sector: Dict[str, Any]) -> str:
+    """Classify sector tradability as mainline, secondary, rotation, fading, or non-main."""
+    phase = sector.get("sector_phase")
+    rank = int(sector.get("sector_rank") or 999)
+    score = float(sector.get("sector_momentum_score") or 0)
+    breadth = float(sector.get("sector_breadth") or 0)
+    pct_5d = float(sector.get("sector_5d_pct") or 0)
+    if phase == "SECTOR_FADE":
+        return "FADING"
+    if phase == "SECTOR_CONFIRM" and rank <= 3 and score >= 75 and breadth >= 65:
+        return "MAIN"
+    if phase in {"SECTOR_CONFIRM", "SECTOR_EARLY"} and rank <= 8 and score >= 58:
+        return "SECONDARY"
+    if score >= 50 and pct_5d > 0:
+        return "ROTATION"
+    return "NON_MAIN"
+
+
 def build_sector_history_context(engine, sector_map: Dict[str, str], lookback: int = 6) -> Dict[str, Dict[str, Any]]:
     """Build recent 3/5-day sector context from local daily_k data."""
     if engine is None or not sector_map:
@@ -187,4 +205,5 @@ def build_sector_strength(
     ranked = sorted(result.items(), key=lambda item: item[1]['sector_momentum_score'], reverse=True)
     for rank, (industry, data) in enumerate(ranked, start=1):
         data['sector_rank'] = rank
+        data['sector_mainline'] = classify_mainline_sector(data)
     return result

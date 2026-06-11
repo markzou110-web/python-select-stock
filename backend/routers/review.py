@@ -32,9 +32,13 @@ def _empty_response() -> Dict[str, Any]:
         "by_trade_bucket": [],
         "execution_summary": {},
         "by_market_regime": [],
+        "by_market_sentiment": [],
         "by_next_open_gap": [],
         "by_sector_phase": [],
         "by_sector_role": [],
+        "by_sector_mainline": [],
+        "by_trade_state": [],
+        "by_opportunity_bucket": [],
         "by_sector_alignment": [],
         "data_quality": {},
         "recommendation_events": [],
@@ -65,8 +69,12 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE((price_action_detail->>'final_trade_score')::float, score, 0) AS final_trade_score,
                 COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers,
                 COALESCE(price_action_detail->>'market_regime', 'UNKNOWN') AS market_regime,
+                COALESCE(price_action_detail->>'market_sentiment_stage', 'UNKNOWN') AS market_sentiment_stage,
                 COALESCE(price_action_detail->>'sector_phase', 'UNKNOWN') AS sector_phase,
                 COALESCE(price_action_detail->>'sector_role', 'UNKNOWN') AS sector_role,
+                COALESCE(price_action_detail->>'sector_mainline', 'UNKNOWN') AS sector_mainline,
+                COALESCE(price_action_detail->>'trade_state', 'UNKNOWN') AS trade_state,
+                COALESCE((price_action_detail->>'trade_opportunity_score')::float, 0) AS trade_opportunity_score,
                 COALESCE((price_action_detail->>'sector_alignment_score')::float, 0) AS sector_alignment_score,
                 COALESCE((price_action_detail->>'sector_relative_pct')::float, 0) AS sector_relative_pct,
                 CASE
@@ -104,8 +112,12 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.final_trade_score,
                 s.trade_blockers,
                 s.market_regime,
+                s.market_sentiment_stage,
                 s.sector_phase,
                 s.sector_role,
+                s.sector_mainline,
+                s.trade_state,
+                s.trade_opportunity_score,
                 s.sector_alignment_score,
                 s.sector_relative_pct,
                 s.pa_trap_risk_bucket,
@@ -223,9 +235,18 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         by_pa_trap_risk = metric_frame(df.groupby("pa_trap_risk_bucket", dropna=False), "risk")
         by_trade_bucket = metric_frame(df.groupby("trade_bucket", dropna=False), "bucket")
         by_market_regime = metric_frame(df.groupby("market_regime", dropna=False), "regime")
+        by_market_sentiment = metric_frame(df.groupby("market_sentiment_stage", dropna=False), "stage")
         by_next_open_gap = metric_frame(df.groupby("next_open_gap_bucket", dropna=False), "bucket")
         by_sector_phase = metric_frame(df.groupby("sector_phase", dropna=False), "phase")
         by_sector_role = metric_frame(df.groupby("sector_role", dropna=False), "role")
+        by_sector_mainline = metric_frame(df.groupby("sector_mainline", dropna=False), "mainline")
+        by_trade_state = metric_frame(df.groupby("trade_state", dropna=False), "state")
+        df["opportunity_bucket"] = pd.cut(
+            pd.to_numeric(df["trade_opportunity_score"], errors="coerce").fillna(0),
+            bins=[-1, 59.99, 69.99, 79.99, 89.99, 1000],
+            labels=["<60", "60-69", "70-79", "80-89", "90+"],
+        )
+        by_opportunity_bucket = metric_frame(df.groupby("opportunity_bucket", observed=False), "bucket")
         by_sector_alignment = metric_frame(df.groupby("sector_alignment_bucket", dropna=False), "bucket")
 
         ret_1d_all = df["ret_1d"].dropna()
@@ -304,9 +325,13 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_pa_trap_risk": by_pa_trap_risk,
             "by_trade_bucket": by_trade_bucket,
             "by_market_regime": by_market_regime,
+            "by_market_sentiment": by_market_sentiment,
             "by_next_open_gap": by_next_open_gap,
             "by_sector_phase": by_sector_phase,
             "by_sector_role": by_sector_role,
+            "by_sector_mainline": by_sector_mainline,
+            "by_trade_state": by_trade_state,
+            "by_opportunity_bucket": by_opportunity_bucket,
             "by_sector_alignment": by_sector_alignment,
             "data_quality": data_quality,
             "execution_summary": execution_summary,

@@ -10,8 +10,11 @@ import asyncio
 
 from core.config import config
 from core.logging_config import logger
-from core.db import get_setting
-from core.trading_calendar import is_a_share_intraday_session
+from core.db import get_setting, save_setting
+from core.trading_calendar import (
+    is_a_share_after_close_sync_window,
+    is_a_share_intraday_session,
+)
 from core.operation_plan import position_health_score, position_size_advice, price_instruction
 
 
@@ -84,6 +87,23 @@ def _brooks_alert_line(stock: Dict[str, Any]) -> Optional[str]:
         summary = stock.get('pa_decision_summary')
         return f"  Brooks: {summary[:44]}..." if summary and len(summary) > 44 else (f"  Brooks: {summary}" if summary else None)
     return f"  Brooks: {' / '.join(alerts[:4])}"
+
+
+def _pullback_alert_line(stock: Dict[str, Any]) -> Optional[str]:
+    label = stock.get("pa_pullback_status_label")
+    if not label:
+        return None
+    support = stock.get("pa_pullback_support_price")
+    confirmation = stock.get("pa_pullback_confirmation_price")
+    invalidation = stock.get("pa_pullback_invalidation_price")
+    prices = []
+    if support:
+        prices.append(f"支撑{support}")
+    if confirmation:
+        prices.append(f"确认>{confirmation}")
+    if invalidation:
+        prices.append(f"失效<{invalidation}")
+    return f"  回踩判断: {label}{' | ' + ' / '.join(prices) if prices else ''}"
 
 
 def _sector_alignment_line(stock: Dict[str, Any]) -> Optional[str]:
@@ -269,14 +289,131 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
     return selected
 
 
-def _send_bark_message(title: str, body: str) -> None:
+def _select_after_close_watchlist(stock_list: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+    """Select next-day observation candidates without presenting blocked stocks as opportunities."""
+    grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4}
+    candidates = [
+        stock for stock in stock_list
+        if (
+            (
+                stock.get('sop_grade') in {'A', 'B', 'M', 'C'}
+                or float(stock.get('trade_opportunity_score') or 0) >= 60
+            )
+            and stock.get('trade_bucket') != 'BLOCK'
+            and not stock.get('sector_watch_only')
+        )
+    ]
+    return sorted(
+        candidates,
+        key=lambda stock: (
+            grade_order.get(stock.get('sop_grade'), 4),
+            -float(stock.get('final_trade_score', stock.get('Score', 0)) or 0),
+        ),
+    )[:limit]
+
+
+def _after_close_price(stock: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = stock.get(key)
+        if value not in (None, "", 0):
+            try:
+                return round(float(value), 2)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _build_after_close_watchlist_body(stock_list: List[Dict[str, Any]], scan_date: str) -> str:
+    first = stock_list[0] if stock_list else {}
+    lines = [
+        f"数据日期：{scan_date}",
+        f"市场：{first.get('market_sentiment_label', '--')} | 情绪分 {first.get('market_sentiment_score', '--')} | 总仓上限 {first.get('portfolio_position_cap_pct', '--')}%",
+        "性质：次日观察清单，不是买入指令；高开或冲高时不追价。",
+        "执行：次日仅在触发价上方站稳且量能确认后复核，跌破失效价立即取消计划。",
+        "",
+    ]
+    for stock in stock_list:
+        name = stock.get('名称') or stock.get('name') or ''
+        code = stock.get('代码') or stock.get('code') or ''
+        grade = stock.get('sop_grade') or '?'
+        current = _after_close_price(stock, '现价', 'price')
+        entry = _after_close_price(stock, 'entry_price', 'pa_entry_price')
+        stop = _after_close_price(stock, 'plan_stop_price', 'stop_price', 'pa_stop_price')
+        blockers = stock.get('trade_blockers') or []
+        if isinstance(blockers, str):
+            blocker_text = blockers.strip("[]'\" ")
+        else:
+            blocker_text = "、".join(str(item) for item in blockers[:2])
+
+        lines.append(f"【{grade}级观察】{name} ({code}) | 收盘 {current if current else '--'}")
+        lines.append(
+            f"  定位：{stock.get('sector_mainline', '--')} / {stock.get('sector_role', '--')}"
+            f" | 机会分 {stock.get('trade_opportunity_score', '--')} | {stock.get('trade_opportunity_label', '观望')}"
+        )
+        lines.append(f"  确认：站稳 >{entry if entry else '--'} 且量能确认，再考虑小仓复核")
+        lines.append(f"  失效：跌破 <{stop if stop else '--'}，取消观察/不得买入")
+        lines.append(f"  当前：等待确认，不追高{f'；原因：{blocker_text}' if blocker_text else ''}")
+        if stock.get("execution_instruction"):
+            lines.append(f"  指令：{stock['execution_instruction']}")
+        brooks_line = _brooks_alert_line(stock)
+        if brooks_line:
+            lines.append(brooks_line)
+        pullback_line = _pullback_alert_line(stock)
+        if pullback_line:
+            lines.append(pullback_line)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def send_after_close_watchlist(
+    stock_list: List[Dict[str, Any]],
+    scan_date: Optional[str] = None,
+    now: Optional[datetime] = None,
+    limit: int = 5,
+) -> Optional[str]:
+    """Push one actionable next-day observation list after a same-day close scan."""
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    scan_date = scan_date or (stock_list[0].get('data_date') if stock_list else None)
+    if not stock_list or not is_a_share_after_close_sync_window(now) or scan_date != today:
+        return None
+    if get_setting("after_close_watchlist_last_date") == today:
+        logger.info("Sentinel: after-close watchlist already pushed today.")
+        return None
+
+    selected = _select_after_close_watchlist(stock_list, limit=limit)
+    if not selected:
+        logger.info("Sentinel: no qualified after-close observation candidates.")
+        return None
+
+    body = _build_after_close_watchlist_body(selected, today)
+    try:
+        from core.db import get_db_engine, save_recommendation_events
+        save_recommendation_events(
+            selected,
+            engine=get_db_engine(),
+            source="bark_next_day",
+            event_date=today,
+        )
+    except Exception as exc:
+        logger.warning(f"After-close recommendation event persistence skipped: {exc}")
+
+    if not _send_bark_message(f"Alpha Vision 次日观察清单 {today}", body):
+        return None
+    save_setting("after_close_watchlist_last_date", today)
+    return body
+
+
+def _send_bark_message(title: str, body: str) -> bool:
     logger.info(f"Notification: {body}")
 
     from core.notifier import notifier
     try:
         asyncio.run(notifier.send(title, body, channels=["bark"]))
+        return True
     except Exception as e:
         logger.error(f"Push notification failed: {e}")
+        return False
 
 
 def _real_position_action(
@@ -313,6 +450,7 @@ def _real_position_action(
     trend_damage = pa.get("pa_trend_damage") or ""
     plan = pa.get("pa_trade_plan") or {}
     pa_action = plan.get("action") or pa.get("pa_trade_action") or ""
+    eight_rule = pa.get("pa_eight_rule_primary") or {}
     breakout_plan = _position_breakout_confirmation(curr, entry, active_stop, pa, df_hist)
 
     if signals:
@@ -325,6 +463,9 @@ def _real_position_action(
     elif pa_action == "AVOID" and trap_risk >= 75 and pl_pct <= 0:
         icon = "⚠️"
         action = "价格行为转弱且高陷阱风险，尾盘不加仓，考虑降到观察仓"
+    elif eight_rule.get("direction") == "RISK" and float(eight_rule.get("confidence") or 0) >= 80:
+        icon = "⚠️"
+        action = f"八诀风险触发：{eight_rule.get('label')}，停止加仓并复核减仓"
     elif giveback_pct >= 5 and upper_shadow_pct >= 3:
         icon = "⚠️"
         action = "冲高回落明显，先锁定部分仓位，剩余按风控线持有"
@@ -372,6 +513,11 @@ def _real_position_action(
         extras.append(f"陷阱风险{trap_risk:.0f}%")
     if volume_pattern in {"放量失败突破", "缩量阴跌"}:
         extras.append(volume_pattern)
+    if eight_rule:
+        trigger = eight_rule.get("trigger_price")
+        invalidation = eight_rule.get("invalidation_price")
+        price_text = f">{trigger}" if eight_rule.get("direction") == "BULLISH" and trigger else f"<{invalidation}" if invalidation else ""
+        extras.append(f"八诀:{eight_rule.get('label')} {price_text}".strip())
     health = position_health_score(
         pl_pct=pl_pct,
         stop_buffer_pct=stop_buffer or 0,
@@ -551,6 +697,11 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
 
     lines = [
         f"大盘：{regime_str}",
+        (
+            f"情绪：{push_stocks[0].get('market_sentiment_label', '--')}"
+            f" {push_stocks[0].get('market_sentiment_score', '--')}分"
+            f" | 总仓上限 {push_stocks[0].get('portfolio_position_cap_pct', '--')}%"
+        ),
         f"策略：{strategy_label} | 数据：实时快照优先，失败回退daily_k",
         "执行：候选≠指令；买入只在14:40-14:55确认，14:57后不追单",
         "确认：接近入场价、未跌破失效价、无冲高回落长上影",
@@ -590,7 +741,13 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
 
             score_text = f" | 交易分: {final_score}" if final_score is not None else ""
             lines.append(f"{grade_icon} {grade}级 {name} ({code}){score_text}")
+            lines.append(
+                f"  定位: {s.get('sector_mainline', '--')} / {s.get('sector_role', '--')}"
+                f" | 机会分 {s.get('trade_opportunity_score', '--')} | {s.get('trade_opportunity_label', '观望')}"
+            )
             lines.append(f"  {_candidate_action_label(s)}")
+            if s.get("execution_instruction"):
+                lines.append(f"  明确指令: {s['execution_instruction']}")
             if s.get('sector_watch_only'):
                 lines.extend(_sector_watch_advice_lines(s))
             if sector:
@@ -604,6 +761,17 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
             brooks_line = _brooks_alert_line(s)
             if brooks_line:
                 lines.append(brooks_line)
+            pullback_line = _pullback_alert_line(s)
+            if pullback_line:
+                lines.append(pullback_line)
+            eight_rule = s.get("pa_eight_rule_primary") or {}
+            if eight_rule:
+                trigger = eight_rule.get("trigger_price")
+                invalidation = eight_rule.get("invalidation_price")
+                lines.append(
+                    f"  八诀: {eight_rule.get('label')} {eight_rule.get('confidence')}%"
+                    f" | 确认>{trigger if trigger else '--'} | 失效<{invalidation if invalidation else '--'}"
+                )
             bonuses = s.get('sop_bonuses', [])
             if bonuses:
                 lines.append(f"  ⭐ {'、'.join(bonuses)}")

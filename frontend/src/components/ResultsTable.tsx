@@ -444,6 +444,16 @@ export default function ResultsTable({
                             pct3d={res.sector_3d_pct}
                             pct5d={res.sector_5d_pct}
                         />
+                        {res.sector_mainline && (
+                            <div className="text-[9px] font-black text-slate-600">
+                                {res.sector_mainline} · 领导力 {res.leadership_score?.toFixed(0) ?? '--'}
+                            </div>
+                        )}
+                        {res.trade_opportunity_score != null && (
+                            <div className="text-[9px] font-black text-blue-700">
+                                机会分 {res.trade_opportunity_score.toFixed(0)} · {res.trade_opportunity_label}
+                            </div>
+                        )}
                     </div>
                 </td>
 
@@ -586,6 +596,7 @@ export default function ResultsTable({
                                             <div className="flex flex-wrap gap-1.5">
                                                 {res.sop_checks?.map((c, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-emerald-50 text-emerald-600 rounded-full font-bold border border-emerald-100">✅ {c}</span>)}
                                                 {res.sop_bonuses?.map((b, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-amber-50 text-amber-600 rounded-full font-bold border border-amber-100">⭐ {b}</span>)}
+                                                {res.sop_risks?.map((r, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-orange-50 text-orange-600 rounded-full font-bold border border-orange-100">⚠️ {r}</span>)}
                                                 {res.sop_vetoes?.map((v, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-rose-50 text-rose-500 rounded-full font-bold border border-rose-100">❌ {v}</span>)}
                                             </div>
                                         </div>
@@ -629,7 +640,7 @@ export default function ResultsTable({
                                                     </div>
                                                     <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
                                                         <BrooksInfo label="回调结构" value={res.pa_pullback_structure || '--'} note={res.pa_pullback_legs != null ? `${res.pa_pullback_legs} 腿回调` : '等待结构确认'} />
-                                                        <BrooksInfo label="突破质量" value={res.pa_breakout_quality || '--'} note="K线实体与收盘位置" tone="blue" />
+                                                        <BrooksInfo label="回踩有效性" value={res.pa_pullback_status_label || '--'} note={res.pa_pullback_confirmation_price ? `确认 >${res.pa_pullback_confirmation_price} · 失效 <${res.pa_pullback_invalidation_price || '--'}` : '等待价量确认'} tone={res.pa_pullback_status === 'CONFIRMED' ? "emerald" : res.pa_pullback_status === 'INVALIDATED' ? "rose" : "slate"} />
                                                         <BrooksInfo label="失败风险" value={explainFailureRisk(res.pa_failure_risk)} note="假突破/上影/位置风险" tone={(res.pa_failure_risk || 0) >= 70 ? "rose" : undefined} />
                                                         <BrooksInfo label="陷阱风险" value={explainFailureRisk(res.pa_trap_risk)} note={res.pa_failed_breakout_type || '多头陷阱风险'} tone={(res.pa_trap_risk || 0) >= 70 ? "rose" : undefined} />
                                                     </div>

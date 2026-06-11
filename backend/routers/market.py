@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import time
 import akshare as ak
 import pandas as pd
+from sqlalchemy import text
 
 from core.logging_config import logger
 from core.data import (
@@ -13,6 +14,7 @@ from core.data import (
     get_sector_map,
     get_sector_trends,
     get_cached_data,
+    get_stale_cache,
     set_cached_data,
 )
 from core.db import get_db_engine
@@ -21,6 +23,41 @@ from core.sector_strength import build_sector_strength, build_sector_history_con
 router = APIRouter(prefix="/api", tags=["market"])
 
 _mine_sweeper_cache = {"data": None, "timestamp": 0}
+
+
+def _get_local_market_snapshot(engine) -> pd.DataFrame:
+    """Build a fast snapshot from the latest two locally stored trading days."""
+    if engine is None:
+        return pd.DataFrame()
+    try:
+        df = pd.read_sql(text("""
+            WITH recent_dates AS (
+                SELECT DISTINCT date
+                FROM daily_k
+                ORDER BY date DESC
+                LIMIT 2
+            )
+            SELECT d.code, d.date, d.close, d.high, d.low, d.vol, s.name
+            FROM daily_k d
+            LEFT JOIN stock_basic s ON s.code = d.code
+            WHERE d.date IN (SELECT date FROM recent_dates)
+            ORDER BY d.code, d.date
+        """), engine)
+    except Exception as exc:
+        logger.warning(f"Local market snapshot unavailable: {exc}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["close"]).sort_values(["code", "date"])
+    df["pct_chg"] = df.groupby("code")["close"].pct_change() * 100
+    latest = df.groupby("code", as_index=False).tail(1).copy()
+    latest["pct_chg"] = latest["pct_chg"].fillna(0).round(2)
+    latest["price"] = latest["close"]
+    latest["turnover"] = 0
+    return latest[["code", "name", "price", "high", "low", "pct_chg", "vol", "turnover"]]
 
 
 def fetch_mine_sweeper_data() -> Dict[str, List[str]]:
@@ -122,11 +159,23 @@ def get_sector_strength(limit: int = 20, force: bool = False):
             cached = get_cached_data(cache_key, 300)
             if cached:
                 return {**cached, "cache_hit": True}
+            stale = get_stale_cache(cache_key)
+            if stale:
+                return {**stale, "cache_hit": True, "cache_stale": True}
 
-        snapshot = get_market_snapshot()
+        engine = get_db_engine()
+        if force:
+            snapshot = get_market_snapshot()
+            sector_trends = get_sector_trends()
+        else:
+            snapshot = get_cached_data("market_snapshot", 300)
+            if snapshot is None:
+                snapshot = get_stale_cache("market_snapshot")
+            if snapshot is None:
+                snapshot = _get_local_market_snapshot(engine)
+            sector_trends = get_cached_data("sector_trends", 600) or get_stale_cache("sector_trends") or {}
         sector_map = get_sector_map()
-        sector_trends = get_sector_trends()
-        history_context = build_sector_history_context(get_db_engine(), sector_map)
+        history_context = build_sector_history_context(engine, sector_map)
         strength = build_sector_strength(snapshot, sector_map, sector_trends, history_context)
         if not strength:
             return {"items": [], "updated_at": datetime.now().isoformat()}
@@ -239,13 +288,25 @@ def get_market_sentiment():
         if up_count + down_count > 0:
             ratio = up_count / (up_count + down_count)
             score = int(ratio * 100)
-            
+
+        from core.data import get_market_regime as get_market_regime_data
+        from core.decision_layer import build_market_decision_context
+
+        engine = get_db_engine()
+        snapshot = get_cached_data("market_snapshot", 300)
+        if snapshot is None:
+            snapshot = get_stale_cache("market_snapshot")
+        if snapshot is None:
+            snapshot = _get_local_market_snapshot(engine)
+        decision = build_market_decision_context(snapshot, get_market_regime_data())
+
         return {
             "date": latest_date.strftime("%Y-%m-%d"),
             "limit_up_count": up_count,
             "limit_down_count": down_count,
             "max_streak": max_streak,
-            "sentiment_score": score
+            "sentiment_score": decision.get("market_sentiment_score", score),
+            **decision,
         }
     except Exception as e:
         logger.error(f"Error fetching market sentiment: {e}")

@@ -162,7 +162,7 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
         logger.info(f"Checkpoint {slot} skipped: market closed.")
         return "Market closed"
 
-    summary = {"slot": slot, "operation_alerts": 0, "watch_alerts": 0, "pruned": 0}
+    summary = {"slot": slot, "operation_alerts": 0, "watch_alerts": 0, "pruned": 0, "next_day_push": 0}
     try:
         from routers.paper_trade import check_operation_triggers
         from routers.watchlist import auto_prune_watchlist, check_watchlist_triggers, refresh_watchlist_decisions
@@ -179,6 +179,15 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
             refresh_watchlist_decisions()
             pruned = auto_prune_watchlist(max_watch_days=15)
             summary["pruned"] = int(pruned.get("updated") or 0)
+
+        if slot == "after_close_review":
+            from core.db import get_scan_history_by_date
+            from core.sentinel import send_after_close_watchlist
+
+            scan_date = now.strftime("%Y-%m-%d")
+            scan_results = get_scan_history_by_date(scan_date)
+            pushed_body = send_after_close_watchlist(scan_results, scan_date=scan_date, now=now)
+            summary["next_day_push"] = 1 if pushed_body else 0
 
         logger.info(f"Intraday checkpoint completed: {summary}")
         return summary

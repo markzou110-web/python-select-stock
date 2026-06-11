@@ -41,6 +41,7 @@ export interface ScanResult {
     sop_vetoes?: string[];
     sop_checks?: string[];
     sop_bonuses?: string[];
+    sop_risks?: string[];
     entry_price?: number;
     stop_price?: number;
     plan_stop_price?: number;
@@ -62,12 +63,29 @@ export interface ScanResult {
     sector_alignment_score?: number;
     sector_relative_pct?: number;
     sector_role?: 'LEADER' | 'CORE' | 'FOLLOWER' | 'LAGGARD' | string;
+    sector_mainline?: 'MAIN' | 'SECONDARY' | 'ROTATION' | 'FADING' | 'NON_MAIN' | string;
+    leadership_score?: number;
     sector_3d_pct?: number;
     sector_5d_pct?: number;
     sector_consecutive_up_days?: number;
     sector_trend_slope?: number;
     brooks_rank_adjustment?: number;
     final_rank_score?: number;
+    market_sentiment_stage?: 'ICE' | 'REPAIR' | 'ADVANCE' | 'CLIMAX' | 'RETREAT' | string;
+    market_sentiment_label?: string;
+    market_sentiment_score?: number;
+    portfolio_position_cap_pct?: number;
+    trade_opportunity_score?: number;
+    trade_opportunity_label?: string;
+    trade_state?: 'BLOCKED' | 'WATCHLIST' | 'PROBE' | 'CONFIRM_ADD' | 'TREND_HOLD' | string;
+    execution_instruction?: string;
+    position_plan?: {
+        label: string;
+        initial_position_pct: number;
+        max_position_pct: number;
+        portfolio_position_cap_pct: number;
+    };
+    decision_score_components?: Record<string, number>;
     price_action_score?: number;
     price_action_regime?: string;
     price_action_signal?: string;
@@ -84,6 +102,21 @@ export interface ScanResult {
     pa_tags?: string[];
     pa_pullback_legs?: number;
     pa_pullback_structure?: string;
+    pa_pullback_status?: 'WAITING_PULLBACK' | 'PENDING_CONFIRMATION' | 'CONFIRMED' | 'INVALIDATED';
+    pa_pullback_status_label?: string;
+    pa_pullback_support_price?: number;
+    pa_pullback_confirmation_price?: number;
+    pa_pullback_invalidation_price?: number;
+    pa_pullback_action?: string;
+    pa_pullback_validity?: {
+        status: string;
+        label: string;
+        score: number;
+        action: string;
+        pullback_volume_ratio?: number | null;
+        confirmation_volume_ratio?: number | null;
+        checks: Array<{ key: string; label: string; passed: boolean }>;
+    };
     pa_breakout_quality?: string;
     pa_failure_risk?: number;
     pa_entry_quality_score?: number;
@@ -112,6 +145,18 @@ export interface ScanResult {
     pa_trend_phase?: string;
     pa_trend_phase_action?: string;
     pa_decision_summary?: string;
+    pa_eight_rule_primary?: {
+        rule_id: string;
+        rule_code: string;
+        label: string;
+        direction: 'RISK' | 'BULLISH';
+        confidence: number;
+        score_delta: number;
+        action: string;
+        trigger_price?: number | null;
+        invalidation_price?: number | null;
+        note: string;
+    } | null;
     pa_trade_action?: 'READY' | 'WATCH' | 'WAIT' | 'AVOID' | string;
     pa_trade_setup?: string;
     pa_risk_pct?: number;
@@ -160,24 +205,6 @@ export interface ScanParams {
     local_only: boolean;
     data_date: string;
     stop_loss_pct: number;
-}
-
-interface ScanPreflightCheck {
-    name: string;
-    status: 'ok' | 'warn' | 'error';
-    message: string;
-}
-
-interface ScanPreflightResult {
-    status: 'ok' | 'warn' | 'error';
-    blocking: boolean;
-    message: string;
-    checks: ScanPreflightCheck[];
-    summary: {
-        selected_date?: string;
-        stock_count?: number;
-        ready_history_count?: number;
-    };
 }
 
 export interface ScanProgress {
@@ -258,7 +285,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
 
     startScan: async () => {
         let ws: WebSocket | null = null;
-        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在执行扫描预检..." } });
+        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在向后台提交扫描任务..." } });
         const startTime = Date.now();
 
         try {
@@ -270,30 +297,6 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                     delete cleanParams[paramKey];
                 }
             });
-
-            const preflightRes = await api.get<ScanPreflightResult>('/api/scan/preflight', {
-                params: {
-                    data_date: cleanParams.data_date || undefined,
-                    min_history_days: cleanParams.min_data_days || 120,
-                }
-            });
-            const preflight = preflightRes.data;
-            if (preflight.blocking) {
-                alert(`扫描预检未通过\n\n${preflight.checks.map(item => item.message).join('\n')}`);
-                set({ isScanning: false, scanProgress: null });
-                return;
-            }
-            if (preflight.status === 'warn') {
-                const shouldContinue = window.confirm(
-                    `扫描预检存在风险：\n\n${preflight.checks.map(item => item.message).join('\n')}\n\n仍要继续扫描吗？`
-                );
-                if (!shouldContinue) {
-                    set({ isScanning: false, scanProgress: null });
-                    return;
-                }
-            }
-
-            set({ scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在向后台提交扫描任务..." } });
 
             ws = connectScanWebSocket((msg) => {
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);

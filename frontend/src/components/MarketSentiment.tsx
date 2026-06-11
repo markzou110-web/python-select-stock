@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import api from '@/lib/api';
 import { 
     AreaChart, Area, XAxis, YAxis, CartesianGrid, 
-    Tooltip, ResponsiveContainer, ReferenceLine 
+    Tooltip, ResponsiveContainer
 } from 'recharts';
 
 interface SentimentData {
@@ -11,6 +11,10 @@ interface SentimentData {
     limit_down_count: number;
     max_streak: number;
     sentiment_score: number;
+    market_sentiment_label?: string;
+    portfolio_position_cap_pct?: number;
+    market_allowed_actions?: string[];
+    market_forbidden_actions?: string[];
     error?: string;
 }
 
@@ -30,22 +34,28 @@ const MarketSentiment: React.FC = () => {
         const fetchAll = async () => {
             try {
                 setLoading(true);
-                const [sentimentRes, historyRes] = await Promise.all([
+                const [sentimentResult, historyResult] = await Promise.allSettled([
                     api.get('/api/market/sentiment'),
                     api.get('/api/market/sentiment/history')
                 ]);
 
+                if (sentimentResult.status === 'rejected') {
+                    throw sentimentResult.reason;
+                }
+
+                const sentimentRes = sentimentResult.value;
                 if (sentimentRes.data.error) {
                     setError(sentimentRes.data.error);
                 } else {
                     setData(sentimentRes.data);
                 }
 
-                if (Array.isArray(historyRes.data)) {
+                if (historyResult.status === 'fulfilled' && Array.isArray(historyResult.value.data)) {
+                    const historyRes = historyResult.value;
                     setHistory(historyRes.data);
                 }
-            } catch (err: any) {
-                setError(err.message || "Failed to fetch sentiment data");
+            } catch (err: unknown) {
+                setError(err instanceof Error ? err.message : "Failed to fetch sentiment data");
             } finally {
                 setLoading(false);
             }
@@ -110,7 +120,10 @@ const MarketSentiment: React.FC = () => {
                                 {data.sentiment_score}
                             </div>
                         </div>
-                        <div className={`mt-2 text-xs font-black ${scoreColor}`}>{statusText}</div>
+                        <div className={`mt-2 text-xs font-black ${scoreColor}`}>{data.market_sentiment_label || statusText}</div>
+                        <div className="mt-1 text-[10px] font-bold text-slate-500">
+                            总仓上限 {data.portfolio_position_cap_pct ?? '--'}%
+                        </div>
                     </div>
 
                     <div className="flex-1 w-full grid grid-cols-3 gap-3">
@@ -168,6 +181,15 @@ const MarketSentiment: React.FC = () => {
                             正在建立历史通道...
                         </div>
                     )}
+                </div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px] font-semibold">
+                <div className="border-l-2 border-emerald-500 pl-2 text-emerald-700">
+                    允许：{data.market_allowed_actions?.join('、') || '等待市场信号'}
+                </div>
+                <div className="border-l-2 border-rose-500 pl-2 text-rose-700">
+                    禁止：{data.market_forbidden_actions?.join('、') || '无'}
                 </div>
             </div>
             

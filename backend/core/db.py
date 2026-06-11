@@ -57,7 +57,9 @@ PRICE_ACTION_DETAIL_KEYS = [
     "price_action_entry_quality", "price_action_summary", "price_action_risks",
     "pa_market_cycle", "pa_range_location", "pa_entry_price", "pa_stop_price",
     "pa_target_price", "pa_risk_reward", "pa_tags", "pa_pullback_legs",
-    "pa_pullback_structure", "pa_breakout_quality", "pa_failure_risk",
+    "pa_pullback_structure", "pa_pullback_validity", "pa_pullback_status",
+    "pa_pullback_status_label", "pa_pullback_support_price", "pa_pullback_confirmation_price",
+    "pa_pullback_invalidation_price", "pa_pullback_action", "pa_breakout_quality", "pa_failure_risk",
     "pa_entry_quality_score", "pa_h2_quality", "pa_range_rule",
     "pa_failed_breakout_type", "pa_trap_risk", "pa_micro_channel",
     "pa_always_in_strength", "pa_trend_damage", "pa_channel_state",
@@ -67,13 +69,20 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_gap_type", "pa_gap_risk", "pa_range_width_quality",
     "pa_range_center_risk", "pa_range_failed_breakout_count",
     "pa_trend_phase", "pa_trend_phase_action", "pa_decision_summary",
+    "pa_eight_rules", "pa_eight_rule_primary", "pa_eight_rule_score_delta",
+    "pa_eight_rule_risk_delta",
     "pa_trade_plan", "trade_eligible", "trade_bucket", "trade_blockers",
     "final_trade_score", "trade_timeframe", "exit_hint",
     "market_regime",
-    "sop_grade", "sop_action", "sector_momentum_score", "sector_breadth",
+    "sop_grade", "sop_action", "sop_risks", "sector_momentum_score", "sector_breadth",
     "sector_phase", "sector_rank", "sector_alignment_score", "sector_relative_pct",
     "sector_3d_pct", "sector_5d_pct", "sector_consecutive_up_days", "sector_role",
+    "sector_mainline", "leadership_score",
     "sector_watch_only", "sector_watch_reason",
+    "market_sentiment_stage", "market_sentiment_label", "market_sentiment_score",
+    "portfolio_position_cap_pct", "market_allowed_actions", "market_forbidden_actions", "market_breadth",
+    "trade_opportunity_score", "trade_opportunity_label", "decision_score_components",
+    "position_plan", "trade_state", "execution_instruction",
 ]
 
 
@@ -318,6 +327,10 @@ def init_db(engine=None):
                     """))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recommendation_events_date ON recommendation_events(event_date DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recommendation_events_code_date ON recommendation_events(code, event_date DESC);"))
+                conn.execute(text("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_recommendation_events_identity
+                    ON recommendation_events(event_date, source, code, strategy_type)
+                """))
                 logger.info("Migration: recommendation event log ensured.")
             except Exception as e:
                 logger.debug(f"recommendation event migration skipped: {e}")
@@ -481,6 +494,14 @@ def save_recommendation_events(
                         :pa_trade_action, :pa_trade_setup, :pa_entry_price, :pa_stop_price,
                         :sector_phase, :market_regime, :blockers, :status, :created_at
                     )
+                    ON CONFLICT (event_date, source, code, strategy_type) DO UPDATE SET
+                        event_time = excluded.event_time,
+                        recommendation_price = excluded.recommendation_price,
+                        score = excluded.score,
+                        trade_bucket = excluded.trade_bucket,
+                        final_trade_score = excluded.final_trade_score,
+                        blockers = excluded.blockers,
+                        status = excluded.status
                 """), rows)
             else:
                 conn.execute(text("""
