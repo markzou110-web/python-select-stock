@@ -25,7 +25,7 @@
 | | 11 | 弱市收紧已有仓位止损 | ✅ | 弱市(bear/volatile) -9%→-6% |
 | | 12 | 组合级熔断（日内亏损上限） | ✅ | 日内亏损超 -5% 暂停新开仓 |
 | **第四优先级（测量验证）** | 13 | 度量口径统一（回撤/胜率/profit factor） | ✅ | 调参基础一致（修复回撤 bug） |
-| | 14 | 走查前推 / 样本外测试 | 🔲 | 暴露过拟合 |
+| | 14 | 走查前推 / 样本外测试 | ✅ | IS/OOS 拆分暴露过拟合 |
 | | 15 | 回测加基准 alpha | ✅ | 区分能力与 β |
 | | 16 | 止损穿越缺口建模 | ✅ | 不再低估真实亏损 |
 | | 17 | failure_samples 学习闭环 | ✅ | 失败形态反哺过滤 |
@@ -34,7 +34,8 @@
 **Phase 2 已完成 4 项**（#3、#5、#6、#11，231 passed）。
 **Phase 3 已完成 3 项**（#7、#10、#12，251 passed）。
 **Phase 4 已完成 4 项**（#13、#15、#16、#17，265 passed）。
-**累计完成 16 / 17 项**，剩余 1 项（#14 走查前推，需重写批量实验，改动最大）留作后续迭代。
+**Phase 5 已完成 1 项**（#14，269 passed）。
+**🎉 全部 17 / 17 项已完成。**
 
 ---
 
@@ -187,13 +188,13 @@
 
 ---
 
-### 🔲 #14 走查前推 / 样本外测试
+### ✅ #14 走查前推 / 样本外测试
 
-**问题**：grep `walk.?forward|out.of.sample|样本外` 在应用代码**零匹配**。`batch_experiment.py` 在全样本跑；`strategy_health.py` 用滚动 120 日，但阈值就是用这段历史调出来的——经典样本内偏差。报告的 60% 胜率样本外可能是 50%。
+**问题**：`batch_experiment.py` 在全样本跑，报告的是**样本内**指标——阈值就是用这段历史调出来的，经典样本内偏差。报告 60% 胜率样本外可能 50%。
 
-**建议**：在 `batch_experiment.py` 加滚动 90 训练/30 测试拆分 + 新增 `/walk-forward` 端点。需重写批量实验，改动最大。
+**已完成方案**：`batch_experiment.py` 新增 `run_walk_forward_experiment`（不改原 `run_batch_experiment`，向后兼容）：按 `train_ratio`（默认 0.7）把日期拆成 train(IS)/test(OOS)，**先在全量上算指标再按时间切**（保证 test 段指标窗口完整），分别回测对比。每只股返回 `in_sample`/`out_of_sample`/`overfit_gap`（OOS胜率-IS胜率，正值=稳健、负值=过拟合）。`overfit_gap < -10` 触发 `overfit_warning`。`backtest.py` 新增 `POST /api/backtest/walk-forward` 端点。
 
-**证据**：`backend/core/batch_experiment.py:9-61`、`backend/core/strategy_health.py:25`
+**证据 / 改动文件**：`backend/core/batch_experiment.py`、`backend/routers/backtest.py`、`backend/tests/test_batch_experiment.py`（+4 测试）
 
 ---
 
@@ -344,6 +345,32 @@
 
 ---
 
-## Phase 5 规划（待实施）
+## Phase 5 实施详情（已完成 — 17/17 全部完成）
 
-剩余 1 项（#14 走查前推 / 样本外测试）——需重写 `batch_experiment` 加 train/test 拆分 + 新增 `/walk-forward` 端点，改动最大，建议作为独立批次谨慎推进。
+**范围**：#14 走查前推 / 样本外测试（最后一项）。
+
+**验证**：`pytest tests/ -q` → **269 passed, 0 failed**（Phase 4 基线 265 → 新增 4 个测试）
+
+**涉及文件**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/core/batch_experiment.py` | 新增 `run_walk_forward_experiment` + `_split_df_by_ratio`（不改原函数） |
+| `backend/routers/backtest.py` | 新增 `POST /api/backtest/walk-forward` 端点 |
+| `backend/tests/test_batch_experiment.py` | +4 测试（拆分顺序/数据不足/返回结构/过拟合标记） |
+
+**新增可配置常量**：`DEFAULT_TRAIN_RATIO`（0.7）、`OVERFIT_WARNING_GAP`（10.0）
+
+---
+
+## 🎉 全部 17 项优化已完成
+
+| 阶段 | 提交 | 项数 | 测试 |
+|---|---|---|---|
+| 数据同步 + Phase 1 | `3acfabb98` | 6 | 220 |
+| Phase 2 | `647fe473f` | 4 | 231 |
+| Phase 3 | `9bb6b8fb9` | 3 | 251 |
+| Phase 4 | `c8c9a883f` | 4 | 265 |
+| Phase 5 | （本次） | 1 | 269 |
+
+所有改动均通过全量回归（269 passed），不破坏现有功能。实时风控相关改动（止损/减仓/止盈/弱市收紧/日内熔断/盘中高频检查）需在下一交易日开盘最终验证。

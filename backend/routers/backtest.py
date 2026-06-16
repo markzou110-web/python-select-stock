@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from core.backtest_lab import run_single_stock_backtest
 from core.db import get_db_engine, load_from_db, validate_stock_code
 from core.indicators import calculate_indicators, calculate_pine_indicators
-from core.batch_experiment import run_batch_experiment
+from core.batch_experiment import run_batch_experiment, run_walk_forward_experiment
 from core.data import get_index_hist
 from core.strategy_registry import list_strategies, supported_backtest_strategies
 
@@ -112,3 +112,25 @@ def run_batch_backtest(payload: Dict[str, Any]):
     if not engine:
         raise HTTPException(status_code=503, detail="Database unavailable")
     return run_batch_experiment(engine, codes, strategy_type, payload)
+
+
+@router.post("/walk-forward")
+def run_walk_forward_backtest(payload: Dict[str, Any]):
+    """改动 #14：走查前推 / 样本外测试。
+
+    把日期范围按 train_ratio 拆成训练段(样本内)和测试段(样本外)，分别回测，
+    对比 IS/OOS 指标以暴露过拟合（OOS 胜率明显低于 IS → 过拟合警告）。
+    """
+    raw_codes = payload.get("codes") or []
+    if isinstance(raw_codes, str):
+        raw_codes = raw_codes.replace("，", ",").split(",")
+    codes = list(dict.fromkeys(str(code).strip() for code in raw_codes if str(code).strip()))
+    if not codes or len(codes) > 10 or any(not validate_stock_code(code) for code in codes):
+        raise HTTPException(status_code=400, detail="codes must contain 1-10 valid stock codes")
+    strategy_type = payload.get("strategy_type") or "squeeze"
+    if strategy_type not in supported_backtest_strategies():
+        raise HTTPException(status_code=400, detail="Unsupported strategy_type")
+    engine = get_db_engine()
+    if not engine:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return run_walk_forward_experiment(engine, codes, strategy_type, payload)
