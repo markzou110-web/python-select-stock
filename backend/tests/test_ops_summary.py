@@ -22,6 +22,7 @@ def test_ops_summary_aggregates_scans_and_failures():
         "status": "SUCCESS",
         "strategy_type": "pine",
         "version_snapshot": {"strategy": "v1"},
+        "params_snapshot": {"performance_phases_sec": {"market_snapshot_load": 0.5, "indicator_batch": 1.2}},
         "candidate_count": 20,
         "result_count": 4,
         "fail_reasons": {"量能不足": 6, "趋势不符": 2},
@@ -56,6 +57,7 @@ def test_ops_summary_aggregates_scans_and_failures():
     assert summary["strategy_distribution"][0]["avg_results"] == 2.0
     assert summary["failure_sample_by_strategy"][0]["avg_pnl_pct"] == -4.0
     assert summary["version_distribution"][0] == {"version": "strategy:v1", "count": 2}
+    assert summary["performance_phases"][0] == {"phase": "indicator_batch", "avg_duration_sec": 1.2, "samples": 1}
 
 
 def test_ops_summary_handles_empty_database():

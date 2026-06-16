@@ -290,18 +290,28 @@ def get_market_sentiment():
             score = int(ratio * 100)
 
         from core.data import get_market_regime as get_market_regime_data
-        from core.decision_layer import build_market_decision_context
+        from core.decision_layer import build_market_decision_context, load_market_cycle_history
 
         engine = get_db_engine()
-        snapshot = get_cached_data("market_snapshot", 300)
-        if snapshot is None:
+        snapshot = get_market_snapshot()
+        snapshot_source = "live"
+        if snapshot is None or snapshot.empty:
             snapshot = get_stale_cache("market_snapshot")
-        if snapshot is None:
+            snapshot_source = "stale_cache"
+        if snapshot is None or snapshot.empty:
             snapshot = _get_local_market_snapshot(engine)
-        decision = build_market_decision_context(snapshot, get_market_regime_data())
+            snapshot_source = "local_daily_k"
+        decision = build_market_decision_context(
+            snapshot,
+            get_market_regime_data(),
+            load_market_cycle_history(engine),
+        )
 
         return {
             "date": latest_date.strftime("%Y-%m-%d"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "snapshot_source": snapshot_source,
+            "snapshot_count": len(snapshot) if snapshot is not None else 0,
             "limit_up_count": up_count,
             "limit_down_count": down_count,
             "max_streak": max_streak,

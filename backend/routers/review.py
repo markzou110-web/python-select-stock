@@ -7,6 +7,8 @@ import pandas as pd
 
 from core.db import get_db_engine
 from core.logging_config import logger
+from core.performance_metrics import return_metrics
+from core.pro_workflow import classify_strategy_health
 
 router = APIRouter(prefix="/api/review", tags=["review"])
 
@@ -17,6 +19,10 @@ def _empty_response() -> Dict[str, Any]:
             "signals": 0,
             "win_rate_5d": 0,
             "avg_return_5d": 0,
+            "expected_return_5d": 0,
+            "profit_loss_ratio_5d": 0,
+            "ci95_low_5d": 0,
+            "ci95_high_5d": 0,
             "best_bucket": "暂无",
             "worst_bucket": "暂无",
         },
@@ -41,6 +47,9 @@ def _empty_response() -> Dict[str, Any]:
         "by_opportunity_bucket": [],
         "by_sector_alignment": [],
         "data_quality": {},
+        "path_metrics": {},
+        "score_buckets": {},
+        "by_price_action_version": [],
         "recommendation_events": [],
         "portfolio_sim": {},
         "brooks_backtests": [],
@@ -57,7 +66,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
     query = text("""
         WITH signals AS (
             SELECT
-                code, name, industry, strategy_type, date AS signal_date, price,
+                code, name, industry, strategy_type, COALESCE(data_date, date) AS signal_date, price,
+                pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward,
                 price_action_pattern, price_action_regime, price_action_entry_quality,
                 pa_trade_action, pa_trade_setup, pa_risk_pct,
                 COALESCE(price_action_detail->>'pa_h2_quality', '未知') AS pa_h2_quality,
@@ -67,6 +77,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
                 COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
                 COALESCE((price_action_detail->>'final_trade_score')::float, score, 0) AS final_trade_score,
+                COALESCE((price_action_detail->>'calibrated_score')::float, score, 0) AS calibrated_score,
+                COALESCE((price_action_detail->>'research_eligible')::boolean, false) AS research_eligible,
                 COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers,
                 COALESCE(price_action_detail->>'market_regime', 'UNKNOWN') AS market_regime,
                 COALESCE(price_action_detail->>'market_sentiment_stage', 'UNKNOWN') AS market_sentiment_stage,
@@ -85,7 +97,13 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE((price_action_detail->>'pa_trap_risk')::float, 0) AS pa_trap_risk,
                 COALESCE((price_action_detail->>'pa_always_in_strength')::float, 0) AS pa_always_in_strength,
                 COALESCE((price_action_detail->>'pa_failure_risk')::float, 0) AS pa_failure_risk,
-                COALESCE(price_action_detail->>'pa_trend_damage', '无') AS pa_trend_damage
+                COALESCE(price_action_detail->>'pa_trend_damage', '无') AS pa_trend_damage,
+                COALESCE((price_action_detail->>'pa_structure_score')::float, price_action_score, 0) AS pa_structure_score,
+                COALESCE((price_action_detail->>'pa_execution_score')::float, 0) AS pa_execution_score,
+                COALESCE((price_action_detail->>'pa_risk_score')::float, 0) AS pa_risk_score,
+                COALESCE(price_action_detail->>'price_action_version', 'legacy') AS price_action_version,
+                COALESCE(price_action_detail->>'target_model_version', 'legacy') AS target_model_version,
+                COALESCE(price_action_detail->>'score_model_version', 'legacy') AS score_model_version
             FROM scan_history
             WHERE date >= CURRENT_DATE - (:days || ' days')::interval
               AND price IS NOT NULL
@@ -110,6 +128,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.trade_bucket,
                 s.trade_eligible,
                 s.final_trade_score,
+                s.calibrated_score,
+                s.research_eligible,
                 s.trade_blockers,
                 s.market_regime,
                 s.market_sentiment_stage,
@@ -125,30 +145,75 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.pa_always_in_strength,
                 s.pa_failure_risk,
                 s.pa_trend_damage,
+                s.pa_structure_score,
+                s.pa_execution_score,
+                s.pa_risk_score,
+                s.price_action_version,
+                s.target_model_version,
+                s.score_model_version,
                 s.signal_date,
                 s.price,
-                h1.close AS close_1d,
-                h1.open AS open_1d,
-                h3.close AS close_3d,
-                h5.close AS close_5d,
-                h10.close AS close_10d,
-                h20.close AS close_20d
+                s.pa_entry_price,
+                s.pa_stop_price,
+                s.pa_target_price,
+                s.pa_risk_reward,
+                trigger_event.trigger_date,
+                trigger_event.actual_entry_price,
+                triggered_path.max_high_20d,
+                triggered_path.min_low_20d,
+                triggered_path.target_hit_date,
+                triggered_path.stop_hit_date,
+                signal_path.closes[1] AS close_1d,
+                signal_path.opens[1] AS open_1d,
+                signal_path.closes[3] AS close_3d,
+                signal_path.closes[5] AS close_5d,
+                signal_path.closes[10] AS close_10d,
+                signal_path.closes[20] AS close_20d,
+                triggered_path.closes[1] AS triggered_close_1d,
+                triggered_path.closes[3] AS triggered_close_3d,
+                triggered_path.closes[5] AS triggered_close_5d,
+                triggered_path.closes[10] AS triggered_close_10d,
+                triggered_path.closes[20] AS triggered_close_20d
             FROM signals s
             LEFT JOIN LATERAL (
-                SELECT open, close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '1 day' ORDER BY d.date DESC LIMIT 1
-            ) h1 ON true
+                SELECT array_agg(p.open ORDER BY p.date) AS opens,
+                       array_agg(p.close ORDER BY p.date) AS closes
+                FROM (
+                    SELECT date, open, close
+                    FROM daily_k d
+                    WHERE d.code = s.code AND d.date > s.signal_date
+                    ORDER BY d.date
+                    LIMIT 20
+                ) p
+            ) signal_path ON true
             LEFT JOIN LATERAL (
-                SELECT close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '3 day' ORDER BY d.date DESC LIMIT 1
-            ) h3 ON true
+                SELECT p.date AS trigger_date, GREATEST(p.open, s.pa_entry_price) AS actual_entry_price
+                FROM (
+                    SELECT d.date, d.open, d.high
+                    FROM daily_k d
+                    WHERE d.code = s.code AND d.date > s.signal_date
+                    ORDER BY d.date
+                    LIMIT 20
+                ) p
+                WHERE s.pa_entry_price > 0 AND p.high >= s.pa_entry_price
+                ORDER BY p.date
+                LIMIT 1
+            ) trigger_event ON true
             LEFT JOIN LATERAL (
-                SELECT close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '5 day' ORDER BY d.date DESC LIMIT 1
-            ) h5 ON true
-            LEFT JOIN LATERAL (
-                SELECT close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '10 day' ORDER BY d.date DESC LIMIT 1
-            ) h10 ON true
-            LEFT JOIN LATERAL (
-                SELECT close FROM daily_k d WHERE d.code = s.code AND d.date > s.signal_date AND d.date <= s.signal_date + INTERVAL '20 day' ORDER BY d.date DESC LIMIT 1
-            ) h20 ON true
+                SELECT
+                    MAX(p.high) AS max_high_20d,
+                    MIN(p.low) AS min_low_20d,
+                    MIN(p.date) FILTER (WHERE s.pa_target_price > 0 AND p.high >= s.pa_target_price) AS target_hit_date,
+                    MIN(p.date) FILTER (WHERE s.pa_stop_price > 0 AND p.low <= s.pa_stop_price) AS stop_hit_date,
+                    array_agg(p.close ORDER BY p.date) FILTER (WHERE p.date > trigger_event.trigger_date) AS closes
+                FROM (
+                    SELECT date, high, low, close
+                    FROM daily_k d
+                    WHERE d.code = s.code AND d.date >= trigger_event.trigger_date
+                    ORDER BY d.date
+                    LIMIT 21
+                ) p
+            ) triggered_path ON true
         )
         SELECT * FROM future
         ORDER BY signal_date DESC
@@ -158,6 +223,24 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
         return df
     for horizon in [1, 3, 5, 10, 20]:
         df[f"ret_{horizon}d"] = (df[f"close_{horizon}d"] - df["price"]) / df["price"] * 100
+        df[f"triggered_ret_{horizon}d"] = (
+            (df[f"triggered_close_{horizon}d"] - df["actual_entry_price"]) / df["actual_entry_price"] * 100
+        )
+    df["triggered"] = df["trigger_date"].notna()
+    df["mfe_20d_pct"] = (df["max_high_20d"] - df["actual_entry_price"]) / df["actual_entry_price"] * 100
+    df["mae_20d_pct"] = (df["min_low_20d"] - df["actual_entry_price"]) / df["actual_entry_price"] * 100
+    df["target_hit_20d"] = df["target_hit_date"].notna()
+    df["stop_hit_20d"] = df["stop_hit_date"].notna()
+    df["target_before_stop"] = (
+        df["target_hit_date"].notna()
+        & (df["stop_hit_date"].isna() | (df["target_hit_date"] < df["stop_hit_date"]))
+    )
+    df["path_outcome"] = "OPEN"
+    df.loc[df["target_hit_date"].notna() & df["stop_hit_date"].isna(), "path_outcome"] = "TARGET_FIRST"
+    df.loc[df["stop_hit_date"].notna() & df["target_hit_date"].isna(), "path_outcome"] = "STOP_FIRST"
+    df.loc[df["target_hit_date"] < df["stop_hit_date"], "path_outcome"] = "TARGET_FIRST"
+    df.loc[df["stop_hit_date"] < df["target_hit_date"], "path_outcome"] = "STOP_FIRST"
+    df.loc[df["target_hit_date"].eq(df["stop_hit_date"]) & df["target_hit_date"].notna(), "path_outcome"] = "AMBIGUOUS"
     df["next_open_gap_pct"] = (df["open_1d"] - df["price"]) / df["price"] * 100
     df["data_quality_excluded"] = (
         df["next_open_gap_pct"].abs().ge(14)
@@ -166,6 +249,12 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
     )
     for horizon in [1, 3, 5, 10, 20]:
         df.loc[df["data_quality_excluded"], f"ret_{horizon}d"] = pd.NA
+    df.loc[df["data_quality_excluded"], ["mfe_20d_pct", "mae_20d_pct"]] = pd.NA
+    df["performance_eligible"] = (
+        ~df["data_quality_excluded"].fillna(False)
+        & df["pa_trade_action"].ne("UNKNOWN")
+        & df["pa_trade_setup"].ne("未知")
+    )
     df["sector_alignment_bucket"] = pd.cut(
         pd.to_numeric(df["sector_alignment_score"], errors="coerce"),
         bins=[-1, 50, 70, 100],
@@ -194,26 +283,29 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         if df.empty:
             return _empty_response()
 
-        def metric_frame(grouped: pd.DataFrame, key: str) -> List[Dict[str, Any]]:
+        def metric_frame(grouped: pd.DataFrame, key: str, return_col: str = "ret_5d") -> List[Dict[str, Any]]:
             rows = []
             for value, group in grouped:
-                returns = group["ret_5d"].dropna()
+                returns = group[return_col].dropna()
                 if returns.empty:
                     continue
+                metrics = return_metrics(returns)
                 rows.append({
                     key: value or "未知",
-                    "signals": int(len(returns)),
-                    "win_rate": round(float((returns > 0).mean() * 100), 1),
-                    "avg_return": round(float(returns.mean()), 2),
+                    **metrics,
                     "best_return": round(float(returns.max()), 2),
                     "worst_return": round(float(returns.min()), 2),
                 })
-            rows.sort(key=lambda r: (r["win_rate"], r["avg_return"], r["signals"]), reverse=True)
+            rows.sort(key=lambda r: (r["expected_return"], r["win_rate"], r["signals"]), reverse=True)
             return rows[:12]
 
+        # Legacy rows often lack market/sector metadata but still contain valid
+        # price-action signals and future prices. Keep them in price-action
+        # outcome analysis while reporting metadata completeness separately.
+        research_df = df[df["performance_eligible"].fillna(False)].copy()
         horizons = []
         for horizon in [1, 3, 5, 10, 20]:
-            returns = df[f"ret_{horizon}d"].dropna()
+            returns = research_df[f"ret_{horizon}d"].dropna()
             if returns.empty:
                 horizons.append({"horizon": f"{horizon}日", "signals": 0, "win_rate": 0, "avg_return": 0})
             else:
@@ -224,35 +316,37 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
                     "avg_return": round(float(returns.mean()), 2),
                 })
 
-        by_strategy = metric_frame(df.groupby("strategy_type", dropna=False), "strategy")
-        by_industry = metric_frame(df.groupby("industry", dropna=False), "industry")
-        by_price_action = metric_frame(df.groupby("pa_trade_setup", dropna=False), "setup")
-        by_pa_action = metric_frame(df.groupby("pa_trade_action", dropna=False), "action")
-        by_pa_h2_quality = metric_frame(df.groupby("pa_h2_quality", dropna=False), "quality")
-        by_pa_volume_pattern = metric_frame(df.groupby("pa_volume_pattern", dropna=False), "pattern")
-        by_pa_trend_phase = metric_frame(df.groupby("pa_trend_phase", dropna=False), "phase")
-        by_pa_weekly_context = metric_frame(df.groupby("pa_weekly_context", dropna=False), "context")
-        by_pa_trap_risk = metric_frame(df.groupby("pa_trap_risk_bucket", dropna=False), "risk")
-        by_trade_bucket = metric_frame(df.groupby("trade_bucket", dropna=False), "bucket")
-        by_market_regime = metric_frame(df.groupby("market_regime", dropna=False), "regime")
-        by_market_sentiment = metric_frame(df.groupby("market_sentiment_stage", dropna=False), "stage")
-        by_next_open_gap = metric_frame(df.groupby("next_open_gap_bucket", dropna=False), "bucket")
-        by_sector_phase = metric_frame(df.groupby("sector_phase", dropna=False), "phase")
-        by_sector_role = metric_frame(df.groupby("sector_role", dropna=False), "role")
-        by_sector_mainline = metric_frame(df.groupby("sector_mainline", dropna=False), "mainline")
-        by_trade_state = metric_frame(df.groupby("trade_state", dropna=False), "state")
-        df["opportunity_bucket"] = pd.cut(
-            pd.to_numeric(df["trade_opportunity_score"], errors="coerce").fillna(0),
+        by_strategy = metric_frame(research_df.groupby("strategy_type", dropna=False), "strategy")
+        for row in by_strategy:
+            row["health"] = classify_strategy_health(row)
+        by_industry = metric_frame(research_df.groupby("industry", dropna=False), "industry")
+        by_price_action = metric_frame(research_df.groupby("pa_trade_setup", dropna=False), "setup")
+        by_pa_action = metric_frame(research_df.groupby("pa_trade_action", dropna=False), "action")
+        by_pa_h2_quality = metric_frame(research_df.groupby("pa_h2_quality", dropna=False), "quality")
+        by_pa_volume_pattern = metric_frame(research_df.groupby("pa_volume_pattern", dropna=False), "pattern")
+        by_pa_trend_phase = metric_frame(research_df.groupby("pa_trend_phase", dropna=False), "phase")
+        by_pa_weekly_context = metric_frame(research_df.groupby("pa_weekly_context", dropna=False), "context")
+        by_pa_trap_risk = metric_frame(research_df.groupby("pa_trap_risk_bucket", dropna=False), "risk")
+        by_trade_bucket = metric_frame(research_df.groupby("trade_bucket", dropna=False), "bucket")
+        by_market_regime = metric_frame(research_df.groupby("market_regime", dropna=False), "regime")
+        by_market_sentiment = metric_frame(research_df.groupby("market_sentiment_stage", dropna=False), "stage")
+        by_next_open_gap = metric_frame(research_df.groupby("next_open_gap_bucket", dropna=False), "bucket")
+        by_sector_phase = metric_frame(research_df.groupby("sector_phase", dropna=False), "phase")
+        by_sector_role = metric_frame(research_df.groupby("sector_role", dropna=False), "role")
+        by_sector_mainline = metric_frame(research_df.groupby("sector_mainline", dropna=False), "mainline")
+        by_trade_state = metric_frame(research_df.groupby("trade_state", dropna=False), "state")
+        research_df["opportunity_bucket"] = pd.cut(
+            pd.to_numeric(research_df["trade_opportunity_score"], errors="coerce").fillna(0),
             bins=[-1, 59.99, 69.99, 79.99, 89.99, 1000],
             labels=["<60", "60-69", "70-79", "80-89", "90+"],
         )
-        by_opportunity_bucket = metric_frame(df.groupby("opportunity_bucket", observed=False), "bucket")
-        by_sector_alignment = metric_frame(df.groupby("sector_alignment_bucket", dropna=False), "bucket")
+        by_opportunity_bucket = metric_frame(research_df.groupby("opportunity_bucket", observed=False), "bucket")
+        by_sector_alignment = metric_frame(research_df.groupby("sector_alignment_bucket", dropna=False), "bucket")
 
-        ret_1d_all = df["ret_1d"].dropna()
-        trade_ret_1d = df.loc[df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
-        blocked_ret_1d = df.loc[df["trade_bucket"].eq("BLOCK"), "ret_1d"].dropna()
-        watch_ret_1d = df.loc[df["trade_bucket"].eq("WATCH"), "ret_1d"].dropna()
+        ret_1d_all = research_df["ret_1d"].dropna()
+        trade_ret_1d = research_df.loc[research_df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
+        blocked_ret_1d = research_df.loc[research_df["trade_bucket"].eq("BLOCK"), "ret_1d"].dropna()
+        watch_ret_1d = research_df.loc[research_df["trade_bucket"].eq("WATCH"), "ret_1d"].dropna()
         execution_summary = {
             "trade_signals": int(len(trade_ret_1d)),
             "trade_win_rate_1d": round(float((trade_ret_1d > 0).mean() * 100), 1) if not trade_ret_1d.empty else 0,
@@ -265,11 +359,47 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         }
         data_quality = {
             "excluded_adjustment_gap_returns": int(df["data_quality_excluded"].fillna(False).sum()),
+            "incomplete_research_samples": int((~df["research_eligible"].fillna(False)).sum()),
+            "effective_research_samples": int(df["research_eligible"].fillna(False).sum()),
+            "performance_eligible_samples": int(df["performance_eligible"].fillna(False).sum()),
             "rule": "次日开盘跳空>=14%且1日收益跳变>=20%的样本不参与收益统计",
         }
+        path_df = research_df[research_df["mfe_20d_pct"].notna()].copy()
+        path_metrics = {
+            "tracked_signals": int(len(path_df)),
+            "triggered_signals": int(research_df["triggered"].sum()),
+            "trigger_rate": round(float(research_df["triggered"].mean() * 100), 1) if not research_df.empty else 0,
+            "avg_mfe_20d_pct": round(float(path_df["mfe_20d_pct"].mean()), 2) if not path_df.empty else 0,
+            "avg_mae_20d_pct": round(float(path_df["mae_20d_pct"].mean()), 2) if not path_df.empty else 0,
+            "target_hit_rate_20d": round(float(path_df["target_hit_20d"].mean() * 100), 1) if not path_df.empty else 0,
+            "stop_hit_rate_20d": round(float(path_df["stop_hit_20d"].mean() * 100), 1) if not path_df.empty else 0,
+            "target_before_stop_rate": round(float(path_df["path_outcome"].eq("TARGET_FIRST").mean() * 100), 1) if not path_df.empty else 0,
+            "ambiguous_paths": int(path_df["path_outcome"].eq("AMBIGUOUS").sum()) if not path_df.empty else 0,
+            "triggered_avg_return_1d": round(float(research_df["triggered_ret_1d"].mean()), 2) if research_df["triggered_ret_1d"].notna().any() else 0,
+            "triggered_avg_return_5d": round(float(research_df["triggered_ret_5d"].mean()), 2) if research_df["triggered_ret_5d"].notna().any() else 0,
+            "triggered_win_rate_5d": round(float((research_df["triggered_ret_5d"].dropna() > 0).mean() * 100), 1) if research_df["triggered_ret_5d"].notna().any() else 0,
+        }
+        triggered_df = research_df[research_df["triggered"]].copy()
+        score_buckets = {}
+        for column in ("pa_structure_score", "pa_execution_score", "pa_risk_score"):
+            triggered_df[f"{column}_bucket"] = pd.cut(
+                pd.to_numeric(triggered_df[column], errors="coerce"),
+                bins=[-1, 34.99, 49.99, 64.99, 79.99, 100],
+                labels=["<35", "35-49", "50-64", "65-79", "80+"],
+            )
+            score_buckets[column] = metric_frame(
+                triggered_df.groupby(f"{column}_bucket", observed=False),
+                "bucket",
+                return_col="triggered_ret_5d",
+            )
+        by_price_action_version = metric_frame(
+            triggered_df.groupby("price_action_version", dropna=False),
+            "version",
+            return_col="triggered_ret_5d",
+        )
 
         def strategy_backtest(name: str, mask: pd.Series) -> Dict[str, Any]:
-            returns = df.loc[mask, "ret_5d"].dropna()
+            returns = research_df.loc[mask.reindex(research_df.index, fill_value=False), "ret_5d"].dropna()
             if returns.empty:
                 return {"strategy": name, "signals": 0, "win_rate": 0, "avg_return": 0, "best_return": 0, "worst_return": 0}
             return {
@@ -291,7 +421,7 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         ]
 
         recent = []
-        for date_value, group in df.groupby("signal_date"):
+        for date_value, group in research_df.groupby("signal_date"):
             returns = group["ret_5d"].dropna()
             if returns.empty:
                 continue
@@ -303,14 +433,19 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             })
         recent.sort(key=lambda r: r["date"], reverse=True)
 
-        ret_5d = df["ret_5d"].dropna()
+        ret_5d = research_df["ret_5d"].dropna()
+        summary_metrics = return_metrics(ret_5d)
         best_bucket = by_industry[0]["industry"] if by_industry else "暂无"
         worst_bucket = by_industry[-1]["industry"] if by_industry else "暂无"
         return {
             "summary": {
-                "signals": int(len(ret_5d)),
-                "win_rate_5d": round(float((ret_5d > 0).mean() * 100), 1) if not ret_5d.empty else 0,
-                "avg_return_5d": round(float(ret_5d.mean()), 2) if not ret_5d.empty else 0,
+                "signals": summary_metrics["signals"],
+                "win_rate_5d": summary_metrics["win_rate"],
+                "avg_return_5d": summary_metrics["avg_return"],
+                "expected_return_5d": summary_metrics["expected_return"],
+                "profit_loss_ratio_5d": summary_metrics["profit_loss_ratio"],
+                "ci95_low_5d": summary_metrics["ci95_low"],
+                "ci95_high_5d": summary_metrics["ci95_high"],
                 "best_bucket": best_bucket,
                 "worst_bucket": worst_bucket,
             },
@@ -334,6 +469,9 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_opportunity_bucket": by_opportunity_bucket,
             "by_sector_alignment": by_sector_alignment,
             "data_quality": data_quality,
+            "path_metrics": path_metrics,
+            "score_buckets": score_buckets,
+            "by_price_action_version": by_price_action_version,
             "execution_summary": execution_summary,
             "recommendation_events": get_recommendation_event_review(days=days, limit=12).get("items", []),
             "portfolio_sim": get_portfolio_simulation(days=days, max_daily=3, hold_days=5),
@@ -405,8 +543,8 @@ def get_portfolio_simulation(days: int = 120, max_daily: int = 3, hold_days: int
         if df.empty:
             return {"trades": 0, "avg_return": 0, "win_rate": 0}
         ret_col = f"ret_{hold_days}d" if f"ret_{hold_days}d" in df.columns else "ret_5d"
-        eligible = df[df["trade_bucket"].isin(["TRADE", "UNKNOWN"])].copy()
-        eligible["rank_score"] = pd.to_numeric(eligible.get("final_trade_score", eligible.get("score", 0)), errors="coerce").fillna(0)
+        eligible = df[df["research_eligible"].fillna(False) & df["trade_bucket"].eq("TRADE")].copy()
+        eligible["rank_score"] = pd.to_numeric(eligible["calibrated_score"], errors="coerce").fillna(0)
         picks = []
         for date_value, group in eligible.groupby("signal_date"):
             picks.append(group.sort_values("rank_score", ascending=False).head(max(1, int(max_daily))))
@@ -594,6 +732,9 @@ def export_scan_performance(days: int = 120):
             "trade_bucket", "trade_eligible", "final_trade_score", "trade_blockers",
             "sector_phase", "sector_role", "sector_alignment_score", "sector_alignment_bucket",
             "data_quality_excluded",
+            "triggered", "trigger_date", "actual_entry_price", "path_outcome",
+            "mfe_20d_pct", "mae_20d_pct", "target_hit_20d", "stop_hit_20d", "target_before_stop",
+            "triggered_ret_1d", "triggered_ret_3d", "triggered_ret_5d", "triggered_ret_10d", "triggered_ret_20d",
             "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
         ])
 
@@ -604,6 +745,9 @@ def export_scan_performance(days: int = 120):
         "trade_bucket", "trade_eligible", "final_trade_score", "trade_blockers",
         "sector_phase", "sector_role", "sector_alignment_score", "sector_alignment_bucket",
         "data_quality_excluded",
+        "triggered", "trigger_date", "actual_entry_price", "path_outcome",
+        "mfe_20d_pct", "mae_20d_pct", "target_hit_20d", "stop_hit_20d", "target_before_stop",
+        "triggered_ret_1d", "triggered_ret_3d", "triggered_ret_5d", "triggered_ret_10d", "triggered_ret_20d",
         "ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
     ]
     export_df = df[[c for c in export_cols if c in df.columns]].copy()
@@ -631,6 +775,20 @@ def export_scan_performance(days: int = 120):
         "sector_alignment_score": "板块联动分",
         "sector_alignment_bucket": "板块联动分桶",
         "data_quality_excluded": "数据异常已剔除",
+        "triggered": "真实触发",
+        "trigger_date": "触发日期",
+        "actual_entry_price": "实际入场价",
+        "path_outcome": "路径结果",
+        "mfe_20d_pct": "20日最大有利波动%",
+        "mae_20d_pct": "20日最大不利波动%",
+        "target_hit_20d": "20日内触达目标",
+        "stop_hit_20d": "20日内触达止损",
+        "target_before_stop": "目标先于止损",
+        "triggered_ret_1d": "触发后1日收益%",
+        "triggered_ret_3d": "触发后3日收益%",
+        "triggered_ret_5d": "触发后5日收益%",
+        "triggered_ret_10d": "触发后10日收益%",
+        "triggered_ret_20d": "触发后20日收益%",
         "ret_1d": "1日收益%",
         "ret_3d": "3日收益%",
         "ret_5d": "5日收益%",

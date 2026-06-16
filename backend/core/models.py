@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, Integer, Date, DateTime, Text, JSON
+from sqlalchemy import Column, String, Float, Integer, Date, DateTime, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase
 from datetime import datetime
 
@@ -23,8 +23,12 @@ class DailyK(Base):
 
 class ScanHistory(Base):
     __tablename__ = "scan_history"
-    code = Column(String(20), primary_key=True)
-    date = Column(Date, primary_key=True)
+    __table_args__ = (UniqueConstraint("code", "data_date", "strategy_type", name="uq_scan_history_signal"),)
+    signal_id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(20), nullable=False)
+    date = Column(Date, nullable=False)
+    data_date = Column(Date, nullable=True)
+    scanned_at = Column(DateTime, nullable=True)
     name = Column(String(50))
     price = Column(Float)
     pct = Column(Float)
@@ -74,6 +78,19 @@ class PaperTrading(Base):
     updated_at = Column(DateTime, nullable=True)
     strategy_type = Column(String(20), nullable=True)
     remark = Column(Text, nullable=True)
+    theme = Column(String(200), nullable=True)
+    rise_logic = Column(Text, nullable=True)
+    logic_status = Column(String(30), default="UNVERIFIED")
+    logic_last_review_at = Column(DateTime, nullable=True)
+    planned_entry_price = Column(Float, nullable=True)
+    actual_entry_price = Column(Float, nullable=True)
+    entry_slippage_pct = Column(Float, nullable=True)
+    position_pct = Column(Float, nullable=True)
+    shares = Column(Integer, nullable=True)
+    capital_used = Column(Float, nullable=True)
+    execution_note = Column(Text, nullable=True)
+    plan_adherence = Column(String(30), default="UNKNOWN")
+    watchlist_id = Column(Integer, nullable=True)
     trade_mode = Column(String(20), default='SIMULATED', nullable=False)  # SIMULATED | REAL
     entry_source = Column(String(50), nullable=True)
     entry_signal_date = Column(Date, nullable=True)
@@ -114,6 +131,10 @@ class WatchlistItem(Base):
     stop_price = Column(Float, nullable=True)
     status = Column(String(20), default="WATCHING")
     reason = Column(Text, nullable=True)
+    theme = Column(String(200), nullable=True)
+    rise_logic = Column(Text, nullable=True)
+    logic_status = Column(String(30), default="UNVERIFIED")
+    logic_last_review_at = Column(DateTime, nullable=True)
     invalidation = Column(Text, nullable=True)
     pa_trade_action = Column(String(20), nullable=True)
     pa_trade_setup = Column(String(80), nullable=True)
@@ -173,6 +194,9 @@ class FailureSample(Base):
 
 class RecommendationEvent(Base):
     __tablename__ = "recommendation_events"
+    __table_args__ = (
+        UniqueConstraint("event_date", "source", "code", "strategy_type", name="uq_recommendation_events_identity"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     event_date = Column(Date)
     event_time = Column(DateTime, default=datetime.utcnow)
@@ -195,3 +219,41 @@ class RecommendationEvent(Base):
     blockers = Column(JSON, nullable=True)
     status = Column(String(30), default="OPEN")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LifecycleEvent(Base):
+    __tablename__ = "lifecycle_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_time = Column(DateTime, default=datetime.utcnow)
+    event_type = Column(String(40))
+    source = Column(String(50), nullable=True)
+    code = Column(String(20), nullable=True)
+    name = Column(String(50), nullable=True)
+    watchlist_id = Column(Integer, nullable=True)
+    trade_id = Column(Integer, nullable=True)
+    strategy_type = Column(String(30), nullable=True)
+    theme = Column(String(200), nullable=True)
+    payload = Column(JSON, nullable=True)
+
+
+class TaskRunAudit(Base):
+    __tablename__ = "task_run_audits"
+    task_id = Column(String(100), primary_key=True)
+    task_name = Column(String(150), nullable=True)
+    status = Column(String(30), default="PENDING")
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    duration_sec = Column(Float, nullable=True)
+    result_summary = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+
+class NotificationAudit(Base):
+    __tablename__ = "notification_audits"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    title = Column(String(200))
+    channels = Column(JSON, nullable=True)
+    results = Column(JSON, nullable=True)
+    group_name = Column(String(100), nullable=True)
+    body_preview = Column(Text, nullable=True)

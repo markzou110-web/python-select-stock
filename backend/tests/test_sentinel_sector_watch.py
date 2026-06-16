@@ -7,6 +7,7 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.sentinel import (
+    _position_breakout_confirmation,
     _build_after_close_watchlist_body,
     _candidate_action_label,
     _real_position_action,
@@ -230,3 +231,16 @@ def test_real_position_action_surfaces_high_confidence_eight_rule_risk():
     assert "八诀风险触发：高位放量滞涨" in suggestion
     assert "停止加仓并复核减仓" in suggestion
     assert "八诀:高位放量滞涨 <21.7" in suggestion
+
+
+def test_position_breakout_uses_price_action_dynamic_volume_threshold():
+    plan = _position_breakout_confirmation(
+        curr=22.5,
+        entry=21.0,
+        active_stop=20.0,
+        pa={"pa_entry_price": 22.0, "pa_breakout_volume_threshold": 1.2},
+        df_hist=_position_df(last_close=22.5, last_volume=1300),
+    )
+
+    assert plan["volume_ratio_threshold"] == 1.2
+    assert plan["volume_ok"] is True

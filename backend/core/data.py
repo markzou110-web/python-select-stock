@@ -622,7 +622,9 @@ def get_sector_map() -> Dict[str, str]:
         def fetch_sector_with_retry(sector_name: str, retries: int = 3) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
             for i in range(retries):
                 try:
-                    time.sleep(random.uniform(0.5, 1.0))
+                    # 仅在重试时退避，首次请求不 sleep，避免冷启动时 ~86 个板块全部先空等。
+                    if i > 0:
+                        time.sleep(random.uniform(0.3, 0.6))
                     df_curr = ak.stock_board_industry_cons_em(symbol=sector_name)
                     if not df_curr.empty:
                         return sector_name, df_curr[['代码', '名称']].copy()
@@ -631,7 +633,8 @@ def get_sector_map() -> Dict[str, str]:
             return None, None
 
         all_basic_data = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # 板块间无频率限制，提升并发度以加速冷启动（原 max_workers=5 → 12）。
+        with ThreadPoolExecutor(max_workers=12) as executor:
             future_to_sector = {executor.submit(fetch_sector_with_retry, name): name for name in all_boards}
 
             for future in as_completed(future_to_sector):

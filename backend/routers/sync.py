@@ -25,7 +25,7 @@ def background_sync_task():
         sync_progress["status_text"] = "正在初始化板块映射..."
 
     try:
-        from core.multi_source_sync import MultiSourceSync
+        from core.multi_source_sync import MultiSourceSync, SYNC_MAX_WORKERS
         from core.db import get_db_engine, init_db
         from sqlalchemy import text
 
@@ -89,11 +89,11 @@ def background_sync_task():
 
         results = syncer.sync_batch(
             all_codes,
-            delay_range=(0.0, 0.1),
+            delay_range=(0.0, 0.0),
             progress_callback=lambda current, total, success, failed: update_sync_progress(
                 current, total, success, failed, len(all_codes)
             ),
-            max_workers=8,
+            max_workers=SYNC_MAX_WORKERS,
             check_stop=should_stop
         )
 

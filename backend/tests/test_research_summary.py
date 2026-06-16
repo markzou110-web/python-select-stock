@@ -26,13 +26,18 @@ def test_research_summary_aggregates_scan_history():
             ('000003', '2026-05-30', '招商银行', '银行', 'squeeze', 66, '55%',
              '多头趋势', '突破回踩', 'BUY', '突破回踩')
         """))
+        conn.execute(text("""
+            UPDATE scan_history
+            SET price_action_detail = '{"research_eligible": true, "calibrated_score": 80}'
+        """))
 
     summary = build_research_summary(engine)
 
     assert summary["status"] == "ok"
     assert summary["summary"]["total_signals"] == 3
     assert summary["summary"]["latest_date"] == "2026-05-31"
-    assert summary["summary"]["avg_score"] == 75.33
+    assert summary["summary"]["avg_score"] == 80.0
+    assert summary["summary"]["effective_signals"] == 3
     assert summary["by_strategy"][0]["strategy_type"] == "pine"
     assert summary["by_strategy"][0]["avg_win_rate"] == 56.0
     assert summary["by_industry"][0] == {"name": "银行", "count": 2}

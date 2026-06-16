@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+import json
 from typing import Any, Dict, List
 
 from sqlalchemy import text
@@ -57,7 +58,7 @@ def build_research_summary(engine, limit: int = 500) -> Dict[str, Any]:
     safe_limit = min(max(int(limit or 500), 1), 2000)
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT date, strategy_type, industry, score, win_rate,
+            SELECT date, strategy_type, industry, score, win_rate, price_action_detail,
                    price_action_regime, price_action_signal,
                    pa_trade_action, pa_trade_setup
             FROM scan_history
@@ -75,15 +76,25 @@ def build_research_summary(engine, limit: int = 500) -> Dict[str, Any]:
     all_win_rates: List[float] = []
     latest_date = None
 
+    incomplete_count = 0
     for row in rows:
         if latest_date is None and row.get("date") is not None:
             latest_date = str(row["date"])
-
+        detail = row.get("price_action_detail") or {}
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except json.JSONDecodeError:
+                detail = {}
+        if detail.get("research_eligible") is not True:
+            incomplete_count += 1
+            continue
         strategy = row.get("strategy_type") or "unknown"
         strategies[strategy]["count"] += 1
 
-        if row.get("score") is not None:
-            score = float(row["score"])
+        score_value = detail.get("calibrated_score", row.get("score"))
+        if score_value is not None:
+            score = float(score_value)
             all_scores.append(score)
             strategies[strategy]["scores"].append(score)
 
@@ -113,6 +124,9 @@ def build_research_summary(engine, limit: int = 500) -> Dict[str, Any]:
         "status": "ok",
         "summary": {
             "total_signals": len(rows),
+            "effective_signals": len(rows) - incomplete_count,
+            "incomplete_signals": incomplete_count,
+            "effective_ratio": round((len(rows) - incomplete_count) / len(rows) * 100, 1) if rows else 0,
             "latest_date": latest_date,
             "avg_score": _avg(all_scores),
             "avg_win_rate": _avg(all_win_rates),

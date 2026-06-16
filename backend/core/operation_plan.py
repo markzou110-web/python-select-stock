@@ -1,5 +1,8 @@
-from datetime import datetime
+from datetime import date, datetime
+import math
 from typing import Any, Dict, List, Optional
+
+from core.risk_constants import FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_PCT
 
 
 def safe_num(value: Any, default: float = 0.0) -> float:
@@ -9,6 +12,146 @@ def safe_num(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def build_position_decision_snapshot(
+    *,
+    current_price: float,
+    entry_price: float,
+    risk: Dict[str, Any],
+    plan: Optional[Dict[str, Any]] = None,
+    time_stop: Optional[Dict[str, Any]] = None,
+    entry_date: Any = None,
+    price_source: str = "",
+    price_updated_at: Any = None,
+    now: Optional[datetime] = None,
+    already_reduced: bool = False,
+) -> Dict[str, Any]:
+    """Build the authoritative position action shared by UI, alerts, and wind control.
+
+    ``already_reduced`` 表示该仓位此前已执行过分批止盈（首笔减仓）。传入 True 时
+    跳过首笔止盈的 REDUCE 触发，避免重复减仓，仅保留跌破风控线的退出/减仓逻辑。
+    """
+    now = now or datetime.now()
+    current = safe_num(current_price)
+    entry = safe_num(entry_price)
+    active_stop = safe_num(risk.get("active_stop_price") or risk.get("stop_price"))
+    structure_stop = safe_num(risk.get("structure_stop_price"))
+    initial_stop = safe_num(risk.get("initial_stop_price"))
+    max_pl_pct = safe_num(risk.get("max_pl_pct"))
+    risk_stage = str(risk.get("risk_stage") or "")
+    plan = plan or {}
+
+    parsed_entry = None
+    try:
+        parsed = datetime.fromisoformat(str(entry_date))
+        parsed_entry = parsed.date()
+    except (TypeError, ValueError):
+        try:
+            parsed_entry = date.fromisoformat(str(entry_date)[:10])
+        except (TypeError, ValueError):
+            parsed_entry = None
+    t1_locked = parsed_entry == now.date()
+
+    invariants: List[Dict[str, Any]] = []
+    if current <= 0 or entry <= 0:
+        invariants.append({"level": "error", "code": "INVALID_PRICE", "message": "现价或入场价无效"})
+    if active_stop > entry and max_pl_pct < 5:
+        invariants.append({
+            "level": "error",
+            "code": "PREMATURE_PROFIT_PROTECTION",
+            "message": "持仓最大浮盈不足5%，风控线不应高于入场价",
+        })
+    for field, value in (("current_price", current), ("entry_price", entry), ("active_stop_price", active_stop)):
+        if not math.isfinite(value):
+            invariants.append({"level": "error", "code": "NON_FINITE_VALUE", "message": f"{field} 不是有限数值"})
+
+    action = "HOLD"
+    trigger = "未触发退出或减仓条件"
+    confidence = 0.72
+    threshold = None
+    if any(item["level"] == "error" for item in invariants):
+        action = "REVIEW"
+        trigger = "决策数据不一致，暂停自动操作并人工复核"
+        confidence = 0.25
+    elif time_stop and time_stop.get("should_close"):
+        action = "CLOSE"
+        trigger = str(time_stop.get("reason") or "达到时间止损条件")
+        confidence = 0.9
+    elif (
+        not already_reduced
+        and max_pl_pct >= FIRST_PROFIT_TAKE_PCT
+        and current > entry
+    ):
+        # 分批止盈：盈利达到 FIRST_PROFIT_TAKE_PCT（+8%）且尚未减仓时，先减仓 50%
+        # 锁定利润，剩余仓位继续用高档移动止损跟踪。already_reduced 防重复触发。
+        action = "REDUCE"
+        threshold = entry * (1 + FIRST_PROFIT_TAKE_PCT / 100)
+        trigger = (
+            f"分批止盈：最大浮盈 {max_pl_pct:.1f}% 达到首笔止盈线 "
+            f"{FIRST_PROFIT_TAKE_PCT:.0f}%，减仓锁定部分利润"
+        )
+        confidence = 0.8
+    elif structure_stop > 0 and current <= structure_stop:
+        action = "CLOSE"
+        threshold = structure_stop
+        trigger = f"现价 {current:.2f} 跌破结构失效线 {structure_stop:.2f}"
+        confidence = 0.95
+    elif active_stop > 0 and current <= active_stop:
+        threshold = active_stop
+        if risk_stage in {"保本保护", "移动风控", "强盈利收紧"}:
+            action = "REDUCE"
+            trigger = f"现价 {current:.2f} 跌破{risk_stage}线 {active_stop:.2f}"
+        else:
+            action = "CLOSE"
+            trigger = f"现价 {current:.2f} 跌破执行止损线 {active_stop:.2f}"
+        confidence = 0.92
+    elif safe_num(plan.get("add_trigger_price")) > 0 and current >= safe_num(plan.get("add_trigger_price")):
+        action = "ADD_REVIEW"
+        threshold = safe_num(plan.get("add_trigger_price"))
+        trigger = f"现价 {current:.2f} 触及加仓触发线，等待价量与收盘确认"
+        confidence = 0.62
+
+    executable = action not in {"CLOSE", "REDUCE"} or not t1_locked
+    if not executable:
+        trigger = f"{trigger}；当日入场受 T+1 限制，次一交易日优先处理"
+
+    labels = {
+        "HOLD": "持仓观察",
+        "ADD_REVIEW": "加仓复核",
+        "REDUCE": "减仓保护",
+        "CLOSE": "退出持仓",
+        "REVIEW": "数据复核",
+    }
+    price_updated_text = str(price_updated_at) if price_updated_at else None
+    if price_updated_text in {"NaT", "nan", "None"}:
+        price_updated_text = None
+    return {
+        "version": "position-decision-v1",
+        "action": action,
+        "label": labels[action],
+        "trigger": trigger,
+        "threshold": round(threshold, 2) if threshold else None,
+        "executable": executable,
+        "t1_locked": t1_locked,
+        "confidence": confidence,
+        "evidence": {
+            "current_price": round(current, 2),
+            "entry_price": round(entry, 2),
+            "active_stop_price": round(active_stop, 2) if active_stop > 0 else None,
+            "structure_stop_price": round(structure_stop, 2) if structure_stop > 0 else None,
+            "initial_stop_price": round(initial_stop, 2) if initial_stop > 0 else None,
+            "max_pl_pct": round(max_pl_pct, 2),
+            "risk_stage": risk_stage,
+        },
+        "data_as_of": {
+            "decision_time": now.isoformat(),
+            "price_source": price_source or "unknown",
+            "price_updated_at": price_updated_text,
+            "entry_date": str(entry_date) if entry_date else None,
+        },
+        "invariants": invariants,
+    }
 
 
 def price_instruction(

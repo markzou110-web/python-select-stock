@@ -15,6 +15,39 @@ _ALERT_DEDUPE_CACHE = {}
 _ALERT_DEDUPE_SECONDS = 30 * 60
 
 
+def _is_limit_up_collection_window(now: datetime) -> bool:
+    final_capture = is_a_share_trading_day(now) and now.hour == 15 and 0 <= now.minute <= 5
+    return is_a_share_intraday_session(now) or final_capture
+
+
+@celery_app.task(name="tasks.collect_limit_up_leadership")
+def collect_limit_up_leadership():
+    now = datetime.now()
+    if not _is_limit_up_collection_window(now):
+        return "Market closed"
+    try:
+        from core.limit_up_leadership import collect_limit_up_events
+
+        return collect_limit_up_events(engine=get_db_engine(), collected_at=now)
+    except Exception as exc:
+        logger.error(f"Limit-up leadership collection failed: {exc}")
+        return {"error": str(exc)}
+
+
+@celery_app.task(name="tasks.collect_candidate_minute_bars")
+def collect_candidate_minute_bars():
+    now = datetime.now()
+    if not is_a_share_intraday_session(now):
+        return "Market closed"
+    try:
+        from core.limit_up_leadership import collect_candidate_minute_bars as collect
+
+        return collect(engine=get_db_engine())
+    except Exception as exc:
+        logger.error(f"Candidate minute-bar collection failed: {exc}")
+        return {"error": str(exc)}
+
+
 def _alert_action(signal: dict, trade_mode: str, pl_pct: float) -> str:
     level = signal.get("level")
     reason = signal.get("reason", "")
@@ -162,10 +195,22 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
         logger.info(f"Checkpoint {slot} skipped: market closed.")
         return "Market closed"
 
-    summary = {"slot": slot, "operation_alerts": 0, "watch_alerts": 0, "pruned": 0, "next_day_push": 0}
+    summary = {
+        "slot": slot,
+        "operation_alerts": 0,
+        "watch_alerts": 0,
+        "watch_status_push": 0,
+        "pruned": 0,
+        "next_day_push": 0,
+    }
     try:
         from routers.paper_trade import check_operation_triggers
-        from routers.watchlist import auto_prune_watchlist, check_watchlist_triggers, refresh_watchlist_decisions
+        from routers.watchlist import (
+            auto_prune_watchlist,
+            check_watchlist_triggers,
+            refresh_watchlist_decisions,
+            send_watchlist_status_report,
+        )
 
         if slot in {"open_risk", "morning_confirm", "late_decision", "price_watch"}:
             operation = check_operation_triggers(notify=True, trade_mode="REAL")
@@ -174,6 +219,13 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
         if slot in {"morning_confirm", "candidate_scan", "late_decision"}:
             watch = check_watchlist_triggers(notify=True)
             summary["watch_alerts"] = int(watch.get("count") or 0)
+
+        if slot == "open_risk":
+            report = send_watchlist_status_report("morning")
+            summary["watch_status_push"] = int(report.get("count") or 0) if report.get("bark") else 0
+        elif slot == "late_decision":
+            report = send_watchlist_status_report("late")
+            summary["watch_status_push"] = int(report.get("count") or 0) if report.get("bark") else 0
 
         if slot in {"candidate_scan", "after_close_review"}:
             refresh_watchlist_decisions()

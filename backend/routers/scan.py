@@ -17,12 +17,12 @@ import akshare as ak
 from core.logging_config import logger
 from core.ws_manager import manager as ws_manager
 from core.db import (
-    get_db_engine, save_scan_results,
+    _json_safe, get_db_engine, save_scan_results,
     get_scan_history_by_date, get_scan_dates, get_available_dates,
     load_from_db
 )
 from core.data import (
-    get_market_snapshot, get_index_hist, get_sector_map
+    get_cached_data, get_market_snapshot, get_index_hist, get_sector_map, get_stale_cache
 )
 from core.indicators import (
     calculate_indicators, calculate_pine_indicators,
@@ -34,6 +34,7 @@ from core.strategy import (
 )
 from core.celery_app import celery_app
 from core.scan_preflight import build_scan_preflight
+from core.audit_log import record_lifecycle_event, record_task_run
 
 router = APIRouter(prefix="/api", tags=["scan"])
 
@@ -74,7 +75,7 @@ def run_market_scan_task(
     stop_loss_pct: float = -8.0
 ):
     from core.scanner import perform_market_scan
-    return perform_market_scan(
+    results = perform_market_scan(
         threshold=threshold,
         vol_multiplier=vol_multiplier,
         rsi_min=rsi_min,
@@ -94,6 +95,23 @@ def run_market_scan_task(
         weekly_ma_period=weekly_ma_period,
         stop_loss_pct=stop_loss_pct
     )
+    if strategy_type == "tv_dual_strict" and results:
+        try:
+            from core.sentinel import send_after_close_watchlist
+            send_after_close_watchlist(results, scan_date=results[0].get("data_date"))
+        except Exception as exc:
+            logger.warning(f"After-close watchlist push skipped: {exc}")
+    for item in results or []:
+        record_lifecycle_event(
+            "SCAN_RECOMMENDED",
+            source="scan",
+            code=item.get("代码") or item.get("code"),
+            name=item.get("名称") or item.get("name"),
+            strategy_type=item.get("strategy_type") or strategy_type,
+            theme=item.get("题材") or item.get("行业") or item.get("industry"),
+            payload={"score": item.get("Score") or item.get("score")},
+        )
+    return _json_safe(results)
 
 @router.get("/scan")
 def scan_market(
@@ -135,6 +153,29 @@ def scan_market(
 
     return {"task_id": task.id, "status": "PENDING", "message": "扫描任务已提交队列"}
 
+
+@router.get("/scan/tasks")
+def list_scan_tasks(limit: int = 20):
+    engine = get_db_engine()
+    if not engine:
+        return []
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT task_id, task_name, status, started_at, finished_at, duration_sec, error_message
+            FROM task_run_audits
+            WHERE task_name = 'scan.run_market_scan_task'
+            ORDER BY COALESCE(started_at, finished_at) DESC
+            LIMIT :limit
+        """), {"limit": min(max(limit, 1), 100)}).mappings().all()
+    return [dict(row) for row in rows]
+
+
+@router.post("/scan/cancel/{task_id}")
+def cancel_scan_task(task_id: str):
+    celery_app.control.revoke(task_id, terminate=True)
+    record_task_run(task_id, "scan.run_market_scan_task", "REVOKED", finished_at=datetime.now())
+    return {"task_id": task_id, "status": "REVOKED", "message": "扫描任务已取消"}
+
 @router.get("/scan/status/{task_id}")
 def get_scan_status(task_id: str):
     """查询扫描任务状态和结果"""
@@ -158,10 +199,12 @@ async def get_history_results(date: str):
     if not results:
         return []
     
-    # 获取实时快照，计算后续表现
+    # Dashboard initialization must not block on a full-market network fetch.
     try:
-        snapshot = get_market_snapshot()
-        if not snapshot.empty:
+        snapshot = get_cached_data("market_snapshot", 300)
+        if snapshot is None:
+            snapshot = get_stale_cache("market_snapshot")
+        if snapshot is not None and not snapshot.empty:
             for r in results:
                 code = r["代码"]
                 hist_price = float(r["现价"])

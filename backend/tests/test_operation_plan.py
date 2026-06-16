@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.operation_plan import alert_priority, evaluate_operation_trigger, operation_bands, pre_trade_check, price_instruction, watch_exit_decision, watch_instruction
+from core.operation_plan import alert_priority, build_position_decision_snapshot, evaluate_operation_trigger, operation_bands, pre_trade_check, price_instruction, watch_exit_decision, watch_instruction
 
 
 def test_price_instruction_has_action_ranges():
@@ -125,3 +125,85 @@ def test_pre_trade_check_passes_when_all_confirmed():
 
     assert result["passed"] is True
     assert result["action"] == "允许小仓执行"
+
+
+def test_position_decision_does_not_close_only_for_market_or_technical_weakness():
+    snapshot = build_position_decision_snapshot(
+        current_price=10.5,
+        entry_price=10,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 6, "risk_stage": "初始/结构防守"},
+        entry_date="2026-06-12",
+        now=datetime(2026, 6, 13, 14, 30),
+    )
+
+    assert snapshot["action"] == "HOLD"
+    assert snapshot["executable"] is True
+
+
+def test_position_decision_marks_same_day_exit_as_t1_locked():
+    snapshot = build_position_decision_snapshot(
+        current_price=9,
+        entry_price=10,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 0, "risk_stage": "初始/结构防守"},
+        entry_date="2026-06-13",
+        now=datetime(2026, 6, 13, 14, 30),
+    )
+
+    assert snapshot["action"] == "CLOSE"
+    assert snapshot["executable"] is False
+    assert snapshot["t1_locked"] is True
+
+
+def test_position_decision_blocks_premature_profit_protection():
+    snapshot = build_position_decision_snapshot(
+        current_price=10,
+        entry_price=10,
+        risk={"active_stop_price": 10.1, "initial_stop_price": 9.1, "max_pl_pct": 0, "risk_stage": "保本保护"},
+    )
+
+    assert snapshot["action"] == "REVIEW"
+    assert snapshot["invariants"][0]["code"] == "PREMATURE_PROFIT_PROTECTION"
+
+
+# ── 分批止盈（改动 #9）──
+
+def test_first_profit_take_triggers_reduce_at_8pct():
+    """盈利达到 +8%（max_pl_pct）且未减仓时，应发 REDUCE 分批止盈。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=11.0,   # +10% 浮盈
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 10.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+    )
+
+    assert snapshot["action"] == "REDUCE"
+    assert "分批止盈" in snapshot["trigger"]
+    assert snapshot["executable"] is True
+
+
+def test_first_profit_take_skipped_when_already_reduced():
+    """已减仓（already_reduced=True）时不再重复触发首笔止盈。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=11.0,   # +10% 浮盈
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 10.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+        already_reduced=True,
+    )
+
+    assert snapshot["action"] != "REDUCE"  # 不重复减仓
+
+
+def test_first_profit_take_does_not_trigger_below_threshold():
+    """盈利未达 +8% 时不触发分批止盈（HOLD）。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=10.5,   # +5% 浮盈
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 5.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+    )
+
+    assert snapshot["action"] == "HOLD"

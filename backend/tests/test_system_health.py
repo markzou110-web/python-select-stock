@@ -57,3 +57,24 @@ def test_system_health_snapshot_scores_ready_system():
     assert payload["score"] >= 70
     assert payload["summary"]["latest_scan_date"] == "2025-05-30"
     assert any(item["name"] == "notification" and item["status"] == "ok" for item in payload["checks"])
+
+
+def test_system_health_detects_same_day_high_contamination():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_trading (
+                code, name, entry_price, entry_date, current_price, high_since_entry, status, trade_mode
+            ) VALUES (
+                '000001', '平安银行', 10, CURRENT_DATE, 10, 11, 'OPEN', 'SIMULATED'
+            )
+        """))
+
+    payload = build_system_health_snapshot(engine)
+
+    assert payload["summary"]["same_day_high_anomalies"] == 1
+    assert any(
+        item["name"] == "position_decision_consistency" and item["status"] == "error"
+        for item in payload["checks"]
+    )

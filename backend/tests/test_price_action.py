@@ -1,6 +1,6 @@
 import pandas as pd
 
-from core.price_action import analyze_price_action, build_price_action_annotations
+from core.price_action import _evaluate_pullback_validity, analyze_price_action, build_price_action_annotations
 
 
 def _ohlc_from_closes(closes):
@@ -39,6 +39,12 @@ def test_price_action_detects_bull_context_and_outputs_risk_levels():
     assert result["pa_trade_plan"]["action"] in {"READY", "WATCH"}
     assert result["pa_trade_plan"]["entry_condition"]
     assert result["pa_trade_plan"]["invalidation"]
+    assert result["pa_risk_reward"] >= 1.5
+    assert result["pa_target_price"] > result["pa_entry_price"]
+    assert result["pa_target_basis"]
+    assert 0 <= result["pa_structure_score"] <= 100
+    assert 0 <= result["pa_execution_score"] <= 100
+    assert 0 <= result["pa_risk_score"] <= 100
 
 
 def test_price_action_handles_short_data():
@@ -84,6 +90,45 @@ def test_price_action_detects_h2_two_legged_pullback():
     assert result["pa_entry_quality_score"] > 0
     assert result["pa_position_strategy"]
     assert result["pa_trade_plan"]["action"] in {"READY", "WATCH"}
+    assert result["pa_pullback_status"] in {"WAITING_PULLBACK", "PENDING_CONFIRMATION", "CONFIRMED", "INVALIDATED"}
+    assert result["pa_pullback_validity"]["checks"]
+
+
+def test_pullback_validity_confirms_only_after_price_and_volume_confirmation():
+    df = _ohlc_from_closes([10 + i * 0.08 for i in range(25)])
+    avg_volume = df["成交量"].iloc[:-1].mean()
+    df.loc[df.index[-2], ["开盘", "最高", "最低", "收盘", "成交量"]] = [11.9, 12.0, 11.7, 11.8, avg_volume * 0.6]
+    df.loc[df.index[-1], ["开盘", "最高", "最低", "收盘", "成交量"]] = [11.8, 12.35, 11.75, 12.3, avg_volume * 1.4]
+
+    result = _evaluate_pullback_validity(
+        df,
+        support_price=11.7,
+        confirmation_price=12.01,
+        invalidation_price=11.5,
+        bull_context=True,
+        trend_damage="无",
+    )
+
+    assert result["status"] == "CONFIRMED"
+    assert result["score"] >= 5
+
+
+def test_pullback_validity_invalidates_on_volume_breakdown():
+    df = _ohlc_from_closes([10 + i * 0.08 for i in range(25)])
+    avg_volume = df["成交量"].iloc[:-1].mean()
+    df.loc[df.index[-1], ["开盘", "最高", "最低", "收盘", "成交量"]] = [12.0, 12.05, 11.2, 11.25, avg_volume * 1.5]
+
+    result = _evaluate_pullback_validity(
+        df,
+        support_price=11.7,
+        confirmation_price=12.1,
+        invalidation_price=11.5,
+        bull_context=True,
+        trend_damage="短线低点破坏",
+    )
+
+    assert result["status"] == "INVALIDATED"
+    assert "取消回踩计划" in result["action"]
 
 
 def test_price_action_detects_bear_l2_as_avoid_context():
@@ -174,6 +219,32 @@ def test_price_action_outputs_multitimeframe_volume_range_phase_and_summary():
     assert result["pa_trend_phase"]
     assert result["pa_trend_phase_action"]
     assert result["pa_decision_summary"]
+    assert result["pa_breakout_volume_threshold"] >= 1.2
+    assert 0 <= result["pa_volume_ratio_percentile"] <= 100
+
+
+def test_price_action_uses_calendar_weeks_when_dates_are_available():
+    dates = pd.bdate_range("2026-01-05", periods=70)
+    df = _ohlc_from_closes([10 + i * 0.08 for i in range(70)])
+    df["日期"] = dates
+
+    result = analyze_price_action(df)
+
+    assert result["pa_weekly_context"] != "周线数据不足"
+    assert result["price_action_version"] == "price-action-v3"
+    assert result["target_model_version"] == "structure-target-v2"
+    assert result["score_model_version"] == "pa-three-score-v1"
+
+
+def test_incomplete_calendar_week_is_marked_unconfirmed():
+    dates = pd.bdate_range("2026-01-05", periods=69)
+    df = _ohlc_from_closes([10 + i * 0.08 for i in range(69)])
+    df["日期"] = dates
+
+    result = analyze_price_action(df)
+
+    assert result["pa_current_week_complete"] is False
+    assert "本周尚未收盘" in result["pa_multi_timeframe_note"]
 
 
 def test_price_action_detects_gap_failure_and_failed_second_entry():

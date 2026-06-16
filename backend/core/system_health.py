@@ -65,6 +65,16 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
             latest_daily = _iso_date(_safe_scalar(conn, "SELECT MAX(date) FROM daily_k"))
             latest_scan = _iso_date(_safe_scalar(conn, "SELECT MAX(date) FROM scan_history"))
             bark_key = _safe_scalar(conn, "SELECT value FROM system_settings WHERE key = 'bark_key'", "")
+            same_day_high_anomalies = int(_safe_scalar(conn, """
+                SELECT COUNT(*)
+                FROM paper_trading
+                WHERE status = 'OPEN'
+                  AND entry_date = CURRENT_DATE
+                  AND high_since_entry > CASE
+                      WHEN current_price > entry_price THEN current_price
+                      ELSE entry_price
+                  END * 1.001
+            """, 0) or 0)
 
             table_counts = {}
             missing_tables = []
@@ -100,6 +110,7 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
         "latest_daily_date": latest_daily,
         "latest_scan_date": latest_scan,
         "table_counts": table_counts,
+        "same_day_high_anomalies": same_day_high_anomalies,
     })
 
     checks.append({
@@ -142,7 +153,15 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
         recommendations.append("补充 stock_fundamentals，提高综合评分可信度")
 
     if latest_scan:
-        checks.append({"name": "scan_history", "status": "ok", "message": f"最近扫描日期 {latest_scan}"})
+        if latest_daily and latest_scan > latest_daily:
+            checks.append({
+                "name": "scan_history",
+                "status": "warn",
+                "message": f"扫描记录日期 {latest_scan} 晚于行情数据日期 {latest_daily}，需明确数据口径",
+            })
+            recommendations.append("扫描页面同时展示执行时间与行情数据日期，避免将非交易日扫描误认为当日行情")
+        else:
+            checks.append({"name": "scan_history", "status": "ok", "message": f"最近扫描日期 {latest_scan}"})
     else:
         checks.append({"name": "scan_history", "status": "warn", "message": "暂无扫描历史，复盘中心样本不足"})
         recommendations.append("完成至少一次策略扫描，建立复盘基线")
@@ -158,6 +177,20 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
     else:
         checks.append({"name": "notification", "status": "warn", "message": "Bark 推送未配置"})
         recommendations.append("配置 Bark Key，确保风险告警能触达手机")
+
+    if same_day_high_anomalies:
+        checks.append({
+            "name": "position_decision_consistency",
+            "status": "error",
+            "message": f"发现 {same_day_high_anomalies} 条当日持仓最高价可能包含入场前价格",
+        })
+        recommendations.append("修正持仓期最高价后再使用保本保护或移动风控")
+    else:
+        checks.append({
+            "name": "position_decision_consistency",
+            "status": "ok",
+            "message": "未发现当日入场最高价污染",
+        })
 
     error_count = sum(1 for item in checks if item["status"] == "error")
     warn_count = sum(1 for item in checks if item["status"] == "warn")

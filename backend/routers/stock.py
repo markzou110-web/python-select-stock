@@ -6,6 +6,7 @@ Extracted from api.py.
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from datetime import datetime, timedelta
+import math
 import akshare as ak
 import pandas as pd
 
@@ -14,11 +15,30 @@ from core.db import get_db_engine, validate_stock_code, load_from_db, save_to_db
 from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
 from core.price_action import build_price_action_annotations
-from core.risk_engine import compute_paper_risk_levels, safe_float
-from core.operation_plan import operation_bands, price_instruction
+from core.risk_engine import compute_paper_risk_levels, safe_float, track_high_since_entry
+from core.operation_plan import build_position_decision_snapshot, operation_bands, price_instruction
 from core.money_flow import get_stock_money_flow
+from core.audit_log import get_position_decision_timeline, record_position_decision_change
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
+
+
+def _json_safe_response(value):
+    """Convert indicator output into values accepted by strict JSON encoders."""
+    if isinstance(value, dict):
+        return {str(key): _json_safe_response(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_response(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if pd.isna(value) if not isinstance(value, (dict, list, tuple, set)) else False:
+        return None
+    return value
 
 
 def _get_live_snapshot_price(code: str) -> dict | None:
@@ -232,6 +252,7 @@ def get_stock_detail(code: str):
         entry_source = None
         entry_signal_date = None
         entry_reason_snapshot = None
+        paper_trade_id = None
         
         with engine.connect() as conn:
             basic_res = conn.execute(text("SELECT name, industry FROM stock_basic WHERE code = :code"), {"code": code}).fetchone()
@@ -249,12 +270,19 @@ def get_stock_detail(code: str):
             
             if paper_res:
                 entry_price = safe_float(paper_res[0])
-                high_since_entry = safe_float(paper_res[1], entry_price)
+                current_close = float(df.iloc[-1]['收盘'])
+                high_since_entry = track_high_since_entry(
+                    entry_price,
+                    safe_float(paper_res[1], entry_price),
+                    current_close,
+                    current_close,
+                    paper_res[4],
+                )
                 is_paper_trade = True
                 risk_levels = compute_paper_risk_levels(
                     entry_price,
                     high_since_entry,
-                    float(df.iloc[-1]['收盘']),
+                    current_close,
                     price_action.get("summary", {}),
                 )
                 buy_price = risk_levels["buy_price"]
@@ -950,7 +978,7 @@ def get_stock_full_analysis(code: str):
 
             paper_res = conn.execute(text("""
                 SELECT entry_price, high_since_entry, status, remark, entry_date, current_price,
-                       entry_source, entry_signal_date, entry_reason_snapshot, strategy_type
+                       entry_source, entry_signal_date, entry_reason_snapshot, strategy_type, id
                 FROM paper_trading
                 WHERE code = :code AND status = 'OPEN'
                 LIMIT 1
@@ -964,7 +992,13 @@ def get_stock_full_analysis(code: str):
                 if live_price:
                     curr_price = live_price["price"]
                     curr_high = live_price["high"]
-                    high_since_entry = max(high_since_entry, curr_high, curr_price)
+                    high_since_entry = track_high_since_entry(
+                        entry_price,
+                        high_since_entry,
+                        curr_price,
+                        curr_high,
+                        paper_res[4],
+                    )
                     price_source = live_price["source"]
                     price_updated_at = live_price["updated_at"]
                     try:
@@ -1005,6 +1039,7 @@ def get_stock_full_analysis(code: str):
                 entry_source = paper_res[6]
                 entry_signal_date = str(paper_res[7]) if paper_res[7] else None
                 entry_reason_snapshot = paper_res[8]
+                paper_trade_id = int(paper_res[10])
                 if paper_res[4]:
                     entry_date = paper_res[4]
                     if isinstance(entry_date, str):
@@ -1117,6 +1152,43 @@ def get_stock_full_analysis(code: str):
                 profitable=pl_pct > 0,
                 trigger_action="放量突破后小幅加仓",
             )
+            stock_info["position_decision_snapshot"] = build_position_decision_snapshot(
+                current_price=current_price,
+                entry_price=buy_price,
+                risk={
+                    "active_stop_price": stop_price,
+                    "structure_stop_price": structure_stop_price,
+                    "initial_stop_price": initial_stop_price,
+                    "max_pl_pct": max_pl_pct,
+                    "risk_stage": risk_stage,
+                },
+                plan={"add_trigger_price": add_trigger, "add_guard_price": add_guard},
+                entry_date=entry_date_str,
+                price_source=price_source,
+                price_updated_at=price_updated_at,
+            )
+            snapshot = stock_info["position_decision_snapshot"]
+            stock_info["position_decision"] = {
+                "grade": {
+                    "CLOSE": "EXIT",
+                    "REDUCE": "DEFEND",
+                    "REVIEW": "REVIEW",
+                    "ADD_REVIEW": "HOLD_ADD_REVIEW",
+                    "HOLD": "HOLD",
+                }.get(snapshot["action"], "HOLD"),
+                "label": snapshot["label"],
+                "action": snapshot["trigger"],
+                "executable": snapshot["executable"],
+                "t1_locked": snapshot["t1_locked"],
+            }
+            record_position_decision_change(
+                source="stock_detail",
+                code=code,
+                name=name,
+                trade_id=paper_trade_id,
+                strategy_type=chart_strategy,
+                snapshot=snapshot,
+            )
 
         # 4. 概念板块 (异步友好 + 24小时缓存)
         concepts = _fetch_stock_concepts(code)
@@ -1139,8 +1211,29 @@ def get_stock_full_analysis(code: str):
 
         # 8. AI 操作建议
         ai_suggestion = _generate_ai_suggestion(df, stock_info, risk_assessment, price_action.get("summary", {}))
+        position_snapshot = stock_info.get("position_decision_snapshot")
+        if position_snapshot:
+            snapshot_action = position_snapshot.get("action")
+            ui_action = {
+                "CLOSE": "CLOSE",
+                "REDUCE": "REDUCE",
+                "ADD_REVIEW": "HOLD",
+                "REVIEW": "HOLD",
+                "HOLD": "HOLD",
+            }.get(snapshot_action, "HOLD")
+            ai_suggestion = {
+                **ai_suggestion,
+                "action": ui_action,
+                "confidence": position_snapshot.get("confidence", ai_suggestion.get("confidence")),
+                "reasoning": [
+                    position_snapshot.get("trigger"),
+                    *[reason for reason in ai_suggestion.get("reasoning", []) if reason != position_snapshot.get("trigger")],
+                ],
+                "action_label": f"{position_snapshot.get('label')} — {position_snapshot.get('trigger')}",
+                "position_decision_version": position_snapshot.get("version"),
+            }
 
-        return {
+        return _json_safe_response({
             "code": code,
             "kline": kline_records,
             "signals": signals,
@@ -1152,7 +1245,8 @@ def get_stock_full_analysis(code: str):
             "money_flow": money_flow,
             "risk_assessment": risk_assessment,
             "ai_suggestion": ai_suggestion,
-        }
+            "position_decision_timeline": get_position_decision_timeline(code) if is_paper_trade else [],
+        })
 
     except HTTPException:
         raise

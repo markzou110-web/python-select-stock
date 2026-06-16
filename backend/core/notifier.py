@@ -103,6 +103,11 @@ class Notifier:
                 results[name] = False
 
         logger.info(f"Notification dispatch results: {results}")
+        try:
+            from core.audit_log import record_notification_audit
+            record_notification_audit(title, targets, results, group, body)
+        except Exception as exc:
+            logger.warning(f"Notification audit unavailable: {exc}")
         return results
 
     async def test_channel(self, channel: str) -> bool:

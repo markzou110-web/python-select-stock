@@ -194,7 +194,8 @@ def _position_breakout_confirmation(
     if trigger <= 0:
         return {}
 
-    volume_threshold = avg_volume_20 * 1.4 if avg_volume_20 > 0 else 0
+    volume_ratio_threshold = float(pa.get("pa_breakout_volume_threshold") or 1.4)
+    volume_threshold = avg_volume_20 * volume_ratio_threshold if avg_volume_20 > 0 else 0
     bar_range = max(high_price - low_price, 0.01)
     close_position = (close_price - low_price) / bar_range
     upper_shadow_pct = max(0.0, high_price - max(open_price, close_price)) / max(close_price, 0.01) * 100
@@ -209,6 +210,7 @@ def _position_breakout_confirmation(
         "trigger": round(trigger, 2),
         "guard": round(guard, 2),
         "volume_threshold": int(volume_threshold) if volume_threshold > 0 else 0,
+        "volume_ratio_threshold": round(volume_ratio_threshold, 2),
         "volume_ratio": round(last_volume / volume_threshold, 2) if volume_threshold > 0 else 0,
         "price_ok": price_ok,
         "volume_ok": volume_ok,
@@ -491,7 +493,8 @@ def _real_position_action(
 
     extras = []
     if breakout_plan:
-        volume_text = f"量≥{breakout_plan['volume_threshold']}" if breakout_plan.get("volume_threshold") else "量≥20日均量1.4x"
+        ratio_text = breakout_plan.get("volume_ratio_threshold") or 1.4
+        volume_text = f"量≥均量{ratio_text}x({breakout_plan['volume_threshold']})" if breakout_plan.get("volume_threshold") else f"量≥20日均量{ratio_text}x"
         status_bits = []
         if breakout_plan.get("price_ok"):
             status_bits.append("价✓")

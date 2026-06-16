@@ -33,14 +33,25 @@ from core.strategy import (
 )
 from core.price_action import analyze_price_action
 from core.risk_engine import compute_paper_risk_levels
+from core.scan_preflight import build_scan_preflight
+
+# 数据预检熔断开关：True 时，若 preflight 报告 blocking（数据异常/陈旧），
+# perform_market_scan 会中止并返回空结果，避免坏数据静默产生假信号。
+# 调试/紧急时可设为 False 绕过。
+SCAN_PREFLIGHT_ENFORCE = True
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
 from core.decision_layer import apply_decision_layer
 from routers.market import fetch_mine_sweeper_data
+from core.data_source_quality import get_suspected_adjustment_gap_codes
 
 
 EXECUTABLE_PA_ACTIONS = {"READY", "WATCH"}
 BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
+
+
+def _should_include_sector_watch(strategy_type: str) -> bool:
+    return strategy_type == "sector_watch"
 
 
 def _money_flow_label(item: Dict[str, Any]) -> str:
@@ -121,37 +132,18 @@ def _is_abnormal_price_move(code: str, pct: Any) -> bool:
 
 
 def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
-    """Translate Brooks price-action context into a bounded scan ranking adjustment."""
+    """Apply only execution-level PA adjustments; component quality is calibrated separately."""
     adjustment = 0.0
-    if (res.get('pa_trade_plan') or {}).get('action') == 'READY':
-        adjustment += 6
-    if res.get('pa_h2_quality') == '强':
-        adjustment += 5
-    elif res.get('pa_h2_quality') == '中':
-        adjustment += 2
-    if res.get('pa_volume_confirmed'):
+    action = (res.get('pa_trade_plan') or {}).get('action')
+    if action == 'READY':
         adjustment += 4
-    if (res.get('pa_multi_timeframe_score') or 0) >= 25:
-        adjustment += 4
-    if (res.get('pa_always_in_strength') or 0) >= 70:
-        adjustment += 3
-    if res.get('pa_micro_channel') == '多头微型通道':
-        adjustment += 2
-
+    elif action == 'AVOID':
+        adjustment -= 8
     if (res.get('pa_trap_risk') or 0) >= 75:
-        adjustment -= 8
-    if (res.get('pa_failure_risk') or 0) >= 70:
-        adjustment -= 6
+        adjustment -= 4
     if res.get('pa_trend_damage') in {'跌破EMA20', '跌破EMA60', '短线低点破坏'}:
-        adjustment -= 8
-    if res.get('pa_failed_second_entry') == '失败H2':
-        adjustment -= 6
-    if (res.get('pa_gap_risk') or 0) >= 70:
         adjustment -= 4
-    if (res.get('pa_multi_timeframe_score') or 0) <= -25:
-        adjustment -= 4
-    adjustment += float(res.get('pa_eight_rule_score_delta') or 0)
-    return max(-20.0, min(20.0, adjustment))
+    return max(-10.0, min(10.0, adjustment))
 
 
 def _is_momentum_watch_candidate(res: Dict[str, Any], vetoes: List[str]) -> bool:
@@ -487,7 +479,7 @@ def _build_sector_watch_candidates(
     return watch
 
 
-def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20, fund_data=None):
+def single_stock_task(code, name, price, vol, open_price, threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter=True, local_only=False, engine=None, preloaded_df=None, target_date=None, bench_df=None, strategy_type="squeeze", pine_min_signals=3, min_data_days=None, weekly_ma_period=20, fund_data=None, tv_weekly_gate=False):
     # Use provided target_date or default to now
     if target_date is None or target_date == "":
         target_date = datetime.now()
@@ -565,6 +557,11 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             else:
                 return stats
         elif strategy_type in {"tv_dual", "tv_dual_strict"}:
+            # 可选周线对齐门槛（默认关闭）。开启后，周线波段未走强（MA 未向上 + EMA10w≤EMA30w）
+            # 的候选直接过滤，避免逆周线下跌结构买入。复用既有 get_weekly_indicators（日→周重采样）。
+            if tv_weekly_gate:
+                if not get_weekly_indicators(code, df=df, local_only=local_only, weekly_ma_period=weekly_ma_period):
+                    return {"reason": "周线波段未走强（tv_dual 门槛）"}
             match, stats = check_tv_dual_strategy(
                 df,
                 threshold=threshold,
@@ -700,7 +697,8 @@ def perform_market_scan(
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,
-    stop_loss_pct: float = -8.0
+    stop_loss_pct: float = -8.0,
+    tv_weekly_gate: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Executes the main market scan logic.
@@ -708,6 +706,15 @@ def perform_market_scan(
     logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
     max_date = None
     scan_started_at = datetime.now()
+    phase_started_at = time.perf_counter()
+    phase_timings: Dict[str, float] = {}
+
+    def mark_phase(name: str) -> None:
+        nonlocal phase_started_at
+        now = time.perf_counter()
+        phase_timings[name] = round(now - phase_started_at, 3)
+        phase_started_at = now
+
     audit_payload: Dict[str, Any] = {
         "started_at": scan_started_at,
         "status": "SUCCESS",
@@ -754,6 +761,26 @@ def perform_market_scan(
 
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
+
+        # 数据预检熔断：若数据质量 blocking，中止扫描，避免坏/陈旧数据静默产生假信号。
+        # （此前 preflight 仅作为 GET 接口暴露，扫描器从不检查。）
+        if SCAN_PREFLIGHT_ENFORCE and engine is not None:
+            try:
+                preflight = build_scan_preflight(engine, data_date=data_date)
+                if preflight.get("blocking"):
+                    block_msgs = [
+                        c.get("message", c.get("name", ""))
+                        for c in preflight.get("checks", [])
+                        if c.get("status") == "error"
+                    ]
+                    logger.warning(
+                        f"[RUN_MARKET_SCAN] 扫描被数据预检熔断中止："
+                        f"{'; '.join(block_msgs) or '存在 error 级检查项'}"
+                    )
+                    return []
+            except Exception as exc:
+                # 预检本身失败不应阻断扫描（降级为告警，保持可用性）
+                logger.warning(f"[RUN_MARKET_SCAN] 数据预检执行异常，跳过熔断：{exc}")
 
         # 1. 如果不是强制本地，尝试联网获取快照
         if not local_only and data_date is None:
@@ -845,6 +872,7 @@ def perform_market_scan(
             else:
                 detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
             raise HTTPException(status_code=503, detail=detail_msg)
+        mark_phase("market_snapshot_load")
 
         # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
         total_snapshot = len(snapshot_df)
@@ -867,7 +895,13 @@ def perform_market_scan(
             (~has_mkt_cap | (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)) &
             (~has_turnover | (snapshot_df['turnover'] >= turnover_min))
         ].copy()
+        adjustment_gap_codes = get_suspected_adjustment_gap_codes(engine, target_date=data_date)
+        if adjustment_gap_codes:
+            candidates = candidates[~candidates["code"].astype(str).isin(adjustment_gap_codes)]
+            audit_payload.setdefault("fail_reasons", {})["suspected_adjustment_gap"] = len(adjustment_gap_codes)
+            logger.warning(f"Quarantined {len(adjustment_gap_codes)} suspected adjustment-gap candidates.")
         audit_payload["candidate_count"] = len(candidates)
+        mark_phase("candidate_filter")
 
         logger.info(f"Snapshot: {total_snapshot} stocks")
         logger.info(f"After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
@@ -1013,6 +1047,7 @@ def perform_market_scan(
                 logger.info(f"Parallel Pine Script indicators calculation completed.")
 
             logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
+            mark_phase("indicator_batch")
 
             # 按代码切分，供并发扫描使用
             hist_map = {code: group for code, group in master_df.groupby('code')}
@@ -1060,7 +1095,8 @@ def perform_market_scan(
                     threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
                     local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
                     bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days,
-                    weekly_ma_period=weekly_ma_period, fund_data=fund_map.get(str(row['code']))
+                    weekly_ma_period=weekly_ma_period, fund_data=fund_map.get(str(row['code'])),
+                    tv_weekly_gate=tv_weekly_gate
                 ): row for _, row in candidates.iterrows()
             }
 
@@ -1116,16 +1152,18 @@ def perform_market_scan(
         sector_history = build_sector_history_context(engine, sector_map)
         sector_strength = build_sector_strength(snapshot_df, sector_map, sector_trends, sector_history)
 
-        sector_watch = _build_sector_watch_candidates(
-            candidates,
-            {str(r.get('代码')) for r in results},
-            hist_map,
-            sector_map,
-            sector_strength,
-        )
-        if sector_watch:
-            logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
-            results.extend(sector_watch)
+        if _should_include_sector_watch(strategy_type):
+            results = []
+            sector_watch = _build_sector_watch_candidates(
+                candidates,
+                set(),
+                hist_map,
+                sector_map,
+                sector_strength,
+            )
+            if sector_watch:
+                logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
+                results.extend(sector_watch)
 
         # 补充增强 data (行业, 胜率) - 并发处理 Top 100 + 板块观察
         logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
@@ -1320,8 +1358,22 @@ def perform_market_scan(
         for res in results:
             res['market_regime'] = market_regime.get('status', 'UNKNOWN')
         _apply_money_flow_to_results(results, money_flow_map)
-        decision_context = apply_decision_layer(results, snapshot_df, market_regime)
-        audit_payload["version_snapshot"]["decision_layer"] = "market-mainline-leadership-v1"
+        from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
+        apply_limit_up_features(results, load_limit_up_event_map(str(max_date), engine))
+        from core.decision_layer import load_market_cycle_history
+        decision_context = apply_decision_layer(
+            results,
+            snapshot_df,
+            market_regime,
+            load_market_cycle_history(engine),
+        )
+        from core.score_calibration import calibrate_scan_scores
+        calibrate_scan_scores(results)
+        from core.strategy_health import apply_strategy_health_controls, build_strategy_health
+        apply_strategy_health_controls(results, build_strategy_health(engine))
+        audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
+        audit_payload["version_snapshot"]["strategy_health_control"] = "expected-return-circuit-breaker-v1"
+        audit_payload["version_snapshot"]["decision_layer"] = "market-cycle-mainline-leadership-v2"
         audit_payload["params_snapshot"]["market_sentiment_stage"] = decision_context.get("market_sentiment_stage")
         audit_payload["params_snapshot"]["portfolio_position_cap_pct"] = decision_context.get("portfolio_position_cap_pct")
         logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
@@ -1337,7 +1389,7 @@ def perform_market_scan(
             key=lambda x: (
                 grade_order.get(x.get('sop_grade', 'D'), 4),
                 -float(x.get('trade_opportunity_score') or 0),
-                -float(x.get('final_rank_score', x.get('Score', 0)) or 0),
+                -float(x.get('calibrated_score', x.get('Score', 0)) or 0),
             ),
         )
 
@@ -1345,9 +1397,21 @@ def perform_market_scan(
         from core.sentinel import sentinel, _select_intraday_push_stocks
         ab_results = [r for r in results if r.get('sop_grade') in ('A', 'B')]
         sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else ab_results[:5]
+        mark_phase("scoring_and_decision")
 
         # --- 持久化保存 ---
-        save_scan_results(results, engine)
+        persist_started_at = time.perf_counter()
+        scan_data_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
+        for res in results:
+            res['data_date'] = scan_data_date
+        save_scan_results(
+            results,
+            engine,
+            data_date=scan_data_date,
+            replace_strategy_types=[strategy_type],
+        )
+        phase_timings["result_persistence"] = round(time.perf_counter() - persist_started_at, 3)
+        audit_payload["params_snapshot"]["performance_phases_sec"] = phase_timings
         audit_payload.update({
             "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
             "finished_at": datetime.now(),
@@ -1363,10 +1427,6 @@ def perform_market_scan(
         })
 
         # 在结果中注入数据日期
-        scan_data_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
-        for res in results:
-            res['data_date'] = scan_data_date
-
         return results
     except HTTPException as he:
         engine = get_db_engine()

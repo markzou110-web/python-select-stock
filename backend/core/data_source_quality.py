@@ -32,6 +32,18 @@ def _is_suspected_corporate_action_gap(name: str, close_jump_pct: Optional[float
     return close_jump_pct <= -20 and open_gap_pct <= -15 and abs(close_jump_pct - open_gap_pct) <= 8
 
 
+def get_suspected_adjustment_gap_codes(engine: Optional[Engine], target_date: Optional[str] = None) -> set[str]:
+    """Return likely ex-right adjustment discontinuities for scan quarantine."""
+    if engine is None:
+        return set()
+    report = build_local_data_quality_report(engine, target_date=target_date, max_abnormal_move_pct=15.0)
+    return {
+        str(item)
+        for item in (report.get("summary", {}).get("suspected_corporate_action_gap_codes") or [])
+        if item
+    }
+
+
 def build_local_data_quality_report(
     engine: Optional[Engine],
     target_date: Optional[str] = None,
@@ -137,12 +149,14 @@ def build_local_data_quality_report(
             """), {"selected_date": selected_date, "max_move": float(max_abnormal_move_pct)}).fetchall()
             abnormal_samples = []
             suspected_corporate_action_count = 0
+            suspected_corporate_action_codes = []
             for row in abnormal_rows:
                 open_gap_pct = _float_or_none(row[5])
                 close_jump_pct = _float_or_none(row[6])
                 suspected = _is_suspected_corporate_action_gap(row[1], close_jump_pct, open_gap_pct)
                 if suspected:
                     suspected_corporate_action_count += 1
+                    suspected_corporate_action_codes.append(row[0])
                 if len(abnormal_samples) < 10:
                     abnormal_samples.append({
                         "code": row[0],
@@ -157,6 +171,7 @@ def build_local_data_quality_report(
             abnormal_count = len(abnormal_rows)
             summary["abnormal_move_count"] = abnormal_count
             summary["suspected_corporate_action_gap_count"] = suspected_corporate_action_count
+            summary["suspected_corporate_action_gap_codes"] = suspected_corporate_action_codes
             summary["abnormal_move_samples"] = abnormal_samples
 
             zero_row = conn.execute(text("""

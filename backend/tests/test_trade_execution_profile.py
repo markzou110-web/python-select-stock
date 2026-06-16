@@ -80,6 +80,42 @@ def test_pine_candidate_gets_short_term_management_hint():
     assert "1-2" in result["exit_hint"]
 
 
+def test_strong_daily_mover_keeps_quality_grade_but_is_observe_only():
+    results = [_base_candidate(**{"涨幅%": 8.2})]
+
+    _apply_sop_filter(results, {"status": "DEFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["sop_grade"] == "A"
+    assert "涨幅>7%" not in result["sop_vetoes"]
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert "涨幅偏高，等待回踩确认" in result["trade_blockers"]
+
+
+def test_near_limit_threshold_respects_board_limit():
+    main = _base_candidate(代码="000001", **{"涨幅%": 9.8})
+    chinext = _base_candidate(代码="300001", **{"涨幅%": 9.8})
+
+    _apply_sop_filter([main, chinext], {"status": "DEFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert "涨停/近涨停，等待隔日确认" in main["trade_blockers"]
+    assert "涨停/近涨停，等待隔日确认" not in chinext["trade_blockers"]
+    assert "涨幅偏高，等待回踩确认" in chinext["trade_blockers"]
+
+
+def test_five_day_surge_is_ranking_risk_not_sop_veto():
+    normal = _base_candidate()
+    surged = _base_candidate(**{"pct_5d": 16.0})
+
+    _apply_sop_filter([normal, surged], {"status": "DEFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert surged["sop_grade"] == "A"
+    assert "5日涨>15%" not in surged["sop_vetoes"]
+    assert surged["sop_risks"] == ["5日涨幅>15%，排序扣分"]
+    assert surged["final_rank_score"] == normal["final_rank_score"] - 6
+
+
 def test_single_stock_task_rejects_abnormal_price_jump():
     close = np.full(130, 10.0)
     close[-2] = 13.0

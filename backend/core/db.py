@@ -56,7 +56,8 @@ PRICE_ACTION_DETAIL_KEYS = [
     "price_action_score", "price_action_regime", "price_action_signal", "price_action_pattern",
     "price_action_entry_quality", "price_action_summary", "price_action_risks",
     "pa_market_cycle", "pa_range_location", "pa_entry_price", "pa_stop_price",
-    "pa_target_price", "pa_risk_reward", "pa_tags", "pa_pullback_legs",
+    "pa_target_price", "pa_risk_reward", "pa_actual_space_rr", "pa_target_basis",
+    "pa_structure_score", "pa_execution_score", "pa_risk_score", "pa_tags", "pa_pullback_legs",
     "pa_pullback_structure", "pa_pullback_validity", "pa_pullback_status",
     "pa_pullback_status_label", "pa_pullback_support_price", "pa_pullback_confirmation_price",
     "pa_pullback_invalidation_price", "pa_pullback_action", "pa_breakout_quality", "pa_failure_risk",
@@ -64,7 +65,11 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_failed_breakout_type", "pa_trap_risk", "pa_micro_channel",
     "pa_always_in_strength", "pa_trend_damage", "pa_channel_state",
     "pa_position_strategy", "pa_weekly_context", "pa_multi_timeframe_score",
-    "pa_multi_timeframe_note", "pa_volume_pattern", "pa_volume_confirmed",
+    "pa_multi_timeframe_note", "pa_current_week_complete",
+    "price_action_version", "target_model_version", "score_model_version",
+    "pa_volume_pattern", "pa_volume_confirmed",
+    "pa_volume_ratio", "pa_volume_ratio_percentile", "pa_breakout_volume_threshold",
+    "pa_confirmation_volume_threshold",
     "pa_volume_risk", "pa_failed_second_entry", "pa_second_entry_risk",
     "pa_gap_type", "pa_gap_risk", "pa_range_width_quality",
     "pa_range_center_risk", "pa_range_failed_breakout_count",
@@ -77,12 +82,18 @@ PRICE_ACTION_DETAIL_KEYS = [
     "sop_grade", "sop_action", "sop_risks", "sector_momentum_score", "sector_breadth",
     "sector_phase", "sector_rank", "sector_alignment_score", "sector_relative_pct",
     "sector_3d_pct", "sector_5d_pct", "sector_consecutive_up_days", "sector_role",
-    "sector_mainline", "leadership_score",
+    "sector_mainline", "leadership_score", "leadership_components", "leadership_reason",
+    "limit_up_status", "first_limit_time", "last_limit_time", "break_count",
+    "limit_up_streak", "seal_amount", "limit_up_sector_rank",
     "sector_watch_only", "sector_watch_reason",
     "market_sentiment_stage", "market_sentiment_label", "market_sentiment_score",
+    "market_sentiment_reason", "market_cycle_metrics", "market_sentiment_model_version",
     "portfolio_position_cap_pct", "market_allowed_actions", "market_forbidden_actions", "market_breadth",
     "trade_opportunity_score", "trade_opportunity_label", "decision_score_components",
     "position_plan", "trade_state", "execution_instruction",
+    "raw_score", "calibrated_score", "score_components",
+    "research_eligible", "research_missing_fields",
+    "strategy_health",
 ]
 
 
@@ -176,6 +187,10 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_strategy_templates_type ON strategy_templates(strategy_type);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_audit_date ON scan_audit_log(scan_date DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_samples_code_date ON failure_samples(code, sample_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_time ON lifecycle_events(event_time DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_type ON lifecycle_events(event_type);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_task_run_audits_started ON task_run_audits(started_at DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notification_audits_sent ON notification_audits(sent_at DESC);"))
                 logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
@@ -204,6 +219,71 @@ def init_db(engine=None):
                 logger.info("Migration: paper trading entry metadata columns ensured.")
             except Exception as e:
                 logger.debug(f"paper trading entry metadata migration skipped: {e}")
+
+            # --- Migration: stock theme and rise logic ---
+            try:
+                if engine.dialect.name == "sqlite":
+                    for table_name in ("paper_trading", "watchlist"):
+                        existing = {
+                            row[1]
+                            for row in conn.execute(text(f"PRAGMA table_info({table_name})"))
+                        }
+                        if "theme" not in existing:
+                            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN theme VARCHAR(200)"))
+                        if "rise_logic" not in existing:
+                            conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN rise_logic TEXT"))
+                else:
+                    conn.execute(text("""
+                        ALTER TABLE paper_trading
+                        ADD COLUMN IF NOT EXISTS theme VARCHAR(200),
+                        ADD COLUMN IF NOT EXISTS rise_logic TEXT
+                    """))
+                    conn.execute(text("""
+                        ALTER TABLE watchlist
+                        ADD COLUMN IF NOT EXISTS theme VARCHAR(200),
+                        ADD COLUMN IF NOT EXISTS rise_logic TEXT
+                    """))
+                logger.info("Migration: stock theme and rise logic columns ensured.")
+            except Exception as e:
+                logger.debug(f"stock theme and rise logic migration skipped: {e}")
+
+            # --- Migration: P1 lifecycle, logic status, and execution audit ---
+            try:
+                columns = {
+                    "paper_trading": {
+                        "logic_status": "VARCHAR(30) DEFAULT 'UNVERIFIED'",
+                        "logic_last_review_at": "TIMESTAMP",
+                        "planned_entry_price": "FLOAT",
+                        "actual_entry_price": "FLOAT",
+                        "entry_slippage_pct": "FLOAT",
+                        "position_pct": "FLOAT",
+                        "shares": "INTEGER",
+                        "capital_used": "FLOAT",
+                        "execution_note": "TEXT",
+                        "plan_adherence": "VARCHAR(30) DEFAULT 'UNKNOWN'",
+                        "watchlist_id": "INTEGER",
+                    },
+                    "watchlist": {
+                        "logic_status": "VARCHAR(30) DEFAULT 'UNVERIFIED'",
+                        "logic_last_review_at": "TIMESTAMP",
+                    },
+                }
+                if engine.dialect.name == "sqlite":
+                    for table_name, definitions in columns.items():
+                        existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})"))}
+                        for column_name, definition in definitions.items():
+                            if column_name not in existing:
+                                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"))
+                else:
+                    for table_name, definitions in columns.items():
+                        clauses = ", ".join(f"ADD COLUMN IF NOT EXISTS {name} {definition}" for name, definition in definitions.items())
+                        conn.execute(text(f"ALTER TABLE {table_name} {clauses}"))
+                conn.execute(text("UPDATE watchlist SET logic_status = 'UNVERIFIED' WHERE logic_status IS NULL"))
+                conn.execute(text("UPDATE paper_trading SET logic_status = 'UNVERIFIED' WHERE logic_status IS NULL"))
+                conn.execute(text("UPDATE paper_trading SET plan_adherence = 'UNKNOWN' WHERE plan_adherence IS NULL"))
+                logger.info("Migration: P1 lifecycle and execution audit columns ensured.")
+            except Exception as e:
+                logger.debug(f"P1 lifecycle migration skipped: {e}")
 
             # --- Migration: paper trading close audit metadata ---
             try:
@@ -239,6 +319,49 @@ def init_db(engine=None):
                 logger.info("Migration: price action columns ensured.")
             except Exception as e:
                 logger.debug(f"price action migration skipped (may already exist): {e}")
+
+            # --- Migration: lossless scan signal identity and data-date semantics ---
+            try:
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("""
+                        ALTER TABLE scan_history
+                        ADD COLUMN IF NOT EXISTS signal_id BIGSERIAL,
+                        ADD COLUMN IF NOT EXISTS data_date DATE,
+                        ADD COLUMN IF NOT EXISTS scanned_at TIMESTAMP
+                    """))
+                    conn.execute(text("""
+                        UPDATE scan_history
+                        SET data_date = COALESCE(data_date, date),
+                            scanned_at = COALESCE(scanned_at, date::timestamp),
+                            strategy_type = COALESCE(strategy_type, 'squeeze')
+                    """))
+                    conn.execute(text("""
+                        DO $$
+                        DECLARE pk_name text;
+                        BEGIN
+                            SELECT conname INTO pk_name
+                            FROM pg_constraint
+                            WHERE conrelid = 'scan_history'::regclass AND contype = 'p';
+                            IF pk_name IS NOT NULL AND pk_name <> 'scan_history_signal_id_pkey' THEN
+                                EXECUTE format('ALTER TABLE scan_history DROP CONSTRAINT %I', pk_name);
+                            END IF;
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_constraint
+                                WHERE conrelid = 'scan_history'::regclass AND contype = 'p'
+                            ) THEN
+                                ALTER TABLE scan_history
+                                ADD CONSTRAINT scan_history_signal_id_pkey PRIMARY KEY (signal_id);
+                            END IF;
+                        END $$;
+                    """))
+                    conn.execute(text("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_scan_history_signal
+                        ON scan_history(code, data_date, strategy_type)
+                    """))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_data_date ON scan_history(data_date DESC)"))
+                logger.info("Migration: scan signal identity and data_date ensured.")
+            except Exception as e:
+                logger.debug(f"scan signal identity migration skipped: {e}")
 
             # --- Migration: Brooks trade-plan snapshots ---
             try:
@@ -335,6 +458,54 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"recommendation event migration skipped: {e}")
 
+            # --- Intraday limit-up / broken-board leadership evidence ---
+            try:
+                id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if engine.dialect.name == "sqlite" else "SERIAL PRIMARY KEY"
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS limit_up_events (
+                        id {id_type},
+                        event_date DATE NOT NULL,
+                        code VARCHAR(20) NOT NULL,
+                        name VARCHAR(80),
+                        industry VARCHAR(100),
+                        status VARCHAR(20) NOT NULL,
+                        first_limit_time VARCHAR(6),
+                        last_limit_time VARCHAR(6),
+                        break_count INTEGER DEFAULT 0,
+                        limit_up_streak INTEGER DEFAULT 0,
+                        seal_amount FLOAT DEFAULT 0,
+                        turnover FLOAT DEFAULT 0,
+                        amount FLOAT DEFAULT 0,
+                        first_seen_at TIMESTAMP,
+                        last_seen_at TIMESTAMP,
+                        UNIQUE(event_date, code)
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_limit_up_events_date ON limit_up_events(event_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_limit_up_events_code_date ON limit_up_events(code, event_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_limit_up_events_industry_date ON limit_up_events(industry, event_date DESC);"))
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS intraday_minute_bars (
+                        id {id_type},
+                        code VARCHAR(20) NOT NULL,
+                        bar_time VARCHAR(19) NOT NULL,
+                        open FLOAT,
+                        close FLOAT,
+                        high FLOAT,
+                        low FLOAT,
+                        volume FLOAT,
+                        amount FLOAT,
+                        average_price FLOAT,
+                        created_at TIMESTAMP,
+                        UNIQUE(code, bar_time)
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_intraday_minute_bars_time ON intraday_minute_bars(bar_time DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_intraday_minute_bars_code_time ON intraday_minute_bars(code, bar_time DESC);"))
+                logger.info("Migration: limit-up leadership events ensured.")
+            except Exception as e:
+                logger.debug(f"limit-up event migration skipped: {e}")
+
             conn.commit()
     except Exception as e:
         logger.error(f"Database init failed: {e}")
@@ -404,6 +575,23 @@ def save_failure_sample(sample: Dict[str, Any], engine=None) -> bool:
     try:
         with engine.connect() as conn:
             date_expr = ":sample_date" if engine.dialect.name == "sqlite" else "CAST(:sample_date AS DATE)"
+            exists = conn.execute(text(f"""
+                SELECT 1 FROM failure_samples
+                WHERE code = :code
+                  AND sample_date = {date_expr}
+                  AND COALESCE(failure_type, '') = COALESCE(:failure_type, '')
+                  AND COALESCE(source, '') = COALESCE(:source, '')
+                  AND ABS(COALESCE(pnl_pct, 0) - COALESCE(:pnl_pct, 0)) < 0.001
+                LIMIT 1
+            """), {
+                "code": sample.get("code"),
+                "sample_date": sample.get("sample_date") or datetime.now().strftime("%Y-%m-%d"),
+                "failure_type": sample.get("failure_type"),
+                "source": sample.get("source") or "paper_trade",
+                "pnl_pct": sample.get("pnl_pct"),
+            }).fetchone()
+            if exists:
+                return True
             conn.execute(text(f"""
                 INSERT INTO failure_samples (
                     code, name, sample_date, strategy_type, failure_type,
@@ -615,7 +803,12 @@ def load_from_db(code: str, start_date: str, engine=None) -> pd.DataFrame:
         logger.error(f"Error loading from DB for {code}: {e}")
         return pd.DataFrame()
 
-def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
+def save_scan_results(
+    results: List[Dict[str, Any]],
+    engine=None,
+    data_date: Optional[str] = None,
+    replace_strategy_types: Optional[List[str]] = None,
+) -> bool:
     """
     持久化保存选股结果集
 
@@ -628,14 +821,36 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
     """
     if engine is None:
         engine = get_db_engine()
-    if not engine or not results:
+    if not engine:
         return False
 
     try:
-        current_date = datetime.now().strftime("%Y-%m-%d")
+        scanned_at = datetime.now()
+        data_date = str(
+            data_date
+            or (results[0].get("data_date") if results else None)
+            or scanned_at.strftime("%Y-%m-%d")
+        )[:10]
         with engine.connect() as conn:
-            # 先删除当天旧记录，避免上次扫描的残留股票仍然显示
-            conn.execute(text("DELETE FROM scan_history WHERE date = :date"), {"date": current_date})
+            # Replace only the strategies produced by this run. Other strategy
+            # snapshots for the same data date remain available for comparison.
+            strategy_types = {
+                str(strategy_type)
+                for strategy_type in (replace_strategy_types or [])
+                if strategy_type
+            }
+            strategy_types.update(str(row.get("strategy_type") or "squeeze") for row in results)
+            if not strategy_types:
+                return False
+            for strategy_type in strategy_types:
+                conn.execute(
+                    text("""
+                        DELETE FROM scan_history
+                        WHERE COALESCE(data_date, date) = :data_date
+                          AND COALESCE(strategy_type, 'squeeze') = :strategy_type
+                    """),
+                    {"data_date": data_date, "strategy_type": strategy_type},
+                )
 
             # 批量构建参数列表
             rows = []
@@ -644,7 +859,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                 rows.append({
                     "code": r.get('代码'),
                     "name": r.get('名称'),
-                    "date": current_date,
+                    "date": data_date,
+                    "data_date": data_date,
+                    "scanned_at": scanned_at,
                     "price": float(r.get('现价', 0)),
                     "pct": float(r.get('涨幅%', 0)),
                     "score": float(r.get('Score', 0)),
@@ -681,12 +898,14 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
             if rows:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
+                        code, name, date, data_date, scanned_at, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
                         price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct, price_action_detail
                     ) VALUES (
-                        :code, :name, :date, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
+                        :code, :name, :date, :data_date, :scanned_at, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
                         :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct, CAST(:price_action_detail AS JSONB)
-                    ) ON CONFLICT (code, date) DO UPDATE SET
+                    ) ON CONFLICT (code, data_date, strategy_type) DO UPDATE SET
+                        date = EXCLUDED.date,
+                        scanned_at = EXCLUDED.scanned_at,
                         price = EXCLUDED.price,
                         pct = EXCLUDED.pct,
                         score = EXCLUDED.score,
@@ -719,9 +938,9 @@ def save_scan_results(results: List[Dict[str, Any]], engine=None) -> bool:
                         price_action_detail = EXCLUDED.price_action_detail
                 '''), rows)
             conn.commit()
-            logger.info(f"Saved {len(results)} scan records to database ({current_date})")
+            logger.info(f"Saved {len(results)} scan records to database (data_date={data_date})")
         try:
-            save_recommendation_events(results, engine=engine, source="scan", event_date=current_date)
+            save_recommendation_events(results, engine=engine, source="scan", event_date=data_date)
         except Exception as event_exc:
             logger.warning(f"Recommendation event persistence skipped: {event_exc}")
         return True
@@ -747,7 +966,7 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
 
     try:
         # 使用参数化查询防止 SQL 注入
-        query = text("SELECT * FROM scan_history WHERE date = :date ORDER BY score DESC")
+        query = text("SELECT * FROM scan_history WHERE COALESCE(data_date, date) = :date ORDER BY score DESC")
         df = pd.read_sql(query, engine, params={"date": date_str})
         if df.empty:
             return []
@@ -755,6 +974,8 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
         # Define a column mapping
         col_mapping = {
             "code": "代码",
+            "data_date": "data_date",
+            "scanned_at": "scanned_at",
             "name": "名称",
             "industry": "行业",
             "price": "现价",
@@ -822,7 +1043,7 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
                     "management": [],
                     "avoid_reasons": [],
                 }
-        return records
+        return _json_safe(records)
     except Exception as e:
         logger.error(f"Error loading scan history for {date_str}: {e}")
         return []
@@ -844,7 +1065,7 @@ def get_scan_dates(engine=None) -> List[str]:
 
     try:
         with engine.connect() as conn:
-            res = conn.execute(text("SELECT DISTINCT date FROM scan_history ORDER BY date DESC"))
+            res = conn.execute(text("SELECT DISTINCT COALESCE(data_date, date) AS signal_date FROM scan_history ORDER BY signal_date DESC"))
             return [str(row[0]) for row in res]
     except Exception as e:
         logger.error(f"Error getting scan dates: {e}")
@@ -918,7 +1139,7 @@ def save_stock_basic(df: pd.DataFrame, engine=None) -> bool:
                         END
                 '''))
                 conn.execute(text(f"DROP TABLE {temp_table}"))
-                conn.commit()
+            conn.commit()
             return True
         except Exception:
             try:

@@ -82,3 +82,59 @@ def test_wind_control_only_closes_on_price_or_confirmed_time_stop():
     assert warning == {"reason": "时间风控预警", "should_close": False}
     assert stop["should_close"] is True
     assert "21.28" in stop["reason"]
+
+
+def test_wind_control_respects_t1_locked_snapshot():
+    result = _wind_control_decision(
+        9.0,
+        {"active_stop_price": 9.1, "risk_stage": "初始/结构防守"},
+        None,
+        {"action": "CLOSE", "executable": False, "trigger": "跌破止损；T+1锁定"},
+    )
+
+    assert result["should_close"] is False
+    assert "T+1" in result["reason"]
+
+
+# ── REDUCE 真减仓（改动 #1）──
+
+def test_wind_control_reduce_in_profit_triggers_partial_close():
+    """REDUCE + 可执行 + 当前盈利 → 返回 should_reduce=True（触发部分平仓）。"""
+    result = _wind_control_decision(
+        11.0,  # 当前价 11，买入价 10 → 盈利
+        {"active_stop_price": 9.1, "risk_stage": "保本保护"},
+        None,
+        {"action": "REDUCE", "executable": True, "trigger": "分批止盈：+8%"},
+        entry_price=10.0,
+    )
+
+    assert result["should_close"] is False
+    assert result["should_reduce"] is True
+
+
+def test_wind_control_reduce_in_loss_degrades_to_warning():
+    """REDUCE + 可执行 + 当前亏损 → 降级为预警（不砍亏损仓位）。"""
+    result = _wind_control_decision(
+        9.5,  # 当前价 9.5，买入价 10 → 亏损
+        {"active_stop_price": 9.1, "risk_stage": "初始/结构防守"},
+        None,
+        {"action": "REDUCE", "executable": True, "trigger": "分批止盈：+8%"},
+        entry_price=10.0,
+    )
+
+    assert result["should_close"] is False
+    assert result.get("should_reduce", False) is False  # 亏损不真减仓
+
+
+def test_wind_control_reduce_t1_locked_does_not_execute():
+    """REDUCE + T+1 锁定（executable=False）→ 不触发部分平仓。"""
+    result = _wind_control_decision(
+        11.0,
+        {"active_stop_price": 9.1, "risk_stage": "保本保护"},
+        None,
+        {"action": "REDUCE", "executable": False, "trigger": "分批止盈；T+1锁定"},
+        entry_price=10.0,
+    )
+
+    assert result["should_close"] is False
+    assert result.get("should_reduce", False) is False

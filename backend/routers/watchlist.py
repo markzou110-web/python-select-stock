@@ -10,6 +10,7 @@ from core.logging_config import logger
 from core.notifier import notifier
 from core.risk_constants import FIXED_STOP_LOSS_RATIO, TAKE_PROFIT_RATIO
 from core.operation_plan import watch_exit_decision, watch_instruction
+from core.audit_log import record_lifecycle_event
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -28,7 +29,7 @@ def _watch_decision(item: Dict[str, Any]) -> Dict[str, str]:
             "decision": "INVALIDATE",
             "action": "失效移除：已触发失效价或 Brooks 回避信号",
         }
-    if target_hit or pa_action == "READY":
+    if target_hit:
         return {
             "decision": "PROMOTE",
             "action": "转可交易：尾盘确认未破失效线，可转入拟合实盘",
@@ -37,6 +38,8 @@ def _watch_decision(item: Dict[str, Any]) -> Dict[str, str]:
         distance = (float(target_price) - current_price) / current_price * 100
         if 0 <= distance <= 2:
             return {"decision": "NEAR_TRIGGER", "action": "接近触发：只等放量站稳，不提前追"}
+    if pa_action == "READY":
+        return {"decision": "READY_WAIT", "action": "结构就绪：仍需站稳触发价，未触发不买"}
     if stop_price and current_price > 0:
         buffer_pct = (current_price - float(stop_price)) / current_price * 100
         if 0 <= buffer_pct < 2:
@@ -44,6 +47,18 @@ def _watch_decision(item: Dict[str, Any]) -> Dict[str, str]:
     if pl_pct >= 5:
         return {"decision": "WATCH_PULLBACK", "action": "已有涨幅：不追，等回踩确认"}
     return {"decision": "KEEP_WATCH", "action": "继续观察：等待回踩/放量站稳或再次入选"}
+
+
+def _logic_status(decision: str) -> str:
+    if decision in {"INVALIDATE", "AUTO_PRUNE"}:
+        return "INVALIDATED"
+    if decision in {"PROMOTE", "TRIGGERED"}:
+        return "CONFIRMED"
+    if decision in {"NEAR_TRIGGER", "READY_WAIT"}:
+        return "STRENGTHENING"
+    if decision in {"RISK", "WATCH_PULLBACK"}:
+        return "WEAKENING"
+    return "UNVERIFIED"
 
 
 def _latest_prices(engine, codes):
@@ -98,6 +113,125 @@ def _send_trigger_notification(alerts) -> Dict[str, bool]:
         return {"bark": False}
 
 
+def _refresh_items_with_snapshot(items):
+    if not items:
+        return []
+    try:
+        from core.data import get_market_snapshot
+
+        snapshot = get_market_snapshot()
+        if snapshot is None or snapshot.empty:
+            return items
+        snapshot_map = snapshot.set_index("code")["price"].to_dict()
+        from core.data import get_market_regime
+        from core.decision_layer import build_market_decision_context, load_market_cycle_history
+        engine = get_db_engine()
+        market_context = build_market_decision_context(
+            snapshot,
+            get_market_regime(),
+            load_market_cycle_history(engine),
+        )
+    except Exception as exc:
+        logger.warning(f"Watchlist status snapshot refresh failed: {exc}")
+        return items
+
+    refreshed = []
+    for original in items:
+        item = dict(original)
+        item.update(market_context)
+        current_price = snapshot_map.get(item["code"])
+        if not current_price:
+            refreshed.append(item)
+            continue
+
+        current_price = round(float(current_price), 2)
+        watch_price = float(item.get("watch_price") or current_price)
+        target_price = item.get("target_price")
+        stop_price = item.get("stop_price")
+        item["current_price"] = current_price
+        item["pl_pct"] = round((current_price - watch_price) / watch_price * 100, 2) if watch_price > 0 else 0
+        item["target_hit"] = target_price is not None and current_price >= float(target_price)
+        item["stop_hit"] = stop_price is not None and current_price <= float(stop_price)
+
+        decision = _watch_decision(item)
+        instruction = watch_instruction(item)
+        item["computed_decision"] = decision["decision"]
+        item["computed_action"] = decision["action"]
+        item["operation_instruction"] = instruction["instruction"]
+        item["trigger_price"] = instruction["trigger_price"]
+        item["guard_price"] = instruction["guard_price"]
+        refreshed.append(item)
+    return refreshed
+
+
+def _build_watchlist_status_body(items, slot: str) -> str:
+    is_morning = slot == "morning"
+    first = items[0] if items else {}
+    market_blocked = first.get("market_sentiment_stage") == "RETREAT"
+    lines = [
+        (
+            f"市场：{first.get('market_sentiment_label', '--')} "
+            f"{first.get('market_sentiment_score', '--')}分 | "
+            f"总仓上限 {first.get('portfolio_position_cap_pct', '--')}%"
+        ),
+        "性质：观察池主动汇报，不是无条件买入指令。",
+        (
+            "晨间纪律：不抢开盘；超过触发价且放量站稳后再复核，跌破保护价立即取消。"
+            if is_morning
+            else "尾盘纪律：仅确认全天承接有效的标的；冲高回落、跌破保护价或未站稳触发价均不买。"
+        ),
+        "",
+    ]
+    for item in items[:10]:
+        decision = item.get("computed_decision") or "KEEP_WATCH"
+        action = item.get("computed_action") or "继续观察"
+        if market_blocked:
+            action = f"市场退潮，禁止新增仓位；原计划：{action}"
+        trigger = item.get("trigger_price") or item.get("target_price")
+        guard = item.get("guard_price") or item.get("stop_price")
+        lines.append(
+            f"【{decision}】{item.get('name', '')}({item.get('code', '')}) "
+            f"现价 {item.get('current_price', '--')} ({float(item.get('pl_pct') or 0):+.2f}%)"
+        )
+        lines.append(f"  结论：{action}")
+        lines.append(f"  价格指令：站稳 >{trigger if trigger else '--'} 再复核；跌破 <{guard if guard else '--'} 取消观察")
+        if market_blocked:
+            lines.append("  操作：今日只观察，不买入；等待市场情绪至少修复后重新评估")
+        elif item.get("operation_instruction"):
+            lines.append(f"  操作：{item['operation_instruction']}")
+        lines.append("")
+    if len(items) > 10:
+        lines.append(f"另有 {len(items) - 10} 只观察票，请打开观察池查看。")
+    return "\n".join(lines).rstrip()
+
+
+def send_watchlist_status_report(slot: str) -> Dict[str, Any]:
+    """Push a proactive morning plan or late-session conclusion for the formal watchlist."""
+    if slot not in {"morning", "late"}:
+        return {"bark": False, "count": 0, "reason": "unsupported slot"}
+
+    payload = list_watchlist(status="WATCHING")
+    items = _refresh_items_with_snapshot(payload.get("items", []))
+    if not items:
+        return {"bark": False, "count": 0, "reason": "empty watchlist"}
+
+    title = "Alpha Vision 观察池晨间计划" if slot == "morning" else "Alpha Vision 观察池尾盘结论"
+    body = _build_watchlist_status_body(items, slot)
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            loop.create_task(notifier.send(title, body, channels=["bark"]))
+            return {"bark": True, "count": len(items), "body": body}
+        result = asyncio.run(notifier.send(title, body, channels=["bark"]))
+        return {"bark": bool(result), "count": len(items), "body": body}
+    except Exception as exc:
+        logger.error(f"Watchlist status notification error: {exc}")
+        return {"bark": False, "count": len(items), "body": body, "detail": str(exc)}
+
+
 @router.get("/list")
 def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
     engine = get_db_engine()
@@ -148,6 +282,9 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
                 "stop_hit": stop_hit,
                 "status": row.get("status") or "WATCHING",
                 "reason": row.get("reason") or "",
+                "theme": row.get("theme") or row.get("industry") or "",
+                "rise_logic": row.get("rise_logic") or row.get("reason") or "",
+                "logic_status": row.get("logic_status") or "UNVERIFIED",
                 "invalidation": row.get("invalidation") or "",
                 "pa_trade_action": row.get("pa_trade_action") or "",
                 "pa_trade_setup": row.get("pa_trade_setup") or "",
@@ -158,7 +295,7 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
                 "watch_decision": row.get("watch_decision") or "",
                 "watch_action": row.get("watch_action") or "",
                 "exit_reason": row.get("exit_reason") or "",
-                "created_at": row["created_at"].isoformat() if row.get("created_at") is not None else "",
+                "created_at": row["created_at"].isoformat() if hasattr(row.get("created_at"), "isoformat") else str(row.get("created_at") or ""),
                 "latest_date": latest.get("date"),
             }
             decision = _watch_decision(item)
@@ -166,6 +303,7 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
             exit_check = watch_exit_decision({**item, "computed_decision": decision["decision"], "computed_action": decision["action"]})
             item["computed_decision"] = decision["decision"]
             item["computed_action"] = decision["action"]
+            item["logic_status"] = _logic_status(decision["decision"])
             item["operation_instruction"] = instruction["instruction"]
             item["trigger_price"] = instruction["trigger_price"]
             item["guard_price"] = instruction["guard_price"]
@@ -214,6 +352,8 @@ def refresh_watchlist_decisions() -> Dict[str, Any]:
                         exit_reason = :exit_reason,
                         last_review_date = :review_date,
                         status = :status,
+                        logic_status = :logic_status,
+                        logic_last_review_at = :updated_at,
                         updated_at = :updated_at
                     WHERE id = :id
                 """), {
@@ -222,6 +362,7 @@ def refresh_watchlist_decisions() -> Dict[str, Any]:
                     "exit_reason": exit_reason,
                     "review_date": datetime.now().strftime("%Y-%m-%d"),
                     "status": status,
+                    "logic_status": _logic_status(decision),
                     "updated_at": datetime.now(),
                     "id": item["id"],
                 })
@@ -326,6 +467,7 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
                         "decision": "INVALIDATE" if is_stop else "TRIGGERED",
                         "action": "触发失效价，移出观察池" if is_stop else "已触发目标价，等待尾盘确认是否转实盘",
                         "review_date": datetime.now().strftime("%Y-%m-%d"),
+                        "logic_status": "INVALIDATED" if is_stop else "CONFIRMED",
                         "updated_at": datetime.now(),
                     })
                 with engine.connect() as conn:
@@ -335,10 +477,22 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
                             watch_decision = :decision,
                             watch_action = :action,
                             last_review_date = :review_date,
+                            logic_status = :logic_status,
+                            logic_last_review_at = :updated_at,
                             updated_at = :updated_at
                         WHERE id = :id
                     """), updates)
                     conn.commit()
+                for alert in alerts:
+                    is_stop = any("失效" in reason for reason in alert.get("reasons", []))
+                    record_lifecycle_event(
+                        "WATCHLIST_INVALIDATED" if is_stop else "WATCHLIST_TRIGGERED",
+                        source="watchlist_trigger",
+                        code=alert.get("code"),
+                        name=alert.get("name"),
+                        watchlist_id=alert.get("id"),
+                        payload={"reasons": alert.get("reasons"), "current_price": alert.get("current_price")},
+                    )
         except Exception as exc:
             logger.warning(f"Watchlist lifecycle update failed: {exc}")
     return {
@@ -372,18 +526,19 @@ def add_watchlist_item(data: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         with engine.connect() as conn:
-            conn.execute(text("""
+            result = conn.execute(text("""
                 INSERT INTO watchlist (
                     code, name, industry, source, strategy_type, watch_price,
-                    target_price, stop_price, status, reason, invalidation,
+                    target_price, stop_price, status, reason, theme, rise_logic, invalidation,
                     pa_trade_action, pa_trade_setup, pa_entry_condition, pa_invalidation, pa_risk_pct,
-                    created_at, updated_at
+                    logic_status, created_at, updated_at
                 ) VALUES (
                     :code, :name, :industry, :source, :strategy_type, :watch_price,
-                    :target_price, :stop_price, 'WATCHING', :reason, :invalidation,
+                    :target_price, :stop_price, 'WATCHING', :reason, :theme, :rise_logic, :invalidation,
                     :pa_trade_action, :pa_trade_setup, :pa_entry_condition, :pa_invalidation, :pa_risk_pct,
-                    :created_at, :updated_at
+                    'UNVERIFIED', :created_at, :updated_at
                 )
+                RETURNING id
             """), {
                 "code": code,
                 "name": data.get("name") or code,
@@ -394,6 +549,8 @@ def add_watchlist_item(data: Dict[str, Any]) -> Dict[str, Any]:
                 "target_price": float(target_price) if target_price is not None else None,
                 "stop_price": float(stop_price) if stop_price is not None else None,
                 "reason": data.get("reason") or "",
+                "theme": data.get("theme") or data.get("industry") or "",
+                "rise_logic": data.get("rise_logic") or data.get("reason") or "",
                 "invalidation": data.get("invalidation") or "",
                 "pa_trade_action": data.get("pa_trade_action"),
                 "pa_trade_setup": data.get("pa_trade_setup"),
@@ -403,8 +560,19 @@ def add_watchlist_item(data: Dict[str, Any]) -> Dict[str, Any]:
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
             })
+            item_id = result.scalar()
             conn.commit()
-        return {"status": "success"}
+        record_lifecycle_event(
+            "WATCHLIST_ADDED",
+            source=data.get("source") or "scan",
+            code=code,
+            name=data.get("name") or code,
+            watchlist_id=item_id,
+            strategy_type=data.get("strategy_type") or "squeeze",
+            theme=data.get("theme") or data.get("industry") or "",
+            payload={"watch_price": price, "target_price": target_price, "stop_price": stop_price},
+        )
+        return {"status": "success", "id": item_id}
     except Exception as exc:
         logger.error(f"Add watchlist error: {exc}")
         return {"status": "error", "detail": str(exc)}

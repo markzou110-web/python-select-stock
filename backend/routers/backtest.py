@@ -6,8 +6,15 @@ from fastapi import APIRouter, HTTPException
 from core.backtest_lab import run_single_stock_backtest
 from core.db import get_db_engine, load_from_db, validate_stock_code
 from core.indicators import calculate_indicators, calculate_pine_indicators
+from core.batch_experiment import run_batch_experiment
+from core.strategy_registry import list_strategies, supported_backtest_strategies
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
+
+
+@router.get("/strategies")
+def get_strategy_registry():
+    return {"items": list_strategies()}
 
 
 @router.post("/single")
@@ -21,7 +28,7 @@ def run_single_backtest(payload: Dict[str, Any]):
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     strategy_type = payload.get("strategy_type") or "squeeze"
-    if strategy_type not in {"squeeze", "pine", "consensus", "tv_zp"}:
+    if strategy_type not in supported_backtest_strategies():
         raise HTTPException(status_code=400, detail="Unsupported strategy_type")
 
     end_date: Optional[str] = payload.get("end_date")
@@ -75,3 +82,20 @@ def run_single_backtest(payload: Dict[str, Any]):
         "data_points": int(len(df)),
     }
     return result
+
+
+@router.post("/batch")
+def run_batch_backtest(payload: Dict[str, Any]):
+    raw_codes = payload.get("codes") or []
+    if isinstance(raw_codes, str):
+        raw_codes = raw_codes.replace("，", ",").split(",")
+    codes = list(dict.fromkeys(str(code).strip() for code in raw_codes if str(code).strip()))
+    if not codes or len(codes) > 10 or any(not validate_stock_code(code) for code in codes):
+        raise HTTPException(status_code=400, detail="codes must contain 1-10 valid stock codes")
+    strategy_type = payload.get("strategy_type") or "squeeze"
+    if strategy_type not in supported_backtest_strategies():
+        raise HTTPException(status_code=400, detail="Unsupported strategy_type")
+    engine = get_db_engine()
+    if not engine:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return run_batch_experiment(engine, codes, strategy_type, payload)

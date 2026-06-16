@@ -11,22 +11,122 @@ import pandas as pd
 
 from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db
-from core.data import get_market_snapshot, get_sector_map
+from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache
 from core.indicators import calculate_indicators
 from core.price_action import analyze_price_action
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
-from core.risk_engine import compute_paper_risk_levels, safe_float
+from core.risk_engine import compute_paper_risk_levels, safe_float, track_high_since_entry
 from core.risk_constants import (
     FIXED_STOP_LOSS_PCT, FIXED_STOP_LOSS_RATIO,
     TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
     TIME_STOP_WARNING_DAYS, TIME_STOP_REVIEW_DAYS,
-    TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT
+    TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT,
+    FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO,
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
-from core.operation_plan import alert_priority, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
+from core.operation_plan import alert_priority, build_position_decision_snapshot, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
+from core.audit_log import record_lifecycle_event
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
+
+
+def _empty_mode_stats() -> Dict[str, Any]:
+    return {
+        "total": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate": 0,
+        "avg_pl_pct": 0,
+        "total_pl_pct": 0,
+        "avg_hold_days": 0,
+    }
+
+
+def _empty_paper_trade_response() -> Dict[str, Any]:
+    return {
+        "trades": [],
+        "stats": {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "flat": 0,
+            "win_rate": 0,
+            "avg_pl_pct": 0,
+            "total_pl_pct": 0,
+            "avg_hold_days": 0,
+            "max_drawdown": 0,
+            "profit_factor": 0,
+            "best_trade": None,
+            "worst_trade": None,
+            "sector_distribution": [],
+            "monte_carlo": None,
+            "rolling_performance": [],
+            "risk_metrics": None,
+            "pnl_attribution": None,
+        },
+        "stats_by_mode": {
+            "SIMULATED": _empty_mode_stats(),
+            "REAL": _empty_mode_stats(),
+        },
+    }
+
+
+def _optional_value(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _optional_int(value: Any) -> int | None:
+    value = _optional_value(value)
+    return int(value) if value is not None else None
+
+
+def _optional_float(value: Any) -> float | None:
+    value = _optional_value(value)
+    return float(value) if value is not None else None
+
+
+def _optional_str(value: Any) -> str | None:
+    value = _optional_value(value)
+    return str(value) if value is not None else None
+
+
+def _resolve_trade_theme_and_logic(engine, trade: PaperTradeCreate, industry: str) -> tuple[str, str]:
+    theme = trade.theme
+    rise_logic = trade.rise_logic
+    try:
+        with engine.connect() as conn:
+            if trade.watchlist_id is not None:
+                watchlist_row = conn.execute(text("""
+                    SELECT theme, industry, rise_logic, reason
+                    FROM watchlist
+                    WHERE id = :id
+                """), {"id": trade.watchlist_id}).mappings().first()
+            else:
+                watchlist_row = conn.execute(text("""
+                    SELECT theme, industry, rise_logic, reason
+                    FROM watchlist
+                    WHERE code = :code
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                """), {"code": trade.code}).mappings().first()
+        if watchlist_row:
+            theme = theme or watchlist_row.get("theme") or watchlist_row.get("industry")
+            rise_logic = rise_logic or watchlist_row.get("rise_logic") or watchlist_row.get("reason")
+    except Exception as exc:
+        logger.warning(f"Failed to inherit trade theme and logic for {trade.code}: {exc}")
+
+    return (
+        theme or industry or "未知题材",
+        rise_logic or trade.entry_reason_snapshot or trade.remark or "待补充上涨逻辑",
+    )
 
 
 def _time_stop_policy(strategy_type: str | None) -> Dict[str, Any]:
@@ -72,12 +172,28 @@ def _count_holding_trading_days(engine, code: str, entry_date: pd.Timestamp, now
 
 
 def _local_price_action_summary(engine, code: str) -> Dict[str, Any]:
+    """加载本地日线并计算 price action 摘要。
+
+    返回的 dict 会额外带上 ``latest_atr``（最近一根 K 线的 ATR），
+    供 compute_paper_risk_levels 用作自适应止损输入，使实盘止损与回测一致。
+    """
     try:
         start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
         df = load_from_db(code, start_date, engine)
         if df.empty:
             return {}
-        return analyze_price_action(calculate_indicators(df, periods=[5, 10, 20, 60]))
+        with_indicators = calculate_indicators(df, periods=[5, 10, 20, 60])
+        summary = analyze_price_action(with_indicators)
+        # 计算 ATR 列已在 calculate_indicators 中产出（true_range.rolling(14).mean()）。
+        # 若列存在且非空，把最新值附加到摘要里，供风控引擎收紧初始止损。
+        if "ATR" in with_indicators.columns and not with_indicators.empty:
+            try:
+                atr_val = float(with_indicators["ATR"].iloc[-1])
+                if atr_val == atr_val:  # 排除 NaN
+                    summary["latest_atr"] = atr_val
+            except (TypeError, ValueError, IndexError):
+                pass
+        return summary
     except Exception as exc:
         logger.warning(f"Local price action unavailable for {code}: {exc}")
         return {}
@@ -197,7 +313,7 @@ def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entr
         profitable=pl_pct > 0,
         trigger_action="放量突破后小幅加仓",
     )
-    return {
+    plan = {
         "entry_price": round(entry, 2),
         "current_price": round(current_price, 2),
         "add_trigger_price": round(trigger, 2),
@@ -209,9 +325,43 @@ def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entr
         "instruction": instruction,
         "bands": operation_bands(trigger=trigger, guard=guard, active_stop=active_stop, structure_stop=structure_stop),
     }
+    plan["decision_snapshot"] = build_position_decision_snapshot(
+        current_price=current_price,
+        entry_price=entry,
+        risk=risk,
+        plan=plan,
+        entry_date=row.get("entry_date"),
+        price_source="paper_cached_price",
+        price_updated_at=row.get("updated_at"),
+    )
+    return plan
 
 
-def _wind_control_decision(curr_price: float, risk_levels: Dict[str, Any], time_stop: Dict[str, Any] | None) -> Dict[str, Any]:
+def _wind_control_decision(
+    curr_price: float,
+    risk_levels: Dict[str, Any],
+    time_stop: Dict[str, Any] | None,
+    decision_snapshot: Dict[str, Any] | None = None,
+    entry_price: float = 0.0,
+) -> Dict[str, Any]:
+    if decision_snapshot:
+        action = decision_snapshot.get("action")
+        if action == "CLOSE" and decision_snapshot.get("executable"):
+            return {"reason": decision_snapshot.get("trigger") or "统一决策快照触发退出", "should_close": True}
+        # 分批止盈 / 减仓保护：REDUCE 且可执行（T+1 已过）且当前盈利时，触发部分平仓。
+        # 盈亏判定用 entry_price vs curr_price，避免对亏损仓位砍仓（亏损应走止损路径）。
+        if action == "REDUCE" and decision_snapshot.get("executable"):
+            in_profit = bool(entry_price > 0 and curr_price > entry_price)
+            if in_profit:
+                return {
+                    "reason": decision_snapshot.get("trigger") or "减仓保护",
+                    "should_close": False,
+                    "should_reduce": True,
+                }
+            # 亏损中的 REDUCE 降级为预警，不真正减仓
+            return {"reason": decision_snapshot.get("trigger") or "", "should_close": False}
+        if action in {"CLOSE", "REDUCE", "REVIEW"}:
+            return {"reason": decision_snapshot.get("trigger") or "", "should_close": False}
     stop_level = safe_num(risk_levels.get("active_stop_price"))
     if stop_level > 0 and curr_price <= stop_level:
         return {
@@ -285,21 +435,30 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                     "current_count": current_count
                 }
 
+        planned_price = float(trade.planned_entry_price or trade.price)
+        actual_price = float(trade.actual_entry_price or trade.price)
+        slippage_pct = (actual_price - planned_price) / planned_price * 100 if planned_price > 0 else 0
+        resolved_theme, resolved_rise_logic = _resolve_trade_theme_and_logic(engine, trade, new_industry)
         with engine.connect() as conn:
-            conn.execute(text('''
+            result = conn.execute(text('''
                 INSERT INTO paper_trading (
                     code, name, entry_price, entry_date, current_price, high_since_entry,
-                    status, strategy_type, remark, trade_mode,
+                    status, strategy_type, remark, theme, rise_logic, trade_mode,
                     entry_source, entry_signal_date, entry_reason_snapshot,
-                    pa_trade_action, pa_trade_setup, pa_entry_condition, pa_invalidation, pa_risk_pct
+                    pa_trade_action, pa_trade_setup, pa_entry_condition, pa_invalidation, pa_risk_pct,
+                    logic_status, planned_entry_price, actual_entry_price, entry_slippage_pct,
+                    position_pct, shares, capital_used, execution_note, plan_adherence, watchlist_id
                 )
                 VALUES (
                     :code, :name, :price, :date, :price, :price,
-                    'OPEN', :strategy_type, :remark, :trade_mode,
+                    'OPEN', :strategy_type, :remark, :theme, :rise_logic, :trade_mode,
                     :entry_source, CAST(:entry_signal_date AS DATE), :entry_reason_snapshot,
-                    :pa_trade_action, :pa_trade_setup, :pa_entry_condition, :pa_invalidation, :pa_risk_pct
+                    :pa_trade_action, :pa_trade_setup, :pa_entry_condition, :pa_invalidation, :pa_risk_pct,
+                    'UNVERIFIED', :planned_entry_price, :actual_entry_price, :entry_slippage_pct,
+                    :position_pct, :shares, :capital_used, :execution_note, :plan_adherence, :watchlist_id
                 )
                 ON CONFLICT (code, entry_date) DO NOTHING
+                RETURNING id
             '''), {
                 "code": trade.code,
                 "name": trade.name,
@@ -307,6 +466,8 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "strategy_type": trade.strategy_type,
                 "remark": trade.remark,
+                "theme": resolved_theme,
+                "rise_logic": resolved_rise_logic,
                 "trade_mode": trade.trade_mode,
                 "entry_source": trade.entry_source or "manual_current_price",
                 "entry_signal_date": trade.entry_signal_date or datetime.now().strftime("%Y-%m-%d"),
@@ -316,8 +477,34 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "pa_entry_condition": trade.pa_entry_condition,
                 "pa_invalidation": trade.pa_invalidation,
                 "pa_risk_pct": trade.pa_risk_pct,
+                "planned_entry_price": planned_price,
+                "actual_entry_price": actual_price,
+                "entry_slippage_pct": slippage_pct,
+                "position_pct": trade.position_pct,
+                "shares": trade.shares,
+                "capital_used": trade.capital_used,
+                "execution_note": trade.execution_note,
+                "plan_adherence": trade.plan_adherence,
+                "watchlist_id": trade.watchlist_id,
             })
+            trade_id = result.scalar()
             conn.commit()
+        if trade_id is None:
+            return {
+                "status": "error",
+                "detail": "该股票今天已有拟合实盘记录，请勿重复加入。",
+            }
+        record_lifecycle_event(
+            "PAPER_OPENED",
+            source=trade.entry_source or "manual_current_price",
+            code=trade.code,
+            name=trade.name,
+            watchlist_id=trade.watchlist_id,
+            trade_id=trade_id,
+            strategy_type=trade.strategy_type,
+            theme=resolved_theme,
+            payload={"planned_price": planned_price, "actual_price": actual_price, "slippage_pct": round(slippage_pct, 3)},
+        )
 
         # 发送 Bark 实时推送 — 根据交易模式区分标题（使用统一风控常量）
         stop_price = round(trade.price * FIXED_STOP_LOSS_RATIO, 2)
@@ -358,7 +545,13 @@ def get_open_trade_plans() -> Dict[str, Any]:
         for _, row in df.iterrows():
             entry = safe_float(row.get("entry_price"))
             current = safe_float(row.get("current_price"), entry)
-            high = max(safe_float(row.get("high_since_entry"), entry), current)
+            high = track_high_since_entry(
+                entry,
+                safe_float(row.get("high_since_entry"), entry),
+                current,
+                current,
+                row.get("entry_date"),
+            )
             risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             items.append({
@@ -414,7 +607,13 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             cached_current = safe_float(row.get("current_price"), entry)
             live = snapshot_map.get(code, {})
             current = safe_float(live.get("price"), cached_current)
-            high = max(safe_float(row.get("high_since_entry"), entry), safe_float(live.get("high"), current), current)
+            high = track_high_since_entry(
+                entry,
+                safe_float(row.get("high_since_entry"), entry),
+                current,
+                safe_float(live.get("high"), current),
+                row.get("entry_date"),
+            )
             risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, code))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             trigger = evaluate_operation_trigger(current, plan)
@@ -639,27 +838,36 @@ def update_trade_journal_feedback(event_id: int, payload: Dict[str, Any]) -> Dic
 
 
 @router.get("/list")
-def list_paper_trades() -> Dict[str, Any]:
+def list_paper_trades(refresh: bool = False) -> Dict[str, Any]:
     """List all paper trades with live P&L tracking"""
     engine = get_db_engine()
     if not engine:
-        return {"trades": [], "stats": {}}
+        raise HTTPException(status_code=503, detail="拟合实盘数据库暂不可用，已保留前端最后成功数据")
     try:
         df = pd.read_sql(text("SELECT * FROM paper_trading ORDER BY entry_date DESC"), engine)
         if df.empty:
-            return {"trades": [], "stats": {"total_trades": 0, "win_rate": 0, "total_pl_pct": 0, "avg_hold_days": 0}}
+            return _empty_paper_trade_response()
 
         # --- 获取最新价格 ---
         codes = df['code'].unique().tolist()
         open_codes = df[df.get('status', 'OPEN') == 'OPEN']['code'].unique().tolist()
 
         # 方法1: OPEN 持仓优先从实时快照获取盘中价格
-        price_map = {}
-        high_map = {}
+        open_rows = df[df.get('status', 'OPEN') == 'OPEN']
+        price_map = {
+            str(row['code']): safe_float(row.get('current_price'), safe_float(row.get('entry_price')))
+            for _, row in open_rows.iterrows()
+        }
+        high_map = {
+            str(row['code']): safe_float(row.get('high_since_entry'), price_map.get(str(row['code']), 0))
+            for _, row in open_rows.iterrows()
+        }
         if open_codes:
             try:
-                snapshot = get_market_snapshot()
-                if not snapshot.empty:
+                snapshot = get_market_snapshot() if refresh else get_cached_data("market_snapshot", 300)
+                if snapshot is None and not refresh:
+                    snapshot = get_stale_cache("market_snapshot")
+                if snapshot is not None and not snapshot.empty:
                     for code in open_codes:
                         match = snapshot[snapshot['code'] == code]
                         if not match.empty:
@@ -717,7 +925,13 @@ def list_paper_trades() -> Dict[str, Any]:
                 
                 # --- 移动止损数据更新 ---
                 current_high = high_map.get(code, current_price)
-                high_since_entry = max(high_since_entry, current_price, current_high)
+                high_since_entry = track_high_since_entry(
+                    entry_price,
+                    high_since_entry,
+                    current_price,
+                    current_high,
+                    entry_date,
+                )
                 # 即使价格没变，我们也需要 high_since_entry 来更新
                 price_updates.append({"price": current_price, "high": high_since_entry, "id": int(row['id'])})
 
@@ -739,21 +953,33 @@ def list_paper_trades() -> Dict[str, Any]:
                 "industry": industry,
                 "status": status,
                 "high_since_entry": round(high_since_entry, 2) if status == 'OPEN' else None,
-                "close_price": round(float(row['close_price']), 2) if row.get('close_price') is not None else None,
-                "close_date": str(row['close_date']) if row.get('close_date') is not None else None,
-                "close_source": row.get('close_source') if row.get('close_source') is not None else None,
-                "closed_by": row.get('closed_by') if row.get('closed_by') is not None else None,
-                "updated_at": str(row.get('updated_at')) if row.get('updated_at') is not None else None,
-                "remark": row.get('remark') if row.get('remark') is not None else None,
-                "trade_mode": row.get('trade_mode', 'SIMULATED') or 'SIMULATED',
-                "entry_source": row.get('entry_source') if row.get('entry_source') is not None else None,
-                "entry_signal_date": str(row.get('entry_signal_date')) if row.get('entry_signal_date') is not None else None,
-                "entry_reason_snapshot": row.get('entry_reason_snapshot') if row.get('entry_reason_snapshot') is not None else None,
-                "pa_trade_action": row.get('pa_trade_action') if row.get('pa_trade_action') is not None else None,
-                "pa_trade_setup": row.get('pa_trade_setup') if row.get('pa_trade_setup') is not None else None,
-                "pa_entry_condition": row.get('pa_entry_condition') if row.get('pa_entry_condition') is not None else None,
-                "pa_invalidation": row.get('pa_invalidation') if row.get('pa_invalidation') is not None else None,
-                "pa_risk_pct": safe_float(row.get('pa_risk_pct')) if row.get('pa_risk_pct') is not None else None,
+                "close_price": round(_optional_float(row.get('close_price')), 2) if _optional_float(row.get('close_price')) is not None else None,
+                "close_date": _optional_str(row.get('close_date')),
+                "close_source": _optional_value(row.get('close_source')),
+                "closed_by": _optional_value(row.get('closed_by')),
+                "updated_at": _optional_str(row.get('updated_at')),
+                "remark": _optional_value(row.get('remark')),
+                "theme": _optional_value(row.get('theme')) or industry,
+                "rise_logic": _optional_value(row.get('rise_logic')) or _optional_value(row.get('remark')) or _optional_value(row.get('entry_reason_snapshot')),
+                "logic_status": _optional_value(row.get('logic_status')) or "UNVERIFIED",
+                "planned_entry_price": safe_float(row.get('planned_entry_price'), entry_price),
+                "actual_entry_price": safe_float(row.get('actual_entry_price'), entry_price),
+                "entry_slippage_pct": safe_float(row.get('entry_slippage_pct')),
+                "position_pct": _optional_float(row.get('position_pct')),
+                "shares": _optional_int(row.get('shares')),
+                "capital_used": _optional_float(row.get('capital_used')),
+                "execution_note": _optional_value(row.get('execution_note')),
+                "plan_adherence": _optional_value(row.get('plan_adherence')) or "UNKNOWN",
+                "watchlist_id": _optional_int(row.get('watchlist_id')),
+                "trade_mode": _optional_value(row.get('trade_mode')) or 'SIMULATED',
+                "entry_source": _optional_value(row.get('entry_source')),
+                "entry_signal_date": _optional_str(row.get('entry_signal_date')),
+                "entry_reason_snapshot": _optional_value(row.get('entry_reason_snapshot')),
+                "pa_trade_action": _optional_value(row.get('pa_trade_action')),
+                "pa_trade_setup": _optional_value(row.get('pa_trade_setup')),
+                "pa_entry_condition": _optional_value(row.get('pa_entry_condition')),
+                "pa_invalidation": _optional_value(row.get('pa_invalidation')),
+                "pa_risk_pct": _optional_float(row.get('pa_risk_pct')),
             }
             trades.append(trade_data)
 
@@ -840,7 +1066,7 @@ def list_paper_trades() -> Dict[str, Any]:
         # --- 按交易模式分组统计 ---
         def _calc_mode_stats(mode_trades):
             if not mode_trades:
-                return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "avg_pl_pct": 0, "total_pl_pct": 0, "avg_hold_days": 0}
+                return _empty_mode_stats()
             m_wins = sum(1 for t in mode_trades if t['pl_pct'] > 0)
             m_losses = sum(1 for t in mode_trades if t['pl_pct'] < 0)
             m_total = len(mode_trades)
@@ -866,7 +1092,7 @@ def list_paper_trades() -> Dict[str, Any]:
         logger.error(f"Error listing paper trades: {e}")
         import traceback
         traceback.print_exc()
-        return {"trades": [], "stats": {}}
+        raise HTTPException(status_code=500, detail="拟合实盘查询失败，请查看后端日志") from e
 
 
 @router.post("/convert/{id}")
@@ -903,6 +1129,16 @@ def convert_trade_mode(id: int) -> Dict[str, Any]:
             f"该记录已标记为真实交易"
         )
         send_paper_trade_notification(title, body)
+        record_lifecycle_event(
+            "REAL_CONVERTED",
+            source="paper_trade",
+            code=code,
+            name=name,
+            trade_id=id,
+            strategy_type=t_map.get("strategy_type"),
+            theme=t_map.get("theme"),
+            payload={"entry_price": entry_price},
+        )
 
         return {"status": "success"}
     except HTTPException:
@@ -957,11 +1193,15 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
                     status = 'CLOSED',
                     close_source = 'manual',
                     closed_by = 'user',
+                    execution_note = COALESCE(:execution_note, execution_note),
+                    logic_status = CASE WHEN :close_price >= entry_price THEN 'CONFIRMED' ELSE 'INVALIDATED' END,
+                    logic_last_review_at = :updated_at,
                     updated_at = :updated_at
                 WHERE id = :id
             """), {
                 "close_price": float(close_price),
                 "close_date": datetime.now().strftime("%Y-%m-%d"),
+                "execution_note": data.execution_note,
                 "updated_at": datetime.now(),
                 "id": id
             })
@@ -989,6 +1229,16 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
             f"累计盈亏：{pl_pct:+.2f}%"
         )
         send_paper_trade_notification(title, body)
+        record_lifecycle_event(
+            "TRADE_CLOSED",
+            source="paper_trade",
+            code=code,
+            name=name,
+            trade_id=id,
+            strategy_type=t_map.get("strategy_type"),
+            theme=t_map.get("theme"),
+            payload={"close_price": float(close_price), "pnl_pct": round(pl_pct, 2)},
+        )
 
         return {"status": "success"}
     except HTTPException:
@@ -1028,6 +1278,7 @@ def run_wind_control() -> Dict[str, Any]:
         warned_simulated_count = 0
         alerts = []
         close_updates = []  # 收集批量更新参数
+        reduce_updates = []  # 收集分批止盈/减仓的拆行参数
         close_date_str = datetime.now().strftime("%Y-%m-%d")
 
         for _, row in df.iterrows():
@@ -1043,19 +1294,47 @@ def run_wind_control() -> Dict[str, Any]:
             if match.empty: continue
             curr_price = float(match.iloc[0]['price'])
             curr_high = safe_float(match.iloc[0].get('high'), curr_price)
-            high_since_entry = max(high_since_entry, curr_high, curr_price)
+            high_since_entry = track_high_since_entry(
+                entry_price,
+                high_since_entry,
+                curr_price,
+                curr_high,
+                entry_date,
+                now,
+            )
             pl_pct = (curr_price - entry_price) / entry_price * 100
             
             # --- 风控逻辑判定 (按优先级, 使用统一风控引擎) ---
-            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, _local_price_action_summary(engine, str(code)))
+            pa_summary = _local_price_action_summary(engine, str(code))
+            # 把 price action 摘要中的 latest_atr 提取出来，喂给风控引擎做自适应止损，
+            # 使实盘 active_stop_price 与回测行为一致（只收紧不放宽）。
+            latest_atr = safe_float(pa_summary.get("latest_atr")) or None
+            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, pa_summary, atr=latest_atr)
             time_stop = _evaluate_time_stop(
                 hold_trading_days,
                 pl_pct,
                 row.get("strategy_type"),
             )
-            decision = _wind_control_decision(curr_price, risk_levels, time_stop)
+            plan = _build_trade_plan(row.to_dict(), curr_price, high_since_entry, risk_levels)
+            # 已减仓标记：通过 remark 中是否含首笔止盈标记判断，避免重复触发分批止盈。
+            existing_remark = str(row.get("remark") or "")
+            already_reduced = bool(existing_remark and FIRST_PROFIT_TAKE_MARK in existing_remark)
+            decision_snapshot = build_position_decision_snapshot(
+                current_price=curr_price,
+                entry_price=entry_price,
+                risk=risk_levels,
+                plan=plan,
+                time_stop=time_stop,
+                entry_date=entry_date,
+                price_source="market_snapshot",
+                price_updated_at=now,
+                now=now,
+                already_reduced=already_reduced,
+            )
+            decision = _wind_control_decision(curr_price, risk_levels, time_stop, decision_snapshot, entry_price=entry_price)
             reason = decision["reason"]
             should_close = decision["should_close"]
+            should_reduce = decision.get("should_reduce", False)
 
             if reason:
                 # 生成更详细的智能备注
@@ -1079,6 +1358,46 @@ def run_wind_control() -> Dict[str, Any]:
                     alerts.append(f"{row['name']}({code}) 模拟仓自动平仓: {reason}")
                     mode_label = "模拟仓风控平仓"
                     action_line = "模拟仓已按风控规则自动平仓。"
+                elif should_reduce:
+                    # 分批止盈 / 减仓保护：把剩余 shares 减半（最小留 100 股），
+                    # 并新增一行 CLOSED 记录已落袋的那部分。剩余仓位继续用移动止损跟踪。
+                    current_shares = int(row.get('shares') or 0)
+                    if current_shares >= 200:  # 至少 200 股才能拆出有意义的一半
+                        reduce_shares = int(current_shares * FIRST_PROFIT_TAKE_RATIO)
+                        reduce_shares = (reduce_shares // 100) * 100  # 对齐到整手
+                        if reduce_shares >= 100:
+                            remaining_shares = current_shares - reduce_shares
+                            reduce_updates.append({
+                                "orig_id": int(row['id']),
+                                "remaining_shares": remaining_shares,
+                                "orig_remark": f"{existing_remark}；{FIRST_PROFIT_TAKE_MARK}({close_date_str})".strip("；"),
+                                # 新 CLOSED 行复制原行关键字段，shares 为减仓部分
+                                "code": str(row['code']),
+                                "name": str(row.get('name') or ''),
+                                "entry_price": float(entry_price),
+                                "entry_date": row['entry_date'],
+                                "strategy_type": str(row.get('strategy_type') or ''),
+                                "trade_mode": str(trade_mode),
+                                "close_price": float(curr_price),
+                                "close_date": close_date_str,
+                                "remark": f"{FIRST_PROFIT_TAKE_MARK}：{reason}",
+                                "close_shares": reduce_shares,
+                                "u": datetime.now(),
+                            })
+                            alerts.append(f"{row['name']}({code}) 模拟仓分批止盈减仓 {reduce_shares} 股（剩余 {remaining_shares} 股）: {reason}")
+                            mode_label = "模拟仓分批止盈"
+                            action_line = f"模拟仓已减仓 {reduce_shares} 股锁定利润，剩余 {remaining_shares} 股继续持有。"
+                        else:
+                            # shares 过少无法整手拆分，降级为预警
+                            warned_simulated_count += 1
+                            alerts.append(f"{row['name']}({code}) 模拟仓减仓预警（份额不足整手）: {reason}")
+                            mode_label = "模拟仓风控预警"
+                            action_line = "模拟仓份额不足以整手减仓，请人工复核。"
+                    else:
+                        warned_simulated_count += 1
+                        alerts.append(f"{row['name']}({code}) 模拟仓减仓预警（份额不足）: {reason}")
+                        mode_label = "模拟仓风控预警"
+                        action_line = "模拟仓份额不足 200 股，无法自动减仓，请人工复核。"
                 else:
                     warned_simulated_count += 1
                     alerts.append(f"{row['name']}({code}) 模拟仓风控预警: {reason}")
@@ -1110,6 +1429,48 @@ def run_wind_control() -> Dict[str, Any]:
                         updated_at = :u
                     WHERE id = :id
                 """), close_updates)
+                conn.commit()
+
+        # 批量执行分批止盈/减仓的拆行：原行 shares 减半并保留 OPEN，新插入一行 CLOSED 记录已落袋部分。
+        if reduce_updates:
+            with engine.connect() as conn:
+                for r in reduce_updates:
+                    # 1) 原行减半并标记，保留 OPEN 让剩余仓位继续被移动止损跟踪
+                    conn.execute(text("""
+                        UPDATE paper_trading
+                        SET shares = :remaining_shares,
+                            remark = :orig_remark,
+                            updated_at = :u
+                        WHERE id = :orig_id
+                    """), {
+                        "remaining_shares": r["remaining_shares"],
+                        "orig_remark": r["orig_remark"],
+                        "u": r["u"],
+                        "orig_id": r["orig_id"],
+                    })
+                    # 2) 新增一行 CLOSED 记录已减仓落袋的部分（复用现有列，无 schema 变更）
+                    conn.execute(text("""
+                        INSERT INTO paper_trading
+                            (code, name, entry_price, entry_date, current_price, high_since_entry,
+                             status, close_price, close_date, close_source, closed_by,
+                             strategy_type, trade_mode, shares, remark, updated_at)
+                        VALUES
+                            (:code, :name, :entry_price, :entry_date, :close_price, :entry_price,
+                             'CLOSED', :close_price, :close_date, 'wind_control_partial', 'system',
+                             :strategy_type, :trade_mode, :close_shares, :remark, :u)
+                    """), {
+                        "code": r["code"],
+                        "name": r["name"],
+                        "entry_price": r["entry_price"],
+                        "entry_date": r["entry_date"],
+                        "close_price": r["close_price"],
+                        "close_date": r["close_date"],
+                        "strategy_type": r["strategy_type"],
+                        "trade_mode": r["trade_mode"],
+                        "close_shares": r["close_shares"],
+                        "remark": r["remark"],
+                        "u": r["u"],
+                    })
                 conn.commit()
 
         return {

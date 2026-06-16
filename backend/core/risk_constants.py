@@ -42,6 +42,14 @@ CAPITAL_PROTECT_FLOOR_PCT = 1.0
 TAKE_PROFIT_PCT = 15.0
 TAKE_PROFIT_RATIO = 1.0 + TAKE_PROFIT_PCT / 100.0  # 1.15
 
+# ── 分批止盈 (Scale-out / First Profit Take) ──
+# 盈利达到此幅度时，先减仓锁定一半利润，剩余仓位继续用高档移动止损跟踪，
+# 实现"让利润奔跑 + 分批落袋"。通过 remark 标记避免重复触发。
+FIRST_PROFIT_TAKE_PCT = 8.0           # 盈利 +8% 触发首笔减仓
+FIRST_PROFIT_TAKE_RATIO = 0.5         # 减仓 50%
+# 重复减仓防护标记（写入 paper_trading.remark，含此标记则不再触发首笔止盈）
+FIRST_PROFIT_TAKE_MARK = "已首笔止盈减仓50%"
+
 # ── 时间止损 (Time Stop) ──
 # 分层时间风控：先预警，再复核，最后才升级为确认平仓
 TIME_STOP_DAYS = 5                 # legacy baseline, keep for compatibility

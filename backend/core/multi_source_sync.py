@@ -19,6 +19,38 @@ from core.logging_config import logger
 from core.config import config
 
 
+MIN_REQUIRED_TRADING_DAYS = 650
+HISTORY_LOOKBACK_CALENDAR_DAYS = 1010
+
+# 批量同步并发度。DB 连接池上限为 30（pool_size=10 + max_overflow=20），
+# 24 个 worker 既能充分并行又留有余量；akshare 调用为 I/O bound，GIL 不阻塞。
+# 如遇数据源限流，可下调此值。
+SYNC_MAX_WORKERS = 24
+
+# 单只股票同步的总超时（秒），防止个别源卡死拖垮整批同步。
+SYNC_SINGLE_STOCK_TIMEOUT = 30
+
+# 数据源切换时的短延迟范围（秒），仅在源失败后用于轻微错峰，
+# 避免对同一源瞬时重试。原值为固定 1s，对批量场景过重。
+SOURCE_FAILOVER_DELAY_RANGE = (0.1, 0.3)
+
+# 腾讯源单股重试退避起始秒数与倍率（指数退避，缩短原 0.5~1.5s 的固定退避）。
+TENCENT_RETRY_BASE_DELAY = 0.2
+TENCENT_RETRY_BACKOFF_FACTOR = 1.5
+
+
+class StockNotSupportedError(Exception):
+    """某数据源确定不支持该股票（如已退市/B股/解析失败）。
+
+    抛出此异常意味着无需重试也不必切换到下一个数据源——
+    对该股票而言所有源大概率都会失败。sync_single_stock 捕获后直接短路返回。
+    """
+
+
+def needs_history_backfill(data_count: int) -> bool:
+    return data_count < MIN_REQUIRED_TRADING_DAYS
+
+
 class DataSourceStatus(Enum):
     """数据源状态"""
     AVAILABLE = "available"
@@ -337,6 +369,7 @@ class TencentDataSource(DataSource):
     def get_hist_data(self, code: str, start_date: str) -> Optional[pd.DataFrame]:
         symbol = self.format_code(code)
         df = None
+        delay = TENCENT_RETRY_BASE_DELAY
         for attempt in range(5):
             try:
                 # Add dates to make it specific and avoid pulling 20 years of history if not needed.
@@ -345,10 +378,17 @@ class TencentDataSource(DataSource):
                 df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end)
                 break
             except Exception as e:
+                err_msg = str(e)
+                # 确定性的"不支持该股票"错误：立即短路，不重试也不切换数据源。
+                # 这些错误表示股票代码无法被解析/已退市/不存在，重试毫无意义。
+                if any(tag in err_msg for tag in ["list index", "invalid literal", "KeyError", "not found"]):
+                    raise StockNotSupportedError(f"腾讯源不支持 {code}: {err_msg}") from e
                 logger.debug(f"腾讯数据源尝试 {attempt+1}/5 失败 ({code}): {e}")
                 if attempt == 4:
                     raise
-                time.sleep(round(random.uniform(0.5, 1.5), 2))
+                # 指数退避：0.2 → 0.3 → 0.45 → 0.68（总等待 ~1.6s，原固定 0.5~1.5s 共 ~6s）
+                time.sleep(delay + random.uniform(0, 0.1))
+                delay *= TENCENT_RETRY_BACKOFF_FACTOR
 
         if df is None or df.empty:
             return None
@@ -400,17 +440,29 @@ class TushareDataSource(DataSource):
             self.status = DataSourceStatus.UNAVAILABLE
             self.last_error = "未配置 TUSHARE_TOKEN"
 
+    def _reserve_slot(self) -> float:
+        """令牌桶式预约下一个 Tushare 调用时间片。
+
+        在锁临界区内只做时间戳的计算与预约（更新 _last_call_time 为"下一个可用时刻"），
+        返回调用方需要等待的秒数。真正的 time.sleep 在锁外执行——这样多个线程可以
+        并发地预约各自的时间片而不会在 sleep 期间互相阻塞，在严格遵守 Tushare
+        频率限制（≥ _min_interval 秒/次）的前提下大幅提升并行度。
+        """
+        with TushareDataSource._lock:
+            now = time.time()
+            earliest = max(now, TushareDataSource._last_call_time + TushareDataSource._min_interval)
+            wait = earliest - now
+            TushareDataSource._last_call_time = earliest
+        return wait
+
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         if not self.pro:
             return None
         try:
-            # 使用频率控制锁
-            with TushareDataSource._lock:
-                now = time.time()
-                elapsed = now - TushareDataSource._last_call_time
-                if elapsed < TushareDataSource._min_interval:
-                    time.sleep(TushareDataSource._min_interval - elapsed)
-                TushareDataSource._last_call_time = time.time()
+            # 频率控制：令牌桶式预约，sleep 在锁外执行以允许跨线程交错。
+            wait = self._reserve_slot()
+            if wait > 0:
+                time.sleep(wait)
 
             # 获取上市股票列表
             df = self.pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,industry')
@@ -445,15 +497,12 @@ class TushareDataSource(DataSource):
             return None
         try:
             ts_code = self.format_code(code)
-            
-            # 使用频率控制锁
-            with TushareDataSource._lock:
-                now = time.time()
-                elapsed = now - TushareDataSource._last_call_time
-                if elapsed < TushareDataSource._min_interval:
-                    time.sleep(TushareDataSource._min_interval - elapsed)
-                TushareDataSource._last_call_time = time.time()
-                
+
+            # 频率控制：令牌桶式预约，sleep 在锁外执行以允许跨线程交错。
+            wait = self._reserve_slot()
+            if wait > 0:
+                time.sleep(wait)
+
             # Tushare pro daily 接口
             df = self.pro.daily(ts_code=ts_code, start_date=start_date)
             
@@ -648,7 +697,10 @@ class MultiSourceSync:
 
     def sync_single_stock(self, code: str, max_retries: int = 3) -> Dict[str, Any]:
         """
-        同步单只股票，自动切换数据源
+        同步单只股票，自动切换数据源。
+
+        对实际同步逻辑套一层总超时保护（SYNC_SINGLE_STOCK_TIMEOUT 秒），防止
+        个别股票因某个数据源卡死而拖垮整批同步。超时则记为失败并返回，不影响其它股票。
 
         Args:
             code: 股票代码
@@ -657,6 +709,26 @@ class MultiSourceSync:
         Returns:
             同步结果字典
         """
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+        # 复用一个单线程池执行，避免为每只股票新建线程的开销；超时后线程仍会
+        # 在后台跑完（无法强制中断 Python 线程），但结果被丢弃，不阻塞批次。
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._sync_single_stock_impl, code, max_retries)
+            try:
+                return future.result(timeout=SYNC_SINGLE_STOCK_TIMEOUT)
+            except FuturesTimeoutError:
+                logger.warning(f"同步 {code} 超时（>{SYNC_SINGLE_STOCK_TIMEOUT}s），跳过")
+                return {
+                    "code": code,
+                    "success": False,
+                    "source": None,
+                    "records": 0,
+                    "message": f"同步超时（>{SYNC_SINGLE_STOCK_TIMEOUT}s）",
+                }
+
+    def _sync_single_stock_impl(self, code: str, max_retries: int = 3) -> Dict[str, Any]:
+        """sync_single_stock 的实际实现（无超时保护）。"""
         result = {
             "code": code,
             "success": False,
@@ -684,16 +756,14 @@ class MultiSourceSync:
 
             today = datetime.now().date()
 
-            # 确保至少有 120 天的数据（用于 Pine Script 策略）
-            # 深度修复：由于 Range Filter 等长线 EMA 需要充分的历史数据预热（长达 199 天的周期，需 3 倍即约 600 天以上才完全收敛）
-            # 将基础同步天数从 120 天上调至 1000 天，确保所有技术指标计算与 TradingView 绝对对齐
-            min_required_days = 1000
+            # Range Filter 等长线 EMA 需要约 600 个交易日预热。
+            # 当前回拉 1010 个自然日通常约覆盖 650+ 个交易日，避免日常同步反复触发历史回补。
 
             if last_date:
                 # 检查数据天数是否足够
-                if data_count < min_required_days:
+                if needs_history_backfill(data_count):
                     # 数据不足，需要补齐历史数据
-                    needed_start_date = today - timedelta(days=min_required_days + 10)  # 多取10天作为缓冲
+                    needed_start_date = today - timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
                     start_date = needed_start_date.strftime("%Y%m%d")
                     result["message"] = f"数据不足({data_count}天)，补齐历史数据..."
                 elif last_date >= today:
@@ -706,7 +776,7 @@ class MultiSourceSync:
                     start_date = (last_date + timedelta(days=1)).strftime("%Y%m%d")
             else:
                 # 无历史数据，获取足够的历史数据
-                start_date = (today - timedelta(days=min_required_days + 10)).strftime("%Y%m%d")
+                start_date = (today - timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
 
         except Exception as e:
             result["message"] = f"查询失败: {e}"
@@ -740,6 +810,13 @@ class MultiSourceSync:
                     result["message"] = "无新数据"
                     return result
 
+            except StockNotSupportedError as e:
+                # 数据源确定不支持该股票（已退市/B股/代码无效等）：
+                # 立即短路，不重试也不切换数据源——其它源大概率同样失败。
+                logger.debug(f"{source.name} 确定不支持 {code}，跳过所有数据源: {e}")
+                result["message"] = f"不支持该股票: {str(e)[:60]}"
+                return result
+
             except Exception as e:
                 err_msg = str(e)
                 if any(err in err_msg for err in ["list index", "invalid literal", "KeyError", "not found"]):
@@ -748,19 +825,21 @@ class MultiSourceSync:
                     logger.warning(f"{source.name} 同步 {code} 失败: {err_msg}", exc_info=True)
                     source.record_failure(err_msg)
 
-                # 短暂延迟后切换下个数据源（仅针对此支股票，不影响全局）
-                time.sleep(1)
+                # 短暂错峰后切换下个数据源（仅针对此支股票，不影响全局）。
+                # 原固定 1s 对批量场景过重，改为轻微抖动。
+                time.sleep(random.uniform(*SOURCE_FAILOVER_DELAY_RANGE))
 
         result["message"] = "所有的可用数据源均未返回数据"
         return result
 
-    def sync_batch(self, codes: List[str], delay_range=(0.0, 0.1), progress_callback=None, max_workers=5, check_stop=None) -> Dict[str, Any]:
+    def sync_batch(self, codes: List[str], delay_range=(0.0, 0.0), progress_callback=None, max_workers=5, check_stop=None) -> Dict[str, Any]:
         """
         批量同步股票 (Enhanced with Threading)
 
         Args:
             codes: 股票代码列表
-            delay_range: 请求间隔范围 (在使用线程池时主要起轻微错峰作用)
+            delay_range: 主线程结果收集时的错峰间隔范围（秒）。默认 (0,0) 不延迟——
+                工作线程本身已是并发，主线程不应在结果收集上人为 sleep 而拖慢吞吐。
             progress_callback: 进度回调函数 callback(current, total, success, failed)
             max_workers: 最大并发线程数
             check_stop: 检查是否应该停止的回调函数，返回 True 表示应该停止

@@ -39,13 +39,14 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
             "strategy_distribution": [],
             "failure_sample_by_strategy": [],
             "version_distribution": [],
+            "performance_phases": [],
         }
 
     safe_limit = min(max(int(limit or 50), 1), 200)
     with engine.connect() as conn:
         scans = conn.execute(text("""
             SELECT status, strategy_type, duration_sec, candidate_count, result_count,
-                   fail_reasons, version_snapshot
+                   fail_reasons, version_snapshot, params_snapshot
             FROM scan_audit_log
             ORDER BY started_at DESC
             LIMIT :limit
@@ -64,6 +65,7 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
         "duration_secs": [],
     })
     versions: Counter[str] = Counter()
+    phase_values: Dict[str, List[float]] = defaultdict(list)
 
     durations: List[float] = []
     candidates: List[float] = []
@@ -96,6 +98,13 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
         for key, value in _parse_json(row.get("version_snapshot")).items():
             if value:
                 versions[f"{key}:{value}"] += 1
+        phases = _parse_json(row.get("params_snapshot")).get("performance_phases_sec") or {}
+        if isinstance(phases, dict):
+            for phase, seconds in phases.items():
+                try:
+                    phase_values[str(phase)].append(float(seconds))
+                except (TypeError, ValueError):
+                    continue
 
     failure_by_strategy: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
         "count": 0,
@@ -148,4 +157,11 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
             {"version": version, "count": count}
             for version, count in versions.most_common(8)
         ],
+        "performance_phases": sorted(
+            [
+                {"phase": phase, "avg_duration_sec": _avg(values), "samples": len(values)}
+                for phase, values in phase_values.items()
+            ],
+            key=lambda item: -item["avg_duration_sec"],
+        ),
     }

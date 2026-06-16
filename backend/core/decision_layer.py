@@ -6,6 +6,7 @@ price-action, and money-flow evidence into execution permissions and sizing.
 from typing import Any, Dict, List
 
 import pandas as pd
+from sqlalchemy import text
 
 from core.sector_strength import classify_mainline_sector
 
@@ -21,8 +22,50 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
 
 
-def build_market_decision_context(snapshot: pd.DataFrame, market_regime: Dict[str, Any]) -> Dict[str, Any]:
-    """Classify short-term market emotion and provide a portfolio exposure cap."""
+def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
+    """Build daily breadth history from local K-lines for cycle classification."""
+    if engine is None:
+        return []
+    try:
+        query = """
+            WITH recent_dates AS (
+                SELECT DISTINCT date FROM daily_k ORDER BY date DESC LIMIT :date_limit
+            )
+            SELECT code, date, close
+            FROM daily_k
+            WHERE date IN (SELECT date FROM recent_dates)
+            ORDER BY code, date
+        """
+        frame = pd.read_sql(text(query), engine, params={"date_limit": int(days) + 1})
+    except Exception:
+        return []
+    if frame.empty:
+        return []
+
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame = frame.dropna(subset=["close"]).sort_values(["code", "date"])
+    frame["pct_chg"] = frame.groupby("code")["close"].pct_change() * 100
+    frame = frame.dropna(subset=["pct_chg"])
+    history: List[Dict[str, Any]] = []
+    for date, group in frame.groupby("date"):
+        pct = group["pct_chg"]
+        total = max(1, len(pct))
+        history.append({
+            "date": str(date),
+            "advance_ratio": round(float((pct > 0).sum() / total * 100), 1),
+            "strong_ratio": round(float((pct >= 5).sum() / total * 100), 1),
+            "weak_ratio": round(float((pct <= -5).sum() / total * 100), 1),
+            "avg_return": round(float(pct.mean()), 2),
+        })
+    return sorted(history, key=lambda item: item["date"])[-days:]
+
+
+def build_market_decision_context(
+    snapshot: pd.DataFrame,
+    market_regime: Dict[str, Any],
+    cycle_history: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    """Classify the multi-day emotion cycle and provide execution permissions."""
     regime = str(market_regime.get("status") or "UNKNOWN").upper()
     if snapshot is None or snapshot.empty or "pct_chg" not in snapshot.columns:
         score = {"OFFENSIVE": 72, "DEFENSIVE": 42, "CRITICAL": 18}.get(regime, 45)
@@ -35,27 +78,57 @@ def build_market_decision_context(snapshot: pd.DataFrame, market_regime: Dict[st
         weak_ratio = float((pct <= -5).sum() / total * 100)
         limit_up_ratio = float((pct >= 9.8).sum() / total * 100)
         limit_down_ratio = float((pct <= -9.8).sum() / total * 100)
-        breadth_score = _clamp((advance_ratio - 25) * 1.6)
-        strength_score = _clamp(50 + (strong_ratio - weak_ratio) * 8)
-        limit_score = _clamp(50 + (limit_up_ratio - limit_down_ratio) * 12)
-        regime_score = {"OFFENSIVE": 90, "DEFENSIVE": 45, "CRITICAL": 10}.get(regime, 50)
-        score = round(breadth_score * 0.35 + strength_score * 0.25 + limit_score * 0.2 + regime_score * 0.2, 1)
+        current_quality = _clamp(advance_ratio + (strong_ratio - weak_ratio) * 2.5)
+        history = list(cycle_history or [])
+        previous = history[:-1] if history and history[-1].get("date") == str(pd.Timestamp.now().date()) else history
+        previous = previous[-5:]
+        prior3 = previous[-3:]
+        prior5_avg = sum(_num(item.get("advance_ratio"), 50) for item in previous) / len(previous) if previous else 50
+        prior3_avg = sum(_num(item.get("advance_ratio"), 50) for item in prior3) / len(prior3) if prior3 else prior5_avg
+        trend = advance_ratio - prior3_avg
+        regime_score = {"OFFENSIVE": 75, "DEFENSIVE": 50, "CRITICAL": 25}.get(regime, 50)
+        score = round(_clamp(current_quality * 0.3 + prior3_avg * 0.35 + prior5_avg * 0.2 + regime_score * 0.15), 1)
 
-    if regime == "CRITICAL" or score < 25:
+    previous = list(cycle_history or [])
+    previous = previous[:-1] if previous and previous[-1].get("date") == str(pd.Timestamp.now().date()) else previous
+    previous = previous[-5:]
+    prior3 = previous[-3:]
+    prior3_avg = sum(_num(item.get("advance_ratio"), 50) for item in prior3) / len(prior3) if prior3 else 50
+    prior3_strong_avg = sum(_num(item.get("strong_ratio")) for item in prior3) / len(prior3) if prior3 else 0
+    prior3_weak_avg = sum(_num(item.get("weak_ratio")) for item in prior3) / len(prior3) if prior3 else 0
+    prior3_return_avg = sum(_num(item.get("avg_return")) for item in prior3) / len(prior3) if prior3 else 0
+    hot_days = sum(_num(item.get("advance_ratio")) >= 60 for item in prior3)
+    weak_days = sum(_num(item.get("advance_ratio"), 50) <= 35 for item in prior3)
+    trend = round(advance_ratio - prior3_avg, 1)
+
+    if weak_days >= 2 and advance_ratio <= 30:
+        stage, label, max_position = "ICE", "冰点", 15
+        allowed, forbidden = ["观察止跌、核心反转试错"], ["重仓抄底", "无确认追涨", "后排股"]
+        reason = "近3日持续极弱，等待止跌与首批主动走强"
+    elif prior3_avg >= 58 and trend <= -15:
+        stage, label, max_position = "DIVERGENCE", "高位分歧", 40
+        allowed, forbidden = ["核心去弱留强", "分歧后回流确认"], ["追涨后排", "扩大仓位"]
+        reason = "此前赚钱效应较强，但今日市场宽度明显回落"
+    elif prior3_avg <= 45 and advance_ratio < 38 and trend < -5:
         stage, label, max_position = "RETREAT", "退潮", 10
         allowed, forbidden = ["处理风险、观察修复"], ["新增仓位", "高位追涨", "非主流交易"]
-    elif score < 42:
-        stage, label, max_position = "ICE", "冰点", 20
-        allowed, forbidden = ["主流核心轻仓试错"], ["重仓", "跟风股", "无确认追涨"]
-    elif score < 58:
-        stage, label, max_position = "REPAIR", "修复", 40
-        allowed, forbidden = ["首批主动走强", "主流核心回踩"], ["非主流重仓", "高位跟风"]
-    elif score < 78:
-        stage, label, max_position = "ADVANCE", "主升", 70
-        allowed, forbidden = ["主流核心", "确认后加仓"], ["无主线交易", "冲高追价"]
-    else:
+        reason = "多日市场宽度偏弱且继续恶化"
+    elif hot_days >= 2 and prior3_strong_avg >= 7 and advance_ratio >= 72 and strong_ratio >= 10:
         stage, label, max_position = "CLIMAX", "高潮", 50
         allowed, forbidden = ["核心持有", "分歧低吸"], ["盲目追高", "后排跟风"]
+        reason = "连续高热后进一步扩散，注意次日分歧风险"
+    elif prior3_avg >= 52 and prior3_strong_avg >= 5 and advance_ratio >= 55 and regime != "CRITICAL":
+        stage, label, max_position = "ADVANCE", "主升", 70
+        allowed, forbidden = ["主流核心", "确认后加仓"], ["无主线交易", "冲高追价"]
+        reason = "赚钱效应连续维持，趋势与市场宽度共振"
+    elif advance_ratio >= 45 or trend >= 10:
+        stage, label, max_position = "REPAIR", "修复", 40 if regime != "CRITICAL" else 30
+        allowed, forbidden = ["首批主动走强", "主流核心回踩"], ["非主流重仓", "高位跟风"]
+        reason = "市场宽度正在改善，但持续性仍需后续交易日确认"
+    else:
+        stage, label, max_position = "RETREAT", "退潮", 10
+        allowed, forbidden = ["处理风险、等待修复"], ["新增仓位", "高位追涨", "非主流交易"]
+        reason = "赚钱效应不足，尚未形成有效修复"
 
     return {
         "market_sentiment_stage": stage,
@@ -65,6 +138,18 @@ def build_market_decision_context(snapshot: pd.DataFrame, market_regime: Dict[st
         "portfolio_position_cap_pct": max_position,
         "market_allowed_actions": allowed,
         "market_forbidden_actions": forbidden,
+        "market_sentiment_reason": reason,
+        "market_cycle_metrics": {
+            "prior3_advance_avg": round(prior3_avg, 1),
+            "prior3_strong_avg": round(prior3_strong_avg, 1),
+            "prior3_weak_avg": round(prior3_weak_avg, 1),
+            "prior3_return_avg": round(prior3_return_avg, 2),
+            "breadth_trend": trend,
+            "hot_days_3d": hot_days,
+            "weak_days_3d": weak_days,
+            "history_days": len(previous),
+        },
+        "market_sentiment_model_version": "cycle-v2",
         "market_breadth": {
             "advance_ratio": round(advance_ratio, 1),
             "strong_ratio": round(strong_ratio, 1),
@@ -80,7 +165,37 @@ def _leadership_score(stock: Dict[str, Any]) -> float:
     alignment = _num(stock.get("sector_alignment_score"), 40)
     relative = _clamp(50 + _num(stock.get("sector_relative_pct")) * 10)
     active = _clamp(50 + _num(stock.get("涨幅%")) * 5)
-    return round(role_score * 0.4 + alignment * 0.3 + relative * 0.2 + active * 0.1, 1)
+    base_score = role_score * 0.4 + alignment * 0.3 + relative * 0.2 + active * 0.1
+
+    status = stock.get("limit_up_status")
+    if not status:
+        stock["leadership_components"] = {
+            "sector_role": round(role_score, 1),
+            "sector_alignment": round(alignment, 1),
+            "relative_strength": round(relative, 1),
+            "activity": round(active, 1),
+        }
+        stock["leadership_reason"] = f"{stock.get('sector_role') or 'UNKNOWN'}，相对板块{_num(stock.get('sector_relative_pct')):+.1f}%"
+        return round(base_score, 1)
+
+    rank = max(1, int(_num(stock.get("limit_up_sector_rank"), 10)))
+    first_board = _clamp(100 - (rank - 1) * 15, 35, 100)
+    breaks = max(0, int(_num(stock.get("break_count"))))
+    stability = _clamp((100 if status == "SEALED" else 45) - breaks * 12)
+    streak = _clamp(35 + _num(stock.get("limit_up_streak")) * 20)
+    seal_amount = _clamp(45 + _num(stock.get("seal_amount")) / 100000000 * 12)
+    limit_score = first_board * 0.3 + stability * 0.25 + streak * 0.25 + seal_amount * 0.2
+    score = round(base_score * 0.65 + limit_score * 0.35, 1)
+    stock["leadership_components"] = {
+        "sector_base": round(base_score, 1),
+        "first_limit_rank": round(first_board, 1),
+        "seal_stability": round(stability, 1),
+        "limit_streak": round(streak, 1),
+        "seal_amount": round(seal_amount, 1),
+    }
+    status_label = "封板" if status == "SEALED" else "炸板"
+    stock["leadership_reason"] = f"板块第{rank}只触及涨停，{status_label}，炸板{breaks}次，{int(_num(stock.get('limit_up_streak')))}连板"
+    return score
 
 
 def _money_flow_score(stock: Dict[str, Any]) -> float:
@@ -154,9 +269,10 @@ def apply_decision_layer(
     results: List[Dict[str, Any]],
     snapshot: pd.DataFrame,
     market_regime: Dict[str, Any],
+    cycle_history: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Enrich scan results with market permission, opportunity score, and execution state."""
-    context = build_market_decision_context(snapshot, market_regime)
+    context = build_market_decision_context(snapshot, market_regime, cycle_history)
     stage_score = _num(context["market_sentiment_score"])
     market_cap = int(context["portfolio_position_cap_pct"])
     for stock in results:

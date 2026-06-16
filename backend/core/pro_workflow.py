@@ -1,14 +1,37 @@
 from typing import Any, Dict, List
 
 
+def classify_strategy_health(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn verified return metrics into an actionable strategy operating state."""
+    signals = int(metrics.get("signals") or 0)
+    expected = float(metrics.get("expected_return") or 0)
+    ci95_high = float(metrics.get("ci95_high") or 0)
+    win_rate = float(metrics.get("win_rate") or 0)
+
+    if signals < 20:
+        return {"status": "OBSERVE", "weight": 0.5, "reason": f"仅 {signals} 个有效样本，继续观察"}
+    if expected < 0 and (ci95_high < 0 or expected <= -1):
+        return {"status": "PAUSED", "weight": 0.0, "reason": "近期净期望显著为负，暂停进入可交易池"}
+    if expected < 0 or win_rate < 45:
+        return {"status": "DOWNWEIGHT", "weight": 0.5, "reason": "近期验证偏弱，降低策略权重并仅保留高质量信号"}
+    return {"status": "ACTIVE", "weight": 1.0, "reason": "近期验证保持正期望，可正常使用"}
+
+
 def recommend_strategy_template(
     market_regime: str = "UNKNOWN",
     risk_status: str = "ok",
     recent_win_rate: float = 0,
+    strategy_health: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Choose a scan template profile for the next run based on regime and recent quality."""
     regime = (market_regime or "UNKNOWN").upper()
-    defensive = risk_status in {"warning", "error"} or recent_win_rate < 45 or regime in {"DEFENSIVE", "CRITICAL"}
+    health_status = (strategy_health or {}).get("status")
+    defensive = (
+        risk_status in {"warning", "error"}
+        or recent_win_rate < 45
+        or regime in {"DEFENSIVE", "CRITICAL"}
+        or health_status in {"DOWNWEIGHT", "PAUSED"}
+    )
 
     if defensive:
         return {
@@ -23,7 +46,8 @@ def recommend_strategy_template(
                 "use_weekly": True,
                 "max_open_gap_pct": 2.0,
             },
-            "reason": "市场或组合风险偏高，优先减少信号数量并提高右侧确认要求",
+            "reason": (strategy_health or {}).get("reason") or "市场或组合风险偏高，优先减少信号数量并提高右侧确认要求",
+            "strategy_health": strategy_health or {},
         }
 
     if regime in {"BULL", "RISK_ON", "CONFIRM"} or recent_win_rate >= 55:
@@ -40,6 +64,7 @@ def recommend_strategy_template(
                 "max_open_gap_pct": 3.0,
             },
             "reason": "近期验证质量较好，可保持共振策略并允许正常触发频率",
+            "strategy_health": strategy_health or {},
         }
 
     return {
@@ -54,6 +79,7 @@ def recommend_strategy_template(
             "max_open_gap_pct": 2.5,
         },
         "reason": "市场状态不明朗，使用均衡参数等待板块和量能进一步确认",
+        "strategy_health": strategy_health or {},
     }
 
 

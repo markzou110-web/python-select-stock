@@ -3,11 +3,15 @@ Unified risk engine for paper-trading display, alerts, and automation.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
 
 from core.risk_constants import (
+    ATR_STOP_MAX_PCT,
+    ATR_STOP_MIN_PCT,
+    ATR_STOP_MULTIPLIER,
     CAPITAL_PROTECT_FLOOR_PCT,
     CAPITAL_PROTECT_THRESHOLD_PCT,
     FIXED_STOP_LOSS_RATIO,
@@ -28,17 +32,47 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def track_high_since_entry(
+    entry_price: float,
+    stored_high: float,
+    current_price: float,
+    snapshot_high: float,
+    entry_date: Any,
+    now: datetime | None = None,
+) -> float:
+    """Avoid treating a same-day pre-entry high as post-entry profit."""
+    entry_price = safe_float(entry_price)
+    current_price = safe_float(current_price, entry_price)
+    now = now or datetime.now()
+    parsed_entry_date = pd.to_datetime(entry_date, errors="coerce")
+    if not pd.isna(parsed_entry_date) and parsed_entry_date.date() == now.date():
+        return max(entry_price, current_price)
+    return max(
+        entry_price,
+        safe_float(stored_high, entry_price),
+        current_price,
+        safe_float(snapshot_high, current_price),
+    )
+
+
 def compute_paper_risk_levels(
     entry_price: float,
     high_since_entry: float,
     current_price: float,
     price_action_summary: dict | None = None,
+    atr: float | None = None,
 ) -> dict:
     """
     Compute the current paper-trading risk ladder.
 
     Initial and valid structure stops are always considered; capital protection
     and trailing stops are activated only after profit milestones are reached.
+
+    When ``atr`` is provided (个股波动率 ATR), the initial stop is tightened to
+    ``max(固定止损, ATR自适应止损)``. 关键安全语义：ATR 只会让初始止损更紧、
+    不会比固定 -9% 更宽，从而让实盘 active_stop_price 与回测行为一致，并避免
+    对低波动股设置过宽的止损。这与 strategy.py 的 evaluate_exit_signals 中
+    ATR 止损语义对齐，但这里额外用 max() 锁定"只收紧不放宽"。
     """
     entry_price = safe_float(entry_price)
     if entry_price <= 0:
@@ -63,12 +97,31 @@ def compute_paper_risk_levels(
     pa = price_action_summary or {}
 
     buy_price = round(entry_price, 2)
-    initial_stop_price = round(entry_price * FIXED_STOP_LOSS_RATIO, 2)
+    # 固定止损作为基准（-9%）。ATR 止损（若可用）只会更紧，不会更宽。
+    fixed_stop_price = round(entry_price * FIXED_STOP_LOSS_RATIO, 2)
+    atr_note = None
+    atr = safe_float(atr, 0.0)
+    if atr > 0:
+        # ATR 自适应止损：entry - N * ATR，并 clamp 到 [ATR_STOP_MAX_PCT, ATR_STOP_MIN_PCT]
+        # （即 [-15%, -5%]，防止低波动过紧、高波动过宽）。
+        atr_stop_price = round(entry_price - atr * ATR_STOP_MULTIPLIER, 2)
+        atr_stop_lower = round(entry_price * (1 + ATR_STOP_MAX_PCT / 100), 2)  # -15%
+        atr_stop_upper = round(entry_price * (1 + ATR_STOP_MIN_PCT / 100), 2)  # -5%
+        atr_stop_price = max(atr_stop_lower, min(atr_stop_upper, atr_stop_price))
+        # 只收紧不放宽：ATR 止损至少要和固定止损一样紧（取较高者）。
+        initial_stop_price = max(fixed_stop_price, atr_stop_price)
+        if initial_stop_price > fixed_stop_price:
+            atr_note = f"ATR 自适应止损收紧至 {initial_stop_price:.2f}（固定止损 {fixed_stop_price:.2f}）"
+    else:
+        initial_stop_price = fixed_stop_price
+
     max_pl_pct = ((high_since_entry - entry_price) / entry_price) * 100
     pl_pct = ((current_price - entry_price) / entry_price) * 100
 
     candidates = [initial_stop_price]
     risk_notes: list[str] = []
+    if atr_note:
+        risk_notes.append(atr_note)
 
     structure_stop_price = 0.0
     pa_stop = safe_float(pa.get("pa_stop_price"))

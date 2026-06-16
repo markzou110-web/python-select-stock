@@ -1,9 +1,12 @@
 from celery import Celery
 import os
+import sys
 from .logging_config import logger
 from .config import config
 config.setup_no_proxy()
 from celery.schedules import crontab
+from celery.signals import task_failure, task_postrun, task_prerun
+from datetime import datetime
 
 import redis
 
@@ -43,6 +46,18 @@ celery_app.conf.update(
             'task': 'tasks.check_realtime_alerts',
             'schedule': 300.0, # 每 5 分钟检查一次
         },
+        'collect-limit-up-leadership-every-minute': {
+            'task': 'tasks.collect_limit_up_leadership',
+            'schedule': crontab(minute='*', hour='9-11,13-14', day_of_week='1-5'),
+        },
+        'collect-limit-up-leadership-after-close': {
+            'task': 'tasks.collect_limit_up_leadership',
+            'schedule': crontab(hour=15, minute=1, day_of_week='1-5'),
+        },
+        'collect-candidate-minute-bars-every-5-minutes': {
+            'task': 'tasks.collect_candidate_minute_bars',
+            'schedule': crontab(minute='*/5', hour='9-11,13-14', day_of_week='1-5'),
+        },
         'intraday-open-risk-0935': {
             'task': 'tasks.intraday_monitor_checkpoint',
             'schedule': crontab(hour=9, minute=35),
@@ -68,23 +83,48 @@ celery_app.conf.update(
             'schedule': crontab(hour=15, minute=10),
             'kwargs': {'slot': 'after_close_review'},
         },
-        'market-sync-before-open': {
-            'task': 'tasks.daily_sync',
-            'schedule': crontab(hour=8, minute=30),
-            'kwargs': {'slot': '盘前'},
-        },
-        'market-sync-at-noon': {
-            'task': 'tasks.daily_sync',
-            'schedule': crontab(hour=12, minute=10),
-            'kwargs': {'slot': '中午'},
-        },
-        'market-sync-after-close': {
-            'task': 'tasks.daily_sync',
-            'schedule': crontab(hour=18, minute=0),
-            'kwargs': {'slot': '晚上'},
-        },
+        # Full-market sync is owned by MarketSyncScheduler in the API process so
+        # progress is observable and it cannot race an embedded Celery beat.
     },
 )
+
+if sys.platform == "darwin":
+    # macOS Objective-C frameworks are not safe after Celery's default fork.
+    celery_app.conf.worker_pool = "solo"
+    celery_app.conf.worker_concurrency = 1
+
+
+@task_prerun.connect
+def audit_task_started(task_id=None, task=None, **kwargs):
+    from .audit_log import record_task_run
+    record_task_run(str(task_id or ""), getattr(task, "name", None), "STARTED", started_at=datetime.now())
+
+
+@task_postrun.connect
+def audit_task_finished(task_id=None, task=None, state=None, retval=None, **kwargs):
+    from .audit_log import record_task_run
+    summary = f"{type(retval).__name__}"
+    if isinstance(retval, (list, dict)):
+        summary += f" count={len(retval)}"
+    record_task_run(
+        str(task_id or ""),
+        getattr(task, "name", None),
+        str(state or "SUCCESS"),
+        finished_at=datetime.now(),
+        result_summary=summary,
+    )
+
+
+@task_failure.connect
+def audit_task_failed(task_id=None, sender=None, exception=None, **kwargs):
+    from .audit_log import record_task_run
+    record_task_run(
+        str(task_id or ""),
+        getattr(sender, "name", None),
+        "FAILURE",
+        finished_at=datetime.now(),
+        error_message=str(exception or "unknown task failure"),
+    )
 
 if __name__ == "__main__":
     celery_app.start()
