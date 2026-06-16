@@ -635,7 +635,7 @@ def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Op
 
     lines = [
         f"大盘：{regime_str}",
-        "策略：TV双策略强共振 | 数据：实时快照优先，失败回退daily_k",
+        "策略：TV双策略强共振 | 数据：实时快照",
         f"结果：{reason}",
         f"统计：强共振命中 {total} 只 | {grade_text}",
         "执行：无A/B级不买入；等待14:30尾盘确认，不追D级和冲高回落票。",
@@ -705,7 +705,7 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
             f" {push_stocks[0].get('market_sentiment_score', '--')}分"
             f" | 总仓上限 {push_stocks[0].get('portfolio_position_cap_pct', '--')}%"
         ),
-        f"策略：{strategy_label} | 数据：实时快照优先，失败回退daily_k",
+        f"策略：{strategy_label} | 数据：实时快照",
         "执行：候选≠指令；买入只在14:40-14:55确认，14:57后不追单",
         "确认：接近入场价、未跌破失效价、无冲高回落长上影",
         "",
@@ -802,6 +802,12 @@ class IntradaySentinel:
         self._stop = False
         self.schedule_times = ["14:20"]
         self.triggered_today = set()
+        # 改动 #10：风控独立高频检查。原先风控与（重）扫描耦合在 schedule_times 触发，
+        # 一天只在 14:20 跑一次，盘中缺口击穿止损可能被漏掉。现拆为独立 tick：
+        # 在交易时段内每 WIND_CONTROL_INTERVAL_MINUTES 分钟跑一次 run_wind_control，
+        # 不影响扫描频率。
+        self.wind_control_interval_minutes = 30
+        self.last_wind_control_dt = None
 
     def update_schedule(self, times_str: Optional[str] = None):
         """实时更新调度时间点"""
@@ -813,6 +819,21 @@ class IntradaySentinel:
     def _load_schedule(self):
         # 保持兼容性调用 update_schedule
         self.update_schedule()
+
+    def _should_run_wind_control(self, now: datetime) -> bool:
+        """改动 #10：风控独立 tick 判定。
+
+        在 A 股交易时段内，距上次风控超过 wind_control_interval_minutes 分钟则返回 True。
+        首次（last_wind_control_dt 为空）且在交易时段内也触发。非交易时段不触发。
+        """
+        if not is_a_share_intraday_session(now):
+            return False
+        if self.wind_control_interval_minutes <= 0:
+            return False
+        if self.last_wind_control_dt is None:
+            return True
+        elapsed = (now - self.last_wind_control_dt).total_seconds() / 60.0
+        return elapsed >= self.wind_control_interval_minutes
 
     def start(self):
         self._load_schedule()
@@ -844,7 +865,11 @@ class IntradaySentinel:
                         from routers.scan import run_market_scan_task
                         
                         logger.info("Sentinel: Running TV Dual Strict strategy scan with realtime snapshot first...")
-                        results = run_market_scan_task(local_only=False, strategy_type="tv_dual_strict") or []
+                        results = run_market_scan_task(
+                            local_only=False,
+                            strategy_type="tv_dual_strict",
+                            require_live_snapshot=True,
+                        ) or []
                         for s in results:
                             s['strategy_type'] = s.get('strategy_type') or 'tv_dual_strict'
 
@@ -862,16 +887,25 @@ class IntradaySentinel:
                                 )
                         else:
                             send_intraday_heartbeat([], "强共振无命中，今日暂不操作。")
-
-                        # --- 新增: 拟合实盘风控检查 ---
-                        logger.info("Sentinel: Running Paper Trading Wind Control...")
-                        from routers.paper_trade import run_wind_control
-                        wc_res = run_wind_control()
-                        if wc_res.get("closed_count", 0) > 0:
-                            logger.info(f"Wind Control: Closed {wc_res['closed_count']} positions.")
+                        # 注：风控检查已拆为独立高频 tick（见下方 _should_run_wind_control），
+                        # 不再耦合在（重）扫描触发块里，避免一天只在 14:20 跑一次。
                     except Exception as e:
                         logger.error(f"Sentinel Scan Error: {e}")
                         send_intraday_heartbeat([], f"扫描异常，未产生可执行候选：{str(e)[:80]}")
+
+                # 改动 #10：风控独立高频检查（交易时段内每 N 分钟一次）
+                if self._should_run_wind_control(now):
+                    try:
+                        logger.info("Sentinel: Running Paper Trading Wind Control (independent tick)...")
+                        from routers.paper_trade import run_wind_control
+                        wc_res = run_wind_control()
+                        self.last_wind_control_dt = now
+                        if wc_res.get("closed_count", 0) > 0:
+                            logger.info(f"Wind Control: Closed {wc_res['closed_count']} positions.")
+                    except Exception as wc_err:
+                        logger.error(f"Sentinel Wind Control Error: {wc_err}")
+                        # 即使出错也更新时间戳，避免高频重试淹没日志
+                        self.last_wind_control_dt = now
 
                 if now.minute % 10 == 0 and now.second < 30:
                     self._load_schedule()

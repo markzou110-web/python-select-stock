@@ -113,7 +113,7 @@ def _send_trigger_notification(alerts) -> Dict[str, bool]:
         return {"bark": False}
 
 
-def _refresh_items_with_snapshot(items):
+def _refresh_items_with_snapshot(items, require_live_snapshot: bool = False):
     if not items:
         return []
     try:
@@ -121,6 +121,8 @@ def _refresh_items_with_snapshot(items):
 
         snapshot = get_market_snapshot()
         if snapshot is None or snapshot.empty:
+            if require_live_snapshot:
+                return None
             return items
         snapshot_map = snapshot.set_index("code")["price"].to_dict()
         from core.data import get_market_regime
@@ -133,6 +135,8 @@ def _refresh_items_with_snapshot(items):
         )
     except Exception as exc:
         logger.warning(f"Watchlist status snapshot refresh failed: {exc}")
+        if require_live_snapshot:
+            return None
         return items
 
     refreshed = []
@@ -141,6 +145,8 @@ def _refresh_items_with_snapshot(items):
         item.update(market_context)
         current_price = snapshot_map.get(item["code"])
         if not current_price:
+            if require_live_snapshot:
+                return None
             refreshed.append(item)
             continue
 
@@ -211,7 +217,10 @@ def send_watchlist_status_report(slot: str) -> Dict[str, Any]:
         return {"bark": False, "count": 0, "reason": "unsupported slot"}
 
     payload = list_watchlist(status="WATCHING")
-    items = _refresh_items_with_snapshot(payload.get("items", []))
+    items = _refresh_items_with_snapshot(payload.get("items", []), require_live_snapshot=True)
+    if items is None:
+        logger.warning("Watchlist status Bark skipped: live market snapshot unavailable.")
+        return {"bark": False, "count": 0, "reason": "live_snapshot_unavailable"}
     if not items:
         return {"bark": False, "count": 0, "reason": "empty watchlist"}
 
@@ -429,9 +438,19 @@ def auto_prune_watchlist(max_watch_days: int = 15) -> Dict[str, Any]:
 @router.post("/check-triggers")
 def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
     payload = list_watchlist(status="WATCHING")
+    items = _refresh_items_with_snapshot(payload.get("items", []), require_live_snapshot=True)
+    if items is None:
+        logger.warning("Watchlist trigger Bark skipped: live market snapshot unavailable.")
+        return {
+            "status": "success",
+            "count": 0,
+            "alerts": [],
+            "notification": {},
+            "reason": "live_snapshot_unavailable",
+        }
     alerts = []
 
-    for item in payload.get("items", []):
+    for item in items:
         reasons = []
         if item.get("target_hit"):
             reasons.append("Brooks入场触发" if item.get("pa_trade_action") else "触达目标价")

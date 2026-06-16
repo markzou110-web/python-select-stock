@@ -18,12 +18,12 @@
 | **第二优先级（抬胜率）** | 4 | tv_dual_strict 周线门槛（默认关闭） | ✅ | 过滤逆周线下跌信号 |
 | | 5 | TV-ZP/tv_dual 信号分连续化 | ✅ | 候选股间有区分度 |
 | | 6 | 历史胜率进综合排序分 | ✅ | 让高胜率股排在前面 |
-| | 7 | 启用 REGIME_PARAMS 自适应阈值 | 🔲 | 牛熊自适应收紧 |
+| | 7 | 启用 REGIME_PARAMS 自适应阈值 | ✅ | 牛熊自适应收紧 |
 | **第三优先级（出场盈利）** | 8 | ATR 自适应止损进实时风控 | ✅ | 止损与回测一致，只收紧不放宽 |
 | | 9 | 分批止盈（阶梯卖出） | ✅ | +8% 锁一半，剩余跟踪 |
-| | 10 | Sentinel 盘中风控频率提升 | 🔲 | 防盘中缺口击穿止损 |
+| | 10 | Sentinel 盘中风控频率提升 | ✅ | 风控独立 tick，每 30 分钟 |
 | | 11 | 弱市收紧已有仓位止损 | ✅ | 弱市(bear/volatile) -9%→-6% |
-| | 12 | 组合级熔断（日内亏损上限） | 🔲 | 防系统性回撤 |
+| | 12 | 组合级熔断（日内亏损上限） | ✅ | 日内亏损超 -5% 暂停新开仓 |
 | **第四优先级（测量验证）** | 13 | 度量口径统一（回撤/胜率/profit factor） | 🔲 | 调参基础一致 |
 | | 14 | 走查前推 / 样本外测试 | 🔲 | 暴露过拟合 |
 | | 15 | 回测加基准 alpha | 🔲 | 区分能力与 β |
@@ -32,7 +32,8 @@
 
 **Phase 1 已完成 5 项**（#1、#2、#4、#8、#9，220 passed）。
 **Phase 2 已完成 4 项**（#3、#5、#6、#11，231 passed）。
-**累计完成 9 / 17 项**，剩余 8 项（#7、#10、#12、#13-17）留作后续迭代。
+**Phase 3 已完成 3 项**（#7、#10、#12，251 passed）。
+**累计完成 12 / 17 项**，剩余 5 项（#13-17，均为测量验证基础设施）留作后续迭代。
 
 ---
 
@@ -105,13 +106,16 @@
 
 ---
 
-### 🔲 #7 启用 REGIME_PARAMS 自适应阈值
+### ✅ #7 启用 REGIME_PARAMS 自适应阈值
 
-**问题**：`market_regime.py:20-66` 定义了牛/熊/震荡自适应参数，`get_adaptive_params`（`:152`）**从未被扫描调用**。扫描只做粗暴的 CRITICAL 时 RSI+5（`scanner.py:742-748`）。
+**问题**：`market_regime.py` 定义了牛/熊/震荡自适应参数（`REGIME_PARAMS`），`get_adaptive_params` **从未被扫描调用**。扫描只做粗暴的 CRITICAL 时 RSI+5。且扫描用的是 `core.data` 的 `OFFENSIVE/CRITICAL/DEFENSIVE` 词表，与 `MarketRegime` 的 `bull/bear/volatile` 不通——全仓库无映射。
 
-**建议**：把写好的自适应阈值接到扫描路径，熊市自动收紧条件。
+**已完成方案**：
+- `market_regime.py` 新增 `map_status_to_regime()`：`OFFENSIVE→bull`、`CRITICAL→bear`、`DEFENSIVE→volatile`，`get_adaptive_params` 内部自动调用（幂等）。
+- `scanner.py` 启用自适应：`perform_market_scan` 根据 `reg_status` 调 `get_adaptive_params`，覆盖 `threshold/vol_multiplier/rsi_min/stop_loss_pct/sqz_lookback/use_bb_sqz/pine_min_signals`。带 `SCAN_REGIME_ADAPTIVE` 开关（默认开）。bear 时最严（threshold↓、vol↑、rsi↑），bull 时最松。
+- 保留 OFFENSIVE 换手率放宽。
 
-**证据**：`backend/core/market_regime.py:20-66,152`、`backend/core/scanner.py:742-748`
+**证据 / 改动文件**：`backend/core/market_regime.py`、`backend/core/scanner.py`、`backend/tests/test_phase3_optimizations.py`（+8 测试：映射 6 + 自适应 2）
 
 ---
 
@@ -137,13 +141,13 @@
 
 ---
 
-### 🔲 #10 Sentinel 盘中风控频率提升
+### ✅ #10 Sentinel 盘中风控频率提升
 
-**问题**：`sentinel.py:803` `schedule_times=["14:20"]`，风控每天只跑一次（`:868-871`）。若 09:35 跳空击穿止损、14:20 收回，盘中止损**永不触发**。
+**问题**：`sentinel.py` `schedule_times=["14:20"]`，风控与（重）扫描耦合在同一触发块，**一天只跑一次**。若 09:35 跳空击穿止损、14:20 收回，盘中止损永不触发。
 
-**建议**：把风控频率提到盘中每 30 分钟，或加价格流触发。
+**已完成方案（风控独立 tick）**：把 `run_wind_control` 从扫描触发块中拆出，新增 `_should_run_wind_control()`：在 A 股交易时段内，距上次风控超过 `wind_control_interval_minutes`（默认 **30 分钟**）则触发。扫描频率不变（仍按 schedule_times）。首次在交易时段内也触发。即使风控出错也更新时间戳避免高频重试淹没日志。
 
-**证据**：`backend/core/sentinel.py:803,866-871`
+**证据 / 改动文件**：`backend/core/sentinel.py`、`backend/tests/test_phase3_optimizations.py`（+4 测试：默认间隔/首次触发/节流/非交易时段）
 
 ---
 
@@ -157,13 +161,16 @@
 
 ---
 
-### 🔲 #12 组合级熔断（日内亏损上限）
+### ✅ #12 组合级熔断（日内亏损上限）
 
-**问题**：`portfolio_risk.py:8-84` 只在加仓前检查，`total_plan_risk_pct>6%` 只阻新单（`:67-68`），不强制减现有敞口。无相关度检查，无日内亏损上限。
+**问题**：`portfolio_risk.py` 只在加仓前检查（持仓数/计划风险%），`total_plan_risk_pct>6%` 只阻新单，**无日内亏损上限、无已实现亏损追踪、无组合熔断**。
 
-**建议**：加日内亏损上限熔断 + 持仓相关度约束。
+**已完成方案（日内亏损硬熔断）**：
+- `portfolio_risk.py` 新增 `evaluate_daily_loss_circuit_breaker()`：统计当日 CLOSED 实现盈亏（按 `(close-entry)*shares` 近似），亏损占比超过 `daily_loss_limit_pct`（默认 **-5%**）时返回 `status="halt"`。`DEFAULT_RISK_BUDGET` 新增 `daily_loss_limit_pct` 键。
+- `add_paper_trade` 接入：熔断触发时硬阻止新开仓（返回 `status="halt"`），**与 warning 不同，不可被 force 绕过**。
+- 盈利日永不熔断；可自定义更紧的熔断线。
 
-**证据**：`backend/core/portfolio_risk.py:8-84`
+**证据 / 改动文件**：`backend/core/portfolio_risk.py`、`backend/routers/paper_trade.py`、`backend/tests/test_phase3_optimizations.py`（+5 测试：无平仓/限内/超限/盈利/自定义线）
 
 ---
 
@@ -276,6 +283,30 @@
 
 ---
 
+## Phase 3 实施详情（已完成）
+
+**范围**：3 项中 ROI（#7、#10、#12），按"风控加固 + 牛熊自适应"组合。
+
+**验证**：`pytest tests/ -q` → **251 passed, 0 failed**（Phase 2 基线 231 → 新增 17 个测试）
+
+**涉及文件**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/core/market_regime.py` | #7 `map_status_to_regime` + `get_adaptive_params` 自动映射 |
+| `backend/core/scanner.py` | #7 `SCAN_REGIME_ADAPTIVE` 开关 + 自适应参数应用 |
+| `backend/core/sentinel.py` | #10 风控独立 tick（`wind_control_interval_minutes`、`_should_run_wind_control`） |
+| `backend/core/portfolio_risk.py` | #12 `evaluate_daily_loss_circuit_breaker` + `daily_loss_limit_pct` |
+| `backend/routers/paper_trade.py` | #12 add_paper_trade 接入日内亏损熔断（硬阻止，不可 force） |
+| `backend/tests/test_phase3_optimizations.py` | +17 测试（#7 映射/自适应 8 + #10 频率 4 + #12 熔断 5） |
+
+**新增可配置常量**（便于回退 / 调参）：
+- `scanner.py`: `SCAN_REGIME_ADAPTIVE`（True）
+- `sentinel.py`: `wind_control_interval_minutes`（30）
+- `portfolio_risk.py`: `DEFAULT_RISK_BUDGET["daily_loss_limit_pct"]`（5.0）
+
+---
+
 ## 待验证项与剩余风险（Phase 1 + 2）
 
 1. **#1 拆行的前端展示**：部分平仓后某只股票会出现多行（OPEN 剩余 + CLOSED 已减仓）。需人工核验前端列表渲染是否正确区分（`list_paper_trades` 按 id 取行天然支持，但前端展示需确认）。
@@ -288,9 +319,12 @@
 
 ---
 
-## Phase 3 规划（待实施）
+## Phase 4 规划（待实施）
 
-剩余 8 项按建议优先级：
+剩余 5 项均为测量验证基础设施（改动大、回归风险高，建议作为独立批次谨慎推进）：
 
-1. **中 ROI**：#7 自适应阈值 · #10 盘中风控 · #12 组合熔断
-2. **基础设施**（改动大，需谨慎）：#13 度量统一 · #14 走查前推 · #15 基准 alpha · #16 缺口建模 · #17 失败样本闭环
+1. **度量统一**：#13 回撤/胜率/profit factor 三套定义统一
+2. **抗过拟合**：#14 走查前推 / 样本外测试
+3. **基准对比**：#15 回测加沪深300基准 alpha
+4. **回测真实性**：#16 止损穿越缺口建模
+5. **学习闭环**：#17 failure_samples 反哺过滤

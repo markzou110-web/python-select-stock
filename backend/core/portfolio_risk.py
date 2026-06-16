@@ -12,7 +12,72 @@ DEFAULT_RISK_BUDGET = {
     "max_strategy_positions": 4,
     "max_single_risk_pct": 2.0,
     "max_total_plan_risk_pct": 6.0,
+    # 改动 #12：日内亏损熔断。当日已平仓实现亏损占初始总资金比例超过此值时，
+    # 暂停当日新开仓（halt），避免连续止损放大系统性回撤。
+    "daily_loss_limit_pct": 5.0,
 }
+
+
+def evaluate_daily_loss_circuit_breaker(
+    engine: Optional[Engine],
+    budget: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """改动 #12：日内亏损熔断。
+
+    统计当日（CLOSED 且 close_date=今天）已实现盈亏，若亏损占初始总资金比例
+    超过 daily_loss_limit_pct，返回 status="halt"（阻止新开仓）。否则 status="ok"。
+
+    盈亏按 (close_price - entry_price) / entry_price * shares 近似，因 paper_trading
+    无 capital 字段，这里用"亏损笔的 entry_price*shares 之和"作分母近似资金占比，
+    已足以触发熔断保护（保守口径）。
+    """
+    if engine is None:
+        return {"status": "error", "halted": False, "daily_loss_pct": 0.0, "message": "数据库不可用"}
+
+    limits = {**DEFAULT_RISK_BUDGET, **(budget or {})}
+    loss_limit = float(limits.get("daily_loss_limit_pct", 5.0))
+    today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
+
+    try:
+        df = pd.read_sql(
+            text("""
+                SELECT entry_price, close_price, shares
+                FROM paper_trading
+                WHERE status = 'CLOSED' AND close_date = :d
+                  AND close_price > 0 AND entry_price > 0
+            """),
+            engine,
+            params={"d": today_str},
+        )
+    except Exception as exc:
+        return {"status": "error", "halted": False, "daily_loss_pct": 0.0, "message": f"日内亏损查询失败: {str(exc)[:80]}"}
+
+    if df.empty:
+        return {"status": "ok", "halted": False, "daily_loss_pct": 0.0, "message": "今日无平仓"}
+
+    df["shares"] = pd.to_numeric(df.get("shares"), errors="coerce").fillna(0).astype(float)
+    # 单笔实现盈亏金额（近似）= (close - entry) * shares
+    df["pnl"] = (df["close_price"].astype(float) - df["entry_price"].astype(float)) * df["shares"]
+    realized_pnl = float(df["pnl"].sum())
+    # 资金分母：当日所有平仓笔的初始投入 entry*shares 之和（近似总资金口径）
+    capital_base = float((df["entry_price"].astype(float) * df["shares"]).sum())
+    daily_loss_pct = (realized_pnl / capital_base * 100.0) if capital_base > 0 else 0.0
+
+    if daily_loss_pct < -abs(loss_limit):
+        return {
+            "status": "halt",
+            "halted": True,
+            "daily_loss_pct": round(daily_loss_pct, 2),
+            "daily_loss_limit_pct": loss_limit,
+            "message": f"日内已实现亏损 {daily_loss_pct:.2f}% 超过熔断线 -{loss_limit:.1f}%，暂停当日新开仓",
+        }
+    return {
+        "status": "ok",
+        "halted": False,
+        "daily_loss_pct": round(daily_loss_pct, 2),
+        "daily_loss_limit_pct": loss_limit,
+        "message": "日内亏损在熔断线内",
+    }
 
 
 def evaluate_portfolio_risk_budget(

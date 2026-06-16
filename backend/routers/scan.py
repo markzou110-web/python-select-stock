@@ -72,7 +72,8 @@ def run_market_scan_task(
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期 (10/20/30/60)
-    stop_loss_pct: float = -8.0
+    stop_loss_pct: float = -8.0,
+    require_live_snapshot: bool = False,
 ):
     from core.scanner import perform_market_scan
     results = perform_market_scan(
@@ -93,7 +94,8 @@ def run_market_scan_task(
         pine_min_signals=pine_min_signals,
         min_data_days=min_data_days,
         weekly_ma_period=weekly_ma_period,
-        stop_loss_pct=stop_loss_pct
+        stop_loss_pct=stop_loss_pct,
+        require_live_snapshot=require_live_snapshot,
     )
     if strategy_type == "tv_dual_strict" and results:
         try:

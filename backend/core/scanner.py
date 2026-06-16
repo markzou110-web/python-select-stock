@@ -39,6 +39,12 @@ from core.scan_preflight import build_scan_preflight
 # perform_market_scan 会中止并返回空结果，避免坏数据静默产生假信号。
 # 调试/紧急时可设为 False 绕过。
 SCAN_PREFLIGHT_ENFORCE = True
+
+# 大盘状态自适应阈值开关（改动 #7）：True 时，perform_market_scan 根据大盘状态
+# (OFFENSIVE/CRITICAL/DEFENSIVE → bull/bear/volatile) 自动收紧/放宽 threshold、
+# vol_multiplier、rsi_min、stop_loss_pct 等参数（启用此前未使用的 REGIME_PARAMS）。
+# 调试/紧急时可设为 False 回退到旧的固定参数。
+SCAN_REGIME_ADAPTIVE = True
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
 from core.decision_layer import apply_decision_layer
@@ -698,7 +704,8 @@ def perform_market_scan(
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,
     stop_loss_pct: float = -8.0,
-    tv_weekly_gate: bool = False
+    tv_weekly_gate: bool = False,
+    require_live_snapshot: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Executes the main market scan logic.
@@ -737,6 +744,7 @@ def perform_market_scan(
             "min_data_days": min_data_days,
             "weekly_ma_period": weekly_ma_period,
             "stop_loss_pct": stop_loss_pct,
+            "require_live_snapshot": require_live_snapshot,
         },
         "version_snapshot": {
             "strategy_logic_version": STRATEGY_LOGIC_VERSION,
@@ -750,14 +758,32 @@ def perform_market_scan(
         regime = get_market_regime()
         reg_status = regime.get("status", "UNKNOWN")
         
-        # 动态调优：在大跌 (CRITICAL) 时收紧筛选，在进攻 (OFFENSIVE) 时适度放宽换手
-        if reg_status == "CRITICAL":
-            rsi_min = min(rsi_min + 5, 80)
-            threshold = max(0.08, threshold - 0.04)
-            logger.info(f"[SCAN] Market is {reg_status}. Tightening RSI to {rsi_min} and Threshold to {threshold}.")
-        elif reg_status == "OFFENSIVE":
+        # 启用 REGIME_PARAMS 自适应阈值（改动 #7）：根据大盘状态自动收紧/放宽
+        # threshold、vol_multiplier、rsi_min、stop_loss_pct 等。bear 时最严，bull 时最松。
+        # 用 SCAN_REGIME_ADAPTIVE 开关控制，便于回退到旧的固定参数。
+        if SCAN_REGIME_ADAPTIVE:
+            from core.market_regime import get_adaptive_params
+            adaptive = get_adaptive_params(reg_status, strategy_type)
+            threshold = float(adaptive.get("threshold", threshold))
+            vol_multiplier = float(adaptive.get("vol_multiplier", vol_multiplier))
+            if "rsi_min" in adaptive:
+                rsi_min = int(adaptive["rsi_min"])
+            if "stop_loss_pct" in adaptive:
+                stop_loss_pct = float(adaptive["stop_loss_pct"])
+            if "sqz_lookback" in adaptive:
+                sqz_lookback = int(adaptive["sqz_lookback"])
+            if adaptive.get("use_bb_sqz") is not None:
+                use_bb_sqz = bool(adaptive["use_bb_sqz"])
+            if "pine_min_signals" in adaptive:
+                pine_min_signals = int(adaptive["pine_min_signals"])
+            logger.info(
+                f"[SCAN] Market regime={reg_status}. Adaptive params: threshold={threshold}, "
+                f"vol_mult={vol_multiplier}, rsi_min={rsi_min}, stop_loss={stop_loss_pct}."
+            )
+        # 换手率调整保留：进攻市适度放宽换手要求
+        if reg_status == "OFFENSIVE":
             turnover_min = max(2.5, turnover_min - 0.5)
-            logger.info(f"[SCAN] Market is {reg_status}. Adjusting turnover requirement to {turnover_min}.")
+            logger.info(f"[SCAN] Market is OFFENSIVE. Adjusting turnover requirement to {turnover_min}.")
 
         snapshot_df = pd.DataFrame()
         engine = get_db_engine()
@@ -791,6 +817,11 @@ def perform_market_scan(
 
         # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
         if snapshot_df.empty:
+            if require_live_snapshot:
+                raise HTTPException(
+                    status_code=503,
+                    detail="实时行情快照不可用，已中止扫描，避免 Bark 使用历史 daily_k 数据。",
+                )
             logger.info(f"Switching to LOCAL DB mode (Local Only: {local_only}, Data Date: {data_date or 'Auto'})...")
             try:
                 with engine.connect() as conn:

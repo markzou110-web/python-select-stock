@@ -152,26 +152,50 @@ def detect_market_regime(index_df: Optional[pd.DataFrame] = None) -> Dict[str, A
 def get_adaptive_params(regime_str: str, strategy_type: str) -> Dict[str, Any]:
     """
     根据市场状态返回推荐参数
-    
+
     Args:
-        regime_str: "bull" / "bear" / "volatile"
-        strategy_type: "squeeze" / "pine" / "both" / "consensus"
-    
+        regime_str: "bull" / "bear" / "volatile"（MarketRegime 值），或
+                    core.data 的 OFFENSIVE/CRITICAL/DEFENSIVE/UNKNOWN（自动映射）
+        strategy_type: "squeeze" / "pine" / "both" / "consensus" / 其它(降级为 squeeze)
+
     Returns:
         推荐参数字典
     """
+    regime_str = map_status_to_regime(regime_str)
     try:
         regime = MarketRegime(regime_str)
     except ValueError:
         regime = MarketRegime.VOLATILE
-    
+
     # both 策略使用 squeeze 的参数
     st = "squeeze" if strategy_type == "both" else strategy_type
     if st not in ("squeeze", "pine", "consensus"):
         st = "squeeze"
-    
+
     params = REGIME_PARAMS.get(regime, REGIME_PARAMS[MarketRegime.VOLATILE])
     return params.get(st, params["squeeze"])
+
+
+def map_status_to_regime(status: str) -> str:
+    """把 core.data.get_market_regime() 的 status 词表映射到 MarketRegime 值。
+
+    core.data 用 OFFENSIVE/CRITICAL/DEFENSIVE/UNKNOWN（基于指数 vs EMA20），
+    market_regime 用 bull/bear/volatile。映射规则：
+      OFFENSIVE  → bull     （两大指数均在 EMA20 之上，强势）
+      CRITICAL   → bear     （两大指数均在 EMA20 之下，弱势）
+      DEFENSIVE  → volatile （一强一弱，震荡）
+      其它/未知   → volatile （默认中性偏防守）
+    传入已是 bull/bear/volatile 时原样返回（幂等）。
+    """
+    s = str(status or "").strip().upper()
+    return {
+        "OFFENSIVE": "bull",
+        "CRITICAL": "bear",
+        "DEFENSIVE": "volatile",
+        "BULL": "bull",
+        "BEAR": "bear",
+        "VOLATILE": "volatile",
+    }.get(s, "volatile")
 
 
 def _fetch_index_data() -> Optional[pd.DataFrame]:

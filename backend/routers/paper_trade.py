@@ -413,6 +413,18 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "budget": budget_check["budget"],
             }
 
+        # 改动 #12：日内亏损熔断。当日已实现亏损超过 daily_loss_limit_pct 时硬阻止新开仓
+        # （与上面的"warning 可 force 跳过"不同，熔断是硬限制，不可被 force 绕过）。
+        from core.portfolio_risk import evaluate_daily_loss_circuit_breaker
+        loss_breaker = evaluate_daily_loss_circuit_breaker(engine)
+        if loss_breaker.get("halted"):
+            return {
+                "status": "halt",
+                "detail": loss_breaker.get("message", "日内亏损熔断，暂停新开仓"),
+                "daily_loss_pct": loss_breaker.get("daily_loss_pct"),
+                "daily_loss_limit_pct": loss_breaker.get("daily_loss_limit_pct"),
+            }
+
         # --- 行业集中度控制 (Sector Exposure Control) ---
         MAX_SECTOR_POSITIONS = 2  # 同行业最多 2 个持仓
         sector_map = get_sector_map()
@@ -599,14 +611,26 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                         }
         except Exception as exc:
             logger.warning(f"Operation trigger snapshot unavailable: {exc}")
+        if not snapshot_map:
+            logger.warning("Operation trigger Bark skipped: live market snapshot unavailable.")
+            return {
+                "status": "success",
+                "checked": int(len(df)),
+                "alerts": [],
+                "notification": False,
+                "reason": "live_snapshot_unavailable",
+            }
 
         alerts: List[Dict[str, Any]] = []
         for _, row in df.iterrows():
             code = str(row.get("code") or "")
             entry = safe_float(row.get("entry_price"))
-            cached_current = safe_float(row.get("current_price"), entry)
             live = snapshot_map.get(code, {})
-            current = safe_float(live.get("price"), cached_current)
+            if not live:
+                continue
+            current = safe_float(live.get("price"))
+            if current <= 0:
+                continue
             high = track_high_since_entry(
                 entry,
                 safe_float(row.get("high_since_entry"), entry),
