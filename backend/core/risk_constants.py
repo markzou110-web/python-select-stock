@@ -11,6 +11,14 @@ wind control) should import from this module instead of hardcoding values.
 FIXED_STOP_LOSS_PCT = -9.0          # -9% (e.g. entry * 0.91)
 FIXED_STOP_LOSS_RATIO = 1.0 + FIXED_STOP_LOSS_PCT / 100.0  # 0.91
 
+# ── 弱市止损收紧 (Regime-aware Stop Tightening) ──
+# 当大盘处于弱市（bear/volatile）时，已有持仓的初始止损从 -9% 收紧到 -6%，
+# 降低系统性回撤期的单笔风险。只在 compute_paper_risk_levels 中生效，只收紧不放宽。
+WEAK_REGIME_STOP_PCT = -6.0
+WEAK_REGIME_STOP_RATIO = 1.0 + WEAK_REGIME_STOP_PCT / 100.0  # 0.94
+# 触发收紧的 regime 值（与 market_regime.py 的 regime 字段对齐）
+WEAK_REGIMES = ("bear", "volatile")
+
 # ── ATR 自适应止损 (ATR Adaptive Stop Loss) ──
 # 基于个股波动率动态计算的止损倍数
 ATR_STOP_MULTIPLIER = 2.0

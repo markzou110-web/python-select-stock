@@ -2,6 +2,16 @@ from collections import defaultdict
 from typing import Any, Dict, List
 
 
+# 综合评分权重（求和=1.0）。历史胜率（historical_win_rate）专项 0.10，
+# 让历史回测胜率高的标的在排序中获得加权优势，而非仅作二元 SOP 勾选。
+# 便于调参：调整后请确保五项权重之和仍为 1.0。
+W_STRATEGY_PERCENTILE = 0.35
+W_PRICE_ACTION = 0.18
+W_SECTOR_ALIGNMENT = 0.12
+W_TRADE_OPPORTUNITY = 0.25
+W_HISTORICAL_WIN_RATE = 0.10
+
+
 def _clamp(value: Any, default: float = 0.0) -> float:
     try:
         return max(0.0, min(100.0, float(value)))
@@ -14,6 +24,21 @@ def _percentile_scores(values: List[float]) -> List[float]:
         return [50.0] * len(values)
     ordered = sorted(values)
     return [round(100 * ordered.index(value) / (len(ordered) - 1), 1) for value in values]
+
+
+def _parse_win_rate(row: Dict[str, Any]) -> float:
+    """从结果行解析历史胜率。scanner 以中文字符串 '58.0%' 存于 '历史胜率' 键。
+
+    无胜率数据时返回中性值 50（不拉高也不拉低该标的的 win_rate 分量）。
+    """
+    raw = row.get("历史胜率")
+    if raw is None:
+        # 兼容可能的英文键
+        raw = row.get("win_rate", row.get("historical_win_rate"))
+    try:
+        return _clamp(float(str(raw).replace("%", "").strip()), 50.0)
+    except (TypeError, ValueError):
+        return 50.0
 
 
 def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -33,6 +58,7 @@ def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             execution = _clamp(row.get("pa_execution_score"), 50)
             safety = _clamp(row.get("pa_risk_score"), 50)
             price_action_composite = round(structure * 0.4 + execution * 0.35 + safety * 0.25, 1)
+            historical_win_rate = _parse_win_rate(row)
             components = {
                 "strategy_percentile": percentile,
                 "price_action": price_action_composite,
@@ -41,12 +67,14 @@ def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "price_action_safety": safety,
                 "sector_alignment": _clamp(row.get("sector_alignment_score"), 50),
                 "trade_opportunity": _clamp(row.get("trade_opportunity_score"), 50),
+                "historical_win_rate": historical_win_rate,
             }
             calibrated = round(
-                components["strategy_percentile"] * 0.40
-                + components["price_action"] * 0.20
-                + components["sector_alignment"] * 0.15
-                + components["trade_opportunity"] * 0.25,
+                components["strategy_percentile"] * W_STRATEGY_PERCENTILE
+                + components["price_action"] * W_PRICE_ACTION
+                + components["sector_alignment"] * W_SECTOR_ALIGNMENT
+                + components["trade_opportunity"] * W_TRADE_OPPORTUNITY
+                + components["historical_win_rate"] * W_HISTORICAL_WIN_RATE,
                 1,
             )
             row["raw_score"] = round(raw_score, 2)

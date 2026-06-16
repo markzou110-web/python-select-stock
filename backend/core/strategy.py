@@ -1161,8 +1161,12 @@ def check_tv_zp_strategy(df, fund_data: dict = None):
         return False, debug_info
 
     fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
+    # 信号强度连续化（替代固定 75）：量能越强、涨幅越大→分越高。
+    # 量能倍数在作用域内重建（与 check_squeeze 的 vol_ratio 同模式），区间约 70~90。
+    vol_ratio = curr['成交量'] / curr['Vol_MA20'] if curr.get('Vol_MA20', 0) > 0 else 0
+    signal_strength = min(vol_ratio, 3.0) * 5 + min(max(pct_change, 0), 5) * 1
     res = {
-        "Score": round(75 + fund_score, 1),
+        "Score": round(70 + signal_strength + fund_score, 1),
         "现价": curr['收盘'],
         "涨幅%": round(pct_change, 2),
         "RSI": round(curr.get('RSI', 0), 1),
@@ -1230,7 +1234,12 @@ def check_tv_dual_strategy(
     ma_hit = bool(recent_ma)
     zp_hit = bool(recent_zp)
     pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100 if prev['收盘'] else 0
-    score = 88 if ma_hit and zp_hit else 75
+    # 信号强度连续化：在双命中/单命中基准上叠加量能与涨幅，让"强突破"高于"弱突破"。
+    # 不改变入选门槛（哪些股票被选中不变），只影响候选之间的相对排名。
+    vol_ratio = curr['成交量'] / curr['Vol_MA20'] if curr.get('Vol_MA20', 0) > 0 else 0
+    signal_strength = min(vol_ratio, 3.0) * 4 + min(max(pct_change, 0), 5) * 1
+    base_score = 82 if ma_hit and zp_hit else 72
+    score = base_score + signal_strength
 
     res = {
         "Score": round(score + fund_score, 1),

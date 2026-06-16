@@ -14,15 +14,15 @@
 |---|---|---|---|---|
 | **第一优先级（修漏洞）** | 1 | REDUCE 真正部分平仓 | ✅ | 止住最大盈利泄漏 |
 | | 2 | 扫描入口检查 preflight blocking | ✅ | 防坏数据产生假信号 |
-| | 3 | 健康熔断用真实交易收益 | 🔲 | 熔断口径与执行一致 |
+| | 3 | 健康熔断用真实交易收益 | ✅ | 熔断口径与执行一致 |
 | **第二优先级（抬胜率）** | 4 | tv_dual_strict 周线门槛（默认关闭） | ✅ | 过滤逆周线下跌信号 |
-| | 5 | TV-ZP/tv_dual 信号分连续化 | 🔲 | 候选股间有区分度 |
-| | 6 | 历史胜率进综合排序分 | 🔲 | 让高胜率股排在前面 |
+| | 5 | TV-ZP/tv_dual 信号分连续化 | ✅ | 候选股间有区分度 |
+| | 6 | 历史胜率进综合排序分 | ✅ | 让高胜率股排在前面 |
 | | 7 | 启用 REGIME_PARAMS 自适应阈值 | 🔲 | 牛熊自适应收紧 |
 | **第三优先级（出场盈利）** | 8 | ATR 自适应止损进实时风控 | ✅ | 止损与回测一致，只收紧不放宽 |
 | | 9 | 分批止盈（阶梯卖出） | ✅ | +8% 锁一半，剩余跟踪 |
 | | 10 | Sentinel 盘中风控频率提升 | 🔲 | 防盘中缺口击穿止损 |
-| | 11 | 弱市收紧已有仓位止损 | 🔲 | CRITICAL 时 -9%→-5% |
+| | 11 | 弱市收紧已有仓位止损 | ✅ | 弱市(bear/volatile) -9%→-6% |
 | | 12 | 组合级熔断（日内亏损上限） | 🔲 | 防系统性回撤 |
 | **第四优先级（测量验证）** | 13 | 度量口径统一（回撤/胜率/profit factor） | 🔲 | 调参基础一致 |
 | | 14 | 走查前推 / 样本外测试 | 🔲 | 暴露过拟合 |
@@ -30,7 +30,9 @@
 | | 16 | 止损穿越缺口建模 | 🔲 | 不再低估真实亏损 |
 | | 17 | failure_samples 学习闭环 | 🔲 | 失败形态反哺过滤 |
 
-**Phase 1 已完成 5 项**（#1、#2、#4、#8、#9），全部测试通过（220 passed）。其余 12 项留作后续迭代。
+**Phase 1 已完成 5 项**（#1、#2、#4、#8、#9，220 passed）。
+**Phase 2 已完成 4 项**（#3、#5、#6、#11，231 passed）。
+**累计完成 9 / 17 项**，剩余 8 项（#7、#10、#12、#13-17）留作后续迭代。
 
 ---
 
@@ -61,13 +63,13 @@
 
 ---
 
-### 🔲 #3 健康熔断用真实交易收益
+### ✅ #3 健康熔断用真实交易收益
 
-**问题**：`strategy_health.py:16` 用"信号收盘价买入、5天后卖出"的**裸收益**判定策略 PAUSED/DOWNWEIGHT（`pro_workflow.py:14-17`），**不含止损、滑点、手续费**。一个带 -8% 止损实际亏钱的策略，可能在这个指标上显示 ACTIVE 继续运行。
+**问题**：`strategy_health.py` 用"信号收盘价买入、5天后卖出"的**裸收益**判定策略 PAUSED/DOWNWEIGHT（`pro_workflow.py:14-17`），**不含止损、滑点、手续费**。一个带 -8% 止损实际亏钱的策略，可能在这个指标上显示 ACTIVE 继续运行。
 
-**建议**：让 `build_strategy_health` 复用回测引擎的执行路径（入场→止损/移动止损/时间止损），而非裸 5 日收益。
+**已完成方案（SQL 简化止损模型 + Python 端计算）**：`build_strategy_health` 取信号后未来 5 个交易日的收盘，在 Python 端用 `_apply_stop_take_model` 套用简化止损/止盈：5 日内曾跌破 -9%（`FIXED_STOP_LOSS_PCT`）→ 计为 -9%；曾涨超 +15%（`TAKE_PROFIT_PCT`）→ 计为 +15%；否则取第 5 日实际收益。SQL 按方言选 `string_agg`(PG)/`GROUP_CONCAT`(SQLite)，截止日在 Python 端算（跨库兼容）。熔断指标现反映止损保护的经济性。
 
-**证据**：`backend/core/strategy_health.py:16`、`backend/core/pro_workflow.py:14-17`
+**证据 / 改动文件**：`backend/core/strategy_health.py`、`backend/tests/test_strategy_health.py`（+3 测试：止损封底/止盈封顶/区间内不变）
 
 ---
 
@@ -83,23 +85,23 @@
 
 ---
 
-### 🔲 #5 TV-ZP / tv_dual 信号分连续化
+### ✅ #5 TV-ZP / tv_dual 信号分连续化
 
 **问题**：`strategy.py:1165`（TV-ZP 固定 `75 + fund_score`）、`strategy.py:1233`（tv_dual 命中双信号固定 `88`）。所有候选股原始分几乎一样，"这次突破有多强"在源头无体现。
 
-**建议**：把原始分改成信号强度的连续函数（成交量倍数、突破实体、均线粘合深度）。
+**已完成方案（复用 check_squeeze 的 vol_ratio 模式）**：在两个评分函数作用域内一行重建 `vol_ratio = 成交量/Vol_MA20`，叠加 `signal_strength = min(vol_ratio,3.0)*系数 + min(pct_change,5)`。TV-ZP：`70 + strength`（区间 70~90）；tv_dual：双命中 `82 + strength`、单命中 `72 + strength`。**严格不改变入选门槛**，只影响候选间相对排名。
 
-**证据**：`backend/core/strategy.py:1165,1233`
+**证据 / 改动文件**：`backend/core/strategy.py`（`:1165`、`:1233`）、`backend/tests/test_scanner_strategy_paths.py`（+1 测试：量能强者分更高）
 
 ---
 
-### 🔲 #6 历史胜率进综合排序分
+### ✅ #6 历史胜率进综合排序分
 
 **问题**：`scanner.py:286-287` 把"历史胜率≥50%"当二元勾选，但最终排序（`scanner.py:1354-1361`）不包含胜率/盈亏比作为加权项。一只历史 70% 胜率的票可能排在 45% 胜率的票后面。
 
-**建议**：把个股历史胜率和 profit factor 作为加权项并入 `calibrated_score`（`score_calibration.py:45`）。
+**已完成方案（重新分配权重，腾出胜率预算）**：`calibrate_scan_scores` 新增 `historical_win_rate` 项，权重重新分配为 `percentile×0.35 + price_action×0.18 + sector×0.12 + trade_opportunity×0.25 + win_rate×0.10`（仍求和=1.0）。解析 `历史胜率` 中文键（`"58.0%"` 字符串），无数据时取中性 50。权重抽为模块级常量（`W_*`）便于调参。
 
-**证据**：`backend/core/scanner.py:286-287,1354-1361`、`backend/core/score_calibration.py:45`
+**证据 / 改动文件**：`backend/core/score_calibration.py`、`backend/tests/test_score_calibration.py`（+3 测试：胜率高者分高/缺省中性/权重和=1）
 
 ---
 
@@ -145,13 +147,13 @@
 
 ---
 
-### 🔲 #11 弱市收紧已有仓位止损
+### ✅ #11 弱市收紧已有仓位止损
 
 **问题**：regime 影响入场和仓位（RETREAT→仓位上限 10%，`decision_layer.py:108-127`），但**已有仓位的止损梯不变**。牛市建仓的票，市场翻空后仍用 -9%。
 
-**建议**：把 `get_market_regime()` 传入 `compute_paper_risk_levels`，CRITICAL 时 -9%→-5%。
+**已完成方案（只收紧不放宽）**：`compute_paper_risk_levels` 新增 `market_regime` 参数。当 regime 为弱市（`bear`/`volatile`，见 `WEAK_REGIMES`）时，初始止损从 -9% 收紧到 **-6%**（`WEAK_REGIME_STOP_RATIO`），用 `max()` 锁定"只收紧不放宽"。`run_wind_control` 把已加载的 `regime.get('regime')` 传入。新增常量 `WEAK_REGIME_STOP_PCT=-6.0`。
 
-**证据**：`backend/core/decision_layer.py:108-127`、`backend/core/risk_engine.py:90`、`backend/core/market_regime.py:20-66`
+**证据 / 改动文件**：`backend/core/risk_engine.py`、`backend/core/risk_constants.py`、`backend/routers/paper_trade.py`、`backend/tests/test_risk_engine.py`（+4 测试：bear/volatile 收紧、bull/无 regime 不变）
 
 ---
 
@@ -246,19 +248,49 @@
 
 ---
 
-## 待验证项与剩余风险（Phase 1）
+## Phase 2 实施详情（已完成）
+
+**范围**：4 项高 ROI（#3、#5、#6、#11），按"抬胜率"组合。
+
+**验证**：`pytest tests/ -q` → **231 passed, 0 failed**（Phase 1 基线 220 → 新增 11 个测试）
+
+**涉及文件**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/core/strategy_health.py` | #3 简化止损模型（Python 端 `_apply_stop_take_model` + 跨库 SQL） |
+| `backend/core/strategy.py` | #5 TV-ZP/tv_dual 信号分连续化（`vol_ratio` + `pct_change`） |
+| `backend/core/score_calibration.py` | #6 历史胜率进排序（权重重分配 + `_parse_win_rate`） |
+| `backend/core/risk_engine.py` | #11 弱市止损收紧（`market_regime` 参数） |
+| `backend/core/risk_constants.py` | #11 `WEAK_REGIME_STOP_PCT`（-6.0）、`WEAK_REGIMES` |
+| `backend/routers/paper_trade.py` | #11 传 `market_regime` 给风控引擎 |
+| `backend/tests/test_strategy_health.py` | +3 测试（止损封底/止盈封顶/区间内不变） |
+| `backend/tests/test_score_calibration.py` | +3 测试（胜率进排序） |
+| `backend/tests/test_scanner_strategy_paths.py` | +1 测试（信号分连续化） |
+| `backend/tests/test_risk_engine.py` | +4 测试（弱市止损收紧） |
+
+**新增可配置常量**（便于回退 / 调参）：
+- `score_calibration.py`: `W_STRATEGY_PERCENTILE`（0.35）、`W_PRICE_ACTION`（0.18）、`W_SECTOR_ALIGNMENT`（0.12）、`W_TRADE_OPPORTUNITY`（0.25）、`W_HISTORICAL_WIN_RATE`（0.10）
+- `risk_constants.py`: `WEAK_REGIME_STOP_PCT`（-6.0）、`WEAK_REGIMES`（"bear","volatile"）
+- `compute_paper_risk_levels(market_regime=None)`：新增参数
+
+---
+
+## 待验证项与剩余风险（Phase 1 + 2）
 
 1. **#1 拆行的前端展示**：部分平仓后某只股票会出现多行（OPEN 剩余 + CLOSED 已减仓）。需人工核验前端列表渲染是否正确区分（`list_paper_trades` 按 id 取行天然支持，但前端展示需确认）。
 2. **#8 ATR 对低波动股收紧止损**：可能让低波动股更早止损出场（预期行为，风险更可控）；若需放宽可调 `ATR_STOP_MIN_PCT`。
 3. **#4 周线门槛默认关闭**：不影响现有信号数量；开启后需下一交易日实际扫描验证过滤效果。
-4. **实时盯盘/风控最终验证**：改动了实时风控逻辑（止损/减仓/止盈），**必须等下一交易日开盘**，通过 `POST /api/paper-trade/wind-control` 实际触发并核对推送内容与 DB 记录（尤其 `close_source='wind_control_partial'` 的新行）。
+4. **#5/#6 改变排序权重**：会让部分股票排名变化（预期效果——高胜率/强突破股上升）。需人工抽查扫描结果排序是否符合预期。
+5. **#3 简化止损模型是近似**：不等于回测引擎的精确模拟（无滑点/移动止损），但已反映止损保护的经济性，远好于裸收益。
+6. **#11 弱市收紧止损**：会让 bear/volatile 市中已有仓位更易止损（预期，风险更可控）。
+7. **实时盯盘/风控最终验证**：改动了实时风控逻辑（止损/减仓/止盈/弱市收紧），**必须等下一交易日开盘**，通过 `POST /api/paper-trade/wind-control` 实际触发并核对推送内容与 DB 记录（尤其 `close_source='wind_control_partial'` 的新行 + 弱市止损收紧日志）。
 
 ---
 
-## Phase 2 规划（待实施）
+## Phase 3 规划（待实施）
 
-剩余 12 项按建议优先级：
+剩余 8 项按建议优先级：
 
-1. **高 ROI**（建议先做）：#3 健康熔断用真实交易收益 · #5 信号分连续化 · #6 历史胜率进排序 · #11 弱市收紧止损
-2. **中 ROI**：#7 自适应阈值 · #10 盘中风控 · #12 组合熔断
-3. **基础设施**（改动大，需谨慎）：#13 度量统一 · #14 走查前推 · #15 基准 alpha · #16 缺口建模 · #17 失败样本闭环
+1. **中 ROI**：#7 自适应阈值 · #10 盘中风控 · #12 组合熔断
+2. **基础设施**（改动大，需谨慎）：#13 度量统一 · #14 走查前推 · #15 基准 alpha · #16 缺口建模 · #17 失败样本闭环

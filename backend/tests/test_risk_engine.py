@@ -98,3 +98,30 @@ def test_atr_clamps_within_bounds():
     """
     risk = compute_paper_risk_levels(10.0, 10.0, 10.0, atr=0.1)
     assert risk["initial_stop_price"] == 9.5  # clamp 到 -5%
+
+
+# ── 弱市止损收紧（改动 #11）──
+
+def test_weak_regime_bear_tightens_stop():
+    """bear 市时初始止损从 -9%（9.1）收紧到 -6%（9.4）。"""
+    risk = compute_paper_risk_levels(10.0, 10.0, 10.0, market_regime="bear")
+    assert risk["initial_stop_price"] == 9.4
+    assert any("弱市" in note for note in risk["risk_notes"])
+
+
+def test_weak_regime_volatile_tightens_stop():
+    """volatile 市同样收紧到 -6%。"""
+    risk = compute_paper_risk_levels(10.0, 10.0, 10.0, market_regime="volatile")
+    assert risk["initial_stop_price"] == 9.4
+
+
+def test_bull_regime_keeps_fixed_stop():
+    """bull 市不收紧，保持 -9%。"""
+    risk = compute_paper_risk_levels(10.0, 10.0, 10.0, market_regime="bull")
+    assert risk["initial_stop_price"] == 9.1
+
+
+def test_no_regime_keeps_fixed_stop():
+    """未传 regime 时保持 -9%（向后兼容）。"""
+    risk = compute_paper_risk_levels(10.0, 10.0, 10.0)
+    assert risk["initial_stop_price"] == 9.1

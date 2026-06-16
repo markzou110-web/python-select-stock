@@ -1309,7 +1309,9 @@ def run_wind_control() -> Dict[str, Any]:
             # 把 price action 摘要中的 latest_atr 提取出来，喂给风控引擎做自适应止损，
             # 使实盘 active_stop_price 与回测行为一致（只收紧不放宽）。
             latest_atr = safe_float(pa_summary.get("latest_atr")) or None
-            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, pa_summary, atr=latest_atr)
+            # 弱市（bear/volatile）时进一步收紧已有仓位止损（regime 已在循环外加载）。
+            regime_status = regime.get("regime") if isinstance(regime, dict) else None
+            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, pa_summary, atr=latest_atr, market_regime=regime_status)
             time_stop = _evaluate_time_stop(
                 hold_trading_days,
                 pl_pct,

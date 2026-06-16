@@ -20,6 +20,8 @@ from core.risk_constants import (
     TIER_HIGH_TRAIL_RATIO,
     TIER_MID_PROFIT_PCT,
     TIER_MID_TRAIL_RATIO,
+    WEAK_REGIMES,
+    WEAK_REGIME_STOP_RATIO,
 )
 
 
@@ -61,6 +63,7 @@ def compute_paper_risk_levels(
     current_price: float,
     price_action_summary: dict | None = None,
     atr: float | None = None,
+    market_regime: str | None = None,
 ) -> dict:
     """
     Compute the current paper-trading risk ladder.
@@ -73,6 +76,10 @@ def compute_paper_risk_levels(
     不会比固定 -9% 更宽，从而让实盘 active_stop_price 与回测行为一致，并避免
     对低波动股设置过宽的止损。这与 strategy.py 的 evaluate_exit_signals 中
     ATR 止损语义对齐，但这里额外用 max() 锁定"只收紧不放宽"。
+
+    When ``market_regime`` 为弱市（bear/volatile，见 WEAK_REGIMES），已有持仓的
+    初始止损从 -9% 进一步收紧到 -6%（WEAK_REGIME_STOP_RATIO），降低系统性回撤期
+    的单笔风险。同样只收紧不放宽。
     """
     entry_price = safe_float(entry_price)
     if entry_price <= 0:
@@ -115,11 +122,23 @@ def compute_paper_risk_levels(
     else:
         initial_stop_price = fixed_stop_price
 
+    risk_notes: list[str] = []
+
+    # 弱市止损收紧：bear/volatile 时把初始止损从 -9% 收紧到 -6%，只收紧不放宽。
+    regime_label = str(market_regime or "").lower()
+    if regime_label in WEAK_REGIMES:
+        weak_stop_price = round(entry_price * WEAK_REGIME_STOP_RATIO, 2)
+        if weak_stop_price > initial_stop_price:
+            initial_stop_price = weak_stop_price
+            risk_notes.append(
+                f"弱市({regime_label})止损收紧至 {initial_stop_price:.2f}"
+                f"（常规固定止损 {fixed_stop_price:.2f}）"
+            )
+
     max_pl_pct = ((high_since_entry - entry_price) / entry_price) * 100
     pl_pct = ((current_price - entry_price) / entry_price) * 100
 
     candidates = [initial_stop_price]
-    risk_notes: list[str] = []
     if atr_note:
         risk_notes.append(atr_note)
 

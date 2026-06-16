@@ -231,3 +231,61 @@ def test_perform_market_scan_proceeds_when_preflight_not_blocking(monkeypatch):
         pass
 
     assert preflight_called["n"] == 1  # 预检确实被调用且未被熔断跳过
+
+
+# ── 信号分连续化（改动 #5）──
+
+def _make_tv_dual_score_df(vol_ratio=2.0, pct_change=3.0):
+    """构造一份带 Vol_MA20 与成交量的 DataFrame，用于检验 Score 连续化公式。
+
+    量能倍数 = 成交量 / Vol_MA20，通过调整成交量控制 vol_ratio。
+    """
+    n = 130
+    close = np.linspace(10, 13, n)
+    df = pd.DataFrame({
+        "日期": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "开盘": close - 0.3,
+        "收盘": close,
+        "最高": close + 0.1,
+        "最低": close - 0.1,
+        "成交量": np.full(n, vol_ratio * 100000.0),
+        "Vol_MA20": np.full(n, 100000.0),
+        "RSI": np.full(n, 60.0),
+        "RSI_WILDER": np.full(n, 60.0),
+        "MACD_DIF": np.full(n, 0.2),
+        "MACD_DEA": np.full(n, 0.1),
+        "BB_Width": np.full(n, 0.08),
+        "Sqz_Ratio": np.full(n, 0.08),
+        "EMA5": close - 0.2,
+        "EMA10": close - 0.3,
+        "EMA20": close - 0.4,
+        "EMA60": close - 0.5,
+    })
+    return df
+
+
+def test_tv_dual_score_continuous_with_volume(monkeypatch):
+    """两只都命中双共振但量能不同 → 量能强者 Score 更高（信号分连续化）。
+
+    用 mock 强制 _find_* 函数返回命中，隔离评分公式。
+    """
+    from core import strategy
+
+    # 强制 squeeze 与 tv_zp 在最后一根命中
+    monkeypatch.setattr(strategy, "_find_squeeze_signal_indices", lambda df, **kw: [len(df) - 1])
+    monkeypatch.setattr(
+        strategy, "_find_tv_zp_signal_indices",
+        lambda df, **kw: ([len(df) - 1], [], {"x": pd.Series(False, index=df.index)}),
+    )
+    monkeypatch.setattr(strategy, "_squeeze_tv_macd", lambda df: pd.DataFrame({"dif": [0.2]}))
+
+    weak = _make_tv_dual_score_df(vol_ratio=1.0)   # 弱量能
+    strong = _make_tv_dual_score_df(vol_ratio=3.0)  # 强量能
+
+    _, weak_res = strategy.check_tv_dual_strategy(weak, require_both=True)
+    _, strong_res = strategy.check_tv_dual_strategy(strong, require_both=True)
+
+    # 两者都命中双共振，但强量能者的 Score 应更高
+    assert strong_res["Score"] > weak_res["Score"]
+    # base(82) + min(vol_ratio,3)*4 + min(pct,5)*1；强量能 vol_ratio=3 → +12，弱 vol_ratio=1 → +4
+    assert strong_res["Score"] >= weak_res["Score"] + 7  # 量能差异贡献明显
