@@ -1047,25 +1047,13 @@ def list_paper_trades(refresh: bool = False) -> Dict[str, Any]:
         best = max(trades, key=lambda t: t['pl_pct']) if trades else None
         worst = min(trades, key=lambda t: t['pl_pct']) if trades else None
 
-        # 最大回撤计算
-        cumulative_returns = []
-        running_sum = 0
-        for t in sorted(trades, key=lambda x: x['entry_date']):
-            running_sum += t['pl_pct']
-            cumulative_returns.append(running_sum)
-        
-        max_drawdown = 0
-        if cumulative_returns:
-            peak = -9999
-            for val in cumulative_returns:
-                if val > peak: peak = val
-                drawdown = peak - val
-                if drawdown > max_drawdown: max_drawdown = drawdown
-
-        # 盈亏比
-        gain_trades = [t['pl_pct'] for t in trades if t['pl_pct'] > 0]
-        loss_trades = [abs(t['pl_pct']) for t in trades if t['pl_pct'] < 0]
-        profit_factor = round(sum(gain_trades) / sum(loss_trades), 2) if loss_trades and sum(loss_trades) > 0 else (9.9 if gain_trades else 0)
+        # 改动 #13：最大回撤改为复利权益曲线口径（修复旧实现用 pl_pct 累加和的数学错误）。
+        # 保留本接口的"正值百分比"输出契约。复用 analytics 规范 helper。
+        from core.analytics import compute_equity_curve_drawdown, compute_profit_factor
+        sorted_for_dd = sorted(trades, key=lambda x: x['entry_date'])
+        max_drawdown, _curve = compute_equity_curve_drawdown([t['pl_pct'] for t in sorted_for_dd])
+        # 盈亏比：改调规范 helper（毛额口径，cap 9.9 保留本接口契约）
+        profit_factor = compute_profit_factor([t['pl_pct'] for t in trades], cap=9.9)
 
         stats = {
             "total_trades": total,
@@ -1378,7 +1366,13 @@ def run_wind_control() -> Dict[str, Any]:
                         "d": close_date_str,
                         "r": remark,
                         "u": datetime.now(),
-                        "id": int(row['id'])
+                        "id": int(row['id']),
+                        # 改动 #17：携带失败样本写入所需元数据
+                        "fs_code": str(code),
+                        "fs_name": str(row.get('name') or ''),
+                        "fs_entry": float(entry_price),
+                        "fs_strategy": str(row.get('strategy_type') or ''),
+                        "fs_pl_pct": float(pl_pct),
                     })
                     closed_count += 1
                     alerts.append(f"{row['name']}({code}) 模拟仓自动平仓: {reason}")
@@ -1456,6 +1450,24 @@ def run_wind_control() -> Dict[str, Any]:
                     WHERE id = :id
                 """), close_updates)
                 conn.commit()
+
+        # 改动 #17：自动止损平仓也写 failure_samples，丰富语料（之前只手动亏损平仓写）。
+        # 仅记录亏损平仓（pl_pct<0），盈利平仓不算失败。
+        try:
+            for cu in close_updates:
+                if cu.get("fs_pl_pct", 0) < 0:
+                    save_failure_sample({
+                        "code": cu.get("fs_code"),
+                        "name": cu.get("fs_name"),
+                        "sample_date": cu.get("d"),
+                        "strategy_type": cu.get("fs_strategy"),
+                        "failure_type": "wind_control_stop",
+                        "reason": "风控自动止损平仓",
+                        "pnl_pct": round(cu.get("fs_pl_pct", 0), 2),
+                        "source": "wind_control_auto",
+                    }, engine)
+        except Exception as fs_err:
+            logger.warning(f"failure_samples 写入异常（不阻断风控）: {fs_err}")
 
         # 批量执行分批止盈/减仓的拆行：原行 shares 减半并保留 OPEN，新插入一行 CLOSED 记录已落袋部分。
         if reduce_updates:

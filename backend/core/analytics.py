@@ -1,6 +1,61 @@
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Sequence, Tuple
+
+
+# ── 改动 #13：度量统一规范 helper ──
+# 全仓库唯一的回撤/profit_factor/win_rate 计算口径。各模块（backtest_lab、
+# paper_trade、analytics）应调用这些 helper，保留各自的字段名/符号/上限契约。
+# 复利权益（起 100）高水位回撤，避免 paper_trade 旧实现用 pl_pct 累加和的数学错误。
+
+def compute_equity_curve_drawdown(pl_pcts: Sequence[float]) -> Tuple[float, List[Dict[str, Any]]]:
+    """复利权益曲线最大回撤。
+
+    Args:
+        pl_pcts: 每笔交易的盈亏百分比（如 5.0 表示 +5%，-3.0 表示 -3%），按时间顺序。
+
+    Returns:
+        (max_drawdown_positive, equity_curve)
+        - max_drawdown_positive: 最大回撤（**正值**百分比，如 12.3 表示 -12.3%）
+        - equity_curve: [{date, equity}]（date 为空，供调用方附加）
+    """
+    equity = 100.0
+    peak = 100.0
+    max_dd = 0.0
+    curve: List[Dict[str, Any]] = [{"date": "", "equity": round(equity, 2)}]
+    for pct in pl_pcts:
+        equity *= (1 + float(pct) / 100.0)
+        if equity > peak:
+            peak = equity
+        dd = (peak - equity) / peak * 100.0 if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+        curve.append({"date": "", "equity": round(equity, 2)})
+    return round(max_dd, 2), curve
+
+
+def compute_profit_factor(pl_pcts: Sequence[float], cap: float = 99.0) -> float:
+    """毛额 profit_factor = 总盈利 / |总亏损|，可配上限 cap。
+
+    无亏损时：有盈利返回 cap，无盈利返回 0。
+    """
+    gains = [p for p in pl_pcts if p > 0]
+    losses = [p for p in pl_pcts if p < 0]
+    gross_profit = float(sum(gains))
+    gross_loss = abs(float(sum(losses)))
+    if gross_loss > 0:
+        return round(min(gross_profit / gross_loss, cap), 2)
+    return cap if gross_profit > 0 else 0.0
+
+
+def compute_win_rate(pl_pcts: Sequence[float], ndigits: int = 1) -> float:
+    """胜率 = 盈利笔数 / 总笔数（>0 计盈，0% 计非盈）。"""
+    total = len(pl_pcts)
+    if total == 0:
+        return 0.0
+    wins = sum(1 for p in pl_pcts if p > 0)
+    return round(wins / total * 100.0, ndigits)
+
 
 def run_monte_carlo(returns: List[float], iterations: int = 1000, trade_count: int = 50) -> Dict[str, Any]:
     """
@@ -106,22 +161,15 @@ def calculate_risk_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     std_ret = np.std(returns) if len(returns) > 1 else 0.001
     sharpe = round((avg_ret - rf_per_trade) / std_ret * np.sqrt(trades_per_year), 2) if std_ret > 0 else 0
     
-    # --- 权益曲线 (Equity Curve) ---
+    # --- 权益曲线 (Equity Curve) — 改动 #13：复用规范 helper（复利权益高水位回撤） ---
     sorted_trades = sorted(closed, key=lambda t: t.get('entry_date', ''))
-    equity = 100.0  # 起始 100
+    trade_pl_pcts = [t['pl_pct'] for t in sorted_trades]
+    max_dd, equity_curve_skeleton = compute_equity_curve_drawdown(trade_pl_pcts)
+    # 重新附加真实日期到 equity_curve（helper 返回的 date 为占位空串）
     equity_curve = [{"date": "", "equity": 100.0}]
-    peak = 100.0
-    max_dd = 0.0
-    
-    for t in sorted_trades:
-        pct = t['pl_pct'] / 100
-        equity *= (1 + pct)
-        if equity > peak:
-            peak = equity
-        dd = (peak - equity) / peak * 100
-        if dd > max_dd:
-            max_dd = dd
-        
+    equity = 100.0
+    for t, _skel in zip(sorted_trades, equity_curve_skeleton[1:]):
+        equity *= (1 + t['pl_pct'] / 100)
         equity_curve.append({
             "date": str(t.get('entry_date', ''))[:10],
             "equity": round(equity, 2)

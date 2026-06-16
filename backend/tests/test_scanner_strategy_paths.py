@@ -289,3 +289,57 @@ def test_tv_dual_score_continuous_with_volume(monkeypatch):
     assert strong_res["Score"] > weak_res["Score"]
     # base(82) + min(vol_ratio,3)*4 + min(pct,5)*1；强量能 vol_ratio=3 → +12，弱 vol_ratio=1 → +4
     assert strong_res["Score"] >= weak_res["Score"] + 7  # 量能差异贡献明显
+
+
+# ── 失败样本闭环（改动 #17）──
+
+def test_inject_failure_pattern_counts_recent_losses():
+    """_inject_failure_pattern 应把近 90 天同代码的失败次数注入 res['recent_failure_count']。"""
+    from datetime import date, timedelta
+    from sqlalchemy import create_engine, text
+    from core.models import Base
+    from core import scanner
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    today = date.today().isoformat()
+    with engine.begin() as conn:
+        for _ in range(3):  # 000001 失败 3 次
+            conn.execute(text("""INSERT INTO failure_samples
+                (code, name, sample_date, strategy_type, failure_type, reason, pnl_pct, source, created_at)
+                VALUES ('000001','测试',:d,'tv_dual_strict','wind_control_stop','r',-5.0,'wind_control_auto',:d)"""), {"d": today})
+        conn.execute(text("""INSERT INTO failure_samples
+            (code, name, sample_date, strategy_type, failure_type, reason, pnl_pct, source, created_at)
+            VALUES ('000002','测试2',:d,'tv_dual_strict','manual_loss_close','r',-3.0,'paper_trade_close',:d)"""), {"d": today})
+
+    results = [{"代码": "000001"}, {"代码": "000002"}, {"代码": "000003"}]
+    scanner._inject_failure_pattern(results, engine)
+    assert results[0]["recent_failure_count"] == 3  # 000001 失败 3 次
+    assert results[1]["recent_failure_count"] == 1  # 000002 失败 1 次
+    assert results[2]["recent_failure_count"] == 0  # 000003 无失败
+
+
+def test_failure_pattern_vetoes_recurring_loss_stock():
+    """_apply_sop_filter 中 recent_failure_count >= 阈值 → veto，sop_grade 降为 D。"""
+    from core import scanner
+    results = [{
+        "代码": "000001", "名称": "反复失败股", "行业": "测试",
+        "影线比": 0.1, "pct_5d": 2, "历史胜率": "60%",
+        "recent_failure_count": scanner.FAILURE_VETO_MIN_COUNT,  # = 阈值（2）
+    }]
+    scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
+    # recent_failure_count 达阈值 → 一票否决 → D 级
+    assert results[0].get("sop_grade") == "D"
+    assert any("失败模式" in v for v in results[0].get("sop_vetoes", []))
+
+
+def test_failure_pattern_below_threshold_not_vetoed():
+    """recent_failure_count < 阈值 → 不否决（不应误伤仅失败 1 次的票）。"""
+    from core import scanner
+    results = [{
+        "代码": "000002", "名称": "偶尔失败", "行业": "测试",
+        "影线比": 0.1, "pct_5d": 2, "历史胜率": "60%",
+        "recent_failure_count": 1,  # < 阈值 2
+    }]
+    scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
+    assert results[0].get("sop_grade") != "D"

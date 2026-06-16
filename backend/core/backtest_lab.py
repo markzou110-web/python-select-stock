@@ -80,6 +80,7 @@ def run_single_stock_backtest(
     df: pd.DataFrame,
     strategy_type: str = "squeeze",
     params: Dict[str, Any] | None = None,
+    bench_df: pd.DataFrame | None = None,
 ) -> Dict[str, Any]:
     """
     Event-style single-stock backtest with one open position at a time.
@@ -216,8 +217,12 @@ def run_single_stock_backtest(
             day_low = low_vals[future_idx]
             hold_days = day
 
+            # 改动 #16：缺口穿越止损建模。若当日开盘已击穿止损线（跳空缺口），
+            # 按当日开盘成交（更差），而非止损线——更真实地反映滑点，不再高估收益。
             if (day_low - entry_price) / entry_price <= stop_ratio:
-                exit_price = entry_price * (1 + stop_ratio)
+                stop_line = entry_price * (1 + stop_ratio)
+                day_open = open_vals[future_idx]
+                exit_price = min(stop_line, day_open) if day_open <= stop_line else stop_line
                 exit_reason = f"固定止损 {stop_loss_pct}%"
                 hit_stop = True
                 break
@@ -304,19 +309,41 @@ def run_single_stock_backtest(
         return result
 
     returns = [trade["return_pct"] for trade in trades]
-    wins = [ret for ret in returns if ret > 0]
-    losses = [ret for ret in returns if ret < 0]
-    gross_profit = sum(wins)
-    gross_loss = abs(sum(losses))
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0)
+    # 改动 #13：profit_factor / win_rate 改调规范 helper（毛额口径，cap 99）
+    from core.analytics import compute_profit_factor, compute_win_rate
+    profit_factor = compute_profit_factor(returns, cap=99.0)
+    win_rate = compute_win_rate(returns, ndigits=1)
+
+    # 改动 #15：基准 alpha / CAGR（沪深300）。无 bench_df 时为 None，前端兜底为 "-"。
+    benchmark_return = None
+    alpha = None
+    cagr = None
+    strategy_total_return = (equity - initial_capital) / initial_capital * 100
+    if bench_df is not None and not bench_df.empty and "收盘" in bench_df.columns:
+        try:
+            import pandas as _pd
+            bclose = _pd.to_numeric(bench_df["收盘"], errors="coerce").dropna()
+            if len(bclose) >= 2:
+                benchmark_return = round((float(bclose.iloc[-1]) / float(bclose.iloc[0]) - 1) * 100, 2)
+                alpha = round(strategy_total_return - benchmark_return, 2)
+                # CAGR：按回测区间实际交易日数年化（约 244 交易日/年）
+                total_trading_days = len(df)
+                years = total_trading_days / 244.0 if total_trading_days > 0 else 1.0
+                if years > 0 and equity > 0:
+                    ratio = equity / initial_capital
+                    cagr = round((ratio ** (1.0 / years) - 1) * 100, 2) if ratio > 0 else None
+        except Exception:
+            benchmark_return = None
+            alpha = None
+            cagr = None
 
     return {
         "summary": {
             "signal_count": len(trades),
-            "win_rate": round(len(wins) / len(trades) * 100, 1),
+            "win_rate": win_rate,
             "avg_return": round(float(np.mean(returns)), 2),
             "max_drawdown": round(float(max_drawdown), 2),
-            "profit_factor": min(profit_factor, 99.0),
+            "profit_factor": profit_factor,
             "avg_hold_days": round(float(np.mean([trade["hold_days"] for trade in trades])), 1),
             "total_return": round((equity - initial_capital) / initial_capital * 100, 2),
             "final_equity": round(float(equity), 2),
@@ -330,6 +357,9 @@ def run_single_stock_backtest(
             "slippage_bps": slippage_bps,
             "position_pct": position_pct,
             "lot_size": lot_size,
+            "benchmark_return": benchmark_return,
+            "alpha": alpha,
+            "cagr": cagr,
         },
         "trades": trades,
         "equity_curve": equity_curve,

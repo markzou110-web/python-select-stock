@@ -45,6 +45,11 @@ SCAN_PREFLIGHT_ENFORCE = True
 # vol_multiplier、rsi_min、stop_loss_pct 等参数（启用此前未使用的 REGIME_PARAMS）。
 # 调试/紧急时可设为 False 回退到旧的固定参数。
 SCAN_REGIME_ADAPTIVE = True
+
+# 改动 #17：失败样本闭环。扫描时预查近 FAILURE_LOOKBACK_DAYS 天内同代码同策略的
+# 失败次数，超过 FAILURE_VETO_MIN_COUNT 次的候选在 SOP 评级中一票否决（降级为 D）。
+FAILURE_LOOKBACK_DAYS = 90
+FAILURE_VETO_MIN_COUNT = 2
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
 from core.decision_layer import apply_decision_layer
@@ -249,6 +254,32 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         res['exit_hint'] = "Pine信号按1-2个交易日短线管理，次日不强则降级观察"
 
 
+def _inject_failure_pattern(results, engine):
+    """改动 #17：预查近 FAILURE_LOOKBACK_DAYS 天内同代码的失败次数，注入到 res['recent_failure_count']。
+
+    查询 failure_samples（手动亏损 + 风控自动止损平仓均会写入），按 code 聚合近期失败次数。
+    engine 为 None 或查询失败时静默跳过（不阻断扫描）。
+    """
+    if not results or engine is None:
+        return
+    try:
+        from sqlalchemy import text
+        from datetime import date, timedelta
+        cutoff = (date.today() - timedelta(days=FAILURE_LOOKBACK_DAYS)).isoformat()
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT code, COUNT(*) AS cnt
+                FROM failure_samples
+                WHERE sample_date >= :cutoff AND pnl_pct < 0
+                GROUP BY code
+            """), {"cutoff": cutoff}).fetchall()
+        fail_map = {str(r[0]): int(r[1]) for r in rows} if rows else {}
+    except Exception:
+        fail_map = {}
+    for res in results:
+        res['recent_failure_count'] = fail_map.get(str(res.get('代码', '')), 0)
+
+
 def _apply_sop_filter(results, market_regime, sector_trends):
     """SOP 过滤引擎：对扫描结果应用硬性条件、一票否决、加分项，生成 A/B/C/D 等级"""
     regime_status = market_regime.get('status', 'UNKNOWN')
@@ -282,6 +313,9 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             vetoes.append("板块下跌")
         if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
             vetoes.append("板块扩散转弱")
+        # 改动 #17：近期失败模式否决（同一代码+策略近 N 天内多次失败 → 降级，避免反复踩雷）
+        if res.get('recent_failure_count', 0) >= FAILURE_VETO_MIN_COUNT:
+            vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
 
         # ── 硬性条件 ──
         win_rate_str = res.get('历史胜率', '0%')
@@ -1383,6 +1417,9 @@ def perform_market_scan(
                 sector_avg,
                 alignment_score=res['sector_alignment_score'],
             )
+
+        # 改动 #17：预查近期失败模式，注入 recent_failure_count 供 _apply_sop_filter 否决
+        _inject_failure_pattern(results, engine)
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)

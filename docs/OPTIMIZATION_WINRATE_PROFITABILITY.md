@@ -24,16 +24,17 @@
 | | 10 | Sentinel 盘中风控频率提升 | ✅ | 风控独立 tick，每 30 分钟 |
 | | 11 | 弱市收紧已有仓位止损 | ✅ | 弱市(bear/volatile) -9%→-6% |
 | | 12 | 组合级熔断（日内亏损上限） | ✅ | 日内亏损超 -5% 暂停新开仓 |
-| **第四优先级（测量验证）** | 13 | 度量口径统一（回撤/胜率/profit factor） | 🔲 | 调参基础一致 |
+| **第四优先级（测量验证）** | 13 | 度量口径统一（回撤/胜率/profit factor） | ✅ | 调参基础一致（修复回撤 bug） |
 | | 14 | 走查前推 / 样本外测试 | 🔲 | 暴露过拟合 |
-| | 15 | 回测加基准 alpha | 🔲 | 区分能力与 β |
-| | 16 | 止损穿越缺口建模 | 🔲 | 不再低估真实亏损 |
-| | 17 | failure_samples 学习闭环 | 🔲 | 失败形态反哺过滤 |
+| | 15 | 回测加基准 alpha | ✅ | 区分能力与 β |
+| | 16 | 止损穿越缺口建模 | ✅ | 不再低估真实亏损 |
+| | 17 | failure_samples 学习闭环 | ✅ | 失败形态反哺过滤 |
 
 **Phase 1 已完成 5 项**（#1、#2、#4、#8、#9，220 passed）。
 **Phase 2 已完成 4 项**（#3、#5、#6、#11，231 passed）。
 **Phase 3 已完成 3 项**（#7、#10、#12，251 passed）。
-**累计完成 12 / 17 项**，剩余 5 项（#13-17，均为测量验证基础设施）留作后续迭代。
+**Phase 4 已完成 4 项**（#13、#15、#16、#17，265 passed）。
+**累计完成 16 / 17 项**，剩余 1 项（#14 走查前推，需重写批量实验，改动最大）留作后续迭代。
 
 ---
 
@@ -176,16 +177,13 @@
 
 ## 第四优先级：测量与验证（无法度量就无法改进）
 
-### 🔲 #13 度量口径统一（回撤 / 胜率 / profit factor）
+### ✅ #13 度量口径统一（回撤 / 胜率 / profit factor）
 
-**问题**：三个模块三套定义——
-- 回撤：`backtest_lab.py:264`（权益曲线）/ `analytics.py:116`（复利）/ `paper_trade.py:996`（`pl_pct` 简单累加和，数学无效）
-- profit_factor：`backtest_lab.py:311`（毛利/毛亏，封顶 99）/ `paper_trade.py:1014`（封顶 9.9）
-- win_rate：`performance_metrics.py:17`（0% 计亏）vs `backtest_lab.py:307`（仅<0 计亏）
+**问题**：三个模块三套定义——回撤（复利/账户权益/累加和，其中 `paper_trade.py` 的累加和数学无效）；profit_factor（毛额，但 cap 99 vs 9.9）；win_rate（0% 计不计亏不一致）。6+ 前端组件依赖各自字段名/符号。
 
-**建议**：统一为一个标准实现（复利权益曲线 + 毛额 profit factor），所有模块调用同一 helper。
+**已完成方案（统一算法，保留输出契约）**：`analytics.py` 新增 3 个规范 helper（`compute_equity_curve_drawdown` 复利权益回撤 / `compute_profit_factor` 毛额可配 cap / `compute_win_rate`）。各模块改调 helper，但**保留字段名/符号/上限**（向后兼容，不改前端）。唯一实质修复：`paper_trade.py` 回撤从无效的 `pl_pct` 累加和改为复利权益曲线（数值更准）。
 
-**证据**：`backend/core/backtest_lab.py:264,311`、`backend/core/analytics.py:116`、`backend/routers/paper_trade.py:996,1014`、`backend/core/performance_metrics.py:17`
+**证据 / 改动文件**：`backend/core/analytics.py`、`backend/core/backtest_lab.py`、`backend/routers/paper_trade.py`、`backend/tests/test_metric_unification.py`（+8 测试）
 
 ---
 
@@ -193,39 +191,41 @@
 
 **问题**：grep `walk.?forward|out.of.sample|样本外` 在应用代码**零匹配**。`batch_experiment.py` 在全样本跑；`strategy_health.py` 用滚动 120 日，但阈值就是用这段历史调出来的——经典样本内偏差。报告的 60% 胜率样本外可能是 50%。
 
-**建议**：在 `batch_experiment.py` 加滚动 90 训练/30 测试拆分。
+**建议**：在 `batch_experiment.py` 加滚动 90 训练/30 测试拆分 + 新增 `/walk-forward` 端点。需重写批量实验，改动最大。
 
 **证据**：`backend/core/batch_experiment.py:9-61`、`backend/core/strategy_health.py:25`
 
 ---
 
-### 🔲 #15 回测加基准 alpha
+### ✅ #15 回测加基准 alpha
 
-**问题**：`backtest_lab.py` grep `benchmark|沪深300|alpha|beta|cagr` **零匹配**。`total_return` 是绝对值，大盘 +40% 时的 +30% 被误读为"好"。
+**问题**：`backtest_lab.py` grep `benchmark|沪深300|alpha|cagr` **零匹配**。`total_return` 是绝对值，大盘 +40% 时的 +30% 被误读为"好"。
 
-**建议**：加沪深300基准和 alpha/CAGR。
+**已完成方案**：`run_single_stock_backtest` 新增 `bench_df` 参数。若提供沪深300（`get_index_hist("000300")`，24h 缓存），summary 新增 `benchmark_return`/`alpha`（策略收益-基准收益）/`cagr`（按 244 交易日/年化）。`backtest.py /single` 端点按相同日期窗取基准传入，try/except 容错（拉取失败字段为 None，前端兜底）。
 
-**证据**：`backend/core/backtest_lab.py:313-333`
-
----
-
-### 🔲 #16 止损穿越缺口建模
-
-**问题**：`backtest_lab.py:219-220` 止损用 `day_low <= 线` 触发但按 `entry*(1+stop_ratio)` 精确成交，跳空穿越时实际成交价远低。系统性低估亏损。
-
-**建议**：缺口穿越时按当日开盘成交。
-
-**证据**：`backend/core/backtest_lab.py:219-220`
+**证据 / 改动文件**：`backend/core/backtest_lab.py`、`backend/routers/backtest.py`、`backend/tests/test_backtest_lab.py`（+2 测试）
 
 ---
 
-### 🔲 #17 failure_samples 学习闭环
+### ✅ #16 止损穿越缺口建模
 
-**问题**：`paper_trade.py:1183` 写入失败样本，但**无代码读回调整评分/阈值/过滤**（仅在 `ops_summary.py` 显示计数）。反复失败的形态不会抑制相似新信号。
+**问题**：`backtest_lab.py:219-220` 止损用 `day_low <= 线` 触发但**永远按止损线成交**，跳空穿越时高估收益。
 
-**建议**：把 failure_samples 接入 `_apply_sop_filter` 或评分校准。
+**已完成方案**：若当日开盘已击穿止损线（缺口穿越），按**当日开盘**成交（更差）；否则按止损线。`exit_price = min(stop_line, day_open) if day_open <= stop_line else stop_line`。更真实地反映滑点。
 
-**证据**：`backend/routers/paper_trade.py:1183-1192`、`backend/core/ops_summary.py`
+**证据 / 改动文件**：`backend/core/backtest_lab.py:219-220`、`backend/tests/test_backtest_lab.py`（+1 测试）
+
+---
+
+### ✅ #17 failure_samples 学习闭环
+
+**问题**：`paper_trade.py` 只在手动亏损平仓时写 failure_samples，自动止损不写；且**无代码读回调整评分/过滤**（仅显示计数）。反复失败的形态不抑制相似新信号。
+
+**已完成方案（扩写入 + 扫描否决）**：
+- **扩写入**：`run_wind_control` 自动止损平仓也写 failure_samples（`failure_type=wind_control_stop`），丰富语料。
+- **扫描否决**：`scanner.py` 扫描完成后预查近 `FAILURE_LOOKBACK_DAYS`(90) 天同代码失败次数，注入 `recent_failure_count`；`_apply_sop_filter` 中 `>= FAILURE_VETO_MIN_COUNT`(2) 次的候选一票否决降为 D 级。`_apply_sop_filter` 不改签名（数据经 res dict 传入，避免改 7 个测试）。
+
+**证据 / 改动文件**：`backend/routers/paper_trade.py`、`backend/core/scanner.py`、`backend/tests/test_scanner_strategy_paths.py`（+3 测试）
 
 ---
 
@@ -319,12 +319,31 @@
 
 ---
 
-## Phase 4 规划（待实施）
+## Phase 4 实施详情（已完成）
 
-剩余 5 项均为测量验证基础设施（改动大、回归风险高，建议作为独立批次谨慎推进）：
+**范围**：4 项测量验证基础设施（#13、#15、#16、#17）。#14 走查前推留后续（需重写批量实验）。
 
-1. **度量统一**：#13 回撤/胜率/profit factor 三套定义统一
-2. **抗过拟合**：#14 走查前推 / 样本外测试
-3. **基准对比**：#15 回测加沪深300基准 alpha
-4. **回测真实性**：#16 止损穿越缺口建模
-5. **学习闭环**：#17 failure_samples 反哺过滤
+**验证**：`pytest tests/ -q` → **265 passed, 0 failed**（Phase 3 基线 251 → 新增 14 个测试）
+
+**涉及文件**：
+
+| 文件 | 改动 |
+|---|---|
+| `backend/core/analytics.py` | #13 新增 3 个规范 helper + 回撤复用 helper |
+| `backend/core/backtest_lab.py` | #13 profit_factor/win_rate 改 helper · #15 bench_df alpha/CAGR · #16 缺口建模 |
+| `backend/routers/paper_trade.py` | #13 回撤修复（累加和→复利）+ profit_factor 改 helper · #17 自动止损写 failure_samples |
+| `backend/routers/backtest.py` | #15 取沪深300 + 传入 bench_df |
+| `backend/core/scanner.py` | #17 失败模式预查注入 + SOP 否决 |
+| `backend/tests/test_metric_unification.py` | +8 测试（helper 4 + 回撤 2 + profit_factor 2） |
+| `backend/tests/test_backtest_lab.py` | +3 测试（alpha 2 + 缺口 1） |
+| `backend/tests/test_scanner_strategy_paths.py` | +3 测试（失败模式注入/否决/不误伤） |
+
+**新增可配置常量**（便于回退 / 调参）：
+- `backtest_lab.py`: `run_single_stock_backtest(bench_df=None)` 新增参数
+- `scanner.py`: `FAILURE_LOOKBACK_DAYS`（90）、`FAILURE_VETO_MIN_COUNT`（2）
+
+---
+
+## Phase 5 规划（待实施）
+
+剩余 1 项（#14 走查前推 / 样本外测试）——需重写 `batch_experiment` 加 train/test 拆分 + 新增 `/walk-forward` 端点，改动最大，建议作为独立批次谨慎推进。

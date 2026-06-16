@@ -7,6 +7,7 @@ from core.backtest_lab import run_single_stock_backtest
 from core.db import get_db_engine, load_from_db, validate_stock_code
 from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.batch_experiment import run_batch_experiment
+from core.data import get_index_hist
 from core.strategy_registry import list_strategies, supported_backtest_strategies
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
@@ -51,6 +52,17 @@ def run_single_backtest(payload: Dict[str, Any]):
     if enable_pine and "RF_Upward" not in df.columns:
         df = calculate_pine_indicators(df)
 
+    # 改动 #15：取沪深300基准（24h 缓存），失败时容错为 None（不阻断回测）
+    bench_df = None
+    try:
+        bench_df = get_index_hist("000300")
+        if bench_df is not None and not bench_df.empty and start_date:
+            bench_df = bench_df[bench_df["日期"].astype(str).str[:10] >= start_date]
+            if end_date:
+                bench_df = bench_df[bench_df["日期"].astype(str).str[:10] <= end_date]
+    except Exception:
+        bench_df = None
+
     result = run_single_stock_backtest(
         df,
         strategy_type=strategy_type,
@@ -73,6 +85,7 @@ def run_single_backtest(payload: Dict[str, Any]):
             "skip_adjustment_gaps": payload.get("skip_adjustment_gaps", True),
             "adjustment_gap_pct": payload.get("adjustment_gap_pct", 20.0),
         },
+        bench_df=bench_df,
     )
     result["meta"] = {
         "code": code,
