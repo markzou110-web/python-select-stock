@@ -50,10 +50,10 @@ def evaluate_daily_loss_circuit_breaker(
             params={"d": today_str},
         )
     except Exception as exc:
-        return {"status": "error", "halted": False, "daily_loss_pct": 0.0, "message": f"日内亏损查询失败: {str(exc)[:80]}"}
+        return {"status": "error", "halted": False, "daily_loss_pct": 0.0, "daily_loss_limit_pct": loss_limit, "message": f"日内亏损查询失败: {str(exc)[:80]}"}
 
     if df.empty:
-        return {"status": "ok", "halted": False, "daily_loss_pct": 0.0, "message": "今日无平仓"}
+        return {"status": "ok", "halted": False, "daily_loss_pct": 0.0, "daily_loss_limit_pct": loss_limit, "message": "今日无平仓"}
 
     df["shares"] = pd.to_numeric(df.get("shares"), errors="coerce").fillna(0).astype(float)
     # 单笔实现盈亏金额（近似）= (close - entry) * shares

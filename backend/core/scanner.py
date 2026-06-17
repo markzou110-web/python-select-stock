@@ -11,7 +11,7 @@ from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import HTTPException
 import akshare as ak
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from core.logging_config import logger
 from core.config import config
@@ -57,8 +57,16 @@ from routers.market import fetch_mine_sweeper_data
 from core.data_source_quality import get_suspected_adjustment_gap_codes
 
 
-EXECUTABLE_PA_ACTIONS = {"READY", "WATCH"}
+EXECUTABLE_PA_ACTIONS = {"READY"}
 BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
+MIN_RAW_EXECUTION_SCORE = 60.0
+MAX_EXECUTION_RISK_PCT = 8.0
+HARD_EXECUTION_RISK_PCT = 12.0
+HIGH_TURNOVER_MKT_CAP_YI = 150.0
+HIGH_TURNOVER_MIN_PCT = 1.5
+LOW_TURNOVER_MKT_CAP_YI = 300.0
+LOW_TURNOVER_MIN_PCT = 1.0
+CAPITAL_EVENT_KEYWORDS = ("定增", "增发", "非公开发行", "限售股解禁", "解禁", "减持")
 
 
 def _should_include_sector_watch(strategy_type: str) -> bool:
@@ -94,12 +102,14 @@ def _apply_money_flow_to_results(results: List[Dict[str, Any]], flow_map: Dict[s
     if not flow_map:
         for res in results:
             res.setdefault("北向", "---")
+            res["money_flow_status"] = "missing"
         return
     for res in results:
         code = str(res.get("代码") or "").zfill(6)
         item = flow_map.get(code)
         if not item:
             res.setdefault("北向", "---")
+            res["money_flow_status"] = "missing"
             continue
         res["北向"] = _money_flow_label(item)
         res["money_flow"] = {
@@ -110,6 +120,9 @@ def _apply_money_flow_to_results(results: List[Dict[str, Any]], flow_map: Dict[s
             "flow_metric": item.get("flow_metric"),
             "metric_label": item.get("metric_label"),
         }
+        amount = _as_float(item.get("main_net_inflow_yi"))
+        ratio = _as_float(item.get("main_net_ratio"))
+        res["money_flow_status"] = "negative" if amount < 0 and ratio < 0 else "ok"
 
 
 def _pa_plan_action(res: Dict[str, Any]) -> str:
@@ -140,6 +153,45 @@ def _is_abnormal_price_move(code: str, pct: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return pct_value > _daily_limit_tolerance_pct(code)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _candidate_price(res: Dict[str, Any]) -> float:
+    return _as_float(res.get('现价') or res.get('price') or res.get('收盘'))
+
+
+def _right_side_quality_confirmed(res: Dict[str, Any]) -> bool:
+    """Right-side entries may be extended, but must prove quality and execution control."""
+    action = _pa_plan_action(res)
+    raw_score = _as_float(res.get('Score') or res.get('score'))
+    pa_score = _as_float(res.get('price_action_score'))
+    risk_pct = _as_float(res.get('pa_risk_pct'))
+    current_price = _candidate_price(res)
+    entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
+    has_volume = bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') == '放量突破'
+    strong_structure = (
+        res.get('price_action_signal') == '强多头趋势K'
+        or res.get('pa_h2_quality') == '强'
+        or res.get('pa_breakout_quality') == '强突破'
+    )
+    sector_ok = _as_float(res.get('sector_alignment_score'), 50) >= 70
+    price_confirmed = not entry_price or not current_price or current_price >= entry_price * 0.995
+    risk_ok = risk_pct <= 0 or risk_pct <= MAX_EXECUTION_RISK_PCT
+    return (
+        action == "READY"
+        and raw_score >= MIN_RAW_EXECUTION_SCORE
+        and pa_score >= 70
+        and risk_ok
+        and price_confirmed
+        and sector_ok
+        and (has_volume or strong_structure)
+    )
 
 
 def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
@@ -191,6 +243,13 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     setup = str(res.get('pa_trade_setup') or "")
     strategy_type = str(res.get('strategy_type') or "")
     blockers: List[str] = []
+    raw_score = _as_float(res.get('Score') or res.get('score'))
+    risk_pct = _as_float(res.get('pa_risk_pct'))
+    current_price = _candidate_price(res)
+    entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
+    turnover = _as_float(res.get('换手率') or res.get('turnover'))
+    mkt_cap_yi = _as_float(res.get('mkt_cap_yi'))
+    right_side_quality = _right_side_quality_confirmed(res)
 
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
         blockers.append("异常价格跳变，排除交易")
@@ -208,10 +267,30 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("板块下跌")
     if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
         blockers.append("板块扩散转弱")
+    if raw_score and raw_score < MIN_RAW_EXECUTION_SCORE:
+        blockers.append(f"原始策略分<{MIN_RAW_EXECUTION_SCORE:.0f}，只观察")
+    if risk_pct > HARD_EXECUTION_RISK_PCT:
+        blockers.append(f"结构风险>{HARD_EXECUTION_RISK_PCT:.0f}%，禁止实盘")
+    elif risk_pct > MAX_EXECUTION_RISK_PCT:
+        blockers.append(f"结构风险>{MAX_EXECUTION_RISK_PCT:.0f}%，等待更优买点")
+    if entry_price > 0 and current_price > 0 and current_price < entry_price * 0.995:
+        blockers.append("未站上确认价，等待突破确认")
+    if mkt_cap_yi >= LOW_TURNOVER_MKT_CAP_YI and 0 < turnover < LOW_TURNOVER_MIN_PCT:
+        blockers.append("大市值低换手，右侧弹性不足")
+    elif mkt_cap_yi >= HIGH_TURNOVER_MKT_CAP_YI and 0 < turnover < HIGH_TURNOVER_MIN_PCT:
+        blockers.append("高市值换手不足，等待放量确认")
+    if res.get('money_flow_status') == 'missing':
+        blockers.append("资金流数据缺失，降级观察")
+    elif res.get('money_flow_status') == 'negative':
+        blockers.append("主力资金流出，等待资金回流")
+    if res.get('capital_event_risk'):
+        blockers.append("近期资本事件利好兑现，等待二次确认")
     if float(res.get('涨幅%', 0) or 0) >= _near_limit_pct(res.get('代码')):
         blockers.append("涨停/近涨停，等待隔日确认")
-    elif float(res.get('涨幅%', 0) or 0) > 7:
-        blockers.append("涨幅偏高，等待回踩确认")
+    elif float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
+        blockers.append("涨幅偏高且质量未确认，等待回踩/次日确认")
+    if float(res.get('pct_5d', 0) or 0) > 15 and not right_side_quality:
+        blockers.append("5日涨幅偏高且质量未确认")
 
     score = float(res.get('final_rank_score', res.get('Score', 0)) or 0)
     if action == "READY":
@@ -231,11 +310,17 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         score += 5
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
         score -= 25
-    if float(res.get('涨幅%', 0) or 0) > 7:
+    if float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
         score -= 8
+    if raw_score and raw_score < MIN_RAW_EXECUTION_SCORE:
+        score -= 15
+    if risk_pct > MAX_EXECUTION_RISK_PCT:
+        score -= 10
+    if res.get('capital_event_risk'):
+        score -= 10
 
     grade = res.get('sop_grade')
-    fatal_markers = ("回避", "结构不进入交易池", "异常价格跳变", "板块下跌")
+    fatal_markers = ("回避", "结构不进入交易池", "异常价格跳变", "板块下跌", "禁止实盘")
     has_fatal_blocker = any(any(marker in b for marker in fatal_markers) for b in blockers)
     trade_eligible = grade in {"A", "B"} and not blockers and strategy_type != "sector_watch"
     if trade_eligible:
@@ -278,6 +363,42 @@ def _inject_failure_pattern(results, engine):
         fail_map = {}
     for res in results:
         res['recent_failure_count'] = fail_map.get(str(res.get('代码', '')), 0)
+
+
+def _inject_capital_event_risk(results, engine, lookback_days: int = 60):
+    """Mark recent financing/unlock/reduction events that can turn into 'good news sold' risk."""
+    if not results or engine is None:
+        return
+    codes = [str(res.get('代码') or '').zfill(6) for res in results if res.get('代码')]
+    if not codes:
+        return
+    cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+    keyword_expr = " OR ".join([f"n.title LIKE :kw{i} OR COALESCE(n.content, '') LIKE :kw{i}" for i, _ in enumerate(CAPITAL_EVENT_KEYWORDS)])
+    params = {f"kw{i}": f"%{kw}%" for i, kw in enumerate(CAPITAL_EVENT_KEYWORDS)}
+    params.update({"codes": codes, "cutoff": cutoff})
+    try:
+        stmt = text(f"""
+            SELECT DISTINCT s.stock_code, n.title
+            FROM news_stocks s
+            JOIN news_raw n ON n.id = s.news_id
+            WHERE s.stock_code IN :codes
+              AND COALESCE(n.publish_time, n.created_at) >= :cutoff
+              AND ({keyword_expr})
+        """).bindparams(bindparam("codes", expanding=True))
+        with engine.connect() as conn:
+            rows = conn.execute(stmt, params).fetchall()
+    except Exception:
+        rows = []
+
+    event_map: Dict[str, List[str]] = {}
+    for code, title in rows:
+        event_map.setdefault(str(code).zfill(6), []).append(str(title or "")[:80])
+    for res in results:
+        code = str(res.get('代码') or '').zfill(6)
+        titles = event_map.get(code, [])
+        if titles:
+            res['capital_event_risk'] = True
+            res['capital_event_titles'] = titles[:3]
 
 
 def _apply_sop_filter(results, market_regime, sector_trends):
@@ -1387,14 +1508,20 @@ def perform_market_scan(
             if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
             res['warnings'] = warnings
 
-        # --- SOP: 注入流通市值 (从快照数据) ---
+        # --- SOP: 注入市值/换手 (从快照数据) ---
         snap_mkt_map = {}
+        snap_turnover_map = {}
         if not snapshot_df.empty and 'mkt_cap' in snapshot_df.columns:
             for _, row in snapshot_df.iterrows():
-                snap_mkt_map[str(row['code'])] = row.get('mkt_cap', 0)
+                code = str(row['code'])
+                snap_mkt_map[code] = row.get('mkt_cap', 0)
+                snap_turnover_map[code] = row.get('turnover', None)
         for res in results:
             mkt_raw = snap_mkt_map.get(res['代码'], 0)
             res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
+            turnover_raw = snap_turnover_map.get(res['代码'])
+            if turnover_raw is not None:
+                res['turnover'] = float(turnover_raw or 0)
 
         # 注入板块走势到每个结果
         for res in results:
@@ -1420,12 +1547,19 @@ def perform_market_scan(
 
         # 改动 #17：预查近期失败模式，注入 recent_failure_count 供 _apply_sop_filter 否决
         _inject_failure_pattern(results, engine)
+        _inject_capital_event_risk(results, engine)
+        for res in results:
+            if res.get('capital_event_risk'):
+                warnings = list(res.get('warnings') or [])
+                warnings.append("🏦 定增/资本事件")
+                res['warnings'] = warnings
+
+        _apply_money_flow_to_results(results, money_flow_map)
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)
         for res in results:
             res['market_regime'] = market_regime.get('status', 'UNKNOWN')
-        _apply_money_flow_to_results(results, money_flow_map)
         from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
         apply_limit_up_features(results, load_limit_up_event_map(str(max_date), engine))
         from core.decision_layer import load_market_cycle_history

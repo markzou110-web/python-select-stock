@@ -76,6 +76,33 @@ def _signal_indices(df: pd.DataFrame, strategy_type: str, params: Dict[str, Any]
     )
 
 
+def _compute_benchmark_fields(bench_df, strategy_total_return: float, trading_days: int):
+    """改动 #15：计算基准收益/alpha/CAGR。返回 (benchmark_return, alpha, cagr)。
+
+    无 bench_df 或数据不足时返回 (None, None, None)。无论策略是否有交易都可计算
+    （benchmark 是市场收益，与策略成交与否无关）。
+    """
+    if bench_df is None or bench_df.empty or "收盘" not in bench_df.columns:
+        return None, None, None
+    try:
+        import pandas as _pd
+        bclose = _pd.to_numeric(bench_df["收盘"], errors="coerce").dropna()
+        if len(bclose) < 2:
+            return None, None, None
+        benchmark_return = round((float(bclose.iloc[-1]) / float(bclose.iloc[0]) - 1) * 100, 2)
+        alpha = round(strategy_total_return - benchmark_return, 2)
+        # CAGR：按交易日数年化（约 244 交易日/年）
+        years = trading_days / 244.0 if trading_days > 0 else 1.0
+        cagr = None
+        if years > 0 and strategy_total_return is not None:
+            ratio = 1.0 + strategy_total_return / 100.0
+            if ratio > 0:
+                cagr = round((ratio ** (1.0 / years) - 1) * 100, 2)
+        return benchmark_return, alpha, cagr
+    except Exception:
+        return None, None, None
+
+
 def run_single_stock_backtest(
     df: pd.DataFrame,
     strategy_type: str = "squeeze",
@@ -117,7 +144,11 @@ def run_single_stock_backtest(
 
     raw_signals = [idx for idx in _signal_indices(df, strategy_type, params) if idx < len(df) - 1]
     if not raw_signals:
-        return _empty_result("回测区间内无策略信号")
+        # 改动 #15：即使无信号也返回 benchmark（市场收益与策略信号无关）
+        _br, _al, _cg = _compute_benchmark_fields(bench_df, 0.0, len(df))
+        _empty = _empty_result("回测区间内无策略信号")
+        _empty["summary"].update({"benchmark_return": _br, "alpha": _al, "cagr": _cg})
+        return _empty
 
     close_vals = df["收盘"].astype(float).to_numpy()
     open_vals = df["开盘"].astype(float).to_numpy()
@@ -295,6 +326,8 @@ def run_single_stock_backtest(
         next_allowed_idx = exit_idx + 1
 
     if not trades:
+        # 改动 #15：即使无交易也计算 benchmark（市场收益与策略成交与否无关）
+        _br, _al, _cg = _compute_benchmark_fields(bench_df, 0.0, len(df))
         result = _empty_result("信号因流动性、复权断点或仓位约束未成交")
         result["summary"].update({
             "skipped_high_open": skipped_high_open,
@@ -305,6 +338,9 @@ def run_single_stock_backtest(
             "slippage_bps": slippage_bps,
             "position_pct": position_pct,
             "lot_size": lot_size,
+            "benchmark_return": _br,
+            "alpha": _al,
+            "cagr": _cg,
         })
         return result
 
@@ -315,27 +351,10 @@ def run_single_stock_backtest(
     win_rate = compute_win_rate(returns, ndigits=1)
 
     # 改动 #15：基准 alpha / CAGR（沪深300）。无 bench_df 时为 None，前端兜底为 "-"。
-    benchmark_return = None
-    alpha = None
-    cagr = None
     strategy_total_return = (equity - initial_capital) / initial_capital * 100
-    if bench_df is not None and not bench_df.empty and "收盘" in bench_df.columns:
-        try:
-            import pandas as _pd
-            bclose = _pd.to_numeric(bench_df["收盘"], errors="coerce").dropna()
-            if len(bclose) >= 2:
-                benchmark_return = round((float(bclose.iloc[-1]) / float(bclose.iloc[0]) - 1) * 100, 2)
-                alpha = round(strategy_total_return - benchmark_return, 2)
-                # CAGR：按回测区间实际交易日数年化（约 244 交易日/年）
-                total_trading_days = len(df)
-                years = total_trading_days / 244.0 if total_trading_days > 0 else 1.0
-                if years > 0 and equity > 0:
-                    ratio = equity / initial_capital
-                    cagr = round((ratio ** (1.0 / years) - 1) * 100, 2) if ratio > 0 else None
-        except Exception:
-            benchmark_return = None
-            alpha = None
-            cagr = None
+    benchmark_return, alpha, cagr = _compute_benchmark_fields(
+        bench_df, strategy_total_return, len(df)
+    )
 
     return {
         "summary": {

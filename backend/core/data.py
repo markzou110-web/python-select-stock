@@ -690,6 +690,8 @@ def _fetch_index_hist_sina(code: str) -> pd.DataFrame:
     """使用新浪纯 HTTP 接口获取指数最近 100 天的日 K 线历史 (100% 避开代理 SSL 问题)"""
     if code == "000001":
         symbol = "sh000001"
+    elif code == "000300":  # 沪深300 指数（上交所发布，需 sh 前缀）
+        symbol = "sh000300"
     elif code == "399006":
         symbol = "sz399006"
     elif code.startswith('6') or code.startswith('900'):
