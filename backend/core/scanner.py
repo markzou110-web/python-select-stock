@@ -75,6 +75,10 @@ EXECUTABLE_PA_ACTIONS = {"READY"}
 BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
 MIN_RAW_EXECUTION_SCORE = 60.0
 MAX_EXECUTION_RISK_PCT = 8.0
+# 强信号分级加权：原始策略分(raw_score)≥此值时，视为信号强度极高，
+# 在 SOP 分级中等效为额外1个check+1个bonus，使强信号更容易达到A/B级
+# （避免历史胜率数据不足的新票/冷门票被拖累到C/D）。
+STRONG_SIGNAL_RAW_THRESHOLD = 95.0
 HARD_EXECUTION_RISK_PCT = 12.0
 HIGH_TURNOVER_MKT_CAP_YI = 150.0
 HIGH_TURNOVER_MIN_PCT = 1.5
@@ -592,14 +596,25 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             bonuses.append("大盘进攻")
 
         # ── 综合评级 ──
+        # 强信号加权：原始策略分≥STRONG_SIGNAL_RAW_THRESHOLD时，等效+1check+1bonus，
+        # 使超强信号（即使历史胜率数据不足）也能达到A/B级，避免信号强度与分级脱节。
+        # raw_score 由 calibrate_scan_scores 存入（校准前的原始信号强度，通常 70-110）
+        _raw_for_grade = float(res.get('raw_score') or res.get('Score') or 0)
+        _strong_signal = _raw_for_grade >= STRONG_SIGNAL_RAW_THRESHOLD
+        _eff_checks = len(checks) + (1 if _strong_signal else 0)
+        _eff_bonuses = len(bonuses) + (1 if _strong_signal else 0)
         if vetoes:
             grade = "D"
-        elif len(checks) >= 3 and len(bonuses) >= 2:
+        elif _eff_checks >= 3 and _eff_bonuses >= 2:
             grade = "A"
-        elif len(checks) >= 2:
+        elif _eff_checks >= 2:
             grade = "B"
         else:
             grade = "C"
+        if _strong_signal and grade == "C":
+            # 强信号至少保底 B（信号强度本身就是质量证据）
+            grade = "B"
+            checks.append(f"强信号(raw≥{STRONG_SIGNAL_RAW_THRESHOLD:.0f})")
 
         res['sop_grade'] = grade
         res['sop_vetoes'] = vetoes

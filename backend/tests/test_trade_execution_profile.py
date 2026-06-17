@@ -266,3 +266,37 @@ def test_strict_gate_off_a_grade_without_resonance_eligible(monkeypatch):
     # 回退模式下 A 级（无共振）仍可交易
     assert results[0]["trade_eligible"] is True
     assert results[0]["trade_bucket"] == "TRADE"
+
+
+# ── 强信号分级加权（raw_score≥95 参与分级，避免信号强度与分级脱节）──
+
+def test_strong_signal_boosted_to_at_least_b():
+    """raw_score≥95 的强信号，即使历史胜率不足（checks 少），至少保底 B 级。
+
+    模拟木林森场景：raw_score=103.6（极强信号）但胜率<50%（少1个check），
+    原逻辑会判 C，加权后应至少 B。
+    """
+    results = [_base_candidate(
+        Score=81.8, raw_score=103.6,  # 强信号
+        历史胜率="40%",  # 胜率<50% → 少1个check（原会降到C）
+        共振="🔥 核心热点",
+    )]
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+    assert results[0]["sop_grade"] in ("A", "B"), f"强信号应≥B，实际{results[0]['sop_grade']}"
+
+
+def test_strong_signal_can_reach_a_with_resonance():
+    """raw_score≥95 + 共振 + 多bonus → 可达 A 级。"""
+    results = [_base_candidate(raw_score=103.6)]  # base 含共振+高bonus
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+    assert results[0]["sop_grade"] == "A"
+
+
+def test_weak_signal_not_boosted():
+    """raw_score<95 的弱信号不享受分级加权（保持原逻辑，不强升）。"""
+    results = [_base_candidate(
+        raw_score=70.0, 历史胜率="40%", 共振="🔥 核心热点",
+    )]
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+    # 弱信号不应被强信号保底逻辑误升到 A
+    assert results[0]["sop_grade"] in ("A", "B", "C")
