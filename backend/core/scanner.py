@@ -187,7 +187,7 @@ def _candidate_price(res: Dict[str, Any]) -> float:
 def _right_side_quality_confirmed(res: Dict[str, Any]) -> bool:
     """Right-side entries may be extended, but must prove quality and execution control."""
     action = _pa_plan_action(res)
-    raw_score = _as_float(res.get('Score') or res.get('score'))
+    raw_score = _as_float(res.get('raw_score') or res.get('Score') or res.get('score'))
     pa_score = _as_float(res.get('price_action_score'))
     risk_pct = _as_float(res.get('pa_risk_pct'))
     current_price = _candidate_price(res)
@@ -261,7 +261,7 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     setup = str(res.get('pa_trade_setup') or "")
     strategy_type = str(res.get('strategy_type') or "")
     blockers: List[str] = []
-    raw_score = _as_float(res.get('Score') or res.get('score'))
+    raw_score = _as_float(res.get('raw_score') or res.get('Score') or res.get('score'))
     risk_pct = _as_float(res.get('pa_risk_pct'))
     current_price = _candidate_price(res)
     entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
