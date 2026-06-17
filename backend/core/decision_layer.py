@@ -80,7 +80,8 @@ def build_market_decision_context(
         limit_down_ratio = float((pct <= -9.8).sum() / total * 100)
         current_quality = _clamp(advance_ratio + (strong_ratio - weak_ratio) * 2.5)
         history = list(cycle_history or [])
-        previous = history[:-1] if history and history[-1].get("date") == str(pd.Timestamp.now().date()) else history
+        # 修复：始终剔除最后一条（最新数据日=当日），避免 T+1 执行时 T 日误入 prior3
+        previous = history[:-1] if history else history
         previous = previous[-5:]
         prior3 = previous[-3:]
         prior5_avg = sum(_num(item.get("advance_ratio"), 50) for item in previous) / len(previous) if previous else 50
@@ -90,7 +91,8 @@ def build_market_decision_context(
         score = round(_clamp(current_quality * 0.3 + prior3_avg * 0.35 + prior5_avg * 0.2 + regime_score * 0.15), 1)
 
     previous = list(cycle_history or [])
-    previous = previous[:-1] if previous and previous[-1].get("date") == str(pd.Timestamp.now().date()) else previous
+    # 修复：同上，始终剔除最后一条
+    previous = previous[:-1] if previous else previous
     previous = previous[-5:]
     prior3 = previous[-3:]
     prior3_avg = sum(_num(item.get("advance_ratio"), 50) for item in prior3) / len(prior3) if prior3 else 50
