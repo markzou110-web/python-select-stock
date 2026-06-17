@@ -51,10 +51,15 @@ SCAN_REGIME_ADAPTIVE = True
 FAILURE_LOOKBACK_DAYS = 90
 FAILURE_VETO_MIN_COUNT = 2
 
-# 改动(上班族Bark)：破位反抽检测。信号日前 N 天内若有单日跌幅 <= BREAKDOWN_DROP_PCT，
-# 且当日上涨（反弹），视为"破位后反抽"诱多，一票否决。防 000958 类陷阱（6/8 -5.99% 后 6/12 +9% 反弹）。
-BREAKDOWN_LOOKBACK_DAYS = 5
-BREAKDOWN_DROP_PCT = -5.0
+# 改动(上班族Bark v2)：破位反抽陷阱多维评分。检测信号前 N 天内单日大跌后，
+# 通过"量能/反抽强度/MA20破位时长/V型未确认"四维评分区分真陷阱与黄金坑洗盘，
+# 避免单一-5%规则误杀强势股洗盘。
+BREAKDOWN_LOOKBACK_DAYS = 5          # 检测窗口（天）
+BREAKDOWN_DROP_PCT = -5.0            # 触发评分的单日跌幅阈值
+TRAP_VETO_SCORE = 70                 # 评分>=此值 → 一票否决降D级
+TRAP_RISK_SCORE = 40                 # 评分>=此值 → 加风险标注（不否决，排序扣分）
+TRAP_VOLUME_RATIO_THRESHOLD = 2.0    # 恐慌抛售量比阈值（>=此值视为真洗盘，量能维度0分）
+TRAP_MA20_BREAK_DAYS = 3             # MA20下方停留天数阈值（>=此值加分）
 
 # 改动(上班族Bark)：实盘信号门槛收紧。True 时仅 A 级 + 多重共振(🔥核心热点)判为可交易，
 # B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。False 回退到原 A/B 均可交易逻辑。
@@ -418,12 +423,15 @@ def _inject_capital_event_risk(results, engine, lookback_days: int = 60):
 
 
 def _inject_breakdown_retracement(results, hist_map):
-    """改动(上班族Bark)：破位反抽检测。
+    """改动(上班族Bark v2)：破位反抽陷阱多维评分。
 
-    对每个候选，取 hist_map[code] 最近 BREAKDOWN_LOOKBACK_DAYS+1 根收盘，算单日涨跌。
-    若近 N 天内任一日跌幅 <= BREAKDOWN_DROP_PCT（如 -5%），标记 res['breakdown_retracement']=True。
-    后续 _apply_sop_filter 会据此一票否决（破位后反抽多为诱多）。
-    hist_map 为空或查不到时静默跳过。
+    取 hist_map[code] 近期数据，若检测窗口内有单日大跌 <= BREAKDOWN_DROP_PCT，
+    通过四维评分区分"真陷阱"（诱多反抽）与"黄金坑"（强势洗盘）：
+      1. 大跌日量能不足（+30）：量比 < TRAP_VOLUME_RATIO_THRESHOLD（非恐慌抛售）
+      2. 缩量弱反抽（+25）：大跌后量比递减（恢复期无真实买盘）
+      3. MA20 长时间破位（+25）：大跌后在 MA20 下方停留 >= TRAP_MA20_BREAK_DAYS 天
+      4. V型未确认突破（+20）：突破日才从 MA20 下方跳到上方，无企稳确认
+    输出 res['breakdown_trap_score']（0-100）。≥TRAP_VETO_SCORE 否决；≥TRAP_RISK_SCORE 加风险。
     """
     if not results or not hist_map:
         return
@@ -432,23 +440,74 @@ def _inject_breakdown_retracement(results, hist_map):
     for res in results:
         code = str(res.get('代码', ''))
         df = hist_map.get(code)
-        res['breakdown_retracement'] = False
+        res['breakdown_trap_score'] = 0
         if df is None or df.empty or '收盘' not in df.columns:
             continue
         try:
-            closes = df['收盘'].astype(float).tail(lookback + 1).tolist()
-            if len(closes) < 2:
+            tail = df.tail(lookback + 1).reset_index(drop=True)
+            if len(tail) < 2:
                 continue
-            # 算最近 N 天的单日涨跌（从倒数第 N 根到最后一根）
-            for i in range(max(1, len(closes) - lookback), len(closes)):
-                prev_c = closes[i - 1]
-                if prev_c > 0:
-                    day_pct = (closes[i] / prev_c - 1) * 100
+            closes = tail['收盘'].astype(float).tolist()
+            # 找检测窗口内的大跌日（单日跌幅 <= drop_pct）
+            drop_idx = None
+            for i in range(1, len(closes)):
+                if closes[i - 1] > 0:
+                    day_pct = (closes[i] / closes[i - 1] - 1) * 100
                     if day_pct <= drop_pct:
-                        res['breakdown_retracement'] = True
+                        drop_idx = i
                         break
+            if drop_idx is None:
+                continue  # 无前置大跌 → score=0（不标记）
+
+            score = 0
+            has_vol_ma = 'Vol_MA20' in tail.columns
+            has_ma20 = 'MA20' in tail.columns
+
+            # 维度1：大跌日量能不足（非恐慌抛售 → 缺乏清洗力度 → 更像诱多）
+            if has_vol_ma:
+                vol_ma_drop = float(tail['Vol_MA20'].iloc[drop_idx]) if pd.notna(tail['Vol_MA20'].iloc[drop_idx]) else 0
+                if vol_ma_drop > 0:
+                    drop_vol_ratio = float(tail['成交量'].iloc[drop_idx]) / vol_ma_drop
+                    if drop_vol_ratio < TRAP_VOLUME_RATIO_THRESHOLD:
+                        score += 30  # 温和放量（非恐慌抛售）
+            else:
+                score += 30  # 无量能数据，保守按量能不足计
+
+            # 维度2：缩量弱反抽（大跌后至最后一日前，量比递减）
+            if has_vol_ma and drop_idx < len(tail) - 1:
+                post_vrs = []
+                for i in range(drop_idx + 1, len(tail)):
+                    vma = float(tail['Vol_MA20'].iloc[i]) if pd.notna(tail['Vol_MA20'].iloc[i]) else 0
+                    if vma > 0:
+                        post_vrs.append(float(tail['成交量'].iloc[i]) / vma)
+                # 量比序列递减（后半均值 < 前半均值）→ 缩量弱反抽
+                if len(post_vrs) >= 2:
+                    mid = len(post_vrs) // 2
+                    first_half = sum(post_vrs[:max(1, mid)]) / max(1, mid)
+                    second_half = sum(post_vrs[mid:]) / max(1, len(post_vrs) - mid)
+                    if second_half < first_half:
+                        score += 25
+
+            # 维度3：MA20 长时间破位（大跌后至最后一日前，收盘持续在 MA20 下方）
+            if has_ma20:
+                below_days = 0
+                for i in range(drop_idx, len(tail) - 1):  # 不含最后一根（突破日）
+                    ma20v = tail['MA20'].iloc[i]
+                    if pd.notna(ma20v) and closes[i] < float(ma20v):
+                        below_days += 1
+                if below_days >= TRAP_MA20_BREAK_DAYS:
+                    score += 25
+
+            # 维度4：V型未确认突破（倒数第二根仍在 MA20 下方 → 突破日才跳上来，无企稳）
+            if has_ma20 and len(tail) >= 2:
+                prev_ma20 = tail['MA20'].iloc[-2]
+                prev_close = closes[-2]
+                if pd.notna(prev_ma20) and prev_close < float(prev_ma20):
+                    score += 20  # 前一日仍在 MA20 下方 → V型未确认
+
+            res['breakdown_trap_score'] = min(score, 100)
         except Exception:
-            res['breakdown_retracement'] = False
+            res['breakdown_trap_score'] = 0
 
 
 def _apply_sop_filter(results, market_regime, sector_trends):
@@ -484,9 +543,13 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             vetoes.append("板块下跌")
         if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
             vetoes.append("板块扩散转弱")
-        # 改动(上班族Bark)：破位反抽否决（近期大跌后反弹，疑诱多）
-        if res.get('breakdown_retracement'):
-            vetoes.append("破位反抽（近期大跌后反弹，疑诱多）")
+        # 改动(上班族Bark v2)：破位反抽陷阱评分。>=TRAP_VETO_SCORE 一票否决；
+        # >=TRAP_RISK_SCORE 加风险标注（不否决，排序扣分）。
+        trap_score = res.get('breakdown_trap_score', 0)
+        if trap_score >= TRAP_VETO_SCORE:
+            vetoes.append(f"破位反抽陷阱(评分{trap_score})")
+        elif trap_score >= TRAP_RISK_SCORE:
+            risks.append(f"破位反抽疑似(评分{trap_score})，排序扣分")
         # 改动 #17：近期失败模式否决（同一代码+策略近 N 天内多次失败 → 降级，避免反复踩雷）
         if res.get('recent_failure_count', 0) >= FAILURE_VETO_MIN_COUNT:
             vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")

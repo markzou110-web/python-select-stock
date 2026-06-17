@@ -345,39 +345,109 @@ def test_failure_pattern_below_threshold_not_vetoed():
     assert results[0].get("sop_grade") != "D"
 
 
-# ── 破位反抽检测（调整2，上班族 Bark 场景）──
+# ── 破位反抽陷阱多维评分（调整2 v2，上班族 Bark 场景）──
 
-def test_breakdown_retracement_detected_after_big_drop():
-    """近 5 天内有单日跌幅 <= -5% → 标记 breakdown_retracement=True（000958 场景）。"""
+def _make_hist_df(closes, vols=None, ma20=None, vol_ma20=None):
+    """构造含 收盘/成交量/MA20/Vol_MA20 列的 DataFrame，用于评分测试。
+
+    vols/ma20/vol_ma20 未提供时按合理默认填充。
+    """
+    n = len(closes)
+    if vols is None:
+        vols = [100000.0] * n
+    if ma20 is None:
+        ma20 = [sum(closes[:i+1])/(i+1) for i in range(n)]  # 简单累计均值
+    if vol_ma20 is None:
+        vol_ma20 = [100000.0] * n
+    return pd.DataFrame({
+        "收盘": closes, "成交量": vols, "MA20": ma20, "Vol_MA20": vol_ma20,
+    })
+
+
+def test_trap_000958_pattern_scored_high():
+    """000958 模式（温和量大跌 + 缩量弱反抽 + MA20破位 + V型未确认）→ 评分≥70，否决。
+
+    构造：稳定→-6%大跌(量比1.5温和)→缩量恢复(1.2→1.0→0.8)→最后一日V型反弹。
+    大跌后3天在MA20下方，且前一日仍在MA20下方。
+    """
     from core import scanner
-    # 构造收盘序列：稳定 → -6% 大跌（破位）→ 反弹
-    closes = [10.0, 10.1, 10.0, 9.4, 9.8, 10.2, 10.5]  # idx3: 10.0→9.4=-6% 大跌
-    df = pd.DataFrame({"收盘": closes})
-    hist_map = {"000958": df}
+    closes = [10.0, 10.1, 10.0, 9.4, 9.6, 9.5, 10.2]  # idx3: -6%大跌; idx6: V型反弹
+    # 量大跌日1.5倍(温和)，恢复期递减1.2/1.0/0.8
+    vols = [100000]*7
+    vols[3] = 150000   # 大跌日量比1.5
+    vols[4] = 120000; vols[5] = 100000  # 恢复期递减
+    vols[6] = 180000
+    vol_ma20 = [100000]*7
+    # MA20设在10.0，使大跌后9.4/9.6/9.5都在下方(idx3,4,5)
+    ma20 = [9.9, 9.95, 10.0, 10.0, 10.0, 10.0, 10.05]
+    df = _make_hist_df(closes, vols, ma20, vol_ma20)
     results = [{"代码": "000958"}]
-    scanner._inject_breakdown_retracement(results, hist_map)
-    assert results[0]["breakdown_retracement"] is True
+    scanner._inject_breakdown_retracement(results, {"000958": df})
+    score = results[0]["breakdown_trap_score"]
+    assert score >= scanner.TRAP_VETO_SCORE, f"应≥{scanner.TRAP_VETO_SCORE}，实际{score}"
 
 
-def test_breakdown_retracement_no_veto_without_prior_drop():
-    """近 5 天无单日大跌 → breakdown_retracement=False（不误伤正常突破）。"""
+def test_golden_pit_high_volume_not_vetoed():
+    """黄金坑（放量洗盘量比≥2 + 快速收复MA20 + 量价齐升）→ 评分<40，不标记。
+
+    构造：-6%大跌但量比2.5（恐慌抛售真洗盘）→ 次日即收复MA20且放量。
+    """
     from core import scanner
-    closes = [10.0, 10.1, 10.2, 10.3, 10.5, 10.8, 11.0]  # 平稳上涨，无大跌
-    df = pd.DataFrame({"收盘": closes})
-    hist_map = {"000001": df}
+    closes = [10.0, 10.1, 10.0, 9.4, 10.1, 10.3]  # idx3: -6%大跌; idx4: 立即收复
+    vols = [100000]*6
+    vols[3] = 250000   # 大跌日量比2.5（恐慌放量）
+    vols[4] = 200000; vols[5] = 220000  # 恢复期放量（量价齐升）
+    vol_ma20 = [100000]*6
+    ma20 = [9.9, 9.95, 10.0, 10.0, 10.0, 10.0]  # idx4收盘10.1>MA20=10.0
+    df = _make_hist_df(closes, vols, ma20, vol_ma20)
     results = [{"代码": "000001"}]
-    scanner._inject_breakdown_retracement(results, hist_map)
-    assert results[0]["breakdown_retracement"] is False
+    scanner._inject_breakdown_retracement(results, {"000001": df})
+    score = results[0]["breakdown_trap_score"]
+    assert score < scanner.TRAP_RISK_SCORE, f"黄金坑应<{scanner.TRAP_RISK_SCORE}，实际{score}"
 
 
-def test_breakdown_retracement_triggers_veto_in_sop_filter():
-    """breakdown_retracement=True → _apply_sop_filter 否决，降为 D 级。"""
+def test_no_drop_not_scored():
+    """无前置大跌（平稳上涨）→ 评分=0，不标记。"""
+    from core import scanner
+    closes = [10.0, 10.1, 10.2, 10.3, 10.5, 10.8, 11.0]  # 无大跌
+    df = _make_hist_df(closes)
+    results = [{"代码": "000001"}]
+    scanner._inject_breakdown_retracement(results, {"000001": df})
+    assert results[0]["breakdown_trap_score"] == 0
+
+
+def test_trap_quick_ma20_reclaim_lower_score():
+    """大跌后1天即收复MA20 → MA20破位维度不加满分（≤阈值），评分降低。
+
+    对比000958（4天破位），快速收复的陷阱评分应更低（可能不到否决线）。
+    """
+    from core import scanner
+    closes = [10.0, 10.1, 10.0, 9.4, 10.05, 10.3]  # idx3大跌; idx4立即回到MA20上方
+    vols = [100000]*6
+    vols[3] = 150000  # 温和量（量能不足+30）
+    vols[4] = 80000; vols[5] = 70000  # 缩量(+25)
+    vol_ma20 = [100000]*6
+    ma20 = [9.9, 9.95, 10.0, 10.0, 10.0, 10.0]  # idx4收10.05>10.0
+    df = _make_hist_df(closes, vols, ma20, vol_ma20)
+    results = [{"代码": "000002"}]
+    scanner._inject_breakdown_retracement(results, {"000002": df})
+    score = results[0]["breakdown_trap_score"]
+    # 快速收复：MA20破位天数=0(idx3大跌日本身算1天，但<阈值3) → 该维度0分
+    # 量能不足30 + 缩量25 + V型(idx3在MA20下方,idx4跳上)20 = 75? 但idx4>MA20所以倒数第二根(idx4)已在上方→V型不加
+    # 实际：30+25+0(MA20仅1天<3)+0(idx-2已在上方) = 55
+    assert score < scanner.TRAP_VETO_SCORE, f"快速收复应<否决线{scanner.TRAP_VETO_SCORE}，实际{score}"
+
+
+def test_moderate_score_adds_risk_not_veto():
+    """中间档评分（40-69）→ 加风险标注，不否决（不一刀切）。"""
     from core import scanner
     results = [{
-        "代码": "000958", "名称": "电投产融", "行业": "电力",
-        "影线比": 0.1, "pct_5d": 8, "历史胜率": "60%",
-        "breakdown_retracement": True,
+        "代码": "000003", "名称": "疑似陷阱", "行业": "测试",
+        "影线比": 0.1, "pct_5d": 4, "历史胜率": "60%",
+        "breakdown_trap_score": 55,  # 中间档
     }]
     scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
-    assert results[0].get("sop_grade") == "D"
-    assert any("破位反抽" in v for v in results[0].get("sop_vetoes", []))
+    # 中间档不否决（grade≠D），但应有风险标注
+    assert results[0].get("sop_grade") != "D"
+    sop_risks = results[0].get("sop_risks", [])
+    assert any("破位反抽" in r for r in sop_risks)
