@@ -11,6 +11,8 @@ from routers.paper_trade import (
     _count_holding_trading_days,
     _evaluate_time_stop,
     _wind_control_decision,
+    _tier_early_warning,
+    _tier_alert_sent,
 )
 
 
@@ -138,3 +140,62 @@ def test_wind_control_reduce_t1_locked_does_not_execute():
 
     assert result["should_close"] is False
     assert result.get("should_reduce", False) is False
+
+
+# ── 分级预警（调整1，上班族 Bark 场景）──
+
+def _reset_tier_cache():
+    _tier_alert_sent.clear()
+
+
+def test_tiered_warning_mild_at_3pct(monkeypatch):
+    """浮亏 -3.5% → 触发轻度预警（tier1）。"""
+    _reset_tier_cache()
+    sent = []
+    monkeypatch.setattr("routers.paper_trade.send_paper_trade_notification", lambda t, b: sent.append((t, b)))
+    _tier_early_warning(code="000001", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=9.65, pl_pct=-3.5, regime_desc="进攻")
+    assert len(sent) == 1
+    assert "⚠️轻度预警" in sent[0][0]
+    _reset_tier_cache()
+
+
+def test_tiered_warning_moderate_at_5pct(monkeypatch):
+    """浮亏 -5.5% → 触发中度预警（tier2）。"""
+    _reset_tier_cache()
+    sent = []
+    monkeypatch.setattr("routers.paper_trade.send_paper_trade_notification", lambda t, b: sent.append((t, b)))
+    _tier_early_warning(code="000002", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=9.45, pl_pct=-5.5, regime_desc="进攻")
+    assert len(sent) == 1
+    assert "🟡中度预警" in sent[0][0]
+    _reset_tier_cache()
+
+
+def test_tiered_warning_dedup_same_tier_same_day(monkeypatch):
+    """同股同级当日不重复推（防 30 分钟循环刷屏）。"""
+    _reset_tier_cache()
+    sent = []
+    monkeypatch.setattr("routers.paper_trade.send_paper_trade_notification", lambda t, b: sent.append((t, b)))
+    _tier_early_warning(code="000003", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=9.65, pl_pct=-3.5, regime_desc="进攻")
+    _tier_early_warning(code="000003", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=9.60, pl_pct=-4.0, regime_desc="进攻")
+    assert len(sent) == 1  # 同级同日只推一次
+    _tier_early_warning(code="000003", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=9.45, pl_pct=-5.5, regime_desc="进攻")
+    assert len(sent) == 2  # 跨级（tier1→tier2）推送
+    _reset_tier_cache()
+
+
+def test_tiered_warning_no_alert_when_profit(monkeypatch):
+    """盈利持仓或浅亏（未到 -3%）不推分级预警。"""
+    _reset_tier_cache()
+    sent = []
+    monkeypatch.setattr("routers.paper_trade.send_paper_trade_notification", lambda t, b: sent.append((t, b)))
+    _tier_early_warning(code="000004", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=10.5, pl_pct=5.0, regime_desc="进攻")
+    _tier_early_warning(code="000004", name="测试", trade_mode="REAL",
+                        entry_price=10.0, curr_price=9.90, pl_pct=-1.0, regime_desc="进攻")
+    assert len(sent) == 0
+    _reset_tier_cache()

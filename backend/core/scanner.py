@@ -50,6 +50,15 @@ SCAN_REGIME_ADAPTIVE = True
 # 失败次数，超过 FAILURE_VETO_MIN_COUNT 次的候选在 SOP 评级中一票否决（降级为 D）。
 FAILURE_LOOKBACK_DAYS = 90
 FAILURE_VETO_MIN_COUNT = 2
+
+# 改动(上班族Bark)：破位反抽检测。信号日前 N 天内若有单日跌幅 <= BREAKDOWN_DROP_PCT，
+# 且当日上涨（反弹），视为"破位后反抽"诱多，一票否决。防 000958 类陷阱（6/8 -5.99% 后 6/12 +9% 反弹）。
+BREAKDOWN_LOOKBACK_DAYS = 5
+BREAKDOWN_DROP_PCT = -5.0
+
+# 改动(上班族Bark)：实盘信号门槛收紧。True 时仅 A 级 + 多重共振(🔥核心热点)判为可交易，
+# B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。False 回退到原 A/B 均可交易逻辑。
+STRICT_REAL_SIGNAL_GATE = True
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
 from core.decision_layer import apply_decision_layer
@@ -322,7 +331,14 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     grade = res.get('sop_grade')
     fatal_markers = ("回避", "结构不进入交易池", "异常价格跳变", "板块下跌", "禁止实盘")
     has_fatal_blocker = any(any(marker in b for marker in fatal_markers) for b in blockers)
-    trade_eligible = grade in {"A", "B"} and not blockers and strategy_type != "sector_watch"
+    # 改动(上班族Bark)：实盘门槛收紧。STRICT_REAL_SIGNAL_GATE=True 时仅 A 级 + 多重共振
+    # (🔥核心热点) 判为可交易；B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。
+    if STRICT_REAL_SIGNAL_GATE:
+        trade_eligible = (grade == "A" and not blockers
+                          and strategy_type != "sector_watch"
+                          and res.get('共振') == "🔥 核心热点")
+    else:
+        trade_eligible = grade in {"A", "B"} and not blockers and strategy_type != "sector_watch"
     if trade_eligible:
         bucket = "TRADE"
     elif has_fatal_blocker:
@@ -401,6 +417,40 @@ def _inject_capital_event_risk(results, engine, lookback_days: int = 60):
             res['capital_event_titles'] = titles[:3]
 
 
+def _inject_breakdown_retracement(results, hist_map):
+    """改动(上班族Bark)：破位反抽检测。
+
+    对每个候选，取 hist_map[code] 最近 BREAKDOWN_LOOKBACK_DAYS+1 根收盘，算单日涨跌。
+    若近 N 天内任一日跌幅 <= BREAKDOWN_DROP_PCT（如 -5%），标记 res['breakdown_retracement']=True。
+    后续 _apply_sop_filter 会据此一票否决（破位后反抽多为诱多）。
+    hist_map 为空或查不到时静默跳过。
+    """
+    if not results or not hist_map:
+        return
+    lookback = BREAKDOWN_LOOKBACK_DAYS
+    drop_pct = BREAKDOWN_DROP_PCT
+    for res in results:
+        code = str(res.get('代码', ''))
+        df = hist_map.get(code)
+        res['breakdown_retracement'] = False
+        if df is None or df.empty or '收盘' not in df.columns:
+            continue
+        try:
+            closes = df['收盘'].astype(float).tail(lookback + 1).tolist()
+            if len(closes) < 2:
+                continue
+            # 算最近 N 天的单日涨跌（从倒数第 N 根到最后一根）
+            for i in range(max(1, len(closes) - lookback), len(closes)):
+                prev_c = closes[i - 1]
+                if prev_c > 0:
+                    day_pct = (closes[i] / prev_c - 1) * 100
+                    if day_pct <= drop_pct:
+                        res['breakdown_retracement'] = True
+                        break
+        except Exception:
+            res['breakdown_retracement'] = False
+
+
 def _apply_sop_filter(results, market_regime, sector_trends):
     """SOP 过滤引擎：对扫描结果应用硬性条件、一票否决、加分项，生成 A/B/C/D 等级"""
     regime_status = market_regime.get('status', 'UNKNOWN')
@@ -434,6 +484,9 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             vetoes.append("板块下跌")
         if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
             vetoes.append("板块扩散转弱")
+        # 改动(上班族Bark)：破位反抽否决（近期大跌后反弹，疑诱多）
+        if res.get('breakdown_retracement'):
+            vetoes.append("破位反抽（近期大跌后反弹，疑诱多）")
         # 改动 #17：近期失败模式否决（同一代码+策略近 N 天内多次失败 → 降级，避免反复踩雷）
         if res.get('recent_failure_count', 0) >= FAILURE_VETO_MIN_COUNT:
             vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
@@ -1547,6 +1600,7 @@ def perform_market_scan(
 
         # 改动 #17：预查近期失败模式，注入 recent_failure_count 供 _apply_sop_filter 否决
         _inject_failure_pattern(results, engine)
+        _inject_breakdown_retracement(results, hist_map)
         _inject_capital_event_risk(results, engine)
         for res in results:
             if res.get('capital_event_risk'):

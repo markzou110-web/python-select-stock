@@ -22,6 +22,7 @@ from core.risk_constants import (
     TIME_STOP_WARNING_DAYS, TIME_STOP_REVIEW_DAYS,
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT,
     FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO,
+    EARLY_WARN_MILD_PCT, EARLY_WARN_MODERATE_PCT, EARLY_WARN_TIER_COOLDOWN_DAYS,
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
 from core.operation_plan import alert_priority, build_position_decision_snapshot, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
@@ -233,6 +234,49 @@ def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: st
             "severity": "warning",
         }
     return None
+
+
+# 改动(上班族Bark)：分级预警去重状态。key=f"{code}:tier{级别}"，value=日期字符串。
+# 每级每天最多推一次；进程重启后重置（sentinel 是常驻线程，可接受）。
+_tier_alert_sent: Dict[str, str] = {}
+
+
+def _tier_early_warning(*, code: str, name: str, trade_mode: str,
+                        entry_price: float, curr_price: float, pl_pct: float,
+                        regime_desc: str) -> None:
+    """持仓浮亏分级预警（-3% 轻度 / -5% 中度）。
+
+    仅对亏损持仓（pl_pct < 0）触发；每级每天最多推一次（去重防 30 分钟循环刷屏）。
+    -9% 紧急预警由原有止损逻辑处理，此处不重复。
+    """
+    if pl_pct >= 0 or entry_price <= 0:
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    # 判定级别：-5% 以下为中度，-3% 以下为轻度
+    if pl_pct <= EARLY_WARN_MODERATE_PCT:
+        tier, label, advice = 2, "🟡中度预警", "浮亏较大，建议下班后评估是否减仓保护"
+    elif pl_pct <= EARLY_WARN_MILD_PCT:
+        tier, label, advice = 1, "⚠️轻度预警", "持仓开始恶化，请留意后续走势"
+    else:
+        return
+    dedupe_key = f"{code}:tier{tier}"
+    last = _tier_alert_sent.get(dedupe_key)
+    if last == today:
+        return  # 同级今日已推，防刷屏
+    _tier_alert_sent[dedupe_key] = today
+    try:
+        title = f"【{label}】{name} ({code})"
+        body = (
+            f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
+            f"建议动作：{advice}\n"
+            f"买入价格：¥{entry_price:.2f}\n"
+            f"当前价格：¥{curr_price:.2f}\n"
+            f"当前浮亏：{pl_pct:+.2f}%\n"
+            f"大盘状态：{regime_desc}"
+        )
+        send_paper_trade_notification(title, body)
+    except Exception as exc:
+        logger.warning(f"分级预警推送异常({code},tier{tier}): {exc}")
 
 
 def send_paper_trade_notification(title: str, body: str):
@@ -1315,7 +1359,17 @@ def run_wind_control() -> Dict[str, Any]:
                 now,
             )
             pl_pct = (curr_price - entry_price) / entry_price * 100
-            
+
+            # 改动(上班族Bark)：分级预警。原逻辑只在跌破 -9% 止损线才推送，导致
+            # -3%~-9% 的恶化过程静默（6/16 -4.4% 零推送）。此处补三级早期预警：
+            # -3% 轻度（留意）→ -5% 中度（建议减仓）。每级每天最多推一次（防刷屏）。
+            _wt_trade_mode = row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
+            _tier_early_warning(
+                code=code, name=row.get('name') or code, trade_mode=_wt_trade_mode,
+                entry_price=entry_price, curr_price=curr_price, pl_pct=pl_pct,
+                regime_desc=regime.get('desc', 'N/A') if isinstance(regime, dict) else 'N/A',
+            )
+
             # --- 风控逻辑判定 (按优先级, 使用统一风控引擎) ---
             pa_summary = _local_price_action_summary(engine, str(code))
             # 把 price action 摘要中的 latest_atr 提取出来，喂给风控引擎做自适应止损，

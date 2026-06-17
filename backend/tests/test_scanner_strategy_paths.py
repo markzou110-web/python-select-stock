@@ -343,3 +343,41 @@ def test_failure_pattern_below_threshold_not_vetoed():
     }]
     scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
     assert results[0].get("sop_grade") != "D"
+
+
+# ── 破位反抽检测（调整2，上班族 Bark 场景）──
+
+def test_breakdown_retracement_detected_after_big_drop():
+    """近 5 天内有单日跌幅 <= -5% → 标记 breakdown_retracement=True（000958 场景）。"""
+    from core import scanner
+    # 构造收盘序列：稳定 → -6% 大跌（破位）→ 反弹
+    closes = [10.0, 10.1, 10.0, 9.4, 9.8, 10.2, 10.5]  # idx3: 10.0→9.4=-6% 大跌
+    df = pd.DataFrame({"收盘": closes})
+    hist_map = {"000958": df}
+    results = [{"代码": "000958"}]
+    scanner._inject_breakdown_retracement(results, hist_map)
+    assert results[0]["breakdown_retracement"] is True
+
+
+def test_breakdown_retracement_no_veto_without_prior_drop():
+    """近 5 天无单日大跌 → breakdown_retracement=False（不误伤正常突破）。"""
+    from core import scanner
+    closes = [10.0, 10.1, 10.2, 10.3, 10.5, 10.8, 11.0]  # 平稳上涨，无大跌
+    df = pd.DataFrame({"收盘": closes})
+    hist_map = {"000001": df}
+    results = [{"代码": "000001"}]
+    scanner._inject_breakdown_retracement(results, hist_map)
+    assert results[0]["breakdown_retracement"] is False
+
+
+def test_breakdown_retracement_triggers_veto_in_sop_filter():
+    """breakdown_retracement=True → _apply_sop_filter 否决，降为 D 级。"""
+    from core import scanner
+    results = [{
+        "代码": "000958", "名称": "电投产融", "行业": "电力",
+        "影线比": 0.1, "pct_5d": 8, "历史胜率": "60%",
+        "breakdown_retracement": True,
+    }]
+    scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
+    assert results[0].get("sop_grade") == "D"
+    assert any("破位反抽" in v for v in results[0].get("sop_vetoes", []))

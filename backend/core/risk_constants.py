@@ -45,6 +45,15 @@ CAPITAL_PROTECT_THRESHOLD_PCT = 5.0
 # 保本底线：跌回至成本线 +1% 以内则触发
 CAPITAL_PROTECT_FLOOR_PCT = 1.0
 
+# ── 分级预警 (Tiered Early-Warning for Bark users) ──
+# 上班族无法盯盘，依赖 Bark 推送。原逻辑只在跌破 -9% 止损线才预警，
+# 导致 -3%~-9% 的恶化过程完全静默。分级预警在恶化早期就提醒：
+#   -3% 轻度（留意）→ -5% 中度（建议减仓）→ -9% 紧急（止损线，已有逻辑）
+EARLY_WARN_MILD_PCT = -3.0       # 轻度预警阈值
+EARLY_WARN_MODERATE_PCT = -5.0   # 中度预警阈值
+# 每级每天最多推一次（防 30 分钟一次的风控循环刷屏）。进程重启后重置。
+EARLY_WARN_TIER_COOLDOWN_DAYS = 1
+
 # ── 止盈目标 (Take Profit Target) ──
 # 前端展示 & 推送消息中的固定止盈目标
 TAKE_PROFIT_PCT = 15.0
