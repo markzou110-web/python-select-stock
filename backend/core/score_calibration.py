@@ -22,8 +22,17 @@ def _clamp(value: Any, default: float = 0.0) -> float:
 def _percentile_scores(values: List[float]) -> List[float]:
     if len(values) <= 1:
         return [50.0] * len(values)
+    # 修复 BUG4：原用 list.index(value) 对并列分数返回首个索引，导致同分股票百分位错乱。
+    # 改用 rank（每个值在排序序列中的位置），并列分数取平均排名。
     ordered = sorted(values)
-    return [round(100 * ordered.index(value) / (len(ordered) - 1), 1) for value in values]
+    n = len(ordered)
+    result = []
+    for v in values:
+        # 找所有等于 v 的位置，取平均排名
+        positions = [i for i, ov in enumerate(ordered) if ov == v]
+        avg_rank = sum(positions) / len(positions)
+        result.append(round(100 * avg_rank / (n - 1), 1))
+    return result
 
 
 def _parse_win_rate(row: Dict[str, Any]) -> float:

@@ -802,6 +802,7 @@ class IntradaySentinel:
         self._stop = False
         self.schedule_times = ["14:20"]
         self.triggered_today = set()
+        self._triggered_date = ""  # 修复 BUG5：基于日期变更重置 triggered_today
         # 改动 #10：风控独立高频检查。原先风控与（重）扫描耦合在 schedule_times 触发，
         # 一天只在 14:20 跑一次，盘中缺口击穿止损可能被漏掉。现拆为独立 tick：
         # 在交易时段内每 WIND_CONTROL_INTERVAL_MINUTES 分钟跑一次 run_wind_control，
@@ -847,10 +848,13 @@ class IntradaySentinel:
             try:
                 now = datetime.now()
                 current_time = now.strftime("%H:%M")
+                today_str = now.strftime("%Y-%m-%d")
 
-                # Reset tracking every day
-                if current_time == "00:00":
+                # 修复 BUG5：原仅靠 current_time=="00:00" 重置 triggered_today，若该分钟
+                # 被错过（长扫描/GC暂停/进程重启），则永久抑制后续扫描。改为基于日期变更重置。
+                if today_str != self._triggered_date:
                     self.triggered_today.clear()
+                    self._triggered_date = today_str
 
                 if current_time in self.schedule_times and current_time not in self.triggered_today:
                     if not is_a_share_intraday_session(now):

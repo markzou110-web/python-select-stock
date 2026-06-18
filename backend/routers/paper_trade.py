@@ -1358,6 +1358,10 @@ def run_wind_control() -> Dict[str, Any]:
                 entry_date,
                 now,
             )
+            # 修复 BUG2：entry_price=0/None 时跳过（避免 ZeroDivisionError 中断整个风控循环）
+            if entry_price <= 0:
+                logger.warning(f"{code} entry_price 异常({entry_price})，跳过风控")
+                continue
             pl_pct = (curr_price - entry_price) / entry_price * 100
 
             # 改动(上班族Bark)：分级预警。原逻辑只在跌破 -9% 止损线才推送，导致
@@ -1376,7 +1380,10 @@ def run_wind_control() -> Dict[str, Any]:
             # 使实盘 active_stop_price 与回测行为一致（只收紧不放宽）。
             latest_atr = safe_float(pa_summary.get("latest_atr")) or None
             # 弱市（bear/volatile）时进一步收紧已有仓位止损（regime 已在循环外加载）。
-            regime_status = regime.get("regime") if isinstance(regime, dict) else None
+            # 修复 BUG1：get_market_regime 返回 {"status":"OFFENSIVE"...}，无 "regime" 键。
+            # 需用 map_status_to_regime 把 status 词表映射到 bull/bear/volatile。
+            from core.market_regime import map_status_to_regime
+            regime_status = map_status_to_regime(regime.get("status")) if isinstance(regime, dict) else None
             risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, pa_summary, atr=latest_atr, market_regime=regime_status)
             time_stop = _evaluate_time_stop(
                 hold_trading_days,

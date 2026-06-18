@@ -46,6 +46,20 @@ def test_win_rate_missing_defaults_to_neutral():
     assert row["score_components"]["historical_win_rate"] == 50.0
 
 
+def test_percentile_scores_handles_ties():
+    """修复 BUG4：并列分数应取平均排名，而非首个索引。
+
+    [10, 10, 20] → 两个10的百分位应相同（25.0），20应为100。
+    原 list.index(10)=0 → 两个10都=0（错），修复后取平均排名(0+1)/2=0.5 → 25。
+    """
+    from core.score_calibration import _percentile_scores
+    result = _percentile_scores([10, 10, 20])
+    # 两个并列的10应有相同百分位
+    assert result[0] == result[1], f"并列分数百分位应相同，实际 {result}"
+    # 20应最高
+    assert result[2] > result[0]
+
+
 def test_weights_sum_to_one():
     """五项权重之和必须为 1.0（保证 calibrated 仍在 0-100 区间）。"""
     from core.score_calibration import (
