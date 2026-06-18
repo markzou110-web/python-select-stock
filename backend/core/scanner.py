@@ -74,12 +74,13 @@ from core.data_source_quality import get_suspected_adjustment_gap_codes
 EXECUTABLE_PA_ACTIONS = {"READY"}
 BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
 MIN_RAW_EXECUTION_SCORE = 60.0
-MAX_EXECUTION_RISK_PCT = 8.0
+MAX_EXECUTION_RISK_PCT = 16.0
 # 强信号分级加权：原始策略分(raw_score)≥此值时，视为信号强度极高，
 # 在 SOP 分级中等效为额外1个check+1个bonus，使强信号更容易达到A/B级
 # （避免历史胜率数据不足的新票/冷门票被拖累到C/D）。
 STRONG_SIGNAL_RAW_THRESHOLD = 95.0
-HARD_EXECUTION_RISK_PCT = 12.0
+HARD_EXECUTION_RISK_PCT = 20.0
+MIN_EXECUTION_SECTOR_ALIGNMENT = 70.0
 HIGH_TURNOVER_MKT_CAP_YI = 150.0
 HIGH_TURNOVER_MIN_PCT = 1.5
 LOW_TURNOVER_MKT_CAP_YI = 300.0
@@ -198,7 +199,7 @@ def _right_side_quality_confirmed(res: Dict[str, Any]) -> bool:
         or res.get('pa_h2_quality') == '强'
         or res.get('pa_breakout_quality') == '强突破'
     )
-    sector_ok = _as_float(res.get('sector_alignment_score'), 50) >= 70
+    sector_ok = _as_float(res.get('sector_alignment_score'), 50) >= MIN_EXECUTION_SECTOR_ALIGNMENT
     price_confirmed = not entry_price or not current_price or current_price >= entry_price * 0.995
     risk_ok = risk_pct <= 0 or risk_pct <= MAX_EXECUTION_RISK_PCT
     return (
@@ -267,6 +268,7 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
     turnover = _as_float(res.get('换手率') or res.get('turnover'))
     mkt_cap_yi = _as_float(res.get('mkt_cap_yi'))
+    sector_alignment = _as_float(res.get('sector_alignment_score'))
     right_side_quality = _right_side_quality_confirmed(res)
 
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
@@ -285,6 +287,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("板块下跌")
     if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
         blockers.append("板块扩散转弱")
+    if 0 < sector_alignment < MIN_EXECUTION_SECTOR_ALIGNMENT:
+        blockers.append(f"板块联动<{MIN_EXECUTION_SECTOR_ALIGNMENT:.0f}，降级观察")
     if raw_score and raw_score < MIN_RAW_EXECUTION_SCORE:
         blockers.append(f"原始策略分<{MIN_RAW_EXECUTION_SCORE:.0f}，只观察")
     if risk_pct > HARD_EXECUTION_RISK_PCT:
@@ -453,8 +457,10 @@ def _inject_breakdown_retracement(results, hist_map):
                 continue
             closes = tail['收盘'].astype(float).tolist()
             # 找检测窗口内的大跌日（单日跌幅 <= drop_pct）
+            # 修复 BUG-D：排除最后一条（突破日本身），只找"突破前的大跌"。
+            # 否则突破日自身的大跌会被误判为"破位反抽"（假阳性+50）。
             drop_idx = None
-            for i in range(1, len(closes)):
+            for i in range(1, len(closes) - 1):
                 if closes[i - 1] > 0:
                     day_pct = (closes[i] / closes[i - 1] - 1) * 100
                     if day_pct <= drop_pct:

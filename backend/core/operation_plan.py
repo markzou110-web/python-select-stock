@@ -80,15 +80,16 @@ def build_position_decision_snapshot(
         confidence = 0.9
     elif (
         not already_reduced
-        and max_pl_pct >= FIRST_PROFIT_TAKE_PCT
-        and current > entry
+        and current >= entry * (1 + FIRST_PROFIT_TAKE_PCT / 100)
     ):
-        # 分批止盈：盈利达到 FIRST_PROFIT_TAKE_PCT（+8%）且尚未减仓时，先减仓 50%
-        # 锁定利润，剩余仓位继续用高档移动止损跟踪。already_reduced 防重复触发。
+        # 分批止盈：当前价达到 FIRST_PROFIT_TAKE_PCT（+8%）且尚未减仓时，先减仓 50%
+        # 锁定利润。修复 BUG-C：原用 max_pl_pct(高点) 判断，但价格可能已从+9%回落到+0.5%，
+        # 此时减仓无意义（几乎没有利润可锁）。改为基于当前价，确保真正在盈利区间减仓。
         action = "REDUCE"
         threshold = entry * (1 + FIRST_PROFIT_TAKE_PCT / 100)
+        current_pl_pct = (current - entry) / entry * 100 if entry > 0 else 0
         trigger = (
-            f"分批止盈：最大浮盈 {max_pl_pct:.1f}% 达到首笔止盈线 "
+            f"分批止盈：当前浮盈 {current_pl_pct:.1f}% 达到首笔止盈线 "
             f"{FIRST_PROFIT_TAKE_PCT:.0f}%，减仓锁定部分利润"
         )
         confidence = 0.8

@@ -752,25 +752,34 @@ def get_index_hist(code: str) -> pd.DataFrame:
     except Exception as e:
         logger.warning(f"Failed to fetch index hist via Sina HTTP, trying fallback: {e}")
 
-    # 2. 第二级：极速无网络本地数据库兜底 (读取 000001 平安银行的历史K线，100% 畅通且数据最新)
+    # 2. 第二级：极速无网络本地数据库兜底
+    # 修复 BUG-F: 原来用 000001(平安银行) 个股作为指数 fallback，但个股不是指数，
+    # 会导致 benchmark_return/alpha 完全失真。改为只尝试从 daily_k 取真正的指数数据，
+    # 取不到就返回 None（让 alpha 诚实显示为 "-"，而非用错误数据误导）。
     try:
         from core.db import get_db_engine
         from sqlalchemy import text
         engine = get_db_engine()
         if engine:
-            query = text("""
-                SELECT date as "日期", close as "收盘", open as "开盘", 
-                       high as "最高", low as "最低", vol as "成交量"
-                FROM daily_k
-                WHERE code = '000001'
-                ORDER BY date DESC LIMIT 100
-            """)
-            with engine.connect() as conn:
-                df_local = pd.read_sql(query, conn)
-                df_local = df_local.sort_values("日期").reset_index(drop=True)
-                if not df_local.empty:
-                    logger.info(f"Loaded 000001 from local database as fallback bench_df (rows: {len(df_local)})")
-                    return df_local
+            # 只取真正的指数代码（上证指数 sh000001、沪深300 000300），
+            # 不再用个股 000001 冒充指数
+            index_code = code if code in ("000001", "000300", "399006") else None
+            if index_code:
+                query = text("""
+                    SELECT date as "日期", close as "收盘", open as "开盘",
+                           high as "最高", low as "最低", vol as "成交量"
+                    FROM daily_k
+                    WHERE code = :code
+                    ORDER BY date DESC LIMIT 500
+                """)
+                with engine.connect() as conn:
+                    df_local = pd.read_sql(query, conn, params={"code": index_code})
+                    df_local = df_local.sort_values("日期").reset_index(drop=True)
+                    if not df_local.empty:
+                        logger.info(f"Loaded index {index_code} from local database as fallback (rows: {len(df_local)})")
+                        return df_local
+            logger.warning(f"Index {code} not in known index codes or no local data, returning None (no stock-substitute fallback)")
+            return None
     except Exception as e:
         logger.warning(f"Fallback loading 000001 from local database failed: {e}")
 

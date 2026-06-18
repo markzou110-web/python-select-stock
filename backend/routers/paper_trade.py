@@ -1064,12 +1064,15 @@ def list_paper_trades(refresh: bool = False) -> Dict[str, Any]:
                 logger.warning(f"Batch paper trading update failed: {e}")
 
         # --- 汇总统计 ---
-        wins = sum(1 for t in trades if t['pl_pct'] > 0)
-        losses = sum(1 for t in trades if t['pl_pct'] < 0)
-        flat = sum(1 for t in trades if t['pl_pct'] == 0)
-        total = len(trades)
-        avg_pl = sum(t['pl_pct'] for t in trades) / total if total > 0 else 0
-        avg_hold = sum(t['hold_days'] for t in trades) / total if total > 0 else 0
+        # 修复 BUG-B: 统计指标(胜率/盈亏比/回撤)只用 CLOSED（已实现），
+        # 不混入 OPEN（浮亏/浮盈会随盘中波动导致胜率不稳定）。
+        closed_for_stats = [t for t in trades if t.get('status') == 'CLOSED']
+        wins = sum(1 for t in closed_for_stats if t['pl_pct'] > 0)
+        losses = sum(1 for t in closed_for_stats if t['pl_pct'] < 0)
+        flat = sum(1 for t in closed_for_stats if t['pl_pct'] == 0)
+        total = len(closed_for_stats)
+        avg_pl = sum(t['pl_pct'] for t in closed_for_stats) / total if total > 0 else 0
+        avg_hold = sum(t['hold_days'] for t in closed_for_stats) / total if total > 0 else 0
 
         # 按板块汇总胜率
         sector_stats = {}
@@ -1094,10 +1097,10 @@ def list_paper_trades(refresh: bool = False) -> Dict[str, Any]:
         # 改动 #13：最大回撤改为复利权益曲线口径（修复旧实现用 pl_pct 累加和的数学错误）。
         # 保留本接口的"正值百分比"输出契约。复用 analytics 规范 helper。
         from core.analytics import compute_equity_curve_drawdown, compute_profit_factor
-        sorted_for_dd = sorted(trades, key=lambda x: x['entry_date'])
+        sorted_for_dd = sorted(closed_for_stats, key=lambda x: x['entry_date'])
         max_drawdown, _curve = compute_equity_curve_drawdown([t['pl_pct'] for t in sorted_for_dd])
         # 盈亏比：改调规范 helper（毛额口径，cap 9.9 保留本接口契约）
-        profit_factor = compute_profit_factor([t['pl_pct'] for t in trades], cap=9.9)
+        profit_factor = compute_profit_factor([t['pl_pct'] for t in closed_for_stats], cap=9.9)
 
         stats = {
             "total_trades": total,
@@ -1264,7 +1267,11 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
             conn.commit()
 
         # 发送 Bark 实时推送 — 根据交易模式区分
-        pl_pct = (float(close_price) - entry_price) / entry_price * 100
+        # 修复 BUG-E: entry_price<=0 时跳过（避免 ZeroDivisionError，与 run_wind_control 的 BUG2 修复一致）
+        if entry_price <= 0:
+            pl_pct = 0.0
+        else:
+            pl_pct = (float(close_price) - entry_price) / entry_price * 100
         if pl_pct < 0:
             save_failure_sample({
                 "code": code,

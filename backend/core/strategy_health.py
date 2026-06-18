@@ -41,21 +41,39 @@ def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
     try:
         # 在 Python 端算截止日，避免 PG/SQLite 的 interval 语法差异（跨库兼容）。
         cutoff = (date.today() - timedelta(days=int(days))).isoformat()
-        # 按方言选择"未来5日收盘聚合"函数：PG 用 string_agg，SQLite 用 GROUP_CONCAT。
+        # 按方言选择"未来5日收盘聚合"：SQLite 用 GROUP_CONCAT（直接在标量子查询中工作），
+        # PG 用嵌套子查询 + string_agg（PG 不允许聚合与 ORDER BY/LIMIT 同级）。
         # 止损/止盈模型在 Python 端计算（_apply_stop_take_model），SQL 只取原始收盘序列。
         dialect = getattr(engine, "dialect", None)
         is_sqlite = bool(dialect) and dialect.name == "sqlite"
-        agg_fn = "GROUP_CONCAT(d.close, ',')" if is_sqlite else "string_agg(d.close::text, ',' ORDER BY d.date)"
-        df = pd.read_sql(text(f"""
-            SELECT s.strategy_type, s.code, s.date, s.price,
-                   (SELECT {agg_fn}
+        if is_sqlite:
+            future_subquery = """(SELECT GROUP_CONCAT(d.close, ',')
                     FROM daily_k d
                     WHERE d.code = s.code AND d.date > s.date
-                    ORDER BY d.date ASC LIMIT 5) AS future_csv
+                    ORDER BY d.date ASC LIMIT 5) AS future_csv"""
+        else:
+            # PG: 先取5行（有序），再 string_agg
+            future_subquery = """(SELECT string_agg(sub.close::text, ',')
+                    FROM (
+                        SELECT d2.close
+                        FROM daily_k d2
+                        WHERE d2.code = s.code AND d2.date > s.date
+                        ORDER BY d2.date ASC LIMIT 5
+                    ) sub) AS future_csv"""
+        # 修复 BUG-A: PG 的 JSONB 列不支持 LIKE 操作符。
+        # PG 用 JSONB 路径操作符 ->>；SQLite（JSON 存为 TEXT）用 LIKE。
+        eligible_filter = (
+            'AND s.price_action_detail LIKE \'%"research_eligible": true%\''
+            if is_sqlite
+            else "AND COALESCE((s.price_action_detail->>'research_eligible')::boolean, false) = true"
+        )
+        df = pd.read_sql(text(f"""
+            SELECT s.strategy_type, s.code, s.date, s.price,
+                   {future_subquery}
             FROM scan_history s
             WHERE s.date >= :cutoff
               AND s.price > 0
-              AND s.price_action_detail LIKE '%"research_eligible": true%'
+              {eligible_filter}
         """), engine, params={"cutoff": cutoff})
     except Exception as exc:
         return {"status": "error", "strategies": {}, "error": str(exc)}
