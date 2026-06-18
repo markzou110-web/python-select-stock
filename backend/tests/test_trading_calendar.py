@@ -1,6 +1,8 @@
 from datetime import datetime
 
 from core.trading_calendar import (
+    _trade_dates_cache,
+    _cache_updated_at,
     is_a_share_after_close_sync_window,
     is_a_share_intraday_session,
     is_a_share_trading_day,
@@ -29,3 +31,36 @@ def test_lunch_and_after_close_guards():
 
     assert not is_a_share_intraday_session(monday_lunch)
     assert is_a_share_after_close_sync_window(monday_after_close)
+
+
+# ── BUG3 修复：节假日识别 ──
+
+def _inject_mock_calendar(dates_set):
+    """注入 mock 交易日历（避免测试依赖网络）。"""
+    import core.trading_calendar as tc
+    tc._trade_dates_cache = dates_set
+    tc._cache_updated_at = datetime.now()
+
+
+def test_holiday_weekday_is_not_trading_day(monkeypatch):
+    """工作日节假日（如春节/国庆）应识别为休市。"""
+    # mock 交易日历：包含正常工作日，不包含节假日
+    _inject_mock_calendar({
+        "2026-02-17", "2026-02-18",  # 春节后交易日
+        "2026-10-08",                # 国庆后交易日
+    })
+    spring_festival = datetime(2026, 2, 16)  # 周一，春节休市
+    national_day = datetime(2026, 10, 1)     # 周四，国庆休市
+    assert not is_a_share_trading_day(spring_festival), "春节应休市"
+    assert not is_a_share_trading_day(national_day), "国庆应休市"
+    # 正常工作日仍为交易日
+    assert is_a_share_trading_day(datetime(2026, 2, 17))
+
+
+def test_no_calendar_falls_back_to_weekday(monkeypatch):
+    """交易日历不可用时（获取失败）回退到 weekday 判断（保证可用性）。"""
+    _inject_mock_calendar(set())  # 空集合（模拟获取失败）
+    # 工作日 → True（回退到 weekday）
+    assert is_a_share_trading_day(datetime(2026, 3, 16))  # 周一
+    # 周末 → False
+    assert not is_a_share_trading_day(datetime(2026, 3, 21))  # 周六
