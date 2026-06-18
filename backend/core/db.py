@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import re
 import uuid
 import pandas as pd
@@ -40,11 +41,24 @@ def _json_safe(value: Any) -> Any:
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_json_safe(v) for v in value]
-    if pd.isna(value) if not isinstance(value, (dict, list, tuple, set)) else False:
-        return None
+    # 修复 R3-1: NaN 和 inf/-inf 都会导致 json.dumps 生成无效 JSON（Infinity token），
+    # 进而导致 PG CAST AS JSONB 失败，整批 save_scan_results 丢失。
+    # stock.py:37 的 _json_safe_response 已有此守卫，此处补齐。
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+    try:
+        if pd.isna(value) if not isinstance(value, (dict, list, tuple, set)) else False:
+            return None
+    except (TypeError, ValueError):
+        pass
     if hasattr(value, "item"):
         try:
-            return value.item()
+            scalar = value.item()
+            # numpy 标量也可能转出 inf/nan
+            if isinstance(scalar, float) and (math.isnan(scalar) or math.isinf(scalar)):
+                return None
+            return scalar
         except Exception:
             pass
     if isinstance(value, (datetime,)):
@@ -505,6 +519,17 @@ def init_db(engine=None):
                 logger.info("Migration: limit-up leadership events ensured.")
             except Exception as e:
                 logger.debug(f"limit-up event migration skipped: {e}")
+
+            # 修复 R3-2: paper_trading 的 ON CONFLICT (code, entry_date) 需要唯一约束。
+            # 原来只在测试中建了这个索引，生产 PG 上缺约束→运行时报错。
+            try:
+                conn.execute(text("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_code_date
+                    ON paper_trading (code, entry_date)
+                """))
+                logger.info("Migration: paper_trading unique index (code, entry_date) ensured.")
+            except Exception as e:
+                logger.debug(f"paper_trading unique index migration skipped: {e}")
 
             conn.commit()
     except Exception as e:

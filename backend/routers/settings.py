@@ -3,7 +3,8 @@ Settings router - system configuration and test endpoints.
 
 Extracted from api.py.
 """
-from fastapi import APIRouter
+import re
+from fastapi import APIRouter, HTTPException
 from typing import Dict, Any
 
 from core.config import config
@@ -11,6 +12,21 @@ from core.db import save_setting, get_setting
 from core.sync_scheduler import SYNC_SCHEDULE_DEFAULT
 
 router = APIRouter(prefix="/api", tags=["settings"])
+
+# 修复 R3-6: schedule_times 格式校验。防止垃圾值（如 "25:99"/""/"noon"）
+# 静默禁用 sentinel/sync 扫描调度。
+_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _validate_schedule_times(raw: str) -> str:
+    """校验逗号分隔的 HH:MM 时间字符串。无效则返回默认值并记录。"""
+    if not raw or not raw.strip():
+        return ""
+    times = [t.strip() for t in str(raw).split(",") if t.strip()]
+    valid = [t for t in times if _TIME_PATTERN.match(t)]
+    if not valid:
+        raise HTTPException(status_code=400, detail="schedule_times 格式无效，需为 HH:MM 逗号分隔（如 14:20,14:50）")
+    return ",".join(valid)
 
 
 @router.get("/settings")
@@ -29,17 +45,19 @@ def save_settings_api(data: dict):
     if "bark_key" in data:
         save_setting("bark_key", data["bark_key"])
     if "sentinel_schedule_times" in data:
-        # 保存设置
-        save_setting("sentinel_schedule_times", data["sentinel_schedule_times"])
-        
+        # 修复 R3-6: 校验格式，防止垃圾值静默禁用扫描
+        validated = _validate_schedule_times(data["sentinel_schedule_times"])
+        save_setting("sentinel_schedule_times", validated)
+
         # 实时通知后台哨兵更新调度时间
         try:
             from api import sentinel
-            sentinel.update_schedule(data["sentinel_schedule_times"])
+            sentinel.update_schedule(validated)
         except Exception:
             pass
     if "market_sync_schedule_times" in data:
-        save_setting("market_sync_schedule_times", data["market_sync_schedule_times"])
+        validated_sync = _validate_schedule_times(data["market_sync_schedule_times"])
+        save_setting("market_sync_schedule_times", validated_sync)
         try:
             from core.sync_scheduler import market_sync_scheduler
             market_sync_scheduler.update_schedule(data["market_sync_schedule_times"])

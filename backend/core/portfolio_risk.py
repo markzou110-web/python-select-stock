@@ -59,8 +59,28 @@ def evaluate_daily_loss_circuit_breaker(
     # 单笔实现盈亏金额（近似）= (close - entry) * shares
     df["pnl"] = (df["close_price"].astype(float) - df["entry_price"].astype(float)) * df["shares"]
     realized_pnl = float(df["pnl"].sum())
-    # 资金分母：当日所有平仓笔的初始投入 entry*shares 之和（近似总资金口径）
-    capital_base = float((df["entry_price"].astype(float) * df["shares"]).sum())
+
+    # 修复 R3-3: 资金分母应为"总账户资金"（所有持仓的初始投入），
+    # 而非仅当日平仓笔的投入。否则单笔小仓位 -5% 就触发熔断（误杀），
+    # 或多笔小亏损永远不触发（漏杀）。
+    try:
+        capital_df = pd.read_sql(
+            text("""
+                SELECT entry_price, shares
+                FROM paper_trading
+                WHERE entry_price > 0 AND COALESCE(shares, 0) > 0
+            """),
+            engine,
+        )
+        if not capital_df.empty:
+            capital_df["shares"] = pd.to_numeric(capital_df["shares"], errors="coerce").fillna(0).astype(float)
+            capital_base = float((capital_df["entry_price"].astype(float) * capital_df["shares"]).sum())
+        else:
+            # fallback: 用当日平仓投入
+            capital_base = float((df["entry_price"].astype(float) * df["shares"]).sum())
+    except Exception:
+        capital_base = float((df["entry_price"].astype(float) * df["shares"]).sum())
+
     daily_loss_pct = (realized_pnl / capital_base * 100.0) if capital_base > 0 else 0.0
 
     if daily_loss_pct < -abs(loss_limit):
