@@ -67,9 +67,19 @@ def build_market_decision_context(
 ) -> Dict[str, Any]:
     """Classify the multi-day emotion cycle and provide execution permissions."""
     regime = str(market_regime.get("status") or "UNKNOWN").upper()
+    # 当 snapshot 为空（盘前/无实时数据）时，回退到 cycle_history 最后一天作为"当前"宽度，
+    # 避免 advance_ratio=0 导致 trend=0-prior3 大幅负值 → 误判 RETREAT。
+    _cycle = list(cycle_history or [])
+    _fallback = _cycle[-1] if _cycle else {}
+    current_cycle_date = None
     if snapshot is None or snapshot.empty or "pct_chg" not in snapshot.columns:
         score = {"OFFENSIVE": 72, "DEFENSIVE": 42, "CRITICAL": 18}.get(regime, 45)
-        advance_ratio = strong_ratio = weak_ratio = limit_up_ratio = limit_down_ratio = 0.0
+        advance_ratio = float(_fallback.get("advance_ratio", 0.0))
+        strong_ratio = float(_fallback.get("strong_ratio", 0.0))
+        weak_ratio = float(_fallback.get("weak_ratio", 0.0))
+        limit_up_ratio = 0.0
+        limit_down_ratio = 0.0
+        current_cycle_date = _fallback.get("date")
     else:
         pct = pd.to_numeric(snapshot["pct_chg"], errors="coerce").dropna()
         total = max(1, len(pct))
@@ -80,8 +90,9 @@ def build_market_decision_context(
         limit_down_ratio = float((pct <= -9.8).sum() / total * 100)
         current_quality = _clamp(advance_ratio + (strong_ratio - weak_ratio) * 2.5)
         history = list(cycle_history or [])
-        # 修复：始终剔除最后一条（最新数据日=当日），避免 T+1 执行时 T 日误入 prior3
-        previous = history[:-1] if history else history
+        # snapshot 与 cycle_history 可能同日（盘后扫描时 daily_k 已更新到当日），
+        # 此时"当日宽度"已从 snapshot 取，cycle 最后一条需剔除避免重复。
+        previous = history[:-1] if history and history[-1].get("date") == str(pd.Timestamp.now().date()) else history
         previous = previous[-5:]
         prior3 = previous[-3:]
         prior5_avg = sum(_num(item.get("advance_ratio"), 50) for item in previous) / len(previous) if previous else 50
@@ -91,8 +102,8 @@ def build_market_decision_context(
         score = round(_clamp(current_quality * 0.3 + prior3_avg * 0.35 + prior5_avg * 0.2 + regime_score * 0.15), 1)
 
     previous = list(cycle_history or [])
-    # 修复：同上，始终剔除最后一条
-    previous = previous[:-1] if previous else previous
+    current_date = current_cycle_date or str(pd.Timestamp.now().date())
+    previous = previous[:-1] if previous and previous[-1].get("date") == current_date else previous
     previous = previous[-5:]
     prior3 = previous[-3:]
     prior3_avg = sum(_num(item.get("advance_ratio"), 50) for item in prior3) / len(prior3) if prior3 else 50

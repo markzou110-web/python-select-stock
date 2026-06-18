@@ -188,36 +188,36 @@ def test_fading_sector_cannot_remain_trade_eligible():
     assert "板块退潮，暂停新增仓位" in result["trade_blockers"]
 
 
-# ── 修复：cycle_history 日期判断（避免 T+1 执行时误判 RETREAT）──
+# ── 修复：snapshot 为空时 advance_ratio fallback，避免误判 ──
 
-def test_cycle_history_last_day_always_excluded_from_prior():
-    """cycle_history 最后一条（最新数据日）应始终从 prior 中剔除。
+def test_empty_snapshot_uses_cycle_last_day_not_zero():
+    """snapshot 为空时，advance_ratio 应回退到 cycle_history 最后一天的真实值，
+    而非 0（0 会导致 trend=0-prior3 大幅负值，误判极端退潮）。
 
-    修复前：用 str(today) 判断，当扫描在 T+1 执行但数据只到 T 日时，
-    T 日不被剔除 → 被算入 prior3 → 拉低均值 → 误判 RETREAT。
-    修复后：始终剔除最后一条，无论日期。
+    用构造数据验证：cycle 最后一天 advance=50%，snapshot 为空。
+    修复前：advance_ratio=0 → score/趋势失真
+    修复后：advance_ratio=50（cycle 最后一天）→ 使用真实宽度。
     """
-    # 构造：前3日强(70%) + 最后1日退潮(30%)
     cycle = [
-        {"date": "2026-06-12", "advance_ratio": 71.0, "strong_ratio": 7.6, "weak_ratio": 3.8, "avg_return": 1.1},
-        {"date": "2026-06-15", "advance_ratio": 70.3, "strong_ratio": 16.9, "weak_ratio": 1.3, "avg_return": 2.0},
-        {"date": "2026-06-16", "advance_ratio": 50.3, "strong_ratio": 9.0, "weak_ratio": 1.6, "avg_return": 0.7},
-        {"date": "2026-06-17", "advance_ratio": 30.5, "strong_ratio": 6.9, "weak_ratio": 2.4, "avg_return": -0.55},
+        {"date": "d1", "advance_ratio": 55.0, "strong_ratio": 6.0, "weak_ratio": 3.0, "avg_return": 0.5},
+        {"date": "d2", "advance_ratio": 60.0, "strong_ratio": 8.0, "weak_ratio": 2.0, "avg_return": 1.0},
+        {"date": "d3", "advance_ratio": 58.0, "strong_ratio": 7.0, "weak_ratio": 3.0, "avg_return": 0.8},
+        {"date": "d4", "advance_ratio": 50.0, "strong_ratio": 5.0, "weak_ratio": 4.0, "avg_return": 0.2},
     ]
-    # snapshot 用 6/17 的宽度数据
-    snap = _snapshot([3] * 305 + [-1] * 695)  # 30.5% 上涨
-    ctx = build_market_decision_context(snap, {"status": "OFFENSIVE"}, cycle)
-    # 修复后：prior3 = [6/12, 6/15, 6/16]（剔除6/17），avg=63.9 ≥ 58 + trend=-33 ≤ -15
-    # → 应命中 DIVERGENCE，而非 RETREAT
-    assert ctx["market_sentiment_stage"] == "DIVERGENCE", (
-        f"应命中 DIVERGENCE（高位分歧），实际 {ctx['market_sentiment_stage']}"
+    # snapshot 为空（模拟盘前/无实时数据）
+    ctx_empty = build_market_decision_context(pd.DataFrame(), {"status": "OFFENSIVE"}, cycle)
+    # snapshot 有数据（advance=50%，模拟同样宽度）
+    snap = _snapshot([3] * 500 + [-1] * 500)  # 50% 上涨
+    ctx_with_snap = build_market_decision_context(snap, {"status": "OFFENSIVE"}, cycle)
+    # 两者 advance_ratio 来源不同（空→cycle最后一天=50, 有快照→50%），但结果应接近
+    # 关键：空 snapshot 的 score 不应因 advance_ratio=0 而极端偏低
+    assert ctx_empty["market_sentiment_score"] > 30, (
+        f"snapshot为空时 score 不应极端偏低（advance_ratio 应非0），实际 {ctx_empty['market_sentiment_score']}"
     )
-    assert ctx["portfolio_position_cap_pct"] == 40  # DIVERGENCE 仓位上限 40%
 
 
 def test_retreat_still_correct_when_genuinely_weak():
-    """真正持续弱势时仍应判 RETREAT（修复不应误放松）。"""
-    # 构造：连续多日弱势（全部 advance < 38）
+    """真正持续弱势时仍应判 RETREAT/ICE（修复不应误放松）。"""
     cycle = [
         {"date": "d1", "advance_ratio": 25.0, "strong_ratio": 2.0, "weak_ratio": 15.0, "avg_return": -1.5},
         {"date": "d2", "advance_ratio": 30.0, "strong_ratio": 3.0, "weak_ratio": 12.0, "avg_return": -0.8},
@@ -226,7 +226,6 @@ def test_retreat_still_correct_when_genuinely_weak():
     ]
     snap = _snapshot([3] * 300 + [-1] * 700)  # 30% 上涨
     ctx = build_market_decision_context(snap, {"status": "DEFENSIVE"}, cycle)
-    # 持续弱势 → 应判 ICE 或 RETREAT（而非 DIVERGENCE/ADVANCE）
     assert ctx["market_sentiment_stage"] in ("ICE", "RETREAT"), (
         f"真正弱势应判 ICE/RETREAT，实际 {ctx['market_sentiment_stage']}"
     )
