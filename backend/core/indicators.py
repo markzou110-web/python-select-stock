@@ -381,5 +381,27 @@ def batch_calculate_indicators(df, snapshot_df=None, periods=[5, 10, 20, 60], be
         # RS MA50 也需要分组
         df['RS_MA50'] = df.groupby('code', sort=False)['RS'].rolling(window=50).mean().reset_index(level=0, drop=True)
         df.drop(columns=['收盘_bench'], inplace=True)
-        
+
+    # 改动(指标一致性): 补齐 batch 缺失的 RSI_WILDER 和 ATR，使扫描路径与详情页一致。
+    # RSI_WILDER 被 check_tv_dual_strategy 使用（rsi_min=55 阈值），
+    # 缺失时 fallback 到 SMA RSI（差 ~4 点，会导致信号误过滤）。
+    # ATR 被风控引擎(#8)和回测使用，缺失时 ATR 自适应止损不生效。
+
+    # RSI_WILDER (Wilder's RSI, 指数平滑 alpha=1/14)
+    delta_w = df.groupby('code')['收盘'].diff()
+    gain_w = delta_w.clip(lower=0)
+    loss_w = (-delta_w.clip(upper=0))
+    avg_gain_w = gain_w.groupby(df['code']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
+    avg_loss_w = loss_w.groupby(df['code']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
+    rs_w = avg_gain_w / avg_loss_w.replace(0, np.nan)
+    df['RSI_WILDER'] = (100 - (100 / (1 + rs_w))).fillna(50)
+
+    # ATR (Average True Range, 14期 SMA of True Range)
+    prev_close = df.groupby('code')['收盘'].shift(1)
+    tr1 = df['最高'] - df['最低']
+    tr2 = (df['最高'] - prev_close).abs()
+    tr3 = (df['最低'] - prev_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['ATR'] = true_range.groupby(df['code']).transform(lambda x: x.rolling(window=14, min_periods=1).mean())
+
     return df
