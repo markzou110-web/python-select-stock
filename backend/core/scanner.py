@@ -565,16 +565,24 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
 
         # ── 加权连续评分（替代原计数法）──
+        # 胜率改进：优先用 adjusted_win_rate（Wilson 下界），fallback 原始胜率
+        _bt_stats = res.get('回测统计', {}) or {}
+        _adj_wr = _bt_stats.get('adjusted_win_rate')
         win_rate_str = res.get('历史胜率', '0%')
         try:
-            _win_rate = float(str(win_rate_str).replace('%', ''))
+            _win_rate_raw = float(str(win_rate_str).replace('%', ''))
         except (ValueError, TypeError):
-            _win_rate = 0
-        pf_raw = res.get('回测统计', {}).get('profit_factor', 0)
+            _win_rate_raw = 0
+        # 使用折扣后胜率（如有），否则用原始胜率
+        _win_rate = float(_adj_wr) if _adj_wr is not None else _win_rate_raw
+
+        pf_raw = _bt_stats.get('profit_factor', 0)
         try:
             _pf = float(pf_raw)
         except (ValueError, TypeError):
             _pf = 0
+        # 期望收益惩罚：expectancy < 0 说明策略长期亏钱，不论胜率多高都应扣分
+        _expectancy = float(_bt_stats.get('expectancy', 0) or 0)
         _raw = float(res.get('raw_score') or res.get('Score') or 0)
         _roe = float(res.get('ROE') or 0)
         _yoy = float(res.get('净利YOY') or 0)
@@ -594,6 +602,10 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             _d_win * 0.25 + _d_pf * 0.20 + _d_sig * 0.15 + _d_fund * 0.15
             + _d_regime * 0.10 + _d_brooks * 0.10 + _d_sector * 0.05, 1
         )
+        # 期望收益惩罚：expectancy < 0 说明策略长期亏钱，扣10分（不论胜率多高）
+        if _expectancy < 0:
+            quality_score -= 10
+            risks.append(f"期望收益为负({_expectancy:+.1f}%)，策略长期可能亏钱")
 
         # 展示信息（前端用，不再作为分级依据）
         if _win_rate >= 50:
@@ -1566,6 +1578,11 @@ def perform_market_scan(
                     "profit_factor": bt['profit_factor'],
                     "avg_hold_days": bt['avg_hold_days'],
                     "stop_loss_hits": bt['stop_loss_hits'],
+                    "adjusted_win_rate": bt.get('adjusted_win_rate', bt['win_rate']),
+                    "adjusted_win_rate_method": bt.get('adjusted_win_rate_method', 'wilson_lower_99'),
+                    "confidence": bt.get('confidence', 1.0),
+                    "expectancy": bt.get('expectancy', 0),
+                    "sample_warning": bt.get('sample_warning', ''),
                     "backtest_engine_version": BACKTEST_ENGINE_VERSION,
                     "exit_rule_version": EXIT_RULE_VERSION,
                 }

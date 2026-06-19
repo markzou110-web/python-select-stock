@@ -14,6 +14,49 @@ BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
 EXIT_RULE_VERSION = "fixed-stop-atr-trailing-time-stop"
 
 
+def _empty_backtest_result() -> Dict[str, Any]:
+    return {
+        "win_rate": 0,
+        "adjusted_win_rate": 0,
+        "adjusted_win_rate_method": "wilson_lower_99",
+        "confidence": 0,
+        "expectancy": 0,
+        "sample_warning": "无历史信号",
+        "signal_count": 0,
+        "avg_hold_days": 0,
+        "avg_return": 0,
+        "max_drawdown": 0,
+        "profit_factor": 0,
+        "stop_loss_hits": 0,
+        "vol_skipped": 0,
+        "time_stopped": 0,
+    }
+
+
+def _sample_confidence(signal_count: int) -> float:
+    if signal_count >= 20:
+        return 1.0
+    if signal_count >= 10:
+        return 0.7
+    if signal_count >= 5:
+        return 0.4
+    if signal_count >= 1:
+        return 0.15
+    return 0.0
+
+
+def _wilson_lower_win_rate(wins: int, total: int, z: float = 2.58) -> float:
+    """Conservative Wilson lower bound for win probability, returned as percent."""
+    if total <= 0:
+        return 0.0
+    p_hat = wins / total
+    z2 = z * z
+    denominator = 1 + z2 / total
+    centre = p_hat + z2 / (2 * total)
+    margin = z * np.sqrt((p_hat * (1 - p_hat) + z2 / (4 * total)) / total)
+    return round(max(0.0, (centre - margin) / denominator) * 100, 1)
+
+
 def get_signal_details(
     df: pd.DataFrame,
     strategy_type: str = "squeeze",
@@ -685,11 +728,7 @@ def _simulate_backtest(
         回测统计字典
     """
     if len(signal_indices) == 0:
-        return {
-            "win_rate": 0, "signal_count": 0, "avg_hold_days": 0,
-            "avg_return": 0, "max_drawdown": 0, "profit_factor": 0,
-            "stop_loss_hits": 0, "vol_skipped": 0, "time_stopped": 0
-        }
+        return _empty_backtest_result()
     
     # --- A 股真实费率常量 ---
     STAMP_TAX_RATE = 0.0005    # 印花税 0.05% (仅卖出, 2023年减半)
@@ -823,14 +862,46 @@ def _simulate_backtest(
     avg_return = round(sum(returns) / total_trades, 2) if total_trades > 0 else 0
     avg_hold = round(sum(hold_days_list) / total_trades, 1) if total_trades > 0 else 0
     profit_factor = round(total_profit / total_loss, 2) if total_loss > 0 else (999.0 if total_profit > 0 else 0)
+
+    # ── 胜率计算改进 ──
+    # 1. 样本可信度：保留给前端解释风险，不直接作为胜率乘数
+    confidence = _sample_confidence(total_trades)
+    # 2. 有效胜率：使用 99% Wilson 下界，避免小样本高胜率误导评分
+    adjusted_win_rate = _wilson_lower_win_rate(wins, total_trades)
+
+    # 3. 期望收益（Expectancy）：每笔交易的统计期望
+    avg_win = total_profit / wins if wins > 0 else 0
+    avg_loss = total_loss / losses if losses > 0 else 0
+    win_prob = wins / total_trades if total_trades > 0 else 0
+    loss_prob = losses / total_trades if total_trades > 0 else 0
+    expectancy = round((win_prob * avg_win - loss_prob * avg_loss) * 100, 2)
+
+    # 4. 样本量警告
+    if total_trades == 0:
+        sample_warning = "无历史信号"
+    elif total_trades < 5:
+        sample_warning = f"仅{total_trades}笔交易，胜率仅供参考"
+    elif total_trades < 10:
+        sample_warning = f"样本偏少({total_trades}笔)，胜率可信度一般"
+    else:
+        sample_warning = ""
+
+    # 5. profit_factor 小样本封顶（避免1笔盈利=999误导）
+    if total_trades < 5 and profit_factor > 3.0:
+        profit_factor = 3.0
     
     return {
         "win_rate": win_rate,
+        "adjusted_win_rate": adjusted_win_rate,
+        "adjusted_win_rate_method": "wilson_lower_99",
+        "confidence": confidence,
+        "expectancy": expectancy,
+        "sample_warning": sample_warning,
         "signal_count": total_trades,
         "avg_hold_days": avg_hold,
         "avg_return": avg_return,
-        "max_drawdown": round(max_drawdown * 100, 2),  # 百分比
-        "profit_factor": min(profit_factor, 99.0),  # cap for display
+        "max_drawdown": round(max_drawdown * 100, 2),
+        "profit_factor": min(profit_factor, 99.0),
         "stop_loss_hits": stop_loss_hits,
         "vol_skipped": vol_skipped,
         "time_stopped": time_stopped
@@ -994,7 +1065,7 @@ def calculate_historical_win_rate(
     use_rs_filter=False,
 ):
     """向量化计算回测统计 (Enhanced v6.0 - 含止损/回撤/盈亏比)"""
-    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
 
@@ -1278,7 +1349,7 @@ def check_tv_dual_strategy(
 
 
 def calculate_tv_zp_win_rate(df, stop_loss_pct=-8.0):
-    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
 
@@ -1311,7 +1382,7 @@ def calculate_tv_dual_win_rate(
     require_both=False,
     signal_window=3,
 ):
-    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
 
@@ -1355,7 +1426,7 @@ def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
     """
     计算 Pine Script 策略的回测统计 (Enhanced v6.0)
     """
-    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
 
@@ -1469,7 +1540,7 @@ def calculate_consensus_win_rate(df, stop_loss_pct=-8.0):
     """
     计算 Azul 共识策略的回测统计 (Enhanced v6.0)
     """
-    empty_result = {"win_rate": 0, "signal_count": 0, "avg_hold_days": 0, "avg_return": 0, "max_drawdown": 0, "profit_factor": 0, "stop_loss_hits": 0}
+    empty_result = _empty_backtest_result()
     if df.empty or len(df) < 80:
         return empty_result
     
