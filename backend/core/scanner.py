@@ -564,99 +564,81 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         if res.get('recent_failure_count', 0) >= FAILURE_VETO_MIN_COUNT:
             vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
 
-        # ── 硬性条件 ──
+        # ── 加权连续评分（替代原计数法）──
         win_rate_str = res.get('历史胜率', '0%')
         try:
-            win_rate = float(str(win_rate_str).replace('%', ''))
+            _win_rate = float(str(win_rate_str).replace('%', ''))
         except (ValueError, TypeError):
-            win_rate = 0
-        pf = res.get('回测统计', {}).get('profit_factor', 0)
+            _win_rate = 0
+        pf_raw = res.get('回测统计', {}).get('profit_factor', 0)
         try:
-            pf = float(pf)
+            _pf = float(pf_raw)
         except (ValueError, TypeError):
-            pf = 0
+            _pf = 0
+        _raw = float(res.get('raw_score') or res.get('Score') or 0)
+        _roe = float(res.get('ROE') or 0)
+        _yoy = float(res.get('净利YOY') or 0)
+        _pa_struct = float(res.get('pa_structure_score') or res.get('price_action_score') or 50)
+        _sector_align = float(res.get('sector_alignment_score') or 50)
 
-        if win_rate >= 50:
-            checks.append("胜率≥50%")
-        if pf >= 1.5:
-            checks.append("盈亏比≥1.5")
-        # SOP改进①: "大盘安全"改为分级制。原逻辑只要非CRITICAL就+1check(95%时间恒True无区分度)。
-        # OFFENSIVE=进攻市算1check; DEFENSIVE/UNKNOWN=不算(需真实条件凑分); CRITICAL=不加。
+        # 7维加权评分（各维度映射到0-100，再按权重加权求和）
+        _d_win = max(0, min(100, _win_rate))
+        _d_pf = max(0, min(100, min(_pf, 3) / 3 * 100))
+        _d_sig = max(0, min(100, _raw / 120 * 100))
+        _d_fund = (max(0, min(100, _roe / 15 * 100)) + max(0, min(100, _yoy / 30 * 100))) / 2
+        _d_regime = {"OFFENSIVE": 100, "DEFENSIVE": 50, "UNKNOWN": 50}.get(regime_status, 0)
+        _d_brooks = max(0, min(100, _pa_struct))
+        _d_sector = max(0, min(100, _sector_align))
+
+        quality_score = round(
+            _d_win * 0.25 + _d_pf * 0.20 + _d_sig * 0.15 + _d_fund * 0.15
+            + _d_regime * 0.10 + _d_brooks * 0.10 + _d_sector * 0.05, 1
+        )
+
+        # 展示信息（前端用，不再作为分级依据）
+        if _win_rate >= 50:
+            checks.append(f"胜率{_win_rate:.0f}%")
+        if _pf >= 1.5:
+            checks.append(f"盈亏比{_pf:.1f}")
         if regime_status == "OFFENSIVE":
-            checks.append("大盘进攻(可加分)")
-        elif regime_status not in ("CRITICAL",):
-            pass  # DEFENSIVE/UNKNOWN 不自动给check，需真实条件凑分
-
-        # ── 加分项 ──
-        # SOP改进③: 板块bonus合并。原8项中板块占4项(50%)，个股基本面仅2项，
-        # 导致板块强但个股差的票容易凑到A级。改为板块最多算2项(共振+动量)，
-        # 个股基本面(ROE/业绩)保持独立。
-        _sector_bonus_count = 0
+            checks.append("大盘进攻")
         if res.get('共振') == "🔥 核心热点":
             bonuses.append("板块核心共振")
-            _sector_bonus_count += 1
-        # 板块领涨+板块动量合并为1项（取较强者）
         if (res.get('sector_momentum_score') or 0) >= 75:
-            if _sector_bonus_count < 2:
-                bonuses.append("板块强动量")
-                _sector_bonus_count += 1
+            bonuses.append("板块强动量")
         elif sector_info.get('trend') == 'LEAD':
-            if _sector_bonus_count < 2:
-                bonuses.append("板块领涨")
-                _sector_bonus_count += 1
-        elif (res.get('sector_momentum_score') or 0) >= 58:
-            if _sector_bonus_count < 2:
-                bonuses.append("板块早期")
-                _sector_bonus_count += 1
-        # 个股基本面（独立计，不受板块限制）
-        if (res.get('ROE') or 0) >= 8:
-            bonuses.append("ROE≥8%")
-        if (res.get('净利YOY') or 0) >= 15:
-            bonuses.append("业绩增长")
-        # 个股技术面
-        if (res.get('sector_alignment_score') or 0) >= 75:
+            bonuses.append("板块领涨")
+        if _roe >= 8:
+            bonuses.append(f"ROE{_roe:.0f}%")
+        if _yoy >= 15:
+            bonuses.append(f"业绩{_yoy:.0f}%")
+        if _sector_align >= 75:
             bonuses.append("个股强于板块")
-        # 大盘
-        if regime_status == "OFFENSIVE":
-            bonuses.append("大盘进攻")
 
-        # ── 综合评级 ──
-        # 强信号加权：原始策略分≥STRONG_SIGNAL_RAW_THRESHOLD时，等效+1check+1bonus，
-        # 使超强信号（即使历史胜率数据不足）也能达到A/B级，避免信号强度与分级脱节。
-        # raw_score 由 calibrate_scan_scores 存入（校准前的原始信号强度，通常 70-110）
-        _raw_for_grade = float(res.get('raw_score') or res.get('Score') or 0)
-        _strong_signal = _raw_for_grade >= STRONG_SIGNAL_RAW_THRESHOLD
-        # SOP改进②: 强信号只加bonus（不加check），避免双重加成。
-        # 原逻辑+1check+1bonus让一个因素贡献2分，矫枉过正。
-        _eff_bonuses = len(bonuses) + (1 if _strong_signal else 0)
-        _real_checks = len(checks)
-        # SOP改进⑤: D级分层。硬否决(板块下跌/地雷/破位陷阱等)=D；
-        # 软否决(上影线/市值<30亿等)降为C而非D。
-        _hard_vetoes = {"板块下跌", "地雷预警", "破位反抽陷阱", "价格行为建议回避",
+        res['sop_quality_dimensions'] = {
+            "win_rate": _d_win, "profit_factor": _d_pf, "signal_strength": _d_sig,
+            "fundamental": _d_fund, "regime": _d_regime, "brooks": _d_brooks, "sector": _d_sector,
+        }
+
+        # ── 评分映射分级 ──
+        _hard_vetoes = {"板块下跌", "地雷预警", "破位反抽陷阱", "价格行为建议回避", "价格行为回避",
                         "异常价格跳变", "低质量价格结构", "近期失败模式命中"}
         _has_hard_veto = any(any(hv in v for hv in _hard_vetoes) for v in vetoes)
+
         if _has_hard_veto:
             grade = "D"
         elif vetoes:
-            # 软否决降为C（而非一刀切D）
-            grade = "C"
+            quality_score -= 15
             risks.append(f"软否决: {', '.join(vetoes[:2])}")
-        elif _real_checks >= 3 and _eff_bonuses >= 2:
-            grade = "A"
-        elif _real_checks >= 2:
-            grade = "B"
-        elif _real_checks >= 1:
-            # SOP改进④: C级细分。有≥1真实check=C1(观察)，0 check=C2(仅参考)
-            grade = "C"
-            res['sop_subgrade'] = 'C1'
+            grade = "D" if quality_score < 30 else "C" if quality_score < 50 else "B" if quality_score < 70 else "A"
         else:
-            grade = "C"
+            grade = "A" if quality_score >= 70 else "B" if quality_score >= 50 else "C"
+        if quality_score < 30 and grade == "C":
             res['sop_subgrade'] = 'C2'
-        if _strong_signal and grade == "C" and not _has_hard_veto:
-            # 强信号保底B（信号强度是质量证据），但软否决时不再保底
-            grade = "B"
-            bonuses.append(f"强信号(raw≥{STRONG_SIGNAL_RAW_THRESHOLD:.0f})")
+        elif grade == "C":
+            res['sop_subgrade'] = 'C1'
 
+        res['sop_quality_score'] = quality_score
         res['sop_grade'] = grade
         res['sop_vetoes'] = vetoes
         res['sop_checks'] = checks
