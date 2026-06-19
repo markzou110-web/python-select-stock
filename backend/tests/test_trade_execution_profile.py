@@ -158,14 +158,15 @@ def test_low_raw_score_and_unconfirmed_entry_block_execution():
 
 
 def test_wide_structure_risk_blocks_execution():
-    results = [_base_candidate(pa_risk_pct=16.84)]
+    # pa_risk_pct=21 > HARD_EXECUTION_RISK_PCT(20) → "禁止实盘"(BLOCK)
+    results = [_base_candidate(pa_risk_pct=21.0)]
 
     _apply_sop_filter(results, {"status": "DEFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
     assert result["trade_eligible"] is False
     assert result["trade_bucket"] == "BLOCK"
-    assert "结构风险>12%，禁止实盘" in result["trade_blockers"]
+    assert "结构风险>20%，禁止实盘" in result["trade_blockers"]
 
 
 def test_large_cap_low_turnover_requires_volume_confirmation():
