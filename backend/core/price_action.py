@@ -43,37 +43,91 @@ def _local_extrema(values: pd.Series, mode: str) -> List[int]:
 
 
 def _count_pullback_legs(work: pd.DataFrame, direction: str, lookback: int = 12) -> int:
-    """
-    Count simple pullback legs before the latest signal bar.
+    """Brooks 方法论的回调腿计数（修复原 close-to-close 简单计数法）。
 
-    For a bull setup, pullback legs are consecutive down-close runs. For a bear
-    setup, they are consecutive up-close runs. The latest bar is excluded so the
-    entry bar does not become part of the pullback being evaluated.
+    原逻辑用 close-diff 方向运行 + min_swing=半根K线，过度计数（任何1根下跌=1腿）。
+    修复：用 swing-point（波段高低点）检测交替推力结构，回调需在 Fibonacci
+    38.2%-61.8% 回调带内才算一有效"腿"。这是 Brooks H2/L2 买点的核心。
+
+    对于 bull 方向：找"推力上→回调"的交替对，回调幅度在推力的 38.2%-61.8% 之间。
     """
-    if len(work) < 4:
+    if len(work) < 6:
         return 0
 
-    recent = work.tail(lookback + 1).reset_index(drop=True)
-    closes = recent["收盘"].astype(float)
-    ranges = (recent["最高"].astype(float) - recent["最低"].astype(float)).replace(0, np.nan)
-    min_swing = max(_safe_float(ranges.mean()) * 0.5, _safe_float(closes.iloc[-1]) * 0.005)
-    moves = closes.diff().iloc[1:-1]
-    if moves.empty or min_swing <= 0:
-        return 0
+    def fallback_count() -> int:
+        recent_simple = work.tail(lookback + 1).reset_index(drop=True)
+        closes = recent_simple["收盘"].astype(float)
+        ranges = (recent_simple["最高"].astype(float) - recent_simple["最低"].astype(float)).replace(0, np.nan)
+        min_swing = max(_safe_float(ranges.mean()) * 0.5, _safe_float(closes.iloc[-1]) * 0.005)
+        moves = closes.diff().iloc[1:-1]
+        if moves.empty or min_swing <= 0:
+            return 0
 
-    leg_count = 0
-    leg_move = 0.0
-    for move in moves:
-        is_pullback = move < 0 if direction == "bull" else move > 0
-        if is_pullback:
-            leg_move += abs(float(move))
-        elif leg_move > 0:
-            if leg_move >= min_swing:
-                leg_count += 1
-            leg_move = 0.0
-    if leg_move >= min_swing:
-        leg_count += 1
-    return leg_count
+        leg_count = 0
+        leg_move = 0.0
+        for move in moves:
+            is_pullback = move < 0 if direction == "bull" else move > 0
+            if is_pullback:
+                leg_move += abs(float(move))
+            elif leg_move > 0:
+                if leg_move >= min_swing:
+                    leg_count += 1
+                leg_move = 0.0
+        if leg_move >= min_swing:
+            leg_count += 1
+        return leg_count
+
+    recent = work.tail(lookback + 2).reset_index(drop=True)
+    # 排除最后一根（信号棒）
+    body = recent.iloc[:-1]
+    highs = body["最高"].astype(float)
+    lows = body["最低"].astype(float)
+
+    # 用 _local_extrema 找 swing points
+    swing_highs = _local_extrema(highs, "high")
+    swing_lows = _local_extrema(lows, "low")
+    if len(swing_highs) < 1 or len(swing_lows) < 1:
+        return fallback_count()
+
+    if direction == "bull":
+        # bull 回调：找 高点→低点 的回撤，回撤幅度在 前推力(低点→高点) 的 38.2%-61.8%
+        # 合并并排序所有 swing points
+        legs = 0
+        # 从最近的 swing 开始回溯
+        all_points = [(i, "H") for i in swing_highs] + [(i, "L") for i in swing_lows]
+        all_points.sort(key=lambda x: x[0])
+        # 找 交替的 H-L 对（推力高点→回调低点）
+        for idx in range(len(all_points) - 2):
+            p0 = all_points[idx]
+            p1 = all_points[idx + 1]
+            p2 = all_points[idx + 2] if idx + 2 < len(all_points) else None
+            # 模式: L → H → L（推力上→回调）
+            if p0[1] == "L" and p1[1] == "H" and p2 and p2[1] == "L":
+                impulse = highs.iloc[p1[0]] - lows.iloc[p0[0]]  # 推力幅度
+                pullback = highs.iloc[p1[0]] - lows.iloc[p2[0]]  # 回调幅度
+                if impulse > 0:
+                    retrace_pct = pullback / impulse
+                    if 0.382 <= retrace_pct <= 0.618:
+                        legs += 1
+        return legs or fallback_count()
+    else:
+        # bear 回调：找 低点→高点 的反弹，幅度在前下跌推力的 38.2%-61.8%
+        legs = 0
+        all_points = [(i, "H") for i in swing_highs] + [(i, "L") for i in swing_lows]
+        all_points.sort(key=lambda x: x[0])
+        for idx in range(len(all_points) - 2):
+            p0 = all_points[idx]
+            p1 = all_points[idx + 1]
+            p2 = all_points[idx + 2] if idx + 2 < len(all_points) else None
+            # 模式: H → L → H（推力下→反弹）
+            if p0[1] == "H" and p1[1] == "L" and p2 and p2[1] == "H":
+                impulse = highs.iloc[p0[0]] - lows.iloc[p1[0]]
+                pullback = highs.iloc[p2[0]] - lows.iloc[p1[0]]
+                if impulse > 0:
+                    retrace_pct = pullback / impulse
+                    if 0.382 <= retrace_pct <= 0.618:
+                        legs += 1
+        return legs or fallback_count()
 
 
 def _volume_series(work: pd.DataFrame) -> pd.Series:
@@ -571,6 +625,14 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     signal_score = 8
     tags: List[str] = []
     risks: List[str] = []
+    # 修复4: Brooks Doji（十字星）分类。body < 15% of range = 十字星。
+    # Brooks: 不用 doji 做信号棒（缺乏方向性）。
+    is_doji = last_body_ratio < 0.15 and (last["最高"] - last["最低"]) > 0
+    # 修复4: Doji 十字星降级（Brooks: 弱K，不用作信号棒）
+    if is_doji:
+        signal = "十字星（弱K）"
+        signal_score = 4
+        risks.append("信号棒为十字星，Brooks不建议用作入场信号")
 
     is_bull_trend_bar = last["收盘"] > last["开盘"] and last_body_ratio >= 0.55 and last_close_position >= 0.7
     is_bear_trend_bar = last["收盘"] < last["开盘"] and last_body_ratio >= 0.55 and last_close_position <= 0.3
@@ -651,7 +713,9 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         elif breaks_prev_high and last["收盘"] > prev["最高"]:
             trend_damage = "短线高点修复"
 
-    if is_bull_trend_bar:
+    if is_doji:
+        pass
+    elif is_bull_trend_bar:
         signal = "强多头趋势K"
         signal_score = 22
         tags.append("趋势K")
@@ -931,8 +995,12 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     trap_risk = int(max(0, min(100, trap_risk)))
 
     entry_price = round(_safe_float(last["最高"]) + 0.01, 2)
-    stop_anchor = min(_safe_float(last["最低"]), _safe_float(recent["最低"].tail(5).min()))
-    stop_price = round(stop_anchor, 2)
+    # 修复2: Brooks 止损 = 信号棒低点 - 1 tick（不再取 5 根最低 widening）。
+    # 原逻辑 min(last_low, 5bar_low) 总是取更远者 → risk% 虚高 → 触发下游阻断。
+    stop_price = round(_safe_float(last["最低"]) - 0.01, 2)
+    # 兜底：若止损 >= 入场价（信号棒倒置等异常），用 -3% 紧急止损
+    if stop_price >= entry_price and entry_price > 0:
+        stop_price = round(entry_price * 0.97, 2)
     support_price = max(stop_price, round(ema20_now, 2)) if bull_context else stop_price
     pullback_validity = _evaluate_pullback_validity(
         work,
@@ -943,9 +1011,29 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         trend_damage=trend_damage,
     )
     risk = max(entry_price - stop_price, 0.01)
+    # 修复3: Brooks 测量移动目标。用最近推力（低点→高点距离）投影。
+    # 原逻辑用 R 倍数（1.5R/2R/3R），不反映 Brooks 的不对称性（大腿1→大目标）。
+    pa_measured_move = 0.0
+    try:
+        body_df = recent.iloc[:-1]
+        sh = _local_extrema(body_df["最高"].astype(float), "high")
+        sl = _local_extrema(body_df["最低"].astype(float), "low")
+        if sh and sl:
+            # 最近一个低点→高点的推力距离
+            last_low_idx = max(i for i in sl if i < max(sh))
+            following_high_idx = min(i for i in sh if i > last_low_idx)
+            pa_measured_move = float(body_df["最高"].iloc[following_high_idx]) - float(body_df["最低"].iloc[last_low_idx])
+    except Exception:
+        pass
+
     if broke_recent_high or regime == "向上突破":
-        measured_target = entry_price + min(range_height, risk * 3)
-        target_basis = "突破区间高度/2R"
+        # Brooks ME 优先，fallback 到 range_height/3R
+        if pa_measured_move > 0:
+            measured_target = entry_price + pa_measured_move
+            target_basis = "测量移动(ME=腿1)"
+        else:
+            measured_target = entry_price + min(range_height, risk * 3)
+            target_basis = "突破区间高度/3R"
     elif h2_entry or pullback_then_bull:
         measured_target = max(prior_high_20, entry_price + risk * 1.5)
         target_basis = "前高/1.5R"
