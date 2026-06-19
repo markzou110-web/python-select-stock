@@ -51,15 +51,13 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Market Sync Scheduler...")
     market_sync_scheduler.start()
 
-    # 异步预热核心缓存
-    from core.data import get_index_data, get_hot_sectors, get_sector_map
-    from routers.market import fetch_mine_sweeper_data
-    loop = asyncio.get_running_loop()
-    logger.info("Pre-warming Index and Sector cache...")
-    loop.run_in_executor(None, get_index_data)
-    loop.run_in_executor(None, get_hot_sectors)
-    loop.run_in_executor(None, get_sector_map)
-    loop.run_in_executor(None, fetch_mine_sweeper_data)
+    # 缓存预热已移至首次请求时懒加载。
+    # 原来在启动时预热(get_index_data/get_hot_sectors等)，但 akshare 部分函数
+    # 内部使用 V8/mini_racer 引擎，在 macOS arm64 上触发 FATAL 段错误
+    # (libmini_racer Check failed)，该 native crash 无法被 try/except 捕获，
+    # 会杀掉整个 uvicorn 进程导致服务无法启动。
+    # 缓存在首次请求对应端点时会自动加载（有 TTL 缓存），不影响功能。
+    logger.info("Cache pre-warming skipped (lazy-load on first request).")
 
     yield
     market_sync_scheduler.stop()
