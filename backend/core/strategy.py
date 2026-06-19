@@ -896,8 +896,19 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     is_rsi_ok = curr_rsi >= rsi_min
     
     # --- 6. MACD ---
+    # 修复 L2: 原逻辑要求精确同日金叉(hist[-1]>0 AND hist[-2]<=0)，拒绝了大量有效突破
+    # (MACD 1-2日前金叉、当前已确认多头)。改为"近3日内曾金叉且当前hist>0"。
     tv_macd = _squeeze_tv_macd(df)
-    is_macd_ok = (tv_macd['hist'].iloc[-1] > 0 and tv_macd['hist'].iloc[-2] <= 0) if use_macd_filter else True
+    if use_macd_filter:
+        hist_now = tv_macd['hist'].iloc[-1]
+        # 近3日内是否有金叉(hist从<=0翻正)
+        recent_cross = any(
+            tv_macd['hist'].iloc[i] > 0 and tv_macd['hist'].iloc[i - 1] <= 0
+            for i in range(max(1, len(tv_macd) - 3), len(tv_macd))
+        )
+        is_macd_ok = hist_now > 0 and recent_cross
+    else:
+        is_macd_ok = True
     
     # --- 7. 相对强度 ---
     is_rs_ok = True

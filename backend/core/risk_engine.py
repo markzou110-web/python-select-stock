@@ -168,14 +168,22 @@ def compute_paper_risk_levels(
         candidates.append(capital_protect_price)
         risk_stage = "保本保护"
 
-    if max_pl_pct >= TIER_HIGH_PROFIT_PCT:
-        moving_stop_price = round(high_since_entry * TIER_HIGH_TRAIL_RATIO, 2)
-        candidates.append(moving_stop_price)
-        risk_stage = "强盈利收紧"
-    elif max_pl_pct >= TIER_MID_PROFIT_PCT:
-        moving_stop_price = round(high_since_entry * TIER_MID_TRAIL_RATIO, 2)
-        candidates.append(moving_stop_price)
+    # 修复 L4: 移动止损跨门槛不连续问题。
+    # 原逻辑: +20%时 trail 从 8%→5%，high*0.95 可能 > 之前的 high*0.92，
+    # 导致止损价瞬间上跳 ~3%，正常回调即被强制平仓。
+    # 修复: 计算"当前应适用的最高止损"（取两档中较紧者），确保止损只上移不下跳。
+    if max_pl_pct >= TIER_MID_PROFIT_PCT:
+        # 中档(8%trail)始终适用
+        mid_stop = round(high_since_entry * TIER_MID_TRAIL_RATIO, 2)
+        moving_stop_price = mid_stop
         risk_stage = "移动风控"
+        # 若已达高档门槛(+20%)，高档(5%trail)可能更紧，取较高者
+        if max_pl_pct >= TIER_HIGH_PROFIT_PCT:
+            high_stop = round(high_since_entry * TIER_HIGH_TRAIL_RATIO, 2)
+            # 取两档中较紧者（较高=更紧），但不会低于中档（避免门槛跨越回退）
+            moving_stop_price = max(mid_stop, high_stop)
+            risk_stage = "强盈利收紧"
+        candidates.append(moving_stop_price)
 
     active_stop_price = round(max(candidates), 2)
 

@@ -5,9 +5,13 @@ from typing import Any, Dict, List
 # 综合评分权重（求和=1.0）。历史胜率（historical_win_rate）专项 0.10，
 # 让历史回测胜率高的标的在排序中获得加权优势，而非仅作二元 SOP 勾选。
 # 便于调参：调整后请确保五项权重之和仍为 1.0。
+# 修复 L-决策2: 板块影响双重计算。trade_opportunity 内部已含 sector_score(权重0.2×0.25=0.05)，
+# 外部又加 sector_alignment(0.12)，总板块影响=0.17(17%)过高。
+# 将 sector_alignment 从 0.12 降至 0.07，总板块影响=0.07+0.05=0.12(合理)，
+# 释放的 0.05 转给 price_action(0.18→0.23)以加强个股技术面权重。
 W_STRATEGY_PERCENTILE = 0.35
-W_PRICE_ACTION = 0.18
-W_SECTOR_ALIGNMENT = 0.12
+W_PRICE_ACTION = 0.23
+W_SECTOR_ALIGNMENT = 0.07
 W_TRADE_OPPORTUNITY = 0.25
 W_HISTORICAL_WIN_RATE = 0.10
 
