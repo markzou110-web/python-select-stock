@@ -2,7 +2,10 @@ from datetime import date, datetime
 import math
 from typing import Any, Dict, List, Optional
 
-from core.risk_constants import FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_PCT
+from core.risk_constants import (
+    FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_PCT,
+    STRONG_PROFIT_TAKE_PCT, STRONG_SECTOR_PHASES, STRONG_CLOSE_POSITION_THRESHOLD,
+)
 
 
 def safe_num(value: Any, default: float = 0.0) -> float:
@@ -26,11 +29,17 @@ def build_position_decision_snapshot(
     price_updated_at: Any = None,
     now: Optional[datetime] = None,
     already_reduced: bool = False,
+    sector_phase: str = "",
+    close_position: float = 0.0,
 ) -> Dict[str, Any]:
     """Build the authoritative position action shared by UI, alerts, and wind control.
 
     ``already_reduced`` 表示该仓位此前已执行过分批止盈（首笔减仓）。传入 True 时
     跳过首笔止盈的 REDUCE 触发，避免重复减仓，仅保留跌破风控线的退出/减仓逻辑。
+
+    改动 B3：新增 sector_phase/close_position 参数。当板块处于主升早期且个股收盘
+    强势时，首笔止盈线从 +8% 上抬到 +12%（STRONG_PROFIT_TAKE_PCT），避免机械减半
+    砍掉主升浪牛股的进攻性。
     """
     now = now or datetime.now()
     current = safe_num(current_price)
@@ -85,14 +94,31 @@ def build_position_decision_snapshot(
         # 分批止盈：当前价达到 FIRST_PROFIT_TAKE_PCT（+8%）且尚未减仓时，先减仓 50%
         # 锁定利润。修复 BUG-C：原用 max_pl_pct(高点) 判断，但价格可能已从+9%回落到+0.5%，
         # 此时减仓无意义（几乎没有利润可锁）。改为基于当前价，确保真正在盈利区间减仓。
-        action = "REDUCE"
-        threshold = entry * (1 + FIRST_PROFIT_TAKE_PCT / 100)
-        current_pl_pct = (current - entry) / entry * 100 if entry > 0 else 0
-        trigger = (
-            f"分批止盈：当前浮盈 {current_pl_pct:.1f}% 达到首笔止盈线 "
-            f"{FIRST_PROFIT_TAKE_PCT:.0f}%，减仓锁定部分利润"
+        # 改动 B3：强势股豁免——板块主升早期 + 收盘强势时，止盈线从 +8% 上抬到 +12%。
+        _is_strong = (
+            sector_phase in STRONG_SECTOR_PHASES
+            and close_position >= STRONG_CLOSE_POSITION_THRESHOLD
         )
-        confidence = 0.8
+        _profit_take_pct = STRONG_PROFIT_TAKE_PCT if _is_strong else FIRST_PROFIT_TAKE_PCT
+        if current >= entry * (1 + _profit_take_pct / 100):
+            action = "REDUCE"
+            threshold = entry * (1 + _profit_take_pct / 100)
+            current_pl_pct = (current - entry) / entry * 100 if entry > 0 else 0
+            _strong_tag = "（强势股延后）" if _is_strong else ""
+            trigger = (
+                f"分批止盈{_strong_tag}：当前浮盈 {current_pl_pct:.1f}% 达到首笔止盈线 "
+                f"{_profit_take_pct:.0f}%，减仓锁定部分利润"
+            )
+            confidence = 0.8
+        else:
+            # 强势股但尚未达到上抬后的 +12% 线，暂不减仓（让利润奔跑）
+            action = "HOLD"
+            current_pl_pct = (current - entry) / entry * 100 if entry > 0 else 0
+            trigger = (
+                f"强势股豁免：浮盈 {current_pl_pct:.1f}% 板块主升中，"
+                f"止盈线上抬至 +{_profit_take_pct:.0f}%，暂不减仓让利润奔跑"
+            )
+            confidence = 0.7
     elif structure_stop > 0 and current <= structure_stop:
         action = "CLOSE"
         threshold = structure_stop

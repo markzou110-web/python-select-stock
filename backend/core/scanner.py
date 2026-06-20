@@ -1754,6 +1754,7 @@ def perform_market_scan(
             snapshot_df,
             market_regime,
             load_market_cycle_history(engine),
+            data_date=str(max_date) if max_date else None,  # 改动 A3：传数据日，修复周末误判
         )
         from core.score_calibration import calibrate_scan_scores
         calibrate_scan_scores(results)

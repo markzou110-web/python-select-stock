@@ -21,6 +21,7 @@ from core.risk_constants import (
     TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
     TIME_STOP_WARNING_DAYS, TIME_STOP_REVIEW_DAYS,
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT,
+    TIME_STOP_PROFIT_EXEMPT_PCT, TIME_STOP_REVIEW_REDUCE_RATIO,
     FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO, FIRST_PROFIT_TAKE_PCT,
     EARLY_WARN_MILD_PCT, EARLY_WARN_MODERATE_PCT, EARLY_WARN_TIER_COOLDOWN_DAYS,
     WIND_CONTROL_INTERVAL_URGENT_MINUTES, URGENT_STOP_BUFFER_PCT,
@@ -202,24 +203,41 @@ def _local_price_action_summary(engine, code: str) -> Dict[str, Any]:
 
 
 def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: str | None) -> Dict[str, Any] | None:
-    if pl_pct > 0:
+    # 改动 B4：原逻辑 pl_pct > 0 就完全豁免，导致 +0.5% 横盘 20 天的僵尸仓无人管。
+    # 改为 pl_pct > TIME_STOP_PROFIT_EXEMPT_PCT(2%) 才豁免——2%以下都算"未达预期"。
+    # 这释放被僵尸仓占用的仓位配额，避免上班族"周末复盘发现全是微盈横盘票"。
+    if pl_pct > TIME_STOP_PROFIT_EXEMPT_PCT:
         return None
 
     policy = _time_stop_policy(strategy_type)
     if hold_trading_days >= policy["force_days"]:
         return {
             "reason": (
-                f"时间止损确认: 持仓 {hold_trading_days} 个交易日仍未盈利 "
+                f"时间止损确认: 持仓 {hold_trading_days} 个交易日仍未达预期盈利 "
                 f"({pl_pct:.1f}%)，建议平仓或移出实盘持仓"
             ),
             "should_close": True,
             "severity": "close",
         }
     if hold_trading_days >= policy["review_days"]:
+        # 改动 B4：微盈震荡仓（0 < pl_pct <= 2%）在 review 档触发减仓，而非只预警。
+        # 亏损中（pl_pct <= TIME_STOP_REVIEW_LOSS_PCT）维持原"建议减仓/退出"逻辑。
+        if 0 < pl_pct <= TIME_STOP_PROFIT_EXEMPT_PCT:
+            action = f"微盈横盘({pl_pct:.1f}%)，建议减仓 {int(TIME_STOP_REVIEW_REDUCE_RATIO*100)}% 释放仓位"
+            return {
+                "reason": (
+                    f"时间止损复核: {policy['label']}策略持仓 {hold_trading_days} 个交易日仅微盈 "
+                    f"({pl_pct:.1f}%)，{action}"
+                ),
+                "should_close": False,
+                "should_reduce": True,
+                "reduce_ratio": TIME_STOP_REVIEW_REDUCE_RATIO,
+                "severity": "review",
+            }
         action = "亏损加重，建议减仓/退出候选" if pl_pct <= TIME_STOP_REVIEW_LOSS_PCT else "建议人工复核"
         return {
             "reason": (
-                f"时间止损复核: {policy['label']}策略持仓 {hold_trading_days} 个交易日未盈利 "
+                f"时间止损复核: {policy['label']}策略持仓 {hold_trading_days} 个交易日未达预期 "
                 f"({pl_pct:.1f}%)，{action}"
             ),
             "should_close": False,
@@ -228,7 +246,7 @@ def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: st
     if hold_trading_days >= policy["warning_days"]:
         return {
             "reason": (
-                f"时间止损预警: {policy['label']}策略持仓 {hold_trading_days} 个交易日未盈利 "
+                f"时间止损预警: {policy['label']}策略持仓 {hold_trading_days} 个交易日未达预期 "
                 f"({pl_pct:.1f}%)，暂不自动平仓"
             ),
             "should_close": False,
@@ -414,10 +432,14 @@ def _wind_control_decision(
             "should_close": True,
         }
     if time_stop:
-        return {
+        # 改动 B4：time_stop 可能携带 should_reduce（微盈横盘减仓），需透传
+        result = {
             "reason": str(time_stop.get("reason") or ""),
             "should_close": bool(time_stop.get("should_close")),
         }
+        if time_stop.get("should_reduce"):
+            result["should_reduce"] = True
+        return result
     return {"reason": "", "should_close": False}
 
 
@@ -1421,6 +1443,11 @@ def run_wind_control() -> Dict[str, Any]:
             # 已减仓标记：通过 remark 中是否含首笔止盈标记判断，避免重复触发分批止盈。
             existing_remark = str(row.get("remark") or "")
             already_reduced = bool(existing_remark and FIRST_PROFIT_TAKE_MARK in existing_remark)
+            # 改动 B3：提取强势股豁免所需数据。
+            # close_position: 从 pa_summary 提取（若 price_action 未暴露则用 0，不豁免）
+            # sector_phase: 持仓记录中存储的板块阶段（开仓时写入）
+            _close_pos = safe_float(pa_summary.get("last_close_position") or pa_summary.get("close_position"))
+            _sector_phase = str(row.get("sector_phase") or "")
             decision_snapshot = build_position_decision_snapshot(
                 current_price=curr_price,
                 entry_price=entry_price,
@@ -1432,6 +1459,8 @@ def run_wind_control() -> Dict[str, Any]:
                 price_updated_at=now,
                 now=now,
                 already_reduced=already_reduced,
+                sector_phase=_sector_phase,
+                close_position=_close_pos,
             )
             decision = _wind_control_decision(curr_price, risk_levels, time_stop, decision_snapshot, entry_price=entry_price)
             reason = decision["reason"]
@@ -1536,6 +1565,9 @@ def run_wind_control() -> Dict[str, Any]:
                     mode_label = "模拟仓风控预警"
                     action_line = "模拟仓暂不自动平仓，请人工复核。"
                 title = f"【{mode_label}】{row['name']} ({code})"
+                # 改动 B4：推送加入持仓天数和时间止损倒计时，解决上班族"忘记持仓时间"痛点
+                _ts_date = plan.get("time_stop_date") if isinstance(plan, dict) else None
+                _ts_line = f"时间止损倒计时：{_ts_date}\n" if _ts_date else ""
                 body = (
                     f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
                     f"处理方式：{action_line}\n"
@@ -1543,6 +1575,8 @@ def run_wind_control() -> Dict[str, Any]:
                     f"买入价格：¥{entry_price:.2f}\n"
                     f"当前价格：¥{curr_price:.2f}\n"
                     f"当前收益：{pl_pct:+.2f}%\n"
+                    f"持仓天数：{hold_trading_days} 个交易日\n"
+                    f"{_ts_line}"
                     f"大盘状态：{regime.get('desc', 'N/A')}"
                 )
                 send_paper_trade_notification(title, body)

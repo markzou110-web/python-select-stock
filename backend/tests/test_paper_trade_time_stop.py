@@ -69,6 +69,41 @@ def test_squeeze_strategy_uses_slower_time_stop():
     assert result["severity"] == "warning"
 
 
+# ---------------------------------------------------------------------------
+# 改动 B4：时间止损盲区修复（微盈不豁免 + 推送可视化）
+# ---------------------------------------------------------------------------
+
+def test_time_stop_triggers_on_marginal_profit():
+    """B4：微盈(0<pl_pct<=2%)不再豁免时间止损，review档触发减仓。
+
+    原逻辑 pl_pct>0 就 return None，导致+0.5%横盘20天的僵尸仓无人管。
+    """
+    # +1% 微盈，7天（review档）
+    result = _evaluate_time_stop(7, 1.0, "tv_dual_strict")
+    assert result is not None, "微盈1%不应豁免"
+    assert result["should_reduce"] is True, "微盈review档应触发减仓"
+    assert result["severity"] == "review"
+
+
+def test_time_stop_exempts_above_profit_threshold():
+    """B4：盈利超过2%才豁免时间止损。"""
+    # +3% 盈利 → 豁免
+    result = _evaluate_time_stop(7, 3.0, "tv_dual_strict")
+    assert result is None, "盈利3%应豁免时间止损"
+
+    # +2.5% 也豁免
+    result2 = _evaluate_time_stop(10, 2.5, "tv_dual_strict")
+    assert result2 is None, "盈利2.5%应豁免"
+
+
+def test_time_stop_zero_profit_still_triggers():
+    """B4：盈亏平衡(0%)仍受时间止损约束（B4前 pl_pct>0 豁免，0不豁免，行为不变）。"""
+    result = _evaluate_time_stop(10, 0.0, "pine")
+    assert result is not None
+    assert result["should_close"] is True
+    assert "确认" in result["reason"]
+
+
 def test_wind_control_only_closes_on_price_or_confirmed_time_stop():
     healthy_risk = {"active_stop_price": 21.28, "risk_stage": "保本保护"}
 

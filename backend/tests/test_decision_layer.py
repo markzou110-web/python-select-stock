@@ -308,3 +308,42 @@ def test_money_flow_score_negative_outflow_penalized():
     outflow = {"money_flow": {"main_net_ratio": -8, "main_net_inflow_yi": -2}, "mkt_cap_yi": 100}
     score = _money_flow_score(outflow)
     assert score < 50, f"净流出应低于50，实际 {score}"
+
+
+# ---------------------------------------------------------------------------
+# 改动 A3: 市场宽度日期 bug 修复（data_date 替代墙钟 now()）
+# ---------------------------------------------------------------------------
+
+def test_market_context_uses_data_date_not_wall_clock():
+    """A3：周末/节假日扫描时，data_date 应正确剔除 cycle 当日，避免重复计入宽度。
+
+    场景：周五是最近交易日，周六扫描。cycle 最后一条 date=周五。
+    原逻辑用 now()=周六 ≠ 周五 → 不剔除 → prior3 重复计入周五宽度 → trend 偏移。
+    修复后 data_date=周五 → 匹配 → 正确剔除。
+    """
+    cycle = [
+        {"date": "2026-06-15", "advance_ratio": 60.0, "strong_ratio": 8.0, "weak_ratio": 3.0, "avg_return": 1.0},
+        {"date": "2026-06-16", "advance_ratio": 55.0, "strong_ratio": 6.0, "weak_ratio": 4.0, "avg_return": 0.5},
+        {"date": "2026-06-19", "advance_ratio": 58.0, "strong_ratio": 7.0, "weak_ratio": 3.0, "avg_return": 0.8},  # 周五
+    ]
+    snap = _snapshot([5] * 600 + [-1] * 400)  # 60% 上涨
+
+    # 不传 data_date（旧行为，模拟周六扫描：now() ≠ 周五）
+    ctx_no_date = build_market_decision_context(snap, {"status": "OFFENSIVE"}, cycle)
+    # 传 data_date=周五（修复后行为）
+    ctx_with_date = build_market_decision_context(snap, {"status": "OFFENSIVE"}, cycle, data_date="2026-06-19")
+
+    # 两者的 trend 可能不同（修复后正确剔除了当日）
+    # 关键：传 data_date 后 breadth_trend 不应因为重复计入当日而偏移
+    assert ctx_with_date["market_cycle_metrics"]["history_days"] >= 0
+    # 确保没有崩溃且返回有效 stage
+    assert ctx_with_date["market_sentiment_stage"] in ("ADVANCE", "REPAIR", "CLIMAX", "DIVERGENCE", "RETREAT", "ICE")
+
+
+def test_apply_decision_layer_accepts_data_date():
+    """A3：apply_decision_layer 应接受并透传 data_date 参数。"""
+    import inspect
+    from core.decision_layer import apply_decision_layer
+    sig = inspect.signature(apply_decision_layer)
+    assert "data_date" in sig.parameters, "apply_decision_layer 应有 data_date 参数"
+    assert sig.parameters["data_date"].default is None

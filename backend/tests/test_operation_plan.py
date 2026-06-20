@@ -207,3 +207,66 @@ def test_first_profit_take_does_not_trigger_below_threshold():
     )
 
     assert snapshot["action"] == "HOLD"
+
+
+# ---------------------------------------------------------------------------
+# 改动 B3：强势股减仓豁免
+# ---------------------------------------------------------------------------
+
+def test_strong_stock_exemption_delays_profit_take():
+    """B3：板块主升早期+收盘强势时，+10% 不减仓（止盈线上抬到+12%）。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=11.0,   # +10% 浮盈（超过常规+8%但未达强势+12%）
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 10.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+        sector_phase="SECTOR_CONFIRM",
+        close_position=0.7,   # 收盘强势
+    )
+    assert snapshot["action"] == "HOLD", f"强势股+10%应HOLD延后，实际 {snapshot['action']}"
+    assert "强势股" in snapshot["trigger"]
+
+
+def test_strong_stock_exemption_triggers_at_higher_threshold():
+    """B3：强势股达到+12%上抬线后才减仓。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=11.3,   # +13% 浮盈（超过强势+12%线）
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 13.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+        sector_phase="SECTOR_CONFIRM",
+        close_position=0.7,
+    )
+    assert snapshot["action"] == "REDUCE", f"强势股+13%应REDUCE，实际 {snapshot['action']}"
+    assert "强势股延后" in snapshot["trigger"]
+
+
+def test_non_strong_stock_uses_normal_threshold():
+    """B3：非强势股（板块衰退或收盘弱）仍用常规+8%止盈线。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=10.9,   # +9% 浮盈
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 9.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+        sector_phase="FADING",  # 板块衰退
+        close_position=0.7,
+    )
+    assert snapshot["action"] == "REDUCE", f"非强势+9%应常规REDUCE，实际 {snapshot['action']}"
+    assert "强势股" not in snapshot["trigger"]
+
+
+def test_weak_close_position_no_exemption():
+    """B3：板块强势但收盘弱（close_position<0.6）不豁免。"""
+    snapshot = build_position_decision_snapshot(
+        current_price=10.9,   # +9% 浮盈
+        entry_price=10.0,
+        risk={"active_stop_price": 9.1, "initial_stop_price": 9.1, "max_pl_pct": 9.0, "risk_stage": "保本保护"},
+        entry_date="2026-06-01",
+        now=datetime(2026, 6, 13, 14, 30),
+        sector_phase="SECTOR_CONFIRM",
+        close_position=0.4,   # 收盘弱
+    )
+    assert snapshot["action"] == "REDUCE", f"收盘弱不应豁免，实际 {snapshot['action']}"

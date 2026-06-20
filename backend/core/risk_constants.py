@@ -78,6 +78,13 @@ FIRST_PROFIT_TAKE_RATIO = 0.5         # 减仓 50%
 # 重复减仓防护标记（写入 paper_trading.remark，含此标记则不再触发首笔止盈）
 FIRST_PROFIT_TAKE_MARK = "已首笔止盈减仓50%"
 
+# ── 强势股减仓豁免 (Strong Stock Scale-out Exemption) ──
+# 改动 B3：机械 +8% 减半仓会砍掉主升浪牛股的进攻性。当板块处于主升早期且
+# 个股收盘强势时，首笔止盈线从 +8% 上抬到 +12%，让利润多跑一段。
+STRONG_PROFIT_TAKE_PCT = 12.0         # 强势股首笔止盈线
+STRONG_SECTOR_PHASES = ("SECTOR_EARLY", "SECTOR_CONFIRM")  # 触发豁免的板块阶段
+STRONG_CLOSE_POSITION_THRESHOLD = 0.6  # 收盘强势度阈值（close_position >= 此值才算强势）
+
 # ── 时间止损 (Time Stop) ──
 # 分层时间风控：先预警，再复核，最后才升级为确认平仓
 TIME_STOP_DAYS = 5                 # legacy baseline, keep for compatibility
@@ -85,6 +92,12 @@ TIME_STOP_WARNING_DAYS = 5         # 5 个交易日未盈利：预警
 TIME_STOP_REVIEW_DAYS = 7          # 7 个交易日未盈利：复核/减仓候选
 TIME_STOP_FORCE_DAYS = 10          # 10 个交易日仍未盈利：确认平仓候选
 TIME_STOP_REVIEW_LOSS_PCT = -2.0   # 复核档亏损加重阈值
+# 改动 B4：盈利豁免阈值。原逻辑 pl_pct > 0 就完全跳过时间止损，导致 +0.5% 横盘
+# 20 天的僵尸仓无人管（占用仓位上限、消耗机会成本）。改为 pl_pct > 此值才豁免，
+# 2% 以下都算"未达预期"，仍受时间止损约束。
+TIME_STOP_PROFIT_EXEMPT_PCT = 2.0
+# 改动 B4：微盈震荡仓的复核减仓比例（review 档 pl_pct∈(0,2%] 时减此比例）
+TIME_STOP_REVIEW_REDUCE_RATIO = 1.0 / 3.0
 
 # ── 回测引擎参数 (Backtest Engine Defaults) ──
 BACKTEST_MAX_HOLD_DAYS = 10         # 最大持有天数 (从 5 改为 10，更适合均线粘合中线策略)
