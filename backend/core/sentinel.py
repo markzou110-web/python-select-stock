@@ -809,6 +809,12 @@ class IntradaySentinel:
         # 不影响扫描频率。
         self.wind_control_interval_minutes = 30
         self.last_wind_control_dt = None
+        # 改动 B1：动态紧迫度。run_wind_control 每次跑完后会更新这两个字段，
+        # _should_run_wind_control 据此把间隔从常规 30 分钟降到紧迫 10 分钟。
+        # _min_stop_buffer_pct：所有持仓中当前价距止损线的最小间距（%）。
+        # _last_regime_urgent：上次风控时大盘是否处于弱市(bear/volatile)。
+        self._min_stop_buffer_pct: float | None = None
+        self._last_regime_urgent: bool = False
 
     def update_schedule(self, times_str: Optional[str] = None):
         """实时更新调度时间点"""
@@ -821,20 +827,36 @@ class IntradaySentinel:
         # 保持兼容性调用 update_schedule
         self.update_schedule()
 
+    def _effective_wind_control_interval(self) -> float:
+        """改动 B1：动态风控间隔。
+
+        常规 30 分钟。当任一持仓 stop_buffer < URGENT_STOP_BUFFER_PCT(2%) 或
+        大盘处于弱市(bear/volatile)时，降到 WIND_CONTROL_INTERVAL_URGENT_MINUTES(10)，
+        缩短急跌行情下的感知延迟。对上班族尤其关键。
+        """
+        from core.risk_constants import WIND_CONTROL_INTERVAL_URGENT_MINUTES, URGENT_STOP_BUFFER_PCT
+        if self._last_regime_urgent:
+            return WIND_CONTROL_INTERVAL_URGENT_MINUTES
+        if self._min_stop_buffer_pct is not None and self._min_stop_buffer_pct < URGENT_STOP_BUFFER_PCT:
+            return WIND_CONTROL_INTERVAL_URGENT_MINUTES
+        return self.wind_control_interval_minutes
+
     def _should_run_wind_control(self, now: datetime) -> bool:
         """改动 #10：风控独立 tick 判定。
 
-        在 A 股交易时段内，距上次风控超过 wind_control_interval_minutes 分钟则返回 True。
+        在 A 股交易时段内，距上次风控超过有效间隔分钟则返回 True。
+        有效间隔由 _effective_wind_control_interval 动态决定（常规30/紧迫10）。
         首次（last_wind_control_dt 为空）且在交易时段内也触发。非交易时段不触发。
         """
         if not is_a_share_intraday_session(now):
             return False
-        if self.wind_control_interval_minutes <= 0:
+        effective_interval = self._effective_wind_control_interval()
+        if effective_interval <= 0:
             return False
         if self.last_wind_control_dt is None:
             return True
         elapsed = (now - self.last_wind_control_dt).total_seconds() / 60.0
-        return elapsed >= self.wind_control_interval_minutes
+        return elapsed >= effective_interval
 
     def start(self):
         self._load_schedule()
@@ -904,6 +926,9 @@ class IntradaySentinel:
                         from routers.paper_trade import run_wind_control
                         wc_res = run_wind_control()
                         self.last_wind_control_dt = now
+                        # 改动 B1：更新动态紧迫度状态，供下次 _should_run_wind_control 判定
+                        self._min_stop_buffer_pct = wc_res.get("min_stop_buffer_pct")
+                        self._last_regime_urgent = bool(wc_res.get("regime_urgent"))
                         if wc_res.get("closed_count", 0) > 0:
                             logger.info(f"Wind Control: Closed {wc_res['closed_count']} positions.")
                     except Exception as wc_err:

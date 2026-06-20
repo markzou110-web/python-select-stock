@@ -229,3 +229,82 @@ def test_retreat_still_correct_when_genuinely_weak():
     assert ctx["market_sentiment_stage"] in ("ICE", "RETREAT"), (
         f"真正弱势应判 ICE/RETREAT，实际 {ctx['market_sentiment_stage']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 改动 A1: risk_reward 评分基于止损距离（修复恒定盈亏比锚定失效）
+# ---------------------------------------------------------------------------
+
+def test_risk_reward_score_based_on_stop_distance():
+    """A1: 止损越紧分越高。原公式 rr*25+45 对所有票恒≈95（rr恒=2），丧失区分度。"""
+    from core.decision_layer import _risk_reward_score
+
+    # 止损 5%（结构风险小）→ 满分
+    s_tight = {"pa_risk_pct": 5.0}
+    # 止损 15%（结构风险大）→ 低分
+    s_wide = {"pa_risk_pct": 15.0}
+    score_tight = _risk_reward_score(s_tight)
+    score_wide = _risk_reward_score(s_wide)
+    assert score_tight == 100.0, f"5%止损应满分，实际 {score_tight}"
+    assert score_wide < score_tight, f"15%止损应低于5%，{score_wide} vs {score_tight}"
+    assert score_wide == 60.0, f"15%止损期望60，实际 {score_wide}"
+
+
+def test_risk_reward_score_trap_deduction():
+    """A1: 破位反抽陷阱风险应额外扣分。"""
+    from core.decision_layer import _risk_reward_score
+
+    base = _risk_reward_score({"pa_risk_pct": 8.0})
+    with_trap = _risk_reward_score({"pa_risk_pct": 8.0, "pa_trap_risk": 10.0})
+    assert with_trap < base, f"trap 应扣分，{with_trap} vs {base}"
+    # 8% 止损 → base=88；trap=10 → 扣 10*0.2=2 → 86
+    assert base == 88.0, f"8%止损期望88，实际 {base}"
+    assert with_trap == 86.0, f"trap=10 期望86，实际 {with_trap}"
+
+
+def test_risk_reward_score_no_data_fallback_neutral():
+    """A1: 无止损数据时回退中性基线（不打极端分）。"""
+    from core.decision_layer import _risk_reward_score
+
+    score = _risk_reward_score({})
+    assert 50 <= score <= 60, f"无数据应中性，实际 {score}"
+
+
+# ---------------------------------------------------------------------------
+# 改动 A2: money_flow 评分市值归一化（消除大盘股系统性虚高）
+# ---------------------------------------------------------------------------
+
+def test_money_flow_score_normalizes_by_market_cap():
+    """A2: 相同绝对流入金额，小盘股应得更高分（归一化后相对强度更大）。"""
+    from core.decision_layer import _money_flow_score
+
+    # 同样 1 亿流入，但市值差 100 倍
+    small_cap = {"money_flow": {"main_net_ratio": 8, "main_net_inflow_yi": 1.0}, "mkt_cap_yi": 80}
+    large_cap = {"money_flow": {"main_net_ratio": 8, "main_net_inflow_yi": 1.0}, "mkt_cap_yi": 8000}
+    score_small = _money_flow_score(small_cap)
+    score_large = _money_flow_score(large_cap)
+    assert score_small > score_large, (
+        f"小盘归一化后应更高，small={score_small} large={score_large}"
+    )
+
+
+def test_money_flow_score_large_cap_not_inflated():
+    """A2: 工行15亿流入不应碾压小盘0.5亿（原公式 amount*3 导致的系统性偏差）。"""
+    from core.decision_layer import _money_flow_score
+
+    # 工行：15亿流入 / 15000亿市值 = 0.1%（很弱的相对流入）
+    gonghang = {"money_flow": {"main_net_ratio": 5, "main_net_inflow_yi": 15}, "mkt_cap_yi": 15000}
+    # 小盘：0.5亿流入 / 80亿市值 = 0.625%（较强的相对流入）
+    small = {"money_flow": {"main_net_ratio": 10, "main_net_inflow_yi": 0.5}, "mkt_cap_yi": 80}
+    assert _money_flow_score(small) > _money_flow_score(gonghang), (
+        "归一化后小盘强势股应高于工行"
+    )
+
+
+def test_money_flow_score_negative_outflow_penalized():
+    """A2: 主力净流出应得低分（<50）。"""
+    from core.decision_layer import _money_flow_score
+
+    outflow = {"money_flow": {"main_net_ratio": -8, "main_net_inflow_yi": -2}, "mkt_cap_yi": 100}
+    score = _money_flow_score(outflow)
+    assert score < 50, f"净流出应低于50，实际 {score}"

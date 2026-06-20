@@ -4,6 +4,7 @@ This module does not create buy signals. It converts existing market, sector,
 price-action, and money-flow evidence into execution permissions and sizing.
 """
 from typing import Any, Dict, List
+import math
 
 import pandas as pd
 from sqlalchemy import text
@@ -212,20 +213,37 @@ def _leadership_score(stock: Dict[str, Any]) -> float:
 
 
 def _money_flow_score(stock: Dict[str, Any]) -> float:
+    # 改动 A2：原公式用绝对金额(亿元)评分：amount*3 会让工行15亿流入碾压小盘0.5亿，
+    # 系统性高估大盘股、低估小盘股。修复：用流通市值归一化为"相对流入强度"，
+    # 再分段评分（饱和上限 20 分，避免极端值 dominating）。
     flow = stock.get("money_flow") or {}
     ratio = _num(flow.get("main_net_ratio"))
     amount = _num(flow.get("main_net_inflow_yi"))
-    return round(_clamp(50 + ratio * 2 + amount * 3), 1)
+    mkt_cap_yi = _num(stock.get("mkt_cap_yi"))
+    # 归一化：流入金额占流通市值的百分比。max(...,50) 防止极小市值除零放大。
+    relative_flow = amount / max(mkt_cap_yi, 50.0) * 100.0 if mkt_cap_yi > 0 else amount * 2.0
+    sign = math.copysign(1.0, relative_flow) if relative_flow != 0 else 0.0
+    # 分段：相对流入强度贡献（饱和在 ±20 分）+ 主力净占比（ratio 贡献减半避免饱和）
+    flow_component = sign * min(20.0, abs(relative_flow) * 8.0)
+    return round(_clamp(50.0 + flow_component + ratio * 0.5), 1)
 
 
 def _risk_reward_score(stock: Dict[str, Any]) -> float:
-    # 修复#5: risk_reward 统一为单一来源。原逻辑优先用 pa_risk_reward（Brooks ME投影，
-    # 偏大），fallback 到 risk_reward（risk_engine 计算），两者口径不一致导致排名失真。
-    # 改为：优先用 risk_engine 的 risk_reward（与止损线一致），pa_risk_reward 仅作展示。
-    rr = _num(stock.get("risk_reward") or stock.get("pa_risk_reward"))
+    # 改动 A1：原公式用 risk_reward(盈亏比) 评分，但 risk_engine 把目标价定为
+    # entry + 2*risk（固定 2:1），导致 rr 恒≈2，代入 rr*25+45=95，几乎所有票都撞
+    # 上限，15% 权重变成常量，完全丧失区分度。
+    # 修复：改为基于"止损距离百分比"评分——止损越紧（结构风险越小）分越高。
+    # 数据来源 pa_risk_pct（scanner 已计算 = (entry-stop)/entry*100）。
+    # 映射：5% 止损=100 分（满分），每多 1% 扣 4 分，16% 止损=12 分。
+    risk_pct = _num(stock.get("pa_risk_pct"))
     trap = _num(stock.get("pa_trap_risk"))
     failure = _num(stock.get("pa_failure_risk"))
-    return round(_clamp(rr * 25 + 45 - trap * 0.2 - failure * 0.15), 1)
+    if risk_pct <= 0:
+        # 无止损数据时回退到中性基线（避免极端打分）
+        base = 55.0
+    else:
+        base = _clamp(100.0 - max(0.0, risk_pct - 5.0) * 4.0)
+    return round(_clamp(base - trap * 0.2 - failure * 0.15), 1)
 
 
 def _position_plan(score: float, market_cap: int, mainline: str, blocked: bool) -> Dict[str, Any]:

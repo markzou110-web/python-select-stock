@@ -23,6 +23,7 @@ from core.risk_constants import (
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT,
     FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO, FIRST_PROFIT_TAKE_PCT,
     EARLY_WARN_MILD_PCT, EARLY_WARN_MODERATE_PCT, EARLY_WARN_TIER_COOLDOWN_DAYS,
+    WIND_CONTROL_INTERVAL_URGENT_MINUTES, URGENT_STOP_BUFFER_PCT,
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
 from core.operation_plan import alert_priority, build_position_decision_snapshot, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
@@ -1349,6 +1350,8 @@ def run_wind_control() -> Dict[str, Any]:
         close_updates = []  # 收集批量更新参数
         reduce_updates = []  # 收集分批止盈/减仓的拆行参数
         close_date_str = datetime.now().strftime("%Y-%m-%d")
+        # 改动 B1：累计本次风控的最小 stop_buffer，供 sentinel 动态调整间隔
+        min_stop_buffer_pct = None
 
         for _, row in df.iterrows():
             code = row['code']
@@ -1363,6 +1366,10 @@ def run_wind_control() -> Dict[str, Any]:
             if match.empty: continue
             curr_price = float(match.iloc[0]['price'])
             curr_high = safe_float(match.iloc[0].get('high'), curr_price)
+            # 改动 B1：读取当日最低价。急跌行情下 30 分钟 tick 可能错过盘中击穿
+            # 止损线又反弹的场景（上班族完全无感）。后续止损判定用 effective_price
+            # = min(curr_price, curr_low)，只要盘中任一时刻击穿过就触发。
+            curr_low = safe_float(match.iloc[0].get('low'), curr_price)
             high_since_entry = track_high_since_entry(
                 entry_price,
                 high_since_entry,
@@ -1404,6 +1411,13 @@ def run_wind_control() -> Dict[str, Any]:
                 row.get("strategy_type"),
             )
             plan = _build_trade_plan(row.to_dict(), curr_price, high_since_entry, risk_levels)
+            # 改动 B1：跟踪本次循环的最小 stop_buffer，用于 sentinel 动态间隔
+            _buf = safe_num(plan.get("health", {}).get("stop_buffer_pct")) if isinstance(plan.get("health"), dict) else safe_num(plan.get("stop_buffer_pct"))
+            _active_stop_buf = safe_num(risk_levels.get("active_stop_price"))
+            if _active_stop_buf > 0 and curr_price > 0:
+                _buf = (curr_price - _active_stop_buf) / curr_price * 100
+            if _buf is not None:
+                min_stop_buffer_pct = _buf if min_stop_buffer_pct is None else min(min_stop_buffer_pct, _buf)
             # 已减仓标记：通过 remark 中是否含首笔止盈标记判断，避免重复触发分批止盈。
             existing_remark = str(row.get("remark") or "")
             already_reduced = bool(existing_remark and FIRST_PROFIT_TAKE_MARK in existing_remark)
@@ -1424,11 +1438,34 @@ def run_wind_control() -> Dict[str, Any]:
             should_close = decision["should_close"]
             should_reduce = decision.get("should_reduce", False)
 
+            # 改动 B1：盘中急跌感知。若当日最低价(curr_low)击穿了执行止损线，但
+            # 最新价(curr_price)因反弹未触发 → 仍然视为止损触发（不能被反弹掩盖）。
+            # 这对上班族尤其关键：30 分钟 tick 可能在反弹后才采样，但盘中击穿已
+            # 经发生，必须如实推送并按击穿价成交（保守口径）。
+            _stop_level = safe_num(risk_levels.get("active_stop_price"))
+            _pierced_by_low = (
+                not should_close
+                and _stop_level > 0
+                and curr_low < curr_price          # 确实有下影线（非平盘）
+                and curr_low <= _stop_level         # 盘中击穿了止损线
+            )
+            if _pierced_by_low:
+                should_close = True
+                reason = (
+                    f"盘中击穿止损线 ¥{_stop_level:.2f}（最低 ¥{curr_low:.2f}），"
+                    f"按击穿价保守成交。{risk_levels.get('risk_stage') or '风险控制'}"
+                )
+                decision["reason"] = reason
+                decision["should_close"] = True
+
             if reason:
                 # 生成更详细的智能备注
                 remark = f"{reason}。卖出时大盘状态：{regime.get('desc', 'N/A')}。"
                 # 发送 Bark 风控平仓推送 — 根据交易模式区分
                 trade_mode = row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
+                # 改动 B1：平仓成交价。若盘中击穿止损线，按击穿价(当日最低)保守成交，
+                # 让模拟盘 PnL 与实盘真实滑点一致（回测引擎已用 gap-through-stop 建模）。
+                exec_price = min(curr_price, curr_low) if _pierced_by_low else curr_price
                 if trade_mode == "REAL":
                     warned_real_count += 1
                     alerts.append(f"{row['name']}({code}) 实盘风控预警: {reason}")
@@ -1436,7 +1473,7 @@ def run_wind_control() -> Dict[str, Any]:
                     action_line = "系统不会自动平仓，请人工确认是否卖出。"
                 elif should_close:
                     close_updates.append({
-                        "p": curr_price,
+                        "p": exec_price,
                         "d": close_date_str,
                         "r": remark,
                         "u": datetime.now(),
@@ -1446,7 +1483,7 @@ def run_wind_control() -> Dict[str, Any]:
                         "fs_name": str(row.get('name') or ''),
                         "fs_entry": float(entry_price),
                         "fs_strategy": str(row.get('strategy_type') or ''),
-                        "fs_pl_pct": float(pl_pct),
+                        "fs_pl_pct": float((exec_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0,
                     })
                     closed_count += 1
                     alerts.append(f"{row['name']}({code}) 模拟仓自动平仓: {reason}")
@@ -1466,13 +1503,14 @@ def run_wind_control() -> Dict[str, Any]:
                                 "remaining_shares": remaining_shares,
                                 "orig_remark": f"{existing_remark}；{FIRST_PROFIT_TAKE_MARK}({close_date_str})".strip("；"),
                                 # 新 CLOSED 行复制原行关键字段，shares 为减仓部分
+                                # 改动 B1：减仓成交价同样用保守口径（盘中击穿时按 low）
                                 "code": str(row['code']),
                                 "name": str(row.get('name') or ''),
                                 "entry_price": float(entry_price),
                                 "entry_date": row['entry_date'],
                                 "strategy_type": str(row.get('strategy_type') or ''),
                                 "trade_mode": str(trade_mode),
-                                "close_price": float(curr_price),
+                                "close_price": float(exec_price),
                                 "close_date": close_date_str,
                                 "remark": f"{FIRST_PROFIT_TAKE_MARK}：{reason}",
                                 "close_shares": reduce_shares,
@@ -1585,12 +1623,19 @@ def run_wind_control() -> Dict[str, Any]:
                     })
                 conn.commit()
 
+        # 改动 B1：判断大盘是否处于弱市（供 sentinel 缩短风控间隔）
+        from core.market_regime import map_status_to_regime
+        _regime_urgent = map_status_to_regime(regime.get("status") if isinstance(regime, dict) else None) in ("bear", "volatile")
+
         return {
             "status": "success",
             "closed_count": closed_count,
             "warned_real_count": warned_real_count,
             "warned_simulated_count": warned_simulated_count,
-            "alerts": alerts
+            "alerts": alerts,
+            # 改动 B1：暴露 urgency 状态给 sentinel 动态间隔
+            "min_stop_buffer_pct": round(min_stop_buffer_pct, 2) if min_stop_buffer_pct is not None else None,
+            "regime_urgent": _regime_urgent,
         }
     except Exception as e:
         logger.error(f"Wind control error: {e}")

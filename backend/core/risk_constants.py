@@ -54,6 +54,17 @@ EARLY_WARN_MODERATE_PCT = -5.0   # 中度预警阈值
 # 每级每天最多推一次（防 30 分钟一次的风控循环刷屏）。进程重启后重置。
 EARLY_WARN_TIER_COOLDOWN_DAYS = 1
 
+# ── 盘中急跌感知 (Intraday Plunge Detection) ──
+# 改动 B1：风控 tick 间隔 30 分钟，急跌行情下可能错过盘中击穿止损线又反弹的
+# 场景（上班族对此完全无感）。修复方案：
+# 1. run_wind_control 读取当日最低价(low)，止损判定用 min(curr_price, low)，
+#    只要盘中任一时刻击穿过止损线就触发，不被反弹掩盖。
+# 2. 当任一持仓 stop_buffer 过小（贴近止损线）或弱市时，风控间隔从常规 30
+#    分钟降到紧迫 10 分钟，缩短感知延迟。
+WIND_CONTROL_INTERVAL_URGENT_MINUTES = 10
+# 触发紧迫模式的 stop_buffer 阈值（当前价距止损线 < 此值则视为紧迫）
+URGENT_STOP_BUFFER_PCT = 2.0
+
 # ── 止盈目标 (Take Profit Target) ──
 # 前端展示 & 推送消息中的固定止盈目标
 TAKE_PROFIT_PCT = 15.0

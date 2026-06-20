@@ -48,8 +48,10 @@ SCAN_REGIME_ADAPTIVE = True
 
 # 改动 #17：失败样本闭环。扫描时预查近 FAILURE_LOOKBACK_DAYS 天内同代码同策略的
 # 失败次数，超过 FAILURE_VETO_MIN_COUNT 次的候选在 SOP 评级中一票否决（降级为 D）。
+# 改动 A4：原阈值 2 次过严——活跃票 90 天内被止损 2 次很常见（尤其弱市期），
+# 提到 3 次避免误杀正常波动。同时改为按 (code, strategy_type) 配对（见 _inject_failure_pattern）。
 FAILURE_LOOKBACK_DAYS = 90
-FAILURE_VETO_MIN_COUNT = 2
+FAILURE_VETO_MIN_COUNT = 3
 
 # 改动(上班族Bark v2)：破位反抽陷阱多维评分。检测信号前 N 天内单日大跌后，
 # 通过"量能/反抽强度/MA20破位时长/V型未确认"四维评分区分真陷阱与黄金坑洗盘，
@@ -369,9 +371,13 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
 
 
 def _inject_failure_pattern(results, engine):
-    """改动 #17：预查近 FAILURE_LOOKBACK_DAYS 天内同代码的失败次数，注入到 res['recent_failure_count']。
+    """改动 #17：预查近 FAILURE_LOOKBACK_DAYS 天内同代码+策略的失败次数，注入到 res['recent_failure_count']。
 
-    查询 failure_samples（手动亏损 + 风控自动止损平仓均会写入），按 code 聚合近期失败次数。
+    查询 failure_samples（手动亏损 + 风控自动止损平仓均会写入），按 (code, strategy_type)
+    聚合近期失败次数。
+    改动 A4：原实现只按 code 聚合，不区分 strategy_type——一只票用 tv_dual 失败 2 次，
+    改用 pine 策略（完全不同信号逻辑）也被误杀。现按 (code, strategy_type) 配对，
+    只否决"同代码同策略"的反复失败。
     engine 为 None 或查询失败时静默跳过（不阻断扫描）。
     """
     if not results or engine is None:
@@ -382,16 +388,24 @@ def _inject_failure_pattern(results, engine):
         cutoff = (date.today() - timedelta(days=FAILURE_LOOKBACK_DAYS)).isoformat()
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT code, COUNT(*) AS cnt
+                SELECT code, strategy_type, COUNT(*) AS cnt
                 FROM failure_samples
                 WHERE sample_date >= :cutoff AND pnl_pct < 0
-                GROUP BY code
+                GROUP BY code, strategy_type
             """), {"cutoff": cutoff}).fetchall()
-        fail_map = {str(r[0]): int(r[1]) for r in rows} if rows else {}
+        # 改动 A4：键改为 (code, strategy_type) 元组
+        fail_map = {(str(r[0]), str(r[1] or "")): int(r[2]) for r in rows} if rows else {}
     except Exception:
         fail_map = {}
     for res in results:
-        res['recent_failure_count'] = fail_map.get(str(res.get('代码', '')), 0)
+        _code = str(res.get('代码', ''))
+        _strat = str(res.get('strategy_type') or "")
+        # 优先按 (code, strategy_type) 精确匹配；无策略维度时回退到纯 code 匹配
+        cnt = fail_map.get((_code, _strat), 0)
+        if cnt == 0 and _strat:
+            # 回退：failure_samples 中 strategy_type 为空的历史记录仍按 code 计入
+            cnt = fail_map.get((_code, ""), 0)
+        res['recent_failure_count'] = cnt
 
 
 def _inject_capital_event_risk(results, engine, lookback_days: int = 60):

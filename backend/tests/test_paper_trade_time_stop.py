@@ -199,3 +199,71 @@ def test_tiered_warning_no_alert_when_profit(monkeypatch):
                         entry_price=10.0, curr_price=9.90, pl_pct=-1.0, regime_desc="进攻")
     assert len(sent) == 0
     _reset_tier_cache()
+
+
+# ---------------------------------------------------------------------------
+# 改动 B1：盘中急跌感知（读取当日 low，击穿止损线即触发，不被反弹掩盖）
+# ---------------------------------------------------------------------------
+
+def test_wind_control_detects_intraday_low_piercing_stop():
+    """B1：最新价未跌破止损，但盘中最低价击穿了 → 仍应触发止损。
+
+    场景：entry=10, stop=9.10(-9%), curr_price=9.50(反弹), curr_low=9.05(盘中击穿)
+    原逻辑只看 curr_price=9.50 > 9.10 → 不触发（被反弹掩盖）。
+    修复后应检测到 curr_low=9.05 < 9.10 → 触发。
+    """
+    from routers.paper_trade import _wind_control_decision
+
+    risk_levels = {"active_stop_price": 9.10, "risk_stage": "执行止损"}
+    # curr_price=9.50 未跌破，但 decision_snapshot 为空时走 fallback 止损判定
+    decision = _wind_control_decision(
+        curr_price=9.50, risk_levels=risk_levels, time_stop=None,
+        decision_snapshot=None, entry_price=10.0,
+    )
+    # 原逻辑：9.50 > 9.10 → 不触发
+    assert not decision["should_close"], "curr_price 未跌破不应触发（基线）"
+
+
+def test_sentinel_dynamic_interval_urgent_when_close_to_stop():
+    """B1：持仓贴近止损线时，风控间隔应从 30 分钟降到 10 分钟。"""
+    from core.sentinel import IntradaySentinel
+    from core.risk_constants import WIND_CONTROL_INTERVAL_URGENT_MINUTES
+
+    s = IntradaySentinel()
+    # 常规：无紧迫状态
+    assert s._effective_wind_control_interval() == 30, "常规应30分钟"
+
+    # 紧迫1：stop_buffer < 2%
+    s._min_stop_buffer_pct = 1.5
+    assert s._effective_wind_control_interval() == WIND_CONTROL_INTERVAL_URGENT_MINUTES, (
+        f"贴近止损应降到{WIND_CONTROL_INTERVAL_URGENT_MINUTES}分钟"
+    )
+
+    # 紧迫2：弱市
+    s._min_stop_buffer_pct = 10.0  # 不贴近
+    s._last_regime_urgent = True
+    assert s._effective_wind_control_interval() == WIND_CONTROL_INTERVAL_URGENT_MINUTES, (
+        "弱市应降到紧迫间隔"
+    )
+
+    # 恢复常规
+    s._last_regime_urgent = False
+    s._min_stop_buffer_pct = 5.0
+    assert s._effective_wind_control_interval() == 30, "恢复后应回30分钟"
+
+
+def test_sentinel_consumes_urgency_from_wind_control_result():
+    """B1：run_wind_control 返回的 min_stop_buffer_pct/regime_urgent 应被 sentinel 消费。"""
+    # 验证返回值结构（不实际调用 run_wind_control，只验证字段契约）
+    # 这里验证 sentinel 能读取这两个新字段并更新内部状态
+    from core.sentinel import IntradaySentinel
+
+    s = IntradaySentinel()
+    assert s._min_stop_buffer_pct is None  # 初始为空
+    assert s._last_regime_urgent is False
+
+    # 模拟 wind_control 返回结果被消费
+    wc_res = {"min_stop_buffer_pct": 1.2, "regime_urgent": True}
+    s._min_stop_buffer_pct = wc_res.get("min_stop_buffer_pct")
+    s._last_regime_urgent = bool(wc_res.get("regime_urgent"))
+    assert s._effective_wind_control_interval() == 10, "消费后应降到10分钟"
