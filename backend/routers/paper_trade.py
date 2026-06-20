@@ -15,13 +15,13 @@ from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_
 from core.indicators import calculate_indicators
 from core.price_action import analyze_price_action
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
-from core.risk_engine import compute_paper_risk_levels, safe_float, track_high_since_entry
+from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context, safe_float, track_high_since_entry
 from core.risk_constants import (
     FIXED_STOP_LOSS_PCT, FIXED_STOP_LOSS_RATIO,
     TAKE_PROFIT_PCT, TAKE_PROFIT_RATIO,
     TIME_STOP_WARNING_DAYS, TIME_STOP_REVIEW_DAYS,
     TIME_STOP_FORCE_DAYS, TIME_STOP_REVIEW_LOSS_PCT,
-    FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO,
+    FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO, FIRST_PROFIT_TAKE_PCT,
     EARLY_WARN_MILD_PCT, EARLY_WARN_MODERATE_PCT, EARLY_WARN_TIER_COOLDOWN_DAYS,
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget
@@ -573,7 +573,8 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
             f"价格来源：{trade.entry_source or 'manual_current_price'}\n"
             f"信号日期：{trade.entry_signal_date or datetime.now().strftime('%Y-%m-%d')}\n"
             f"固定止损：¥{stop_price:.2f} ({FIXED_STOP_LOSS_PCT}%)\n"
-            f"目标止盈：¥{tp_price:.2f} (+{TAKE_PROFIT_PCT}%)\n"
+            f"首笔止盈：+{FIRST_PROFIT_TAKE_PCT:.0f}%减半仓，剩余移动止盈跟踪\n"
+            f"目标上限：¥{tp_price:.2f} (+{TAKE_PROFIT_PCT}%,剩余仓位的乐观上限)\n"
             f"交易备注：{trade.remark or '无'}"
         )
         body += (
@@ -608,7 +609,7 @@ def get_open_trade_plans() -> Dict[str, Any]:
                 current,
                 row.get("entry_date"),
             )
-            risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")))
+            risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")), str(row.get("code") or ""))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             items.append({
                 "id": int(row["id"]),
@@ -682,7 +683,7 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                 safe_float(live.get("high"), current),
                 row.get("entry_date"),
             )
-            risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, code))
+            risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, code), code)
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             trigger = evaluate_operation_trigger(current, plan)
             if not trigger.get("triggered"):
@@ -758,7 +759,7 @@ def run_pre_trade_check(payload: Dict[str, Any]) -> Dict[str, Any]:
             entry = safe_float(row.get("entry_price"))
             current = current or safe_float(row.get("current_price"), entry)
             high = max(safe_float(row.get("high_since_entry"), entry), current)
-            risk = compute_paper_risk_levels(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")))
+            risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")), str(row.get("code") or ""))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
         except Exception as exc:
             logger.error(f"Pre-trade plan resolve error: {exc}")
@@ -1253,7 +1254,12 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
                     close_source = 'manual',
                     closed_by = 'user',
                     execution_note = COALESCE(:execution_note, execution_note),
-                    logic_status = CASE WHEN :close_price >= entry_price THEN 'CONFIRMED' ELSE 'INVALIDATED' END,
+                    -- 修复#3: logic_status 改为更准确的三态（盈利/亏损/待验证）
+                    logic_status = CASE
+                        WHEN :close_price >= entry_price * 1.05 THEN 'CONFIRMED'
+                        WHEN :close_price < entry_price * 0.97 THEN 'INVALIDATED'
+                        ELSE 'PENDING'
+                    END,
                     logic_last_review_at = :updated_at,
                     updated_at = :updated_at
                 WHERE id = :id

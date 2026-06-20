@@ -219,7 +219,10 @@ def _money_flow_score(stock: Dict[str, Any]) -> float:
 
 
 def _risk_reward_score(stock: Dict[str, Any]) -> float:
-    rr = _num(stock.get("pa_risk_reward") or stock.get("risk_reward"))
+    # 修复#5: risk_reward 统一为单一来源。原逻辑优先用 pa_risk_reward（Brooks ME投影，
+    # 偏大），fallback 到 risk_reward（risk_engine 计算），两者口径不一致导致排名失真。
+    # 改为：优先用 risk_engine 的 risk_reward（与止损线一致），pa_risk_reward 仅作展示。
+    rr = _num(stock.get("risk_reward") or stock.get("pa_risk_reward"))
     trap = _num(stock.get("pa_trap_risk"))
     failure = _num(stock.get("pa_failure_risk"))
     return round(_clamp(rr * 25 + 45 - trap * 0.2 - failure * 0.15), 1)
@@ -304,7 +307,18 @@ def apply_decision_layer(
             + risk_score * 0.15,
             1,
         )
-        market_blocked = context["market_sentiment_stage"] == "RETREAT"
+        # 修复#1: ICE(冰点)阶段也应阻断建仓（原仅阻断RETREAT）。
+        # 同时允许防御性板块(黄金/公用事业等)在RETREAT时轮动（不一刀切阻断）。
+        _stage = context["market_sentiment_stage"]
+        _is_defensive_sector = mainline in ("防御", "DEFENSIVE") or stock.get("行业", "") in (
+            "黄金", "贵金属", "电力", "水务", "燃气", "高速公路", "港口", "银行", "煤炭"
+        )
+        # ICE 和 RETREAT 都阻断，但 RETREAT 时防御性板块可观察（不禁止）
+        market_blocked = _stage in ("RETREAT", "ICE")
+        if market_blocked and _is_defensive_sector and _stage == "RETREAT":
+            # 防御性板块在退潮期可观察（降级但不一刀切禁止）
+            market_blocked = False
+            stock["defensive_rotation"] = True
         sector_blocked = mainline == "FADING"
         score_blocked = opportunity < 60
         blocked = market_blocked or sector_blocked or score_blocked or stock.get("trade_bucket") == "BLOCK"

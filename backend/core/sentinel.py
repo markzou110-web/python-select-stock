@@ -552,7 +552,7 @@ def _append_real_position_status(lines: List[str]) -> None:
     from core.data import get_market_snapshot, get_index_hist
     from core.indicators import calculate_indicators
     from core.strategy import evaluate_exit_signals
-    from core.risk_engine import compute_paper_risk_levels, safe_float
+    from core.risk_engine import compute_paper_risk_levels_with_context, safe_float
     from core.price_action import analyze_price_action
 
     try:
@@ -595,7 +595,7 @@ def _append_real_position_status(lines: List[str]) -> None:
             if len(df_hist) >= 20:
                 df_labeled = calculate_indicators(df_hist, current_price=curr, bench_df=bench_df)
                 signals = evaluate_exit_signals(df_labeled, entry, high)
-                risk = compute_paper_risk_levels(entry, high, curr)
+                risk = compute_paper_risk_levels_with_context(entry, high, curr, None, code)
                 pa = analyze_price_action(df_hist)
                 active_stop = risk.get("active_stop_price") or risk.get("stop_price") or 0
                 stop_buffer = ((curr - active_stop) / curr * 100) if curr > 0 and active_stop > 0 else None

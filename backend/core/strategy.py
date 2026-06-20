@@ -7,7 +7,7 @@ from core.risk_constants import (
     BACKTEST_TRAILING_ATR_MULT,
     ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT
 )
-from core.risk_engine import compute_paper_risk_levels
+from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context
 
 STRATEGY_LOGIC_VERSION = "2026.05-brooks-pine5"
 BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
@@ -1602,7 +1602,7 @@ def evaluate_exit_signals(
     max_pl_pct = (high_price - entry_price) / entry_price * 100
     
     alerts = []
-    risk = compute_paper_risk_levels(entry_price, high_price, curr_price)
+    risk = compute_paper_risk_levels_with_context(entry_price, high_price, curr_price, None, code)
     active_stop = risk.get("active_stop_price") or risk.get("stop_price") or 0
 
     # --- 1. 绝对止损 & ATR 自适应止损 (Survival First) ---

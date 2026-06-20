@@ -57,6 +57,56 @@ def track_high_since_entry(
     )
 
 
+def compute_paper_risk_levels_with_context(
+    entry_price: float,
+    high_since_entry: float,
+    current_price: float,
+    price_action_summary: dict | None = None,
+    code: str | None = None,
+) -> dict:
+    """compute_paper_risk_levels 的便捷封装：自动获取 ATR 和 market_regime。
+
+    修复#2: 原来很多调用点不传 atr/market_regime，导致 UI/推送/策略信号
+    看到的止损线与风控循环不一致（弱市时差3%）。此函数统一获取这两个参数。
+    """
+    # 获取 market_regime（只取 status 映射到 bull/bear/volatile）
+    _regime = None
+    try:
+        from core.data import get_market_regime
+        from core.market_regime import map_status_to_regime
+        _reg = get_market_regime()
+        if isinstance(_reg, dict):
+            _regime = map_status_to_regime(_reg.get("status"))
+    except Exception:
+        pass
+
+    # 获取 ATR（从 price_action_summary 或按需计算）
+    _atr = None
+    if price_action_summary and isinstance(price_action_summary, dict):
+        _atr = price_action_summary.get("latest_atr")
+    if _atr is None and code:
+        try:
+            from core.db import load_from_db, get_db_engine
+            from core.indicators import calculate_indicators
+            from datetime import datetime, timedelta
+            _eng = get_db_engine()
+            if _eng:
+                _df = load_from_db(code, (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"), _eng)
+                if _df is not None and not _df.empty:
+                    _df_i = calculate_indicators(_df)
+                    if "ATR" in _df_i.columns and not _df_i.empty:
+                        _v = float(_df_i["ATR"].iloc[-1])
+                        if _v == _v:  # 排除 NaN
+                            _atr = _v
+        except Exception:
+            pass
+
+    return compute_paper_risk_levels(
+        entry_price, high_since_entry, current_price, price_action_summary,
+        atr=_atr, market_regime=_regime
+    )
+
+
 def compute_paper_risk_levels(
     entry_price: float,
     high_since_entry: float,

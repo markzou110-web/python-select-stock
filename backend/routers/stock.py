@@ -15,7 +15,7 @@ from core.db import get_db_engine, validate_stock_code, load_from_db, save_to_db
 from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
 from core.price_action import build_price_action_annotations
-from core.risk_engine import compute_paper_risk_levels, safe_float, track_high_since_entry
+from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context, safe_float, track_high_since_entry
 from core.operation_plan import build_position_decision_snapshot, operation_bands, price_instruction
 from core.money_flow import get_stock_money_flow
 from core.audit_log import get_position_decision_timeline, record_position_decision_change
@@ -279,11 +279,12 @@ def get_stock_detail(code: str):
                     paper_res[4],
                 )
                 is_paper_trade = True
-                risk_levels = compute_paper_risk_levels(
+                risk_levels = compute_paper_risk_levels_with_context(
                     entry_price,
                     high_since_entry,
                     current_close,
                     price_action.get("summary", {}),
+                    code,
                 )
                 buy_price = risk_levels["buy_price"]
                 stop_price = risk_levels["stop_price"]
@@ -1018,11 +1019,12 @@ def get_stock_full_analysis(code: str):
                 else:
                     curr_price = safe_float(paper_res[5], current_price)
                     price_source = "paper_cached_price" if curr_price > 0 else "daily_k"
-                risk_levels = compute_paper_risk_levels(
+                risk_levels = compute_paper_risk_levels_with_context(
                     entry_price,
                     high_since_entry,
                     curr_price,
                     price_action.get("summary", {}),
+                    code,
                 )
                 buy_price = risk_levels["buy_price"]
                 stop_price = risk_levels["stop_price"]

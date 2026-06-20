@@ -161,12 +161,12 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                     LIMIT 1
                 """), {"code": code}).fetchone()
                 if paper_res:
-                    from core.risk_engine import compute_paper_risk_levels
+                    from core.risk_engine import compute_paper_risk_levels_with_context
 
                     entry = safe_num(paper_res[0])
                     current = safe_num(paper_res[2]) or safe_num(df.iloc[-1]["收盘"])
                     high = max(safe_num(paper_res[1], entry), current)
-                    risk = compute_paper_risk_levels(entry, high, current)
+                    risk = compute_paper_risk_levels_with_context(entry, high, current, None, code)
                     trigger = max(current * 1.02, high)
                     guard = max(safe_num(risk.get("active_stop_price")), trigger * 0.985)
                     chart_context["operation_bands"] = operation_bands(

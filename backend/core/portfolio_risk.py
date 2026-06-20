@@ -15,6 +15,10 @@ DEFAULT_RISK_BUDGET = {
     # 改动 #12：日内亏损熔断。当日已平仓实现亏损占初始总资金比例超过此值时，
     # 暂停当日新开仓（halt），避免连续止损放大系统性回撤。
     "daily_loss_limit_pct": 5.0,
+    # 修复#4: 总仓位上限。所有OPEN持仓的capital_used之和占虚拟总资金的比例上限。
+    # 防止理论上满仓单票或过度集中。
+    "max_total_capital_pct": 80.0,
+    "virtual_total_capital": 1000000.0,  # 虚拟总资金100万（用于仓位占比计算）
 }
 
 
@@ -151,6 +155,19 @@ def evaluate_portfolio_risk_budget(
         warnings.append(f"单笔计划风险 {new_risk:.1f}% 超过上限 {float(limits['max_single_risk_pct']):.1f}%")
     if total_plan_risk + new_risk > float(limits["max_total_plan_risk_pct"]):
         warnings.append(f"组合计划风险将达到 {total_plan_risk + new_risk:.1f}%，超过上限 {float(limits['max_total_plan_risk_pct']):.1f}%")
+
+    # 修复#4: 总仓位上限检查。所有OPEN持仓的capital_used之和 + 新仓 占虚拟总资金的比例。
+    try:
+        existing_capital = float(open_df.get("capital_used", pd.Series(dtype=float)).fillna(0).sum())
+    except Exception:
+        existing_capital = 0.0
+    new_capital = float(new_trade.get("capital_used") or new_trade.get("position_pct", 0) * float(new_trade.get("entry_price", 0) or 0) / 100 or 0)
+    total_capital = existing_capital + new_capital
+    virtual_cap = float(limits.get("virtual_total_capital", 1000000))
+    capital_pct = total_capital / virtual_cap * 100 if virtual_cap > 0 else 0
+    max_cap_pct = float(limits.get("max_total_capital_pct", 80.0))
+    if capital_pct > max_cap_pct:
+        warnings.append(f"总仓位占比将达到 {capital_pct:.1f}%，超过上限 {max_cap_pct:.0f}%（虚拟资金¥{virtual_cap/10000:.0f}万）")
 
     summary.update({
         "open_positions": open_count,
