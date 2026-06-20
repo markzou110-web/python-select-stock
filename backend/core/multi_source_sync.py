@@ -4,6 +4,7 @@
 """
 import time
 import random
+import atexit
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
@@ -19,8 +20,28 @@ from core.logging_config import logger
 from core.config import config
 
 
-MIN_REQUIRED_TRADING_DAYS = 650
-HISTORY_LOOKBACK_CALENDAR_DAYS = 1010
+def _baostock_cleanup():
+    """进程退出时关闭 baostock 全局 session，避免资源泄漏。
+
+    延迟导入 + 防御性 try/except：即使 baostock 未安装或在 logout 时
+    抛异常，也不会影响进程正常退出。
+    """
+    try:
+        import baostock as bs
+        bs.logout()
+    except Exception:
+        pass
+
+
+atexit.register(_baostock_cleanup)
+
+
+# 数据深度要求：1000 个交易日（约 4 年）足以让胜率/ATR/Range Filter 等
+# 长周期指标稳定收敛，且为后续 1500 日历史回补预留缓冲。
+MIN_REQUIRED_TRADING_DAYS = 1000
+# 1500 个自然日 ≈ 1000 个交易日。考虑节假日/停牌，实际回补通常会覆盖 1000+
+# 个交易日，确保 needs_history_backfill 阈值被满足后不再反复触发历史回补。
+HISTORY_LOOKBACK_CALENDAR_DAYS = 1500
 
 # 批量同步并发度。DB 连接池上限为 30（pool_size=10 + max_overflow=20），
 # 24 个 worker 既能充分并行又留有余量；akshare 调用为 I/O bound，GIL 不阻塞。
@@ -531,6 +552,140 @@ class TushareDataSource(DataSource):
             raise
 
 
+class BaoStockDataSource(DataSource):
+    """
+    BaoStock 数据源 (https://baostock.com)
+
+    特点：
+    - 免费、无需 token，支持 1990 年至今的全部 A 股
+    - 前复权 (`adjustflag='2'`) 数据稳定，适合做历史回补
+    - 覆盖范围广，作为 Tushare/Sina/EastMoney 之外的历史数据兜底源
+
+    注意：
+    - baostock 的 `bs.login()` 维护进程级全局 session，**不是线程安全的**。
+      本类用类级锁串行化 login/logout/query 三步，确保在 24 worker 并发下
+      不会出现 session 串扰。
+    - baostock 的成交量单位是「股」，而本系统数据库约定为「手」(1手=100股)，
+      与 Sina/Tushare 保持一致，因此需 / 100。
+    - 字段全部以字符串返回，必须显式转 float。
+    """
+
+    # 类级别锁：baostock 全局 session 不支持并发，整个 login→query→logout
+    # 必须串行执行，否则会出现 "baostock data client not login" 等错误。
+    _bs_lock = threading.Lock()
+    _logged_in = False
+
+    def __init__(self):
+        super().__init__("BaoStock")
+        # 优先级设为 4：作为历史数据兜底源，低于其它在线源。
+        # 日常增量更新优先走腾讯/Tushare；只有它们都失败时才回退到 BaoStock。
+        # 但 BaoStock 的优势在于历史深度（1990 至今），非常适合 backfill 场景。
+        self.priority = 4
+        # 延迟导入：仅在首次实例化时 import baostock，避免未安装该包的环境
+        # 在 import 本模块时直接崩溃。
+        try:
+            import baostock  # noqa: F401
+            self._baostock = baostock
+            self.status = DataSourceStatus.AVAILABLE
+        except ImportError:
+            self._baostock = None
+            self.status = DataSourceStatus.UNAVAILABLE
+            self.last_error = "未安装 baostock 包 (pip install baostock)"
+
+    def get_stock_list(self) -> Optional[pd.DataFrame]:
+        """BaoStock 提供完整股票列表，但其它源（新浪/东方财富）已能覆盖，
+        且后者包含更丰富的行业/名称信息。此处返回 None，让 manager 回退。
+        """
+        return None
+
+    def format_code(self, code: str) -> str:
+        """BaoStock 需要 sh.XXXXXX / sz.XXXXXX / bj.XXXXXX 格式。"""
+        if code.startswith('6') or code.startswith('900'):
+            return f'sh.{code}'
+        elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
+            return f'sz.{code}'
+        elif code.startswith('8') or code.startswith('4') or code.startswith('920'):
+            return f'bj.{code}'
+        return f'sz.{code}'
+
+    def _ensure_login(self):
+        """在类锁保护下确保 baostock 已登录。
+
+        baostock 的 login 是幂等的——已登录状态下再次 login 会返回成功。
+        但为减少网络往返，使用 _logged_in 标志位做短路。
+        """
+        if self._logged_in:
+            return
+        bs = self._baostock
+        lg = bs.login()
+        if lg.error_code != '0':
+            raise RuntimeError(f"BaoStock login 失败: {lg.error_msg}")
+        self._logged_in = True
+
+    def get_hist_data(self, code: str, start_date: str) -> Optional[pd.DataFrame]:
+        if self._baostock is None:
+            return None
+
+        # start_date 在本系统中是 YYYYMMDD，BaoStock 需要 YYYY-MM-DD
+        start_str = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+        end_str = datetime.now().strftime("%Y-%m-%d")
+        bs_code = self.format_code(code)
+
+        # 串行化整个 login→query→（可选）logout 流程。
+        # logout 会关闭全局 session，影响其它线程，因此本类常驻 login 状态，
+        # 仅在进程退出时由 atexit 触发清理（见模块底部）。
+        with BaoStockDataSource._bs_lock:
+            try:
+                self._ensure_login()
+                rs = self._baostock.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume",
+                    start_date=start_str,
+                    end_date=end_str,
+                    frequency="d",
+                    adjustflag="2",  # 前复权，与其它源保持一致
+                )
+            except Exception:
+                # 任何 query 阶段异常都不 logout（保持 session 供下次复用）
+                raise
+
+            if rs.error_code != '0':
+                raise RuntimeError(f"BaoStock query 失败 ({bs_code}): {rs.error_msg}")
+
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows, columns=rs.fields)
+        # baostock 所有字段均为字符串，需转 float
+        for col in ("open", "high", "low", "close", "volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # 丢弃无效行（停牌日可能返回空值）
+        df = df.dropna(subset=["open", "high", "low", "close"])
+        if df.empty:
+            return None
+
+        # 成交量单位转换：baostock 返回「股」，DB 约定「手」(1 手 = 100 股)。
+        # 与 SinaDataSource 的处理一致（line ~306）。
+        df["volume"] = (df["volume"] / 100.0).round(2)
+
+        # 统一列名为本系统约定的中文 schema，与 save_to_db 期望一致
+        df = df.rename(columns={
+            "date": "日期",
+            "open": "开盘",
+            "high": "最高",
+            "low": "最低",
+            "close": "收盘",
+            "volume": "成交量",
+        })
+        df["日期"] = pd.to_datetime(df["日期"]).dt.date
+
+        return df
+
+
 class DataSourceManager:
     """
     数据源管理器
@@ -554,6 +709,7 @@ class DataSourceManager:
             EastMoneyDataSource(),
             SinaDataSource(),
             TencentDataSource(),
+            BaoStockDataSource(),  # 历史数据兜底源：免费、无 token、1990 至今
         ]
 
         # 按优先级排序
@@ -756,8 +912,9 @@ class MultiSourceSync:
 
             today = datetime.now().date()
 
-            # Range Filter 等长线 EMA 需要约 600 个交易日预热。
-            # 当前回拉 1010 个自然日通常约覆盖 650+ 个交易日，避免日常同步反复触发历史回补。
+            # Range Filter 等长线 EMA 需要约 600 个交易日预热，胜率引擎/ATR
+            # 需要更长样本。当前回拉 1500 个自然日通常约覆盖 1000 个交易日，
+            # 避免日常同步反复触发历史回补。
 
             if last_date:
                 # 检查数据天数是否足够

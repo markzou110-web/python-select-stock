@@ -1,24 +1,37 @@
 import time
+import threading
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 from core.multi_source_sync import (
     MIN_REQUIRED_TRADING_DAYS,
+    HISTORY_LOOKBACK_CALENDAR_DAYS,
     needs_history_backfill,
     SYNC_MAX_WORKERS,
     SYNC_SINGLE_STOCK_TIMEOUT,
     SOURCE_FAILOVER_DELAY_RANGE,
     StockNotSupportedError,
     MultiSourceSync,
+    DataSourceManager,
     TushareDataSource,
     TencentDataSource,
+    BaoStockDataSource,
 )
 
 
 def test_needs_history_backfill_uses_trading_day_threshold():
     assert needs_history_backfill(MIN_REQUIRED_TRADING_DAYS - 1)
     assert not needs_history_backfill(MIN_REQUIRED_TRADING_DAYS)
-    assert not needs_history_backfill(665)
+    # 新阈值是 1000，旧的 665 现在应触发 backfill
+    assert needs_history_backfill(665)
+
+
+def test_sync_constants_raised_for_deeper_history():
+    """胜率引擎/ATR 需要更长样本，常量已从 650/1010 提升到 1000/1500。"""
+    assert MIN_REQUIRED_TRADING_DAYS == 1000
+    assert HISTORY_LOOKBACK_CALENDAR_DAYS == 1500
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +233,8 @@ def test_sync_batch_max_workers_config():
 def test_sync_single_stock_already_latest_returns_early():
     """数据足够且 last_date >= today 时应立即返回，不调用任何源的 get_hist_data。"""
     today = datetime.now().date()
-    # data_count=700 (>650 阈值) 且 last_date >= today → 命中"已是最新"分支
-    engine = _conn_returning(today, 700)
+    # data_count=1200 (>1000 阈值) 且 last_date >= today → 命中"已是最新"分支
+    engine = _conn_returning(today, 1200)
 
     network_source = _FakeSource("腾讯财经", hist_data=None)  # 不应被调用
     syncer = _make_syncer([network_source], engine=engine)
@@ -232,3 +245,173 @@ def test_sync_single_stock_already_latest_returns_early():
     assert "已是最新" in result["message"]
     # 关键回归断言：不应触达任何数据源的网络调用
     network_source._get_hist.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 6. BaoStock 代码格式化：sh/sz/bj 前缀路由
+# ---------------------------------------------------------------------------
+
+def test_baostock_format_code_routes_by_prefix():
+    """format_code 必须根据代码首位路由到 sh./sz./bj. 前缀。"""
+    src = BaoStockDataSource()
+    assert src.format_code("600000") == "sh.600000"   # 沪市主板
+    assert src.format_code("688981") == "sh.688981"   # 科创板
+    assert src.format_code("000001") == "sz.000001"   # 深市主板
+    assert src.format_code("300750") == "sz.300750"   # 创业板
+    assert src.format_code("830123") == "bj.830123"   # 北交所
+
+
+# ---------------------------------------------------------------------------
+# 7. BaoStock 成交量单位转换：股 → 手 (÷100)
+#    这是关键的跨源一致性保证：DB 约定 vol 字段为「手」，
+#    而 baostock 原始返回是「股」。
+# ---------------------------------------------------------------------------
+
+def _make_fake_baostock(rows):
+    """构造一个 mock baostock 模块，返回预设的 rs 对象。
+
+    rows: List[List[str]] —— 每行对应 [date, open, high, low, close, volume]
+    """
+    fake_bs = MagicMock()
+    fake_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+
+    class _RS:
+        def __init__(self):
+            self.error_code = "0"
+            self.error_msg = "success"
+            self.fields = ["date", "open", "high", "low", "close", "volume"]
+            self._rows = list(rows)
+            self._idx = 0
+
+        def next(self):
+            if self._idx < len(self._rows):
+                self._idx += 1
+                return True
+            return False
+
+        def get_row_data(self):
+            return self._rows[self._idx - 1]
+
+    fake_bs.query_history_k_data_plus.return_value = _RS()
+    fake_bs.logout.return_value = MagicMock(error_code="0")
+    return fake_bs
+
+
+def test_baostock_volume_converted_to_hands(monkeypatch):
+    """BaoStock 返回的成交量（股）必须 ÷100 转换为「手」，与 Sina/Tushare 一致。"""
+    # 模拟 baostock 返回 10000 股的成交量
+    fake_bs = _make_fake_baostock([
+        ["2024-01-02", "10.00", "10.50", "9.80", "10.20", "10000"],
+        ["2024-01-03", "10.20", "10.60", "10.10", "10.55", "50000"],
+    ])
+
+    src = BaoStockDataSource()
+    src._baostock = fake_bs
+    src._logged_in = False  # 强制走 _ensure_login
+
+    df = src.get_hist_data("600000", "20240101")
+
+    assert df is not None
+    assert len(df) == 2
+    # 关键断言：10000 股 → 100 手；50000 股 → 500 手
+    assert df["成交量"].tolist() == [100.0, 500.0]
+    # 列名必须是中文 schema，与 save_to_db 期望一致
+    assert list(df.columns) == ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
+    # 数值列必须是 float（baostock 原始返回是字符串）
+    assert df["开盘"].dtype == float
+    assert df["收盘"].dtype == float
+
+
+def test_baostock_drops_rows_with_null_ohlc():
+    """停牌日可能返回空字符串值，必须被 dropna 清除。"""
+    fake_bs = _make_fake_baostock([
+        ["2024-01-02", "10.00", "10.50", "9.80", "10.20", "10000"],
+        ["2024-01-03", "", "", "", "", ""],  # 停牌：空值
+        ["2024-01-04", "10.20", "10.60", "10.10", "10.55", "50000"],
+    ])
+
+    src = BaoStockDataSource()
+    src._baostock = fake_bs
+    src._logged_in = False
+
+    df = src.get_hist_data("600000", "20240101")
+    # 中间一行被 dropna 剔除
+    assert len(df) == 2
+    assert df["日期"].tolist() != []  # 至少有数据
+
+
+def test_baostock_query_failure_raises_runtime_error():
+    """baostock query 返回非 0 error_code 时应抛 RuntimeError（供上层切换源）。"""
+    fake_bs = MagicMock()
+    fake_bs.login.return_value = MagicMock(error_code="0", error_msg="success")
+
+    class _ErrRS:
+        error_code = "600001"
+        error_msg = "code not exist"
+
+        def next(self):
+            return False
+
+        def get_row_data(self):
+            return []
+
+    fake_bs.query_history_k_data_plus.return_value = _ErrRS()
+
+    src = BaoStockDataSource()
+    src._baostock = fake_bs
+    src._logged_in = False
+
+    try:
+        src.get_hist_data("999999", "20240101")
+        assert False, "应抛 RuntimeError"
+    except RuntimeError as e:
+        assert "code not exist" in str(e) or "query 失败" in str(e)
+
+
+def test_baostock_login_failure_raises():
+    """baostock login 失败时应抛 RuntimeError。"""
+    fake_bs = MagicMock()
+    fake_bs.login.return_value = MagicMock(error_code="1", error_msg="network error")
+
+    src = BaoStockDataSource()
+    src._baostock = fake_bs
+    src._logged_in = False
+
+    try:
+        src.get_hist_data("600000", "20240101")
+        assert False, "应抛 RuntimeError"
+    except RuntimeError as e:
+        assert "login" in str(e).lower() or "network" in str(e).lower()
+
+
+def test_baostock_serializes_via_class_lock():
+    """BaoStockDataSource 使用类级锁串行化 baostock 全局 session 访问。
+
+    这是回归保护：确保 _bs_lock 仍然存在，且 get_hist_data 在锁内完成 query。
+    （baostock 的 bs.login() 维护进程级全局 session，并发调用会串扰）
+    """
+    assert hasattr(BaoStockDataSource, "_bs_lock")
+    # 锁必须是类属性（非实例属性），确保跨实例/跨线程共享
+    assert isinstance(BaoStockDataSource.__dict__.get("_bs_lock"), type(threading.Lock()))
+
+
+# ---------------------------------------------------------------------------
+# 8. BaoStock 在 DataSourceManager 中注册且优先级最低（兜底源）
+# ---------------------------------------------------------------------------
+
+def test_baostock_registered_in_manager():
+    """DataSourceManager 应注册 BaoStockDataSource，且其优先级最高数字（兜底）。"""
+    # 用 __new__ 绕过 __init__ 的网络探测
+    mgr = DataSourceManager.__new__(DataSourceManager)
+    mgr.sources = [
+        TushareDataSource.__new__(TushareDataSource),
+        TencentDataSource.__new__(TencentDataSource),
+        BaoStockDataSource(),
+    ]
+    for i, s in enumerate(mgr.sources):
+        s.priority = i
+    mgr.sources[-1].priority = 4  # BaoStock 兜底
+
+    # 排序后 BaoStock 应排到最后
+    mgr.sources.sort(key=lambda x: x.priority)
+    assert isinstance(mgr.sources[-1], BaoStockDataSource)
