@@ -36,11 +36,16 @@ def _baostock_cleanup():
 atexit.register(_baostock_cleanup)
 
 
-# 数据深度要求：1000 个交易日（约 4 年）足以让胜率/ATR/Range Filter 等
-# 长周期指标稳定收敛，且为后续 1500 日历史回补预留缓冲。
-MIN_REQUIRED_TRADING_DAYS = 1000
-# 1500 个自然日 ≈ 1000 个交易日。考虑节假日/停牌，实际回补通常会覆盖 1000+
-# 个交易日，确保 needs_history_backfill 阈值被满足后不再反复触发历史回补。
+# 数据深度要求：950 个交易日（约 3.8 年）足以让胜率/ATR/Range Filter 等
+# 长周期指标稳定收敛。
+#
+# 阈值选择的现实约束：腾讯/BaoStock 在 1500 自然日窗口下实际只能返回
+# ~996 个交易日（节假日 + 停牌损耗）。若阈值设为 1000，会导致
+# needs_history_backfill() 永远返回 True → 每次同步都触发历史回填却
+# 永远到不了 1000 → 无限循环。因此设为 950，留出 ~5% 缓冲。
+MIN_REQUIRED_TRADING_DAYS = 950
+# 1500 个自然日 ≈ 1000 个交易日（理论值）。实际因节假日/停牌，各数据源
+# 平均返回 990~996 天，足以覆盖 950 天阈值，确保回填后稳定收敛。
 HISTORY_LOOKBACK_CALENDAR_DAYS = 1500
 
 # 批量同步并发度。DB 连接池上限为 30（pool_size=10 + max_overflow=20），
@@ -913,8 +918,8 @@ class MultiSourceSync:
             today = datetime.now().date()
 
             # Range Filter 等长线 EMA 需要约 600 个交易日预热，胜率引擎/ATR
-            # 需要更长样本。当前回拉 1500 个自然日通常约覆盖 1000 个交易日，
-            # 避免日常同步反复触发历史回补。
+            # 需要更长样本。当前回拉 1500 个自然日通常约覆盖 990~996 个交易日
+            #（节假日损耗），足以满足 950 天阈值，避免日常同步反复触发历史回补。
 
             if last_date:
                 # 检查数据天数是否足够

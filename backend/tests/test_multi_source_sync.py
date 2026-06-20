@@ -24,14 +24,23 @@ from core.multi_source_sync import (
 def test_needs_history_backfill_uses_trading_day_threshold():
     assert needs_history_backfill(MIN_REQUIRED_TRADING_DAYS - 1)
     assert not needs_history_backfill(MIN_REQUIRED_TRADING_DAYS)
-    # 新阈值是 1000，旧的 665 现在应触发 backfill
-    assert needs_history_backfill(665)
+    # 新阈值是 950：数据源 1500 日窗口实际返回 ~996 天（节假日损耗），
+    # 阈值设为 950 留 5% 缓冲，避免因源上限 < 阈值导致无限回填循环。
+    assert needs_history_backfill(665)  # 旧的 650 阈值下的典型深度，现在触发 backfill
+    assert not needs_history_backfill(996)  # 源实际上限，不应再触发
 
 
 def test_sync_constants_raised_for_deeper_history():
-    """胜率引擎/ATR 需要更长样本，常量已从 650/1010 提升到 1000/1500。"""
-    assert MIN_REQUIRED_TRADING_DAYS == 1000
+    """胜率引擎/ATR 需要更长样本。
+
+    阈值选择约束：腾讯/BaoStock 在 1500 自然日窗口下实际返回 ~996 天。
+    阈值必须 < 996，否则会陷入"永远差几天"的无限回填循环。
+    950 留出 ~5% 缓冲，既满足指标稳定性，又确保回填后能收敛。
+    """
+    assert MIN_REQUIRED_TRADING_DAYS == 950
     assert HISTORY_LOOKBACK_CALENDAR_DAYS == 1500
+    # 关键不变式：阈值必须低于数据源的实际返回上限
+    assert MIN_REQUIRED_TRADING_DAYS < 996
 
 
 # ---------------------------------------------------------------------------
