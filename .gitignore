@@ -40,6 +40,9 @@ celerybeat.pid
 # Agent tools (not part of the open-source project)
 .agent/
 .celery_pid
+.serena/
+.backend_pid
+.frontend_pid
 
 # Debug / temporary scripts
 diag.py
@@ -47,3 +50,4 @@ debug_*.py
 verify_*.py
 check_*.py
 scan_today_signals.py
+backend/scratch/

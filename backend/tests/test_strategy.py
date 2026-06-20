@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import sys
 import os
+from copy import deepcopy
 
 # Add backend to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -20,6 +21,7 @@ from core.strategy import (
     calculate_pine_win_rate,
     calculate_historical_win_rate,
 )
+from core.scanner import _apply_sop_filter
 
 
 class TestSimulateBacktestBasic:
@@ -33,6 +35,11 @@ class TestSimulateBacktestBasic:
         result = _simulate_backtest(close, high, low, signal_indices=[])
         assert result["signal_count"] == 0
         assert result["win_rate"] == 0
+        assert result["confidence"] == 0
+        assert result["adjusted_win_rate"] == 0
+        assert result["adjusted_win_rate_method"] == "wilson_lower_99"
+        assert result["expectancy"] == 0
+        assert result["sample_warning"] == "无历史信号"
         assert result["vol_skipped"] == 0
         assert result["time_stopped"] == 0
 
@@ -93,6 +100,118 @@ class TestSimulateBacktestBasic:
             use_trailing_stop=False
         )
         assert result["avg_hold_days"] == 5
+
+
+class TestBacktestWinRateReliability:
+    """Test sample-size reliability fields for historical win-rate stats."""
+
+    def test_single_trade_win_rate_is_discounted_and_profit_factor_capped(self):
+        prices = np.array([10.0, 12.0, 12.0])
+        high = prices + 0.1
+        low = prices - 0.1
+
+        result = _simulate_backtest(
+            close_vals=prices,
+            high_vals=high,
+            low_vals=low,
+            signal_indices=[0],
+            max_hold_days=1,
+            stop_loss_pct=-50.0,
+            use_trailing_stop=False,
+        )
+
+        assert result["signal_count"] == 1
+        assert result["win_rate"] == 100.0
+        assert result["confidence"] == 0.15
+        assert result["adjusted_win_rate"] == 13.1
+        assert result["adjusted_win_rate_method"] == "wilson_lower_99"
+        assert result["profit_factor"] == 3.0
+        assert result["sample_warning"] == "仅1笔交易，胜率仅供参考"
+
+    def test_five_trade_sample_gets_partial_confidence(self):
+        prices = np.linspace(10.0, 16.0, 12)
+        high = prices + 0.1
+        low = prices - 0.1
+
+        result = _simulate_backtest(
+            close_vals=prices,
+            high_vals=high,
+            low_vals=low,
+            signal_indices=[0, 1, 2, 3, 4],
+            max_hold_days=1,
+            stop_loss_pct=-50.0,
+            use_trailing_stop=False,
+        )
+
+        assert result["signal_count"] == 5
+        assert result["win_rate"] == 100.0
+        assert result["confidence"] == 0.4
+        assert result["adjusted_win_rate"] == 42.9
+        assert result["adjusted_win_rate_method"] == "wilson_lower_99"
+        assert result["sample_warning"] == "样本偏少(5笔)，胜率可信度一般"
+
+    def test_expectancy_can_be_negative_despite_mixed_win_rate(self):
+        prices = np.array([10.0, 11.0, 10.0, 8.0, 8.0])
+        high = prices + 0.1
+        low = prices - 0.1
+
+        result = _simulate_backtest(
+            close_vals=prices,
+            high_vals=high,
+            low_vals=low,
+            signal_indices=[0, 2],
+            max_hold_days=1,
+            stop_loss_pct=-50.0,
+            use_trailing_stop=False,
+        )
+
+        assert result["signal_count"] == 2
+        assert result["win_rate"] == 50.0
+        assert result["expectancy"] < 0
+
+
+class TestSopUsesAdjustedBacktestStats:
+    """SOP quality scoring should use reliability-adjusted backtest stats."""
+
+    def _base_result(self):
+        return {
+            "代码": "000001",
+            "名称": "测试股",
+            "行业": "测试行业",
+            "Score": 120,
+            "raw_score": 120,
+            "历史胜率": "100%",
+            "影线比": 0.1,
+            "mkt_cap_yi": 100,
+            "ROE": 15,
+            "净利YOY": 30,
+            "pa_structure_score": 100,
+            "sector_alignment_score": 100,
+            "涨幅%": 1.0,
+            "回测统计": {
+                "adjusted_win_rate": 15.0,
+                "profit_factor": 3.0,
+                "expectancy": 1.0,
+            },
+        }
+
+    def test_sop_uses_adjusted_win_rate_dimension(self):
+        rows = [self._base_result()]
+
+        _apply_sop_filter(rows, {"status": "OFFENSIVE"}, {})
+
+        assert rows[0]["sop_quality_dimensions"]["win_rate"] == 15.0
+
+    def test_negative_expectancy_penalizes_quality_score(self):
+        positive = self._base_result()
+        negative = deepcopy(positive)
+        negative["回测统计"]["expectancy"] = -1.0
+        rows = [positive, negative]
+
+        _apply_sop_filter(rows, {"status": "OFFENSIVE"}, {})
+
+        assert negative["sop_quality_score"] == pytest.approx(positive["sop_quality_score"] - 10)
+        assert any("期望收益为负" in risk for risk in negative["sop_risks"])
 
 
 class TestDynamicCommission:
