@@ -65,7 +65,7 @@ const MarketSentiment: React.FC = () => {
 
     if (loading) {
         return (
-            <div className="workspace-panel p-5 flex items-center justify-center min-h-[120px]">
+            <div className="workspace-panel p-4 flex items-center justify-center min-h-[96px]">
                 <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-700"></div>
             </div>
         );
@@ -73,7 +73,7 @@ const MarketSentiment: React.FC = () => {
 
     if (error || !data) {
         return (
-            <div className="workspace-panel p-5 text-sm text-slate-500 min-h-[120px] flex items-center">
+            <div className="workspace-panel p-4 text-sm text-slate-500 min-h-[96px] flex items-center">
                 暂无情绪数据: {error}
             </div>
         );
@@ -103,20 +103,20 @@ const MarketSentiment: React.FC = () => {
     }
 
     return (
-        <div className="workspace-panel p-4">
-            <div className="flex items-center justify-between mb-4">
+        <div className="workspace-panel p-3">
+            <div className="flex items-center justify-between mb-2">
                 <h3 className="font-black text-slate-900 flex items-center gap-2">
                     市场情绪温度计
                 </h3>
                 <span className="metric-label">{data.date}</span>
             </div>
 
-            <div className="flex flex-col lg:flex-row gap-5">
+            <div className="flex flex-col lg:flex-row gap-3">
                 {/* Left Section: Current Snapshot */}
-                <div className="flex flex-col md:flex-row items-center gap-5 lg:w-1/2">
+                <div className="flex flex-col md:flex-row items-center gap-3 lg:w-[42%]">
                     <div className="flex flex-col items-center">
-                        <div className={`relative w-20 h-20 rounded-lg flex items-center justify-center border border-slate-200 ${bgPulse}`}>
-                            <div className={`text-3xl font-black font-mono ${scoreColor}`}>
+                        <div className={`relative w-16 h-16 rounded-lg flex items-center justify-center border border-slate-200 ${bgPulse}`}>
+                            <div className={`text-2xl font-black font-mono ${scoreColor}`}>
                                 {data.sentiment_score}
                             </div>
                         </div>
@@ -126,24 +126,24 @@ const MarketSentiment: React.FC = () => {
                         </div>
                     </div>
 
-                    <div className="flex-1 w-full grid grid-cols-3 gap-3">
-                        <div className="bg-slate-50 rounded-lg p-3 text-center border border-slate-100">
+                    <div className="flex-1 w-full grid grid-cols-3 gap-2">
+                        <div className="bg-slate-50 rounded-lg p-2 text-center border border-slate-100">
                             <div className="metric-label mb-1">涨停</div>
-                            <div className="text-xl font-black font-mono text-rose-600">{data.limit_up_count}</div>
+                            <div className="text-lg font-black font-mono text-rose-600">{data.limit_up_count}</div>
                         </div>
-                        <div className="bg-slate-50 rounded-lg p-3 text-center border border-slate-100">
+                        <div className="bg-slate-50 rounded-lg p-2 text-center border border-slate-100">
                             <div className="metric-label mb-1">跌停</div>
-                            <div className="text-xl font-black font-mono text-teal-600">{data.limit_down_count}</div>
+                            <div className="text-lg font-black font-mono text-teal-600">{data.limit_down_count}</div>
                         </div>
-                        <div className="bg-slate-50 rounded-lg p-3 text-center border border-slate-100">
+                        <div className="bg-slate-50 rounded-lg p-2 text-center border border-slate-100">
                             <div className="metric-label mb-1">连板</div>
-                            <div className="text-xl font-black font-mono text-amber-600">{data.max_streak}</div>
+                            <div className="text-lg font-black font-mono text-amber-600">{data.max_streak}</div>
                         </div>
                     </div>
                 </div>
 
                 {/* Right Section: History Trend */}
-                <div className="flex-1 h-32 lg:h-auto min-h-[120px]">
+                <div className="flex-1 h-24 lg:h-auto min-h-[96px]">
                     <div className="metric-label mb-2">最近 10 日情绪趋势 (涨跌停家数)</div>
                     {history.length > 0 ? (
                         <ResponsiveContainer width="100%" height="100%">
@@ -184,7 +184,7 @@ const MarketSentiment: React.FC = () => {
                 </div>
             </div>
 
-            <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px] font-semibold">
+            <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] font-semibold">
                 <div className="border-l-2 border-emerald-500 pl-2 text-emerald-700">
                     允许：{data.market_allowed_actions?.join('、') || '等待市场信号'}
                 </div>
@@ -193,7 +193,7 @@ const MarketSentiment: React.FC = () => {
                 </div>
             </div>
             
-            <div className="mt-4 w-full h-1.5 bg-slate-100 rounded-full overflow-hidden flex">
+            <div className="mt-2 w-full h-1.5 bg-slate-100 rounded-full overflow-hidden flex">
                 <div 
                     className="h-full bg-rose-500 transition-all duration-1000 ease-out"
                     style={{ width: `${data.sentiment_score}%` }}

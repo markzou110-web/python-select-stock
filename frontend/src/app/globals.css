@@ -1,16 +1,16 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f4f6f8;
+  --background: #eef1f5;
   --foreground: #111827;
   --card: #ffffff;
   --card-foreground: #1f2937;
-  --primary: #3157d5;
+  --primary: #1f5eff;
   --primary-foreground: #ffffff;
-  --border: #d9dee7;
+  --border: #d8dee8;
   --muted: #667085;
-  --surface: #ffffff;
-  --surface-subtle: #f7f9fc;
+  --surface: #fdfcf9;
+  --surface-subtle: #f3f5f8;
   --radius: 0.5rem;
 }
 
@@ -34,39 +34,44 @@ body {
 
 @layer components {
   .glass-card {
-    @apply bg-white border border-slate-200 shadow-sm;
+    @apply border border-slate-200/80 shadow-sm;
+    background: linear-gradient(180deg, #ffffff 0%, #fbfaf7 100%);
     border-radius: 8px !important;
     backdrop-filter: none !important;
   }
   
   .premium-gradient {
-    @apply bg-blue-700;
+    background: linear-gradient(135deg, #162033 0%, #24324b 55%, #8a6a2f 100%);
   }
 
   .nav-item {
-    @apply flex items-center gap-3 px-3 py-2 rounded-md transition-colors duration-150 hover:bg-slate-100 hover:text-blue-700;
+    @apply flex items-center gap-3 px-3 py-2 rounded-md transition-colors duration-150;
   }
 
   .nav-item.active {
-    @apply bg-blue-50 text-blue-700 shadow-none;
-    box-shadow: inset 3px 0 0 #3157d5;
+    @apply shadow-none;
+    background: rgba(255, 255, 255, 0.08);
+    box-shadow: inset 2px 0 0 #d6ad60;
   }
 
   .workspace-panel {
-    @apply bg-white border border-slate-200 shadow-sm;
+    @apply border border-slate-200/80 shadow-sm;
+    background: linear-gradient(180deg, #ffffff 0%, #fbfaf7 100%);
     border-radius: 8px;
   }
 
   .toolbar-button {
-    @apply inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-bold text-slate-700 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex items-center justify-center gap-2 rounded-md border border-slate-300 bg-white/80 px-3 py-2 text-xs font-semibold text-slate-700 transition-colors hover:border-amber-300 hover:bg-amber-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50;
   }
 
   .primary-button {
-    @apply inline-flex items-center justify-center gap-2 rounded-md bg-blue-700 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-3.5 py-2 text-xs font-semibold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+    background: linear-gradient(135deg, #1f5eff 0%, #1b3f92 100%);
+    box-shadow: 0 8px 18px rgba(31, 94, 255, 0.18);
   }
 
   .metric-label {
-    @apply text-[10px] font-bold uppercase tracking-widest text-slate-500;
+    @apply text-[10px] font-semibold uppercase tracking-widest text-slate-500;
   }
 
   .metric-value {

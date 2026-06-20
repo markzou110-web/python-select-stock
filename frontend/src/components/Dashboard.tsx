@@ -23,7 +23,7 @@ import OperationsCenter from '@/components/OperationsCenter';
 import BacktestLab from '@/components/BacktestLab';
 import StockDetailPage from '@/components/StockDetailPage';
 import SectorRadarView from '@/components/SectorRadarView';
-import { Play, Filter, Download, LayoutGrid, List, Search, Loader2, Zap, Calendar } from 'lucide-react';
+import { Download, LayoutGrid, List, Search, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
 import { useMarketStore } from '@/stores/marketStore';
@@ -98,7 +98,7 @@ export default function Dashboard() {
     }, []);
 
     return (
-        <div className="flex h-screen overflow-hidden w-full bg-slate-100">
+        <div className="flex h-screen overflow-hidden w-full bg-[#e8ecf2]">
             <Sidebar
                 syncProgress={syncProgress}
                 onStartSync={startSync}
@@ -110,7 +110,7 @@ export default function Dashboard() {
                     setActiveView(view);
                 }}
             />
-            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-slate-100">
+            <div className="flex-1 flex flex-col min-h-0 overflow-y-auto bg-[linear-gradient(180deg,#eef1f5_0%,#e7ebf1_52%,#f2efe8_100%)]">
                 <Header
                     onScan={startScan}
                     loading={isScanning}
@@ -119,15 +119,15 @@ export default function Dashboard() {
                     onSelectStock={(stock) => {
                         setSelectedStock(null);
                         setSearchDetailStock({
-                            code: stock.code || stock.代码,
-                            name: stock.name || stock.名称,
+                            code: stock.code,
+                            name: stock.name,
                         });
                     }}
                 />
 
-                <div className="flex-1 overflow-y-auto px-6 py-5">
-                    <div className="flex gap-5 items-start">
-                        <div className={cn("transition-all duration-300 space-y-6", selectedStock ? "flex-1 min-w-0" : "w-full")}>
+                <div className="flex-1 overflow-y-auto px-3.5 py-3.5">
+                    <div className="mx-auto flex w-full max-w-none gap-3.5 items-start">
+                        <div className={cn("transition-all duration-300 space-y-3.5", selectedStock ? "flex-1 min-w-0" : "w-full")}>
                             {searchDetailStock ? (
                                 <ErrorBoundary fallbackTitle="个股详情加载异常">
                                     <StockDetailPage
@@ -176,17 +176,17 @@ export default function Dashboard() {
                             ) : activeView === 'scanner' ? (
                                 <>
                                     {/* Market Overview */}
-                                    <div className="workspace-panel px-4 py-3 flex items-center justify-between">
+                                    <div className="px-3.5 py-2.5 flex items-center justify-between gap-4 rounded-lg border border-slate-700/80 bg-[#202838] text-white shadow-sm">
                                         <div className="flex items-center gap-3 min-w-0">
-                                            <h2 className="text-sm font-black text-slate-900 uppercase tracking-widest flex items-center gap-2">
-                                                大盘多因子风控
+                                            <h2 className="text-sm font-black flex items-center gap-2">
+                                                大盘风控
                                             </h2>
                                             {marketRegime && (
                                                 <div className={cn(
-                                                    "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-black border",
-                                                    marketRegime.status === "CRITICAL" && "bg-rose-50 border-rose-200 text-rose-700",
-                                                    marketRegime.status === "OFFENSIVE" && "bg-teal-50 border-teal-200 text-teal-700",
-                                                    marketRegime.status === "DEFENSIVE" && "bg-amber-50 border-amber-200 text-amber-700"
+                                                    "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold border",
+                                                    marketRegime.status === "CRITICAL" && "bg-rose-500/15 border-rose-300/30 text-rose-100",
+                                                    marketRegime.status === "OFFENSIVE" && "bg-teal-400/15 border-teal-300/30 text-teal-100",
+                                                    marketRegime.status === "DEFENSIVE" && "bg-amber-400/15 border-amber-300/30 text-amber-100"
                                                 )}>
                                                     {marketRegime.status === "OFFENSIVE" ? "强力进攻" :
                                                      marketRegime.status === "CRITICAL" ? "严格防守" : "减仓观望"}
@@ -194,14 +194,14 @@ export default function Dashboard() {
                                             )}
                                         </div>
                                         {marketRegime && (
-                                            <span className="text-[10px] text-slate-500 font-bold truncate">
+                                            <span className="text-[11px] text-slate-300 font-semibold truncate">
                                                 {marketRegime.desc} | {Object.entries(marketRegime.indices as Record<string, MarketPulseIndex>).map(([name, d]) => 
                                                     `${name}: ${d.trend === 'BULL' ? '多头' : '空头'} `
                                                 )}
                                             </span>
                                         )}
                                     </div>
-                                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-2.5">
                                         {marketLoading ? (
                                             Array(5).fill(0).map((_, i) => <MarketCard key={i} name="" price={0} pct={0} loading />)
                                         ) : (
@@ -211,32 +211,18 @@ export default function Dashboard() {
                                         )}
                                     </div>
                                     
-                                    <div>
-                                        <MarketSentiment />
-                                    </div>
+                                    <MarketSentiment />
 
                                     {/* Hot Sectors */}
                                     <SectorGrid sectors={sectors} />
 
-                                    {/* Scan Actions & Filters */}
-                                    <div className="workspace-panel p-3 flex items-center justify-between gap-4">
-                                        <div className="flex items-center gap-3 flex-wrap">
-                                            <button
-                                                onClick={startScan}
-                                                disabled={isScanning}
-                                                className="primary-button"
-                                            >
-                                                {isScanning ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
-                                                {isScanning ? '正在扫描全市场...' : '开始全市场扫描'}
-                                            </button>
-                                            <button
-                                                onClick={() => setIsFilterOpen(true)}
-                                                className="toolbar-button"
-                                            >
-                                                <Filter size={18} />
-                                                策略参数配置
-                                            </button>
-
+                                    {/* Result Toolbar */}
+                                    <div className="workspace-panel p-2.5 flex items-center justify-between gap-4">
+                                        <div className="flex items-center gap-3 flex-wrap min-w-0">
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <span className="text-sm font-black text-slate-900">扫描结果</span>
+                                                <span className="metric-label normal-case tracking-normal">{results.length} 只</span>
+                                            </div>
                                             {/* History Selector */}
                                             {historyDates.length > 0 && (
                                                 <div className="flex items-center gap-2 pl-3 border-l border-slate-200">
@@ -246,9 +232,9 @@ export default function Dashboard() {
                                                     <select
                                                         value={selectedDate}
                                                         onChange={(e) => loadHistory(e.target.value)}
-                                                        className="bg-white border border-slate-200 text-slate-700 text-xs font-bold rounded-md px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-300 transition-all cursor-pointer"
+                                                        className="bg-white border border-slate-200 text-slate-700 text-xs font-semibold rounded-md px-3 py-2 outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-300 transition-all cursor-pointer"
                                                     >
-                                                        <option value="">-- 选择记录日期 --</option>
+                                                        <option value="">选择日期</option>
                                                         {historyDates.map(date => (
                                                             <option key={date} value={date}>
                                                                 {date} {date === new Date().toISOString().split('T')[0] ? "(今日扫描)" : ""}
@@ -263,12 +249,14 @@ export default function Dashboard() {
                                             <button
                                                 onClick={() => setViewMode('list')}
                                                 className={cn("p-2 rounded-md transition-colors", viewMode === 'list' ? "bg-white text-blue-700 shadow-sm" : "text-slate-400 hover:text-slate-600")}
+                                                title="列表视图"
                                             >
                                                 <List size={20} />
                                             </button>
                                             <button
                                                 onClick={() => setViewMode('grid')}
                                                 className={cn("p-2 rounded-md transition-colors", viewMode === 'grid' ? "bg-white text-blue-700 shadow-sm" : "text-slate-400 hover:text-slate-600")}
+                                                title="网格视图"
                                             >
                                                 <LayoutGrid size={20} />
                                             </button>
@@ -283,6 +271,7 @@ export default function Dashboard() {
                                             <button
                                                 onClick={handleExport}
                                                 className="p-2 text-slate-400 hover:text-blue-700 hover:bg-white rounded-md transition-colors"
+                                                title="导出"
                                             >
                                                 <Download size={20} />
                                             </button>
@@ -290,7 +279,7 @@ export default function Dashboard() {
                                     </div>
 
                                     {/* Results Section */}
-                                    <div className="flex flex-col gap-5">
+                                    <div className="flex flex-col gap-3">
                                         {viewMode === 'history' ? (
                                             <ErrorBoundary fallbackTitle="历史回溯加载异常">
                                                 <ScanHistoryView availableDates={availableDates.map(d => d.date)} />
@@ -304,7 +293,7 @@ export default function Dashboard() {
                                                 />
                                             </ErrorBoundary>
                                         ) : (
-                                            <div className="glass-card min-h-[360px] flex flex-col items-center justify-center text-slate-400 p-16 border-dashed border">
+                                            <div className="glass-card min-h-[220px] flex flex-col items-center justify-center text-slate-400 p-8 border-dashed border">
                                                 {isScanning ? (
                                                     <div className="flex flex-col items-center animate-pulse w-full max-w-md">
                                                         <div className="w-14 h-14 bg-blue-50 text-blue-700 rounded-lg flex items-center justify-center mb-5">
@@ -365,7 +354,7 @@ export default function Dashboard() {
 
                         {/* Global Sidebar: AI Deep Dive (K-Line) */}
                         {selectedStock && (
-                            <div className="w-[430px] sticky top-0 animate-in slide-in-from-right-8 duration-300 h-fit">
+                            <div className="w-[380px] sticky top-0 animate-in slide-in-from-right-8 duration-300 h-fit">
                                 <ErrorBoundary fallbackTitle="AI 深度分析加载异常">
                                     <AIDeepDive
                                         stock={selectedStock}

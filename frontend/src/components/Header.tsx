@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, User, Play, Loader2, Clock, X, ArrowRight, Star } from 'lucide-react';
+import { Search, Play, Loader2, Clock, X, ArrowRight, Star, SlidersHorizontal } from 'lucide-react';
 import api from '@/lib/api';
 
 interface HeaderProps {
@@ -9,7 +9,7 @@ interface HeaderProps {
     loading: boolean;
     lastUpdated: string;
     onOpenFilters: () => void;
-    onSelectStock: (stock: any) => void;
+    onSelectStock: (stock: StockSearchResult) => void;
 }
 
 interface StockSearchResult {
@@ -93,39 +93,51 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
                 source: 'header_search',
             });
             setNotice(`${stock.name} 已加入观察池`);
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error("Header add watchlist error:", err);
-            setNotice(err.response?.data?.detail || '加入观察池失败');
+            const message = typeof err === 'object' && err !== null && 'response' in err
+                ? (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
+                : undefined;
+            setNotice(message || '加入观察池失败');
         } finally {
             setAddingWatchCode(null);
         }
     };
 
     return (
-        <header className="flex items-center justify-between px-6 py-3 bg-white border-b border-slate-200">
-            <div>
-                <h2 className="text-lg font-black text-slate-950 tracking-tight flex items-center gap-2">
-                    Alpha Vision <span className="text-blue-700 bg-blue-50 border border-blue-100 px-2 py-0.5 rounded text-[10px] font-black">PRO</span>
+        <header className="flex items-center justify-between gap-4 px-5 py-3 border-b border-slate-300/80 bg-[#fbfaf6]/95">
+            <div className="min-w-0">
+                <h2 className="text-base font-black text-slate-950 tracking-tight">
+                    Alpha Vision
                 </h2>
-                <p className="text-xs text-slate-500 font-bold mt-0.5 flex items-center gap-2">
-                    <Clock size={12} /> 最后同步: {lastUpdated}
+                <p className="text-[11px] text-slate-500 font-semibold mt-0.5 flex items-center gap-1.5 truncate">
+                    <Clock size={12} /> {lastUpdated || '等待同步'}
                 </p>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex flex-1 items-center justify-end gap-2">
                 <button
                     onClick={onScan}
                     disabled={loading}
-                    className="primary-button"
+                    className="primary-button shrink-0"
                 >
                     {loading ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
-                    {loading ? '正在分析...' : '一键扫描'}
+                    {loading ? '分析中' : '扫描'}
                 </button>
 
-                <div className="h-7 w-[1px] bg-slate-200 mx-1" />
+                <button
+                    onClick={onOpenFilters}
+                    className="toolbar-button shrink-0"
+                    title="策略参数"
+                >
+                    <SlidersHorizontal size={17} />
+                    参数
+                </button>
+
+                <div className="h-7 w-[1px] bg-slate-300 mx-1 hidden sm:block" />
 
                 {/* Search Container */}
-                <div className="relative" ref={dropdownRef}>
+                <div className="relative w-full max-w-sm" ref={dropdownRef}>
                     <div className="relative group">
                         <div className="absolute inset-y-0 left-3 flex items-center pointer-events-none text-slate-400 group-focus-within:text-blue-600 transition-colors">
                             {isSearching ? <Loader2 size={18} className="animate-spin text-blue-600" /> : <Search size={18} />}
@@ -136,7 +148,7 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
                             onChange={(e) => setSearchQuery(e.target.value)}
                             onFocus={() => searchQuery.trim() && setShowDropdown(true)}
                             placeholder="代码/名称搜索..."
-                            className="pl-10 pr-8 py-2 bg-slate-50 border border-slate-200 rounded-md text-sm font-bold w-72 focus:ring-2 focus:ring-blue-500/20 focus:border-blue-300 transition-all outline-none"
+                            className="w-full pl-10 pr-8 py-2 bg-white/80 border border-slate-300 rounded-md text-sm font-semibold shadow-inner focus:ring-2 focus:ring-amber-400/20 focus:border-amber-300 transition-all outline-none"
                         />
                         {searchQuery && (
                             <button 
@@ -149,7 +161,7 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
                     </div>
 
                     {showDropdown && results.length > 0 && (
-                        <div className="absolute right-0 mt-2 w-96 bg-white border border-slate-200 rounded-lg shadow-xl max-h-96 overflow-y-auto z-50 p-2 space-y-1">
+                        <div className="absolute right-0 mt-2 w-[min(24rem,calc(100vw-2rem))] bg-white border border-slate-200 rounded-lg shadow-xl max-h-96 overflow-y-auto z-50 p-2 space-y-1">
                             <div className="px-3 py-1.5 metric-label border-b border-slate-100">
                                 股票检索结果 ({results.length})
                             </div>
@@ -204,10 +216,6 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
                             未匹配到相关个股
                         </div>
                     )}
-                </div>
-
-                <div className="w-9 h-9 bg-slate-50 border border-slate-200 rounded-md flex items-center justify-center text-slate-500 cursor-pointer hover:bg-blue-50 hover:text-blue-700 transition-colors">
-                    <User size={20} />
                 </div>
             </div>
         </header>

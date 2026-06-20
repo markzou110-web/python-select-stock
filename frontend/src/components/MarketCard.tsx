@@ -16,28 +16,28 @@ export default function MarketCard({ name, price, pct, loading = false }: Market
 
     if (loading) {
         return (
-            <div className="glass-card p-4 animate-pulse">
-                <div className="h-3 w-12 bg-slate-200 rounded mb-4" />
-                <div className="h-7 w-24 bg-slate-200 rounded mb-2" />
+            <div className="glass-card p-3 animate-pulse">
+                <div className="h-3 w-12 bg-slate-200 rounded mb-3" />
+                <div className="h-6 w-24 bg-slate-200 rounded mb-2" />
                 <div className="h-4 w-16 bg-slate-200 rounded" />
             </div>
         );
     }
 
     return (
-        <div className="glass-card p-4 group transition-colors duration-150 hover:border-blue-200">
-            <div className="flex justify-between items-start mb-3">
+        <div className="glass-card p-3 group transition-colors duration-150 hover:border-blue-200">
+            <div className="flex justify-between items-start mb-2">
                 <span className="metric-label">{name}</span>
                 <div className={cn(
-                    "p-1.5 rounded-md transition-colors",
+                    "p-1 rounded-md transition-colors",
                     isUp ? "bg-rose-50 text-rose-600 group-hover:bg-rose-100" : "bg-teal-50 text-teal-600 group-hover:bg-teal-100"
                 )}>
-                    {isUp ? <ArrowUpRight size={16} /> : <ArrowDownRight size={16} />}
+                    {isUp ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
                 </div>
             </div>
 
             <div className="space-y-1">
-                <div className="metric-value text-2xl">
+                <div className="metric-value text-xl">
                     {price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
                 <div className={cn(
