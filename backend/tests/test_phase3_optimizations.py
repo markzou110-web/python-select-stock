@@ -187,3 +187,77 @@ def test_daily_loss_custom_limit():
     result = evaluate_daily_loss_circuit_breaker(engine, budget={"daily_loss_limit_pct": 3.0})
     assert result["status"] == "halt"
     assert result["halted"] is True
+
+
+# ---------------------------------------------------------------------------
+# 改动 B5：组合浮亏熔断（未实现亏损检测，与已实现亏损熔断互补）
+# ---------------------------------------------------------------------------
+
+def _insert_open_trade(engine, code="000001", entry=10.0, shares=1000):
+    """写入一条 OPEN 持仓（供浮亏熔断测试用）。"""
+    d = datetime.now().strftime("%Y-%m-%d")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_trading (code, name, entry_price, shares, status, trade_mode, entry_date)
+            VALUES (:code, '测试', :e, :s, 'OPEN', 'SIMULATED', :d)
+        """), {"code": code, "e": entry, "s": shares, "d": d})
+
+
+def test_floating_loss_triggers_on_deep_drawdown():
+    """B5：组合浮亏超 -5% 时熔断（halt），阻止加仓。"""
+    import pandas as pd
+    from core.portfolio_risk import evaluate_floating_loss_circuit_breaker
+
+    engine = _setup_paper_engine()
+    for code in ["000001", "000002", "000003"]:
+        _insert_open_trade(engine, code=code, entry=10.0, shares=1000)
+    # 全部 -8% → 组合浮亏 -8% > 5% 熔断线
+    snap = pd.DataFrame([
+        {"code": "000001", "price": 9.2},
+        {"code": "000002", "price": 9.2},
+        {"code": "000003", "price": 9.2},
+    ])
+    result = evaluate_floating_loss_circuit_breaker(engine, snap)
+    assert result["status"] == "halt"
+    assert result["halted"] is True
+    assert result["floating_loss_pct"] < -5.0
+
+
+def test_floating_loss_ok_within_limit():
+    """B5：浮亏在熔断线内（-2%）不触发。"""
+    import pandas as pd
+    from core.portfolio_risk import evaluate_floating_loss_circuit_breaker
+
+    engine = _setup_paper_engine()
+    for code in ["000001", "000002"]:
+        _insert_open_trade(engine, code=code, entry=10.0, shares=1000)
+    snap = pd.DataFrame([
+        {"code": "000001", "price": 9.8},  # -2%
+        {"code": "000002", "price": 9.8},
+    ])
+    result = evaluate_floating_loss_circuit_breaker(engine, snap)
+    assert result["status"] == "ok"
+    assert result["halted"] is False
+
+
+def test_floating_loss_profit_never_triggers():
+    """B5：盈利时永远不触发。"""
+    import pandas as pd
+    from core.portfolio_risk import evaluate_floating_loss_circuit_breaker
+
+    engine = _setup_paper_engine()
+    _insert_open_trade(engine, code="000001", entry=10.0, shares=1000)
+    snap = pd.DataFrame([{"code": "000001", "price": 11.0}])  # +10%
+    result = evaluate_floating_loss_circuit_breaker(engine, snap)
+    assert result["status"] == "ok"
+    assert result["floating_loss_pct"] > 0
+
+
+def test_floating_loss_no_snapshot_returns_ok():
+    """B5：无快照数据时不阻断（返回 ok）。"""
+    from core.portfolio_risk import evaluate_floating_loss_circuit_breaker
+
+    engine = _setup_paper_engine()
+    result = evaluate_floating_loss_circuit_breaker(engine, snapshot=None)
+    assert result["status"] == "ok"
+    assert result["halted"] is False

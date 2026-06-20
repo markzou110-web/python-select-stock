@@ -15,11 +15,94 @@ DEFAULT_RISK_BUDGET = {
     # 改动 #12：日内亏损熔断。当日已平仓实现亏损占初始总资金比例超过此值时，
     # 暂停当日新开仓（halt），避免连续止损放大系统性回撤。
     "daily_loss_limit_pct": 5.0,
+    # 改动 B5：组合浮亏熔断。所有 OPEN 持仓的浮亏（未实现）占初始总资金比例
+    # 超过此值时，暂停加仓。与 daily_loss_limit_pct（已实现）互补——系统性下跌日
+    # 持仓全部浮亏但未触发止损时，仍能阻止"越跌越加"。
+    "floating_loss_limit_pct": 5.0,
     # 修复#4: 总仓位上限。所有OPEN持仓的capital_used之和占虚拟总资金的比例上限。
     # 防止理论上满仓单票或过度集中。
     "max_total_capital_pct": 80.0,
     "virtual_total_capital": 1000000.0,  # 虚拟总资金100万（用于仓位占比计算）
 }
+
+
+def evaluate_floating_loss_circuit_breaker(
+    engine: Optional[Engine],
+    snapshot: Optional[pd.DataFrame] = None,
+    budget: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """改动 B5：组合浮亏熔断。
+
+    统计所有 OPEN 持仓的浮亏（用 snapshot 最新价计算未实现 PnL），若组合浮亏占
+    初始总资金比例超过 floating_loss_limit_pct，返回 status="halt"（阻止加仓）。
+
+    与 evaluate_daily_loss_circuit_breaker（已实现亏损）互补：
+    - 系统性下跌日持仓全部浮亏 -6% 但未触发止损 → 无已实现亏损 → 旧熔断不触发
+    - 本函数检测到浮亏超限 → halt → 阻止 ADD_REVIEW 和新开仓
+
+    snapshot 需含 code/price 列；为空时返回 ok（不阻断）。
+    """
+    if engine is None:
+        return {"status": "error", "halted": False, "floating_loss_pct": 0.0, "message": "数据库不可用"}
+
+    limits = {**DEFAULT_RISK_BUDGET, **(budget or {})}
+    loss_limit = float(limits.get("floating_loss_limit_pct", 5.0))
+
+    if snapshot is None or snapshot.empty or "code" not in snapshot.columns or "price" not in snapshot.columns:
+        return {"status": "ok", "halted": False, "floating_loss_pct": 0.0, "floating_loss_limit_pct": loss_limit, "message": "无快照数据，跳过浮亏检查"}
+
+    try:
+        df = pd.read_sql(
+            text("""
+                SELECT code, entry_price, shares
+                FROM paper_trading
+                WHERE status = 'OPEN' AND entry_price > 0 AND COALESCE(shares, 0) > 0
+            """),
+            engine,
+        )
+    except Exception as exc:
+        return {"status": "error", "halted": False, "floating_loss_pct": 0.0, "floating_loss_limit_pct": loss_limit, "message": f"持仓查询失败: {str(exc)[:80]}"}
+
+    if df.empty:
+        return {"status": "ok", "halted": False, "floating_loss_pct": 0.0, "floating_loss_limit_pct": loss_limit, "message": "无 OPEN 持仓"}
+
+    price_map = {}
+    for _, row in snapshot.iterrows():
+        try:
+            price_map[str(row["code"])] = float(row["price"])
+        except (TypeError, ValueError):
+            continue
+
+    df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0).astype(float)
+    df["curr_price"] = df["code"].astype(str).map(price_map)
+    # 无法匹配价格的持仓不计入（保守跳过）
+    df_valid = df[df["curr_price"].notna()].copy()
+    if df_valid.empty:
+        return {"status": "ok", "halted": False, "floating_loss_pct": 0.0, "floating_loss_limit_pct": loss_limit, "message": "持仓无有效最新价"}
+
+    # 浮亏金额 = (curr - entry) * shares；初始投入 = entry * shares
+    df_valid["unrealized_pnl"] = (df_valid["curr_price"].astype(float) - df_valid["entry_price"].astype(float)) * df_valid["shares"]
+    df_valid["cost"] = df_valid["entry_price"].astype(float) * df_valid["shares"]
+    total_unrealized = float(df_valid["unrealized_pnl"].sum())
+    total_cost = float(df_valid["cost"].sum())
+
+    floating_loss_pct = (total_unrealized / total_cost * 100.0) if total_cost > 0 else 0.0
+
+    if floating_loss_pct < -abs(loss_limit):
+        return {
+            "status": "halt",
+            "halted": True,
+            "floating_loss_pct": round(floating_loss_pct, 2),
+            "floating_loss_limit_pct": loss_limit,
+            "message": f"组合浮亏 {floating_loss_pct:.2f}% 超过熔断线 -{loss_limit:.1f}%，暂停加仓",
+        }
+    return {
+        "status": "ok",
+        "halted": False,
+        "floating_loss_pct": round(floating_loss_pct, 2),
+        "floating_loss_limit_pct": loss_limit,
+        "message": "组合浮亏在熔断线内",
+    }
 
 
 def evaluate_daily_loss_circuit_breaker(

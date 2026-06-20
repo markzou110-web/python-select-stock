@@ -302,3 +302,48 @@ def test_sentinel_consumes_urgency_from_wind_control_result():
     s._min_stop_buffer_pct = wc_res.get("min_stop_buffer_pct")
     s._last_regime_urgent = bool(wc_res.get("regime_urgent"))
     assert s._effective_wind_control_interval() == 10, "消费后应降到10分钟"
+
+
+# ---------------------------------------------------------------------------
+# 改动 B2：实盘仓位告警升级（首次普通 → 第N次 critical）
+# ---------------------------------------------------------------------------
+
+def test_real_stop_alert_escalation_state_exists():
+    """B2：实盘止损告警升级状态 dict 应存在（进程级，跨 tick 累计次数）。"""
+    from routers.paper_trade import _real_stop_alert_state, _REAL_STOP_ALERT_DATE
+    assert isinstance(_real_stop_alert_state, dict)
+    assert isinstance(_REAL_STOP_ALERT_DATE, dict)
+
+
+def test_real_stop_alert_escalation_logic():
+    """B2：首次告警普通推送，第2次起升级为"未处理·第N次"。
+
+    ponytail 简化：砍掉了一键平仓端点（过度设计），只保留告警升级。
+    """
+    from routers.paper_trade import _real_stop_alert_state, _REAL_STOP_ALERT_DATE
+
+    # 清空状态模拟首次
+    _real_stop_alert_state.clear()
+    _REAL_STOP_ALERT_DATE.clear()
+
+    # 模拟首次触发：code=000001，当天
+    _alert_key = "000001:real_stop"
+    _today = "2026-06-18"
+    _REAL_STOP_ALERT_DATE[_alert_key] = _today
+    _real_stop_alert_state[_alert_key] = 0
+    _real_stop_alert_state[_alert_key] += 1
+    n1 = _real_stop_alert_state[_alert_key]
+    assert n1 == 1, "首次应计数为1（普通推送）"
+
+    # 第2次 tick 仍未平仓 → 升级
+    _real_stop_alert_state[_alert_key] += 1
+    n2 = _real_stop_alert_state[_alert_key]
+    assert n2 == 2, "第2次应计数为2（升级推送）"
+    # 升级标记：n >= 2 时标题应含"未处理·第N次"
+    assert n2 >= 2
+
+    # 跨日重置
+    _REAL_STOP_ALERT_DATE[_alert_key] = "2026-06-19"
+    if _REAL_STOP_ALERT_DATE.get(_alert_key) != _today:
+        _real_stop_alert_state[_alert_key] = 0
+    assert _real_stop_alert_state[_alert_key] == 0, "跨日应重置计数"

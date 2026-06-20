@@ -9,11 +9,14 @@ from typing import Any, Dict, List
 # 外部又加 sector_alignment(0.12)，总板块影响=0.17(17%)过高。
 # 将 sector_alignment 从 0.12 降至 0.07，总板块影响=0.07+0.05=0.12(合理)，
 # 释放的 0.05 转给 price_action(0.18→0.23)以加强个股技术面权重。
+# 改动 A5：W_HISTORICAL_WIN_RATE 0.10→0.05（与 scanner 层 0.18 权重双重计入，
+# 实际权重远超 0.28），释放给 W_TRADE_OPPORTUNITY(0.25→0.30)，后者信息密度更高
+# （含市场+板块+资金+风险综合判断）。
 W_STRATEGY_PERCENTILE = 0.35
 W_PRICE_ACTION = 0.23
 W_SECTOR_ALIGNMENT = 0.07
-W_TRADE_OPPORTUNITY = 0.25
-W_HISTORICAL_WIN_RATE = 0.10
+W_TRADE_OPPORTUNITY = 0.30
+W_HISTORICAL_WIN_RATE = 0.05
 
 
 def _clamp(value: Any, default: float = 0.0) -> float:

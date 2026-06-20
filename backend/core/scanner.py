@@ -52,6 +52,9 @@ SCAN_REGIME_ADAPTIVE = True
 # 提到 3 次避免误杀正常波动。同时改为按 (code, strategy_type) 配对（见 _inject_failure_pattern）。
 FAILURE_LOOKBACK_DAYS = 90
 FAILURE_VETO_MIN_COUNT = 3
+# 改动 A5：小样本胜率折扣。无 Wilson 下界时对原始胜率打此折扣，
+# 惩罚样本量不足（如样本=3、胜率=100% 的票折扣后=70%，更接近真实置信度）。
+SMALL_SAMPLE_WIN_RATE_DISCOUNT = 0.7
 
 # 改动(上班族Bark v2)：破位反抽陷阱多维评分。检测信号前 N 天内单日大跌后，
 # 通过"量能/反抽强度/MA20破位时长/V型未确认"四维评分区分真陷阱与黄金坑洗盘，
@@ -588,7 +591,13 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         except (ValueError, TypeError):
             _win_rate_raw = 0
         # 使用折扣后胜率（如有），否则用原始胜率
-        _win_rate = float(_adj_wr) if _adj_wr is not None else _win_rate_raw
+        # 改动 A5：无 Wilson 下界时对原始胜率打 7 折（小样本惩罚）。
+        # 原逻辑 fallback 用原始胜率，导致样本=3、胜率=100% 的票（Wilson下界≈42%）
+        # 被严重高估。打 7 折后 70%，更接近真实置信度。
+        if _adj_wr is not None:
+            _win_rate = float(_adj_wr)
+        else:
+            _win_rate = _win_rate_raw * SMALL_SAMPLE_WIN_RATE_DISCOUNT
 
         pf_raw = _bt_stats.get('profit_factor', 0)
         try:
@@ -604,6 +613,9 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         _sector_align = float(res.get('sector_alignment_score') or 50)
 
         # 7维加权评分（各维度映射到0-100，再按权重加权求和）
+        # 改动 A5：胜率权重 0.25→0.18（胜率受样本量影响大，且在 score_calibration
+        # 层还有 0.05 权重双重计入），释放给盈亏比(0.20→0.22)和信号强度(0.15→0.18)，
+        # 这两个指标更稳健。权重和仍=1.0。
         _d_win = max(0, min(100, _win_rate))
         _d_pf = max(0, min(100, min(_pf, 3) / 3 * 100))
         _d_sig = max(0, min(100, _raw / 120 * 100))
@@ -613,8 +625,8 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         _d_sector = max(0, min(100, _sector_align))
 
         quality_score = round(
-            _d_win * 0.25 + _d_pf * 0.20 + _d_sig * 0.15 + _d_fund * 0.15
-            + _d_regime * 0.10 + _d_brooks * 0.10 + _d_sector * 0.05, 1
+            _d_win * 0.18 + _d_pf * 0.22 + _d_sig * 0.18 + _d_fund * 0.15
+            + _d_regime * 0.10 + _d_brooks * 0.10 + _d_sector * 0.07, 1
         )
         # 期望收益惩罚：expectancy < 0 说明策略长期亏钱，扣10分（不论胜率多高）
         if _expectancy < 0:

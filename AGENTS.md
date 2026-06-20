@@ -49,3 +49,76 @@
 - **说明改动文件**：每次交付时清晰列出被修改的后端/前端文件及具体原因。
 - **说明验证命令和结果**：交付前必须通过本地手动或自动化脚本验证，输出 API 请求状态或前端编译结果，证明功能畅通。
 - **说明未验证项和剩余风险**：如果在盘后时间修改了实时盯盘（Sentinel）逻辑或第三方数据接口（如新浪/腾讯行情 API），需明确指出必须等下一个交易日开盘方能最终验证，并说明可能的风险点。
+
+## Ponytail 原则（懒资开发 / Lazy Senior Dev）
+
+写代码前，从上往下找到第一个成立的就用（来自 [ponytail](https://github.com/DietrichGebert/ponytail)）：
+
+1. **这东西需要存在吗？**（YAGNI — 不需要就跳过，不做"未来可能用到"的预判）
+2. **标准库能做吗？**（优先 Python/TS 内置能力，而非引入第三方包）
+3. **平台原生功能能做吗？**（如 FastAPI/SQLAlchemy/React 已有能力就不重造）
+4. **已安装的依赖能解决吗？**（先查 requirements.txt/package.json 再 pip/npm install）
+5. **能写成一行吗？**（在不牺牲可读性的前提下，短优先于长）
+6. 以上都不行，才写"最少能跑的代码"（MVP，非完美方案）
+
+### 必须遵守的约束
+- **不主动加抽象**：除非有 ≥2 个具体复用场景，否则不抽函数/类/接口。YAGNI。
+- **不增新依赖**：新增 pip/npm 依赖前必须说明"现有依赖为何不够"，并与用户确认。
+- **删除优先于新增**：能用删除/简化解决的，不靠新增代码解决。
+- **复杂请求先反问**："你真的需要 X 吗？Y 够不够？"——在用户确认前不写大段代码。
+- **复用优先**：动手前先 Grep/Glob 搜现有实现，避免重复造轮子。
+
+### 不允许偷懒的地方（懒 ≠ 粗糙）
+- 信任边界的输入校验（API 参数、跨模块调用、外部数据）
+- 防数据丢失的错误处理（尤其涉及 `paper_trades`、`daily_k` 的写操作）
+- 安全（凭证、注入、权限）
+- 可访问性（前端语义化）
+
+### 应用到本项目的具体要求
+- 量化策略（`backend/core/strategy.py`）非必要不重构，修改前必须完全理解指标算法。
+- 风控阈值改动必须常量化（`risk_constants.py`），禁止魔法数字散落代码中。
+- 推送改动只增字段不改字段（避免破坏前端契约）。
+
+
+<!-- headroom:rtk-instructions -->
+# RTK (Rust Token Killer) - Token-Optimized Commands
+
+When running shell commands, **always prefix with `rtk`**. This reduces context
+usage by 60-90% with zero behavior change. If rtk has no filter for a command,
+it passes through unchanged — so it is always safe to use.
+
+## Key Commands
+```bash
+# Git (59-80% savings)
+rtk git status          rtk git diff            rtk git log
+
+# Files & Search (60-75% savings)
+rtk ls <path>           rtk read <file>         rtk grep <pattern>
+rtk find <pattern>      rtk diff <file>
+
+# Test (90-99% savings) — shows failures only
+rtk pytest tests/       rtk cargo test          rtk test <cmd>
+
+# Build & Lint (80-90% savings) — shows errors only
+rtk tsc                 rtk lint                rtk cargo build
+rtk prettier --check    rtk mypy                rtk ruff check
+
+# Analysis (70-90% savings)
+rtk err <cmd>           rtk log <file>          rtk json <file>
+rtk summary <cmd>       rtk deps                rtk env
+
+# GitHub (26-87% savings)
+rtk gh pr view <n>      rtk gh run list         rtk gh issue list
+
+# Infrastructure (85% savings)
+rtk docker ps           rtk kubectl get         rtk docker logs <c>
+
+# Package managers (70-90% savings)
+rtk pip list            rtk pnpm install        rtk npm run <script>
+```
+
+## Rules
+- In command chains, prefix each segment: `rtk git add . && rtk git commit -m "msg"`
+- For debugging, use raw command without rtk prefix
+- `rtk proxy <cmd>` runs command without filtering but tracks usage
+<!-- /headroom:rtk-instructions -->

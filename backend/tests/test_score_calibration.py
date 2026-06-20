@@ -69,3 +69,22 @@ def test_weights_sum_to_one():
     total = (W_STRATEGY_PERCENTILE + W_PRICE_ACTION + W_SECTOR_ALIGNMENT
              + W_TRADE_OPPORTUNITY + W_HISTORICAL_WIN_RATE)
     assert abs(total - 1.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# 改动 A5：权重调参（胜率双重计入 + 小样本折扣）
+# ---------------------------------------------------------------------------
+
+def test_win_rate_weight_reduced_in_calibration():
+    """A5：W_HISTORICAL_WIN_RATE 从 0.10 降到 0.05（避免与 scanner 层双重计入）。"""
+    from core.score_calibration import W_HISTORICAL_WIN_RATE, W_TRADE_OPPORTUNITY
+    assert W_HISTORICAL_WIN_RATE == 0.05, "A5: calibration 历史胜率权重应降至0.05"
+    assert W_TRADE_OPPORTUNITY == 0.30, "A5: trade_opportunity 权重应升至0.30"
+
+
+def test_small_sample_win_rate_discount():
+    """A5：无 Wilson 下界时对原始胜率打 7 折（小样本惩罚）。"""
+    from core.scanner import SMALL_SAMPLE_WIN_RATE_DISCOUNT
+    assert SMALL_SAMPLE_WIN_RATE_DISCOUNT == 0.7
+    # 样本3笔胜率100% → 折扣后 70%（原逻辑用100%严重高估）
+    assert 100 * SMALL_SAMPLE_WIN_RATE_DISCOUNT == 70.0

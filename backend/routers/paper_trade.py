@@ -26,7 +26,7 @@ from core.risk_constants import (
     EARLY_WARN_MILD_PCT, EARLY_WARN_MODERATE_PCT, EARLY_WARN_TIER_COOLDOWN_DAYS,
     WIND_CONTROL_INTERVAL_URGENT_MINUTES, URGENT_STOP_BUFFER_PCT,
 )
-from core.portfolio_risk import evaluate_portfolio_risk_budget
+from core.portfolio_risk import evaluate_portfolio_risk_budget, evaluate_floating_loss_circuit_breaker
 from core.operation_plan import alert_priority, build_position_decision_snapshot, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
 from core.audit_log import record_lifecycle_event
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
@@ -258,6 +258,12 @@ def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: st
 # 改动(上班族Bark)：分级预警去重状态。key=f"{code}:tier{级别}"，value=日期字符串。
 # 每级每天最多推一次；进程重启后重置（sentinel 是常驻线程，可接受）。
 _tier_alert_sent: Dict[str, str] = {}
+
+# 改动 B2：实盘止损告警升级状态。key=f"{code}:real_stop"，value=当日已推送次数。
+# 首次触发普通推送；后续每次 tick 仍未平仓 → 升级为"未处理·第N次"。
+# 进程重启后重置（同 _tier_alert_sent 模式，sentinel 常驻可接受）。
+_real_stop_alert_state: Dict[str, int] = {}
+_REAL_STOP_ALERT_DATE: Dict[str, str] = {}  # 记录推送日期，跨日重置
 
 
 def _tier_early_warning(*, code: str, name: str, trade_mode: str,
@@ -1375,6 +1381,12 @@ def run_wind_control() -> Dict[str, Any]:
         # 改动 B1：累计本次风控的最小 stop_buffer，供 sentinel 动态调整间隔
         min_stop_buffer_pct = None
 
+        # 改动 B5：组合浮亏熔断。系统性下跌日持仓全部浮亏但未触发止损时，
+        # 旧熔断（已实现亏损）不触发。此处检测浮亏超限并推送告警。
+        floating_cb = evaluate_floating_loss_circuit_breaker(engine, snapshot)
+        if floating_cb.get("halted"):
+            alerts.append(f"🔴【组合浮亏熔断】{floating_cb['message']}，暂停加仓")
+
         for _, row in df.iterrows():
             code = row['code']
             entry_price = safe_float(row['entry_price'])
@@ -1497,9 +1509,24 @@ def run_wind_control() -> Dict[str, Any]:
                 exec_price = min(curr_price, curr_low) if _pierced_by_low else curr_price
                 if trade_mode == "REAL":
                     warned_real_count += 1
-                    alerts.append(f"{row['name']}({code}) 实盘风控预警: {reason}")
-                    mode_label = "实盘风控预警"
-                    action_line = "系统不会自动平仓，请人工确认是否卖出。"
+                    # 改动 B2：实盘告警升级。首次普通推送，后续每次 tick（~30分钟）仍未
+                    # 平仓 → 升级为"未处理·第N次"，让上班族意识到紧迫性。
+                    _today_key = close_date_str
+                    _alert_key = f"{code}:real_stop"
+                    # 跨日重置
+                    if _REAL_STOP_ALERT_DATE.get(_alert_key) != _today_key:
+                        _REAL_STOP_ALERT_DATE[_alert_key] = _today_key
+                        _real_stop_alert_state[_alert_key] = 0
+                    _real_stop_alert_state[_alert_key] = _real_stop_alert_state.get(_alert_key, 0) + 1
+                    _alert_n = _real_stop_alert_state[_alert_key]
+                    if _alert_n == 1:
+                        alerts.append(f"{row['name']}({code}) 实盘风控预警: {reason}")
+                        mode_label = "实盘风控预警"
+                        action_line = "系统不会自动平仓，请人工确认是否卖出。"
+                    else:
+                        alerts.append(f"🔴【未处理·第{_alert_n}次】{row['name']}({code}) 实盘止损仍未处理: {reason}")
+                        mode_label = f"实盘风控预警·第{_alert_n}次"
+                        action_line = f"⚠️ 已第{_alert_n}次提醒！请立即在券商App处理，或点击下方链接记录平仓。"
                 elif should_close:
                     close_updates.append({
                         "p": exec_price,
