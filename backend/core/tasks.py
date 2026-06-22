@@ -7,6 +7,7 @@ from .indicators import calculate_indicators
 from core.strategy import evaluate_exit_signals
 from core.risk_engine import safe_float
 from core.trading_calendar import is_a_share_intraday_session, is_a_share_trading_day
+import asyncio
 import pandas as pd
 from datetime import datetime
 from sqlalchemy import text
@@ -302,3 +303,39 @@ def daily_sync(slot: str = "晚上"):
         return str(e)
     finally:
         release_sync_lock()
+
+
+@celery_app.task(name="tasks.weekly_entry_timing_report")
+def weekly_entry_timing_report():
+    """每周一 09:00 生成"买入时点周报"，对比尾盘买 vs 次日开盘买的胜率。
+
+    取近 30 天推送过的票，跑 backtest_lab 两种 entry_mode，聚合后推送 bark。
+    """
+    try:
+        from core.entry_timing_report import build_entry_timing_report
+        report = build_entry_timing_report(days=30, max_codes=50)
+        body = report.get("body", "")
+        meta = report.get("meta", {})
+
+        # 无有效样本时静默跳过（不发空报告）
+        if meta.get("effective_size", 0) == 0:
+            logger.info("Weekly entry timing report skipped: no effective samples")
+            return {"bark": False, "reason": "no_effective_samples", "meta": meta}
+
+        title = f"Alpha Vision 买入时点周报 {datetime.now().strftime('%m-%d')}"
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(notifier.send(
+            title, body,
+            group="AlphaVision_Report",
+            url="http://localhost:3000"
+        ))
+        logger.info(f"Weekly entry timing report sent: {meta.get('effective_size')} stocks")
+        return {"bark": True, "meta": meta, "aggregate": report.get("aggregate", {})}
+    except Exception as e:
+        logger.error(f"Error in weekly_entry_timing_report task: {e}")
+        return {"bark": False, "error": str(e)}

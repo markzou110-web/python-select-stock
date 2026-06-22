@@ -45,6 +45,15 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     init_db()
 
+    # 必须在后台线程启动前预加载交易日历：tool_trade_date_hist_sina() 内部
+    # 实例化 py_mini_racer.MiniRacer()（V8 引擎），若 sentinel / sync_scheduler
+    # 后台线程并发触发会引起 V8 地址池重复初始化的 native crash
+    # (address_pool_manager Check failed)，无法被 try/except 捕获，会杀进程。
+    # 在主线程单线程预加载，V8 只初始化一次，后续后台线程命中缓存不再触碰 V8。
+    from core.trading_calendar import preload_trade_calendar
+    logger.info("Pre-loading trade calendar (single-thread V8 init)...")
+    preload_trade_calendar()
+
     logger.info("Starting Intraday Sentinel...")
     sentinel.start()
 

@@ -11,6 +11,7 @@ Trading-session guards for A-share scheduled tasks.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, time
 from typing import Optional, Set
 
@@ -22,31 +23,67 @@ _trade_dates_cache: Optional[Set[str]] = None
 _cache_updated_at: Optional[datetime] = None
 _CACHE_TTL_HOURS = 24
 
+# 加载锁：tool_trade_date_hist_sina() 内部会实例化 py_mini_racer.MiniRacer()（V8 引擎），
+# V8 地址池在多线程并发初始化时会触发 native crash (address_pool_manager
+# Check failed: !pool->IsInitialized())，该段错误无法被 try/except 捕获，
+# 会杀掉整个进程。此锁确保同一时刻只有一个线程初始化 V8。
+# 配合 preload_trade_calendar() 在进程启动时（单线程）预加载，从根本上避免并发。
+_trade_dates_lock = threading.Lock()
+
 
 def _load_trade_dates() -> Set[str]:
     """从 akshare 加载 A 股交易日历，缓存 24 小时。
 
     失败时返回空集合（调用方回退到 weekday 判断）。
+    线程安全：通过 _trade_dates_lock 串行化，避免并发触发 V8 初始化崩溃。
     """
     global _trade_dates_cache, _cache_updated_at
+    # 无锁快速路径：缓存有效直接返回
     now = datetime.now()
     if _trade_dates_cache is not None and _cache_updated_at is not None:
         if (now - _cache_updated_at).total_seconds() < _CACHE_TTL_HOURS * 3600:
             return _trade_dates_cache
 
+    with _trade_dates_lock:
+        # 二次检查：可能在等锁期间已被其他线程加载
+        now = datetime.now()
+        if _trade_dates_cache is not None and _cache_updated_at is not None:
+            if (now - _cache_updated_at).total_seconds() < _CACHE_TTL_HOURS * 3600:
+                return _trade_dates_cache
+
+        try:
+            import akshare as ak
+            df = ak.tool_trade_date_hist_sina()
+            col = "trade_date" if "trade_date" in df.columns else df.columns[0]
+            dates = set(str(d)[:10] for d in df[col].tolist())
+            _trade_dates_cache = dates
+            _cache_updated_at = now
+            logger.info(f"交易日历已加载: {len(dates)} 个交易日（缓存 {_CACHE_TTL_HOURS}h）")
+            return dates
+        except Exception as exc:
+            logger.warning(f"交易日历加载失败，回退到 weekday 判断: {exc}")
+            # 保留旧缓存（如果有），避免一次失败就丢缓存
+            return _trade_dates_cache or set()
+
+
+def preload_trade_calendar() -> bool:
+    """在进程启动时（单线程、后台线程启动前）预加载交易日历。
+
+    目的：让 V8/mini_racer 在主线程安全初始化一次，避免后续 sentinel /
+    sync_scheduler 后台线程并发调用 _load_trade_dates 时触发 V8 地址池
+    重复初始化的 native crash。
+
+    必须在 sentinel.start() / market_sync_scheduler.start() 之前调用。
+
+    Returns:
+        True 加载成功，False 加载失败（已回退到 weekday 判断，不阻断启动）
+    """
     try:
-        import akshare as ak
-        df = ak.tool_trade_date_hist_sina()
-        col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-        dates = set(str(d)[:10] for d in df[col].tolist())
-        _trade_dates_cache = dates
-        _cache_updated_at = now
-        logger.info(f"交易日历已加载: {len(dates)} 个交易日（缓存 {_CACHE_TTL_HOURS}h）")
-        return dates
+        dates = _load_trade_dates()
+        return bool(dates)
     except Exception as exc:
-        logger.warning(f"交易日历加载失败，回退到 weekday 判断: {exc}")
-        # 保留旧缓存（如果有），避免一次失败就丢缓存
-        return _trade_dates_cache or set()
+        logger.warning(f"preload_trade_calendar 失败（不阻断启动）: {exc}")
+        return False
 
 
 def is_a_share_trading_day(now: datetime | None = None) -> bool:

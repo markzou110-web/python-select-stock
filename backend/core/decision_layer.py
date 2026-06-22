@@ -24,9 +24,40 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 
 def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
-    """Build daily breadth history from local K-lines for cycle classification."""
+    """Build daily breadth history for cycle classification.
+
+    优先用 breadth_history 表的 MARKET 行（盘中实时聚合写入），修复 6/22 节后首日 bug：
+    节后首日 daily_k 还是上个交易日数据，导致 cycle_history 缺今日宽度、情绪误判。
+    新表空时回退 daily_k 聚合逻辑（向下兼容）。
+    """
     if engine is None:
         return []
+
+    # ── 优先尝试 breadth_history MARKET 行 ──
+    try:
+        bh = pd.read_sql(text("""
+            SELECT bar_date, advance_ratio, strong_ratio, weak_ratio, avg_return
+            FROM breadth_history
+            WHERE scope = 'MARKET'
+            ORDER BY bar_date DESC
+            LIMIT :days
+        """), engine, params={"days": int(days)})
+    except Exception:
+        bh = pd.DataFrame()
+
+    if not bh.empty:
+        history: List[Dict[str, Any]] = []
+        for _, row in bh.iterrows():
+            history.append({
+                "date": str(row["bar_date"]),
+                "advance_ratio": round(float(row["advance_ratio"] or 0), 1),
+                "strong_ratio": round(float(row["strong_ratio"] or 0), 1),
+                "weak_ratio": round(float(row["weak_ratio"] or 0), 1),
+                "avg_return": round(float(row["avg_return"] or 0), 2),
+            })
+        return sorted(history, key=lambda item: item["date"])[-days:]
+
+    # ── 回退：从 daily_k 聚合 ──
     try:
         query = """
             WITH recent_dates AS (
@@ -47,7 +78,7 @@ def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
     frame = frame.dropna(subset=["close"]).sort_values(["code", "date"])
     frame["pct_chg"] = frame.groupby("code")["close"].pct_change() * 100
     frame = frame.dropna(subset=["pct_chg"])
-    history: List[Dict[str, Any]] = []
+    history = []
     for date, group in frame.groupby("date"):
         pct = group["pct_chg"]
         total = max(1, len(pct))
@@ -184,7 +215,10 @@ def build_market_decision_context(
 def _leadership_score(stock: Dict[str, Any]) -> float:
     role_score = {"LEADER": 92, "CORE": 78, "FOLLOWER": 48, "LAGGARD": 20}.get(stock.get("sector_role"), 40)
     alignment = _num(stock.get("sector_alignment_score"), 40)
-    relative = _clamp(50 + _num(stock.get("sector_relative_pct")) * 10)
+    # 改动 D1：原 *10 缩放过激进——实测 sector_relative_pct 中位数 4.66%，*10 后
+    # 50+46.6=96.6，>5% 即撞顶 100，导致 46% 股票饱和满分、丧失区分度（同 A1/A2 修复模式）。
+    # 改为 *5：5% 跑赢=75 分（中位），10%=100 满分，分布更均匀。
+    relative = _clamp(50 + _num(stock.get("sector_relative_pct")) * 5)
     active = _clamp(50 + _num(stock.get("涨幅%")) * 5)
     base_score = role_score * 0.4 + alignment * 0.3 + relative * 0.2 + active * 0.1
 

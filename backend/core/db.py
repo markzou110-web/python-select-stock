@@ -93,9 +93,12 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_trade_plan", "trade_eligible", "trade_bucket", "trade_blockers",
     "final_trade_score", "trade_timeframe", "exit_hint",
     "market_regime",
-    "sop_grade", "sop_action", "sop_risks", "sector_momentum_score", "sector_breadth",
+    "sop_grade", "sop_action", "sop_risks", "sop_vetoes", "sop_checks", "sop_bonuses",
+    "sop_quality_score", "sop_subgrade",
+    "sector_momentum_score", "sector_breadth",
     "sector_phase", "sector_rank", "sector_alignment_score", "sector_relative_pct",
     "sector_3d_pct", "sector_5d_pct", "sector_consecutive_up_days", "sector_role",
+    "stock_rank_in_sector", "limit_up_unsealed",
     "sector_mainline", "leadership_score", "leadership_components", "leadership_reason",
     "limit_up_status", "first_limit_time", "last_limit_time", "break_count",
     "limit_up_streak", "seal_amount", "limit_up_sector_rank",
@@ -520,6 +523,33 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"limit-up event migration skipped: {e}")
 
+            # ── breadth_history：盘中实时聚合的市场/板块宽度历史 ──
+            # 修复 6/22 节后首日 bug：原 build_sector_history_context / load_market_cycle_history
+            # 直接读 daily_k 表，节后首日 daily_k 还是上个交易日数据，导致板块 slope 和市场宽度
+            # 用滞后数据误判（证券板块暴涨却判 SECTOR_FADE）。本表由 record_breadth_snapshot
+            # 在每次扫描后写入今日实时聚合，读函数优先读此表，新表空时回退 daily_k（向下兼容）。
+            try:
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS breadth_history (
+                        bar_date DATE NOT NULL,
+                        scope VARCHAR(10) NOT NULL,
+                        industry VARCHAR(50),
+                        advance_ratio FLOAT,
+                        strong_ratio FLOAT,
+                        weak_ratio FLOAT,
+                        avg_return FLOAT,
+                        limit_up_ratio FLOAT,
+                        total_count INTEGER,
+                        updated_at TIMESTAMP,
+                        UNIQUE(bar_date, scope, industry)
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_breadth_history_date_scope ON breadth_history(bar_date DESC, scope);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_breadth_history_industry_date ON breadth_history(industry, bar_date DESC);"))
+                logger.info("Migration: breadth_history table ensured.")
+            except Exception as e:
+                logger.debug(f"breadth_history migration skipped: {e}")
+
             # 修复 R3-2: paper_trading 的 ON CONFLICT (code, entry_date) 需要唯一约束。
             # 原来只在测试中建了这个索引，生产 PG 上缺约束→运行时报错。
             try:
@@ -641,6 +671,107 @@ def save_failure_sample(sample: Dict[str, Any], engine=None) -> bool:
     except Exception as exc:
         logger.error(f"Failed to save failure sample: {exc}")
         return False
+
+
+def record_breadth_snapshot(
+    snapshot_df: pd.DataFrame,
+    sector_map: Dict[str, str],
+    engine=None,
+    bar_date: Optional[str] = None,
+) -> None:
+    """把实时快照聚合成市场/板块宽度，upsert 进 breadth_history 表。
+
+    修复 6/22 节后首日 bug：盘中扫描时板块/市场层面的历史数据直接读 daily_k，
+    但节后首日 daily_k 滞后，导致 sector_trend_slope 和市场宽度误判。本函数在
+    每次扫描后写入今日实时聚合，让后续读取拿到新鲜数据。
+
+    写入两级行：
+      - scope='MARKET'  industry=NULL  全市场宽度
+      - scope='SECTOR'  industry=板块名  各板块宽度
+
+    安全契约：失败只 log 不抛，绝不阻断扫描主流程。
+
+    Args:
+        snapshot_df: 实时快照（含 code, pct_chg, industry 等列）
+        sector_map: {code: 板块名} 映射；snapshot_df 已含 industry 列时可为空
+        engine: DB engine；为空时静默跳过
+        bar_date: 交易日字符串；为空时用今日
+    """
+    if engine is None or snapshot_df is None or snapshot_df.empty:
+        return
+    try:
+        today = bar_date or datetime.now().strftime("%Y-%m-%d")
+        pct = pd.to_numeric(snapshot_df["pct_chg"], errors="coerce").dropna()
+        if pct.empty:
+            return
+        total = len(pct)
+        rows = []
+
+        # MARKET 级别（industry 用 '__MARKET__' 哨兵值，避免 NULL 在 ON CONFLICT 的歧义）
+        rows.append({
+            "bar_date": today, "scope": "MARKET", "industry": "__MARKET__",
+            "advance_ratio": round(float((pct > 0).sum() / total * 100), 1),
+            "strong_ratio": round(float((pct >= 5).sum() / total * 100), 1),
+            "weak_ratio": round(float((pct <= -5).sum() / total * 100), 1),
+            "avg_return": round(float(pct.mean()), 2),
+            "limit_up_ratio": round(float((pct >= 9.8).sum() / total * 100), 1),
+            "total_count": int(total),
+            "updated_at": datetime.now(),
+        })
+
+        # SECTOR 级别：优先用 snapshot_df 自带的 industry 列，回退到 sector_map
+        if "industry" in snapshot_df.columns:
+            industries = snapshot_df.assign(
+                _pct=pct.reindex(snapshot_df.index)
+            ).dropna(subset=["_pct"])
+            industries = industries.assign(
+                industry=industries["industry"].fillna(
+                    industries["code"].map(sector_map)
+                ).fillna("未知")
+            )
+        else:
+            industries = snapshot_df.assign(
+                _pct=pct.reindex(snapshot_df.index),
+                industry=snapshot_df["code"].map(sector_map).fillna("未知"),
+            ).dropna(subset=["_pct"])
+
+        for industry, group in industries.groupby("industry"):
+            g_pct = pd.to_numeric(group["_pct"], errors="coerce").dropna()
+            if g_pct.empty:
+                continue
+            g_total = len(g_pct)
+            rows.append({
+                "bar_date": today, "scope": "SECTOR", "industry": str(industry),
+                "advance_ratio": round(float((g_pct > 0).sum() / g_total * 100), 1),
+                "strong_ratio": round(float((g_pct >= 5).sum() / g_total * 100), 1),
+                "weak_ratio": round(float((g_pct <= -5).sum() / g_total * 100), 1),
+                "avg_return": round(float(g_pct.mean()), 2),
+                "limit_up_ratio": None,
+                "total_count": int(g_total),
+                "updated_at": datetime.now(),
+            })
+
+        with engine.begin() as conn:
+            for r in rows:
+                conn.execute(text("""
+                    INSERT INTO breadth_history
+                        (bar_date, scope, industry, advance_ratio, strong_ratio,
+                         weak_ratio, avg_return, limit_up_ratio, total_count, updated_at)
+                    VALUES
+                        (:bar_date, :scope, :industry, :advance_ratio, :strong_ratio,
+                         :weak_ratio, :avg_return, :limit_up_ratio, :total_count, :updated_at)
+                    ON CONFLICT(bar_date, scope, industry) DO UPDATE SET
+                        advance_ratio=EXCLUDED.advance_ratio,
+                        strong_ratio=EXCLUDED.strong_ratio,
+                        weak_ratio=EXCLUDED.weak_ratio,
+                        avg_return=EXCLUDED.avg_return,
+                        limit_up_ratio=EXCLUDED.limit_up_ratio,
+                        total_count=EXCLUDED.total_count,
+                        updated_at=EXCLUDED.updated_at
+                """), r)
+        logger.debug(f"breadth_history updated: {len(rows)} rows for {today}")
+    except Exception as exc:
+        logger.warning(f"record_breadth_snapshot failed (scan continues): {exc}")
 
 
 def save_recommendation_events(
@@ -781,7 +912,12 @@ def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
             conn.execute(text('''
                 INSERT INTO daily_k (code, date, open, high, low, close, vol)
                 VALUES (:code, CAST(:date AS DATE), :open, :high, :low, :close, :vol)
-                ON CONFLICT (code, date) DO NOTHING
+                ON CONFLICT (code, date) DO UPDATE SET
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    vol = EXCLUDED.vol
             '''), rows)
             conn.commit()
         return True

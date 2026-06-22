@@ -166,6 +166,12 @@ def _refresh_items_with_snapshot(items, require_live_snapshot: bool = False):
         item["operation_instruction"] = instruction["instruction"]
         item["trigger_price"] = instruction["trigger_price"]
         item["guard_price"] = instruction["guard_price"]
+        # DB 中已是 TRIGGERED 的票：target_hit=True 会被 _watch_decision 算成 PROMOTE，
+        # 这里覆盖为 TRIGGERED 语义，使其在分区渲染中归入"已触发待确认"段，
+        # 与 WATCHING 池里恰好接近目标价的票视觉区分。不修改 DB 字段。
+        if original.get("status") == "TRIGGERED":
+            item["computed_decision"] = "TRIGGERED"
+            item["computed_action"] = "已触发目标价：待确认是否转入拟合实盘"
         refreshed.append(item)
     return refreshed
 
@@ -188,7 +194,8 @@ def _build_watchlist_status_body(items, slot: str) -> str:
         ),
         "",
     ]
-    for item in items[:10]:
+
+    def render_item(item: Dict[str, Any]) -> None:
         decision = item.get("computed_decision") or "KEEP_WATCH"
         action = item.get("computed_action") or "继续观察"
         if market_blocked:
@@ -206,8 +213,24 @@ def _build_watchlist_status_body(items, slot: str) -> str:
         elif item.get("operation_instruction"):
             lines.append(f"  操作：{item['operation_instruction']}")
         lines.append("")
-    if len(items) > 10:
-        lines.append(f"另有 {len(items) - 10} 只观察票，请打开观察池查看。")
+
+    # 分区：WATCHING 票（继续观察）与 TRIGGERED 票（已触发待确认）视觉分离，
+    # 避免 TRIGGERED 票混在普通观察票里被忽略（600460 漏推根因）。
+    watching_items = [i for i in items if i.get("computed_decision") != "TRIGGERED"]
+    triggered_items = [i for i in items if i.get("computed_decision") == "TRIGGERED"]
+
+    for item in watching_items[:10]:
+        render_item(item)
+    if len(watching_items) > 10:
+        lines.append(f"另有 {len(watching_items) - 10} 只观察票，请打开观察池查看。")
+
+    if triggered_items:
+        lines.append("--- 已触发待确认 ---")
+        for item in triggered_items[:5]:
+            render_item(item)
+        if len(triggered_items) > 5:
+            lines.append(f"另有 {len(triggered_items) - 5} 只已触发票，请打开观察池查看。")
+
     return "\n".join(lines).rstrip()
 
 
@@ -216,8 +239,12 @@ def send_watchlist_status_report(slot: str) -> Dict[str, Any]:
     if slot not in {"morning", "late"}:
         return {"bark": False, "count": 0, "reason": "unsupported slot"}
 
-    payload = list_watchlist(status="WATCHING")
-    items = _refresh_items_with_snapshot(payload.get("items", []), require_live_snapshot=True)
+    # 拉取 WATCHING + TRIGGERED 两个池，TRIGGERED 票（已触发目标价）需持续追踪，
+    # 否则会从所有后续晨报/尾盘报告中消失，失去后续价格追踪（600460 漏推根因）。
+    watching_payload = list_watchlist(status="WATCHING")
+    triggered_payload = list_watchlist(status="TRIGGERED")
+    combined_items = watching_payload.get("items", []) + triggered_payload.get("items", [])
+    items = _refresh_items_with_snapshot(combined_items, require_live_snapshot=True)
     if items is None:
         logger.warning("Watchlist status Bark skipped: live market snapshot unavailable.")
         return {"bark": False, "count": 0, "reason": "live_snapshot_unavailable"}

@@ -33,6 +33,7 @@ from core.strategy import (
 )
 from core.price_action import analyze_price_action
 from core.risk_engine import compute_paper_risk_levels
+from core.risk_constants import BACKTEST_STOP_LOSS_PCT  # 与实盘硬止损同源，保证回测胜率反映真实规则
 from core.scan_preflight import build_scan_preflight
 
 # 数据预检熔断开关：True 时，若 preflight 报告 blocking（数据异常/陈旧），
@@ -312,8 +313,15 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("主力资金流出，等待资金回流")
     if res.get('capital_event_risk'):
         blockers.append("近期资本事件利好兑现，等待二次确认")
-    if float(res.get('涨幅%', 0) or 0) >= _near_limit_pct(res.get('代码')):
+    # 改动 #13 扫描端增强：涨停/近涨停默认加 blocker（等待隔日确认，防追高）。
+    # 但若 apply_limit_up_features 注入的 limit_up_status='BROKEN'（曾封板但已开板），
+    # 说明抛压已释放、未真正封死，反而是低吸机会——不加 blocker 并标记，后续可加分。
+    near_limit = float(res.get('涨幅%', 0) or 0) >= _near_limit_pct(res.get('代码'))
+    lu_status = res.get('limit_up_status')
+    if near_limit and lu_status != 'BROKEN':
         blockers.append("涨停/近涨停，等待隔日确认")
+    elif lu_status == 'BROKEN' and near_limit:
+        res['limit_up_unsealed'] = True  # 封板失败=抛压释放，标记为低吸机会（只增字段不改契约）
     elif float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
         blockers.append("涨幅偏高且质量未确认，等待回踩/次日确认")
     if float(res.get('pct_5d', 0) or 0) > 15 and not right_side_quality:
@@ -339,6 +347,9 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         score -= 25
     if float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
         score -= 8
+    # 改动 #13：曾封板但已开板（limit_up_unsealed）= 抛压释放，反而是低吸机会，加分鼓励
+    if res.get('limit_up_unsealed'):
+        score += 4
     if raw_score and raw_score < MIN_RAW_EXECUTION_SCORE:
         score -= 15
     if risk_pct > MAX_EXECUTION_RISK_PCT:
@@ -1050,7 +1061,7 @@ def perform_market_scan(
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,
-    stop_loss_pct: float = -8.0,
+    stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
     tv_weekly_gate: bool = False,
     require_live_snapshot: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -1527,6 +1538,12 @@ def perform_market_scan(
         sector_map = get_sector_map()
         sector_trends = get_sector_trends()
         market_regime = get_market_regime()
+        # 把实时快照聚合写入 breadth_history（修复 6/22 节后首日 bug：让后续
+        # build_sector_history_context / load_market_cycle_history 读到今日实时宽度，
+        # 而非滞后的 daily_k）。失败只 log 不阻断扫描。
+        if not snapshot_df.empty and 'pct_chg' in snapshot_df.columns:
+            from core.db import record_breadth_snapshot
+            record_breadth_snapshot(snapshot_df, sector_map, engine)
         sector_history = build_sector_history_context(engine, sector_map)
         sector_strength = build_sector_strength(snapshot_df, sector_map, sector_trends, sector_history)
 
@@ -1562,7 +1579,7 @@ def perform_market_scan(
                 try:
                     sl_pct = float(stop_loss_pct)
                 except (TypeError, ValueError):
-                    sl_pct = -8.0
+                    sl_pct = BACKTEST_STOP_LOSS_PCT
                 
                 if strategy_type == "pine":
                     bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
@@ -1702,23 +1719,59 @@ def perform_market_scan(
             warnings = []
             if code in mine_data["earnings"]: warnings.append("📅 财报")
             if code in mine_data["unlocks"]: warnings.append("🔒 解禁")
+            # reductions 分支已停用：原数据源 ak.stock_dzjy_mrtj() 是大宗交易（≠减持），
+            # 且返回陈旧数据，曾导致 601138 等股票被误判 D 级。mine_data["reductions"] 恒为空。
+            # 若未来接入正确的减持数据源（如高管减持公告），此行可直接复用。
             if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
             res['warnings'] = warnings
 
-        # --- SOP: 注入市值/换手 (从快照数据) ---
+        # --- SOP: 注入市值/换手/PE (从快照数据) ---
         snap_mkt_map = {}
         snap_turnover_map = {}
+        snap_pe_map = {}
         if not snapshot_df.empty and 'mkt_cap' in snapshot_df.columns:
             for _, row in snapshot_df.iterrows():
                 code = str(row['code'])
                 snap_mkt_map[code] = row.get('mkt_cap', 0)
                 snap_turnover_map[code] = row.get('turnover', None)
+                # 改动 P2：注入 PE（快照含 pe 列，原代码漏注入导致 scan_history.pe 全 None）
+                snap_pe_map[code] = row.get('pe', None)
         for res in results:
-            mkt_raw = snap_mkt_map.get(res['代码'], 0)
+            code = res['代码']
+            mkt_raw = snap_mkt_map.get(code, 0)
             res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
-            turnover_raw = snap_turnover_map.get(res['代码'])
+            turnover_raw = snap_turnover_map.get(code)
             if turnover_raw is not None:
                 res['turnover'] = float(turnover_raw or 0)
+            elif res['mkt_cap_yi'] > 0:
+                # 改动 P1：快照无换手率（盘后/快照过期）时，用"成交额/市值"复算近似换手率。
+                # turnover ≈ (vol × close) / mkt_cap × 100。这是标准近似（流通市值≈总市值的大盘股误差小），
+                # 让"大市值低换手"过滤(306-309行)在盘后也能生效，不再因 turnover 缺失而静默跳过。
+                _vol = float(res.get('成交量', 0) or res.get('vol', 0) or 0)
+                _close = float(res.get('price', 0) or res.get('最新价', 0) or 0)
+                _mkt = float(mkt_raw)  # 元
+                if _vol > 0 and _close > 0 and _mkt > 0:
+                    res['turnover'] = round(_vol * _close / _mkt * 100, 2)
+            # 改动 P2：注入 PE（原代码漏注入，导致 scan_history.pe 全 None）
+            pe_raw = snap_pe_map.get(code)
+            if pe_raw is not None:
+                try:
+                    res['pe'] = round(float(pe_raw), 1)
+                except (TypeError, ValueError):
+                    pass
+
+        # 改动 P0：预计算每只票在板块内的涨幅排名（用于 classify_sector_role 的 LEADER 判定）。
+        # 原 res.update(strength) 会把"板块排名"(sector_rank) 覆盖到 res，但那是板块在全市场的排名，
+        # 不是个股在板块内的排名。这里从快照按板块分组、涨幅降序算出个股板块内 rank。
+        stock_sector_rank_map: Dict[str, int] = {}
+        if not snapshot_df.empty and 'pct_chg' in snapshot_df.columns and 'industry' in snapshot_df.columns:
+            snap_rank = snapshot_df.copy()
+            snap_rank['code'] = snap_rank['code'].astype(str).str.zfill(6)
+            snap_rank['pct_chg'] = pd.to_numeric(snap_rank['pct_chg'], errors='coerce').fillna(0)
+            for _ind, _grp in snap_rank.groupby('industry'):
+                _ranked = _grp.sort_values('pct_chg', ascending=False)
+                for _r, (_, _row) in enumerate(_ranked.iterrows(), start=1):
+                    stock_sector_rank_map[str(_row['code']).zfill(6)] = _r
 
         # 注入板块走势到每个结果
         for res in results:
@@ -1736,9 +1789,13 @@ def perform_market_scan(
             breadth = float(strength.get('sector_breadth', 0) or 0)
             leader_bonus = 15 if relative_pct >= 3 else 8 if relative_pct >= 1 else 0
             res['sector_alignment_score'] = round(min(100, momentum * 0.45 + breadth * 0.25 + leader_bonus + min(15, max(0, stock_pct) * 1.5)), 1)
+            # 个股在板块内的涨幅排名（P0：传入 rank 约束 LEADER 判定）
+            _stock_rank_in_sector = stock_sector_rank_map.get(str(res.get('代码', '')).zfill(6), 0)
+            res['stock_rank_in_sector'] = _stock_rank_in_sector
             res['sector_role'] = classify_sector_role(
                 stock_pct,
                 sector_avg,
+                rank_in_sector=_stock_rank_in_sector,
                 alignment_score=res['sector_alignment_score'],
             )
 
