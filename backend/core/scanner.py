@@ -20,7 +20,8 @@ from core.db import (
     get_db_engine, save_scan_results, load_from_db, save_scan_audit_log
 )
 from core.data import (
-    get_market_snapshot, get_index_hist, get_sector_map, get_sector_trends, get_market_regime
+    get_market_snapshot, get_index_hist, get_sector_map, get_sector_trends, get_market_regime,
+    is_snapshot_stale,
 )
 from core.indicators import (
     calculate_indicators, calculate_pine_indicators,
@@ -1174,6 +1175,11 @@ def perform_market_scan(
                 logger.debug("Network snapshot failed.")
 
         # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
+        if require_live_snapshot and is_snapshot_stale(snapshot_df):
+            raise HTTPException(
+                status_code=503,
+                detail="实时行情快照已过期，已中止扫描，避免 Bark 使用过时行情数据。",
+            )
         if snapshot_df.empty:
             if require_live_snapshot:
                 raise HTTPException(

@@ -12,12 +12,17 @@ from .db import save_to_db, get_db_engine, save_stock_basic, get_stock_basic_map
 from sqlalchemy import text
 from .indicators import calculate_ema
 from .logging_config import logger
+from .risk_constants import STALE_SNAPSHOT_WARN, FRESHNESS_WARN_THRESHOLD_MIN
+
+# P1：记录最近一次成功的快照来源（在 _fetch_snapshot_* 内赋值），供 attrs.source 使用。
+# 模块级而非函数内，便于各内嵌 _fetch 函数写入。
+_last_snapshot_source: str = "unknown"
 
 
 # ═══════════════════════════════════════════════════════
 _resilient_executor = ThreadPoolExecutor(max_workers=10)
 
-def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = "data"):
+def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = "data", min_rows: int = 0):
     """
     按优先级依次尝试多个数据源函数，任何一个成功即返回结果。
     所有调用强制 timeout 秒超时，防止 akshare 底层挂起。
@@ -26,6 +31,9 @@ def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = 
         fetch_funcs: 一组 callable，按优先级排列
         timeout: 每个源的最大等待秒数
         label: 日志标签
+        min_rows: DataFrame 结果的最小行数阈值，低于此值视为残缺数据并继续降级。
+                  防止数据源被限流后返回截断结果(如东财返回100行)造成"假成功"。
+                  仅对 pd.DataFrame 结果生效，默认 0 表示不校验。
     Returns:
         第一个成功函数的返回值，或 None
     """
@@ -37,6 +45,16 @@ def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = 
                 future = _resilient_executor.submit(func)
                 result = future.result(timeout=timeout)
                 if result is not None and not (isinstance(result, pd.DataFrame) and result.empty):
+                    # 行数完整性校验:防止被限流的数据源返回截断数据(如东财返回100行)
+                    # 被误判为成功而阻断降级
+                    if min_rows > 0 and isinstance(result, pd.DataFrame) and len(result) < min_rows:
+                        logger.warning(
+                            f"[{label}] {source_name} returned incomplete data: "
+                            f"{len(result)} rows < {min_rows} required (attempt {attempt+1})"
+                        )
+                        if attempt == 0:
+                            time.sleep(1)
+                        continue  # 行数不足，视为失败，继续尝试下一源/重试
                     return result
             except FuturesTimeoutError:
                 logger.warning(f"[{label}] {source_name} timed out after {timeout}s (attempt {attempt+1})")
@@ -48,6 +66,29 @@ def resilient_fetch(fetch_funcs: List[Callable], timeout: int = 8, label: str = 
                 
     logger.warning(f"[{label}] All {len(fetch_funcs)} sources failed after multiple attempts.")
     return None
+
+
+def _fetch_limit_down_count() -> Optional[int]:
+    """获取当日 A 股跌停家数（用于市场宽度降级）。
+
+    走 akshare 东财跌停池接口，带 8s 超时容错。盘后/非交易日接口仍返回当日数据；
+    盘中返回实时跌停家数。失败返回 None，调用方退回纯指数趋势判定（不阻断）。
+    """
+    def _fetch_ztpool():
+        today = datetime.now().strftime('%Y%m%d')
+        df = ak.stock_zt_pool_dtgc_em(date=today)
+        if df is not None and not df.empty:
+            return df
+        return None
+    try:
+        df = resilient_fetch([_fetch_ztpool], timeout=8, label="limit_down")
+        if df is not None and not df.empty:
+            return int(len(df))
+        return None
+    except Exception as e:
+        logger.debug(f"limit_down count fetch failed: {e}")
+        return None
+
 
 def get_market_regime() -> Dict[str, Any]:
     """
@@ -78,20 +119,27 @@ def get_market_regime() -> Dict[str, Any]:
             close_col = 'close' if 'close' in df.columns else '收盘'
             df_regime = pd.DataFrame({'收盘': df[close_col].values})
             df_regime = calculate_ema(df_regime, 20)
-            
+
             latest = df_regime.iloc[-1]
             close = float(latest['收盘'])
             ema20 = float(latest['EMA20'])
-            
+            # 当日涨跌幅：相对前一日收盘。用于让推送文案对单日急跌有感知（不改 regime 判定本身）。
+            chg_pct = None
+            if len(df_regime) >= 2:
+                prev_close = float(df_regime.iloc[-2]['收盘'])
+                if prev_close > 0:
+                    chg_pct = round((close - prev_close) / prev_close * 100, 2)
+
             states[name] = {
                 "close": round(close, 2),
                 "ema20": round(ema20, 2),
-                "trend": "BULL" if close > ema20 else "BEAR"
+                "trend": "BULL" if close > ema20 else "BEAR",
+                "chg_pct": chg_pct,
             }
         
         if "上证" not in states or "创业" not in states:
-            return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": states, "updated_at": ""}
-            
+            return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": states, "updated_at": "", "limit_down_count": None}
+
         # 综合评判
         if states["上证"]["trend"] == "BULL" and states["创业"]["trend"] == "BULL":
             status = "OFFENSIVE"
@@ -102,16 +150,30 @@ def get_market_regime() -> Dict[str, Any]:
         else:
             status = "DEFENSIVE"
             desc = "减仓观望：市场进入震荡/分化期"
-            
+
+        # 市场宽度降级：指数趋势是慢变量，对"指数被权重股托住但个股大面积跌停"
+        # 的结构性行情失明。读取实时跌停家数，达到阈值时强制降级（只降不升），
+        # 联动收紧扫描阈值/下调仓位上限/触发减仓。失败返回 None 不阻断（退回纯指数判定）。
+        limit_down_count = _fetch_limit_down_count()
+        if isinstance(limit_down_count, int):
+            from core.risk_constants import BREADTH_DOWNGRADE_DEFENSIVE, BREADTH_DOWNGRADE_CRITICAL
+            if limit_down_count >= BREADTH_DOWNGRADE_CRITICAL and status != "CRITICAL":
+                status = "CRITICAL"
+                desc = f"宽度降级·空仓防守：跌停 {limit_down_count} 家（指数失真，个股恐慌扩散）"
+            elif limit_down_count >= BREADTH_DOWNGRADE_DEFENSIVE and status == "OFFENSIVE":
+                status = "DEFENSIVE"
+                desc = f"宽度降级·减仓观望：跌停 {limit_down_count} 家（指数失真，市场宽度恶化）"
+
         return {
             "status": status,
             "desc": desc,
             "indices": states,
+            "limit_down_count": limit_down_count,
             "updated_at": datetime.now().strftime('%H:%M:%S')
         }
     except Exception as e:
         logger.error(f"Error getting market regime: {e}")
-        return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": {}, "updated_at": ""}
+        return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": {}, "limit_down_count": None, "updated_at": ""}
 
 # --- 统一根据配置禁用代理 ---
 from core.config import config
@@ -173,6 +235,10 @@ def get_stale_cache(key: str) -> Optional[Any]:
 
 def get_market_snapshot() -> pd.DataFrame:
     """获取全市场实时快照 (v6.0 - 引入 resilient_fetch 多源容灾弹性重构)"""
+    # P0：在 get_cached_data 调用前先持有 stale 引用。因为 get_cached_data 命中过期条目时
+    # 会 del CACHE[key]，导致后续 get_stale_cache 取不到全失败兜底用的旧快照。
+    # 提前持有引用可避免这个时序问题，且对新启动（无缓存）场景无副作用。
+    stale_fallback = get_stale_cache('market_snapshot')
     # 增加 60 秒的高速缓存，防止双策略或并发扫描时频繁高负荷请求
     cached = get_cached_data('market_snapshot', 60)
     if cached is not None:
@@ -180,6 +246,7 @@ def get_market_snapshot() -> pd.DataFrame:
         return cached
 
     def _fetch_snapshot_em():
+        global _last_snapshot_source
         # 增加随机延迟以避开频率限制
         time.sleep(random.uniform(0.1, 0.5))
         df = ak.stock_zh_a_spot_em()
@@ -200,6 +267,7 @@ def get_market_snapshot() -> pd.DataFrame:
             '总市值': 'mkt_cap',
             '市盈率-动态': 'pe'
         })
+        _last_snapshot_source = "akshare东财"
         return df
 
     def _fetch_snapshot_sina():
@@ -240,6 +308,7 @@ def get_market_snapshot() -> pd.DataFrame:
 
     def _fetch_snapshot_tencent():
         """使用腾讯行情API，并发分批抓取全市场快照"""
+        global _last_snapshot_source
         basic_map = get_stock_basic_map()
         codes = list(basic_map.keys())
         if not codes:
@@ -247,62 +316,36 @@ def get_market_snapshot() -> pd.DataFrame:
         
         logger.info(f"Tencent snapshot fetch triggered for {len(codes)} stocks.")
         
-        def format_tencent_code(code: str) -> str:
-            if code.startswith('6') or code.startswith('900'):
-                return f'sh{code}'
-            elif code.startswith('0') or code.startswith('3') or code.startswith('2'):
-                return f'sz{code}'
-            elif code.startswith('8') or code.startswith('4') or code.startswith('920'):
-                return f'bj{code}'
-            return code
-
         def fetch_tencent_chunk(chunk_codes):
-            symbols = [format_tencent_code(c) for c in chunk_codes]
-            url = f"http://qt.gtimg.cn/q={','.join(symbols)}"
             try:
-                r = requests.get(url, timeout=8)
-                if r.status_code != 200:
-                    return []
-                r.encoding = 'gbk'
-                lines = r.text.strip().split('\n')
+                from .direct_sources import tencent_quote
+
+                quotes = tencent_quote(chunk_codes)
                 results = []
-                for line in lines:
-                    if not line or '"' not in line:
-                        continue
-                    try:
-                        content = line.split('"')[1]
-                        parts = content.split('~')
-                        if len(parts) < 46:
-                            continue
-                        
-                        # 提取核心字段
-                        code = parts[2]
-                        name = parts[1]
-                        price = float(parts[3]) if parts[3] else None
-                        open_val = float(parts[5]) if parts[5] else None
-                        high_val = float(parts[33]) if (len(parts) > 33 and parts[33]) else price
-                        low_val = float(parts[34]) if (len(parts) > 34 and parts[34]) else price
-                        pct_chg = float(parts[32]) if parts[32] else 0.0
-                        vol = float(parts[6]) if parts[6] else 0.0 # 已经是手
-                        turnover = float(parts[38]) if parts[38] else None
-                        mkt_cap = float(parts[45]) * 100000000.0 if parts[45] else None # 换算为元
-                        pe = float(parts[39]) if parts[39] else None
-                        
-                        results.append({
-                            'code': code,
-                            'name': name,
-                            'price': price,
-                            'open': open_val,
-                            'high': high_val,
-                            'low': low_val,
-                            'pct_chg': pct_chg,
-                            'vol': vol,
-                            'turnover': turnover,
-                            'mkt_cap': mkt_cap,
-                            'pe': pe
-                        })
-                    except Exception:
-                        continue
+                for code, quote in quotes.items():
+                    mcap_yi = quote.get("mcap_yi")
+                    float_mcap_yi = quote.get("float_mcap_yi")
+                    results.append({
+                        'code': code,
+                        'name': quote.get("name", ""),
+                        'price': quote.get("price") or None,
+                        'open': quote.get("open") or None,
+                        'high': quote.get("high") or quote.get("price") or None,
+                        'low': quote.get("low") or quote.get("price") or None,
+                        'pct_chg': quote.get("change_pct") or 0.0,
+                        'vol': quote.get("vol") or 0.0,
+                        'amount': (quote.get("amount_wan") or 0.0) * 10000.0,
+                        'turnover': quote.get("turnover_pct") or None,
+                        'mkt_cap': mcap_yi * 100000000.0 if mcap_yi else None,
+                        'float_mkt_cap': float_mcap_yi * 100000000.0 if float_mcap_yi else None,
+                        'pe': quote.get("pe_ttm") or None,
+                        'pb': quote.get("pb") or None,
+                        'limit_up': quote.get("limit_up") or None,
+                        'limit_down': quote.get("limit_down") or None,
+                        'vol_ratio': quote.get("vol_ratio") or None,
+                        'amplitude': quote.get("amplitude_pct") or None,
+                        'last_close': quote.get("last_close") or None,
+                    })
                 return results
             except Exception as e:
                 logger.debug(f"Tencent chunk fetch failed: {e}")
@@ -327,24 +370,155 @@ def get_market_snapshot() -> pd.DataFrame:
             
         df = pd.DataFrame(all_results)
         logger.info(f"Tencent snapshot fetched successfully: {len(df)} rows.")
+        _last_snapshot_source = "腾讯"
         return df
 
-    # 通过 resilient_fetch 容灾调用，给新浪源/腾讯源充足的超时空间（35秒）
-    df = resilient_fetch([_fetch_snapshot_em, _fetch_snapshot_sina, _fetch_snapshot_tencent], timeout=35, label="market_snapshot")
-    
+    def _fetch_em_direct():
+        """P2：直连东财 push2 端点（绕过 akshare wrapper 层的封禁）。
+        复用 direct_sources.em_get 节流器；单次分页(pz=6000)返回全市场 11 列。"""
+        global _last_snapshot_source
+        from .direct_sources import snapshot_from_eastmoney
+        df = snapshot_from_eastmoney()
+        if df is None or df.empty:
+            raise ValueError("Eastmoney direct returned empty snapshot")
+        _last_snapshot_source = "东财直连"
+        return df
+
+    def _fetch_snapshot_sina_direct():
+        """P2：直连新浪 hq.sinajs.cn（绕过 akshare 的 py_mini_racer V8 段错误）。
+        用标准库 re 解析，无需 demjson3 依赖。第 3 独立提供商，终极兜底。"""
+        global _last_snapshot_source
+        from .direct_sources import snapshot_from_sina
+        basic_map = get_stock_basic_map()
+        codes = list(basic_map.keys())
+        if not codes:
+            raise ValueError("Sina direct aborted: stock_basic table has no codes.")
+        df = snapshot_from_sina(codes)
+        if df is None or df.empty:
+            raise ValueError("Sina direct returned empty snapshot")
+        _last_snapshot_source = "新浪直连"
+        return df
+
+    # 通过 resilient_fetch 容灾调用，给腾讯源充足的超时空间（35秒）
+    # 注意：已移除 _fetch_snapshot_sina。新浪源 stock_zh_a_spot() 内部会实例化
+    # py_mini_racer.MiniRacer()（V8 引擎），在 macOS arm64 + 多线程环境下触发
+    # native crash (address_pool_manager Check failed: !pool->IsInitialized())，
+    # 该段错误无法被 try/except 捕获，会杀掉整个 uvicorn 进程。
+    # 该段错误根因是 akshare wrapper 内部的 py_mini_racer，不是新浪接口本身。
+    # P2 新增的 _fetch_snapshot_sina_direct 用 requests 直连 hq.sinajs.cn，绕开 V8，
+    # 已在 scratch/debug_sina.py 验证 arm64 安全。
+    # 数据源优先级:腾讯/新浪直连(实测稳定)优先,东财(易被限流截断)降为末位兜底。
+    # 2026-06 修复:东财被限流时返回截断的 100 行(应 ~5500),且 resilient_fetch
+    # 旧逻辑只判 df.empty 导致"假成功"阻断降级。现腾讯/新浪前置 + min_rows 校验。
+    df = resilient_fetch(
+        [_fetch_snapshot_tencent, _fetch_snapshot_sina_direct, _fetch_snapshot_em, _fetch_em_direct],
+        timeout=35, label="market_snapshot", min_rows=4000,
+    )
+
     if df is not None and not df.empty:
         # 双重防御：确保 high 和 low 列始终存在，若不存在以最新价/今开填充
         if 'high' not in df.columns:
             df['high'] = df['price'] if 'price' in df.columns else df['open']
         if 'low' not in df.columns:
             df['low'] = df['price'] if 'price' in df.columns else df['open']
-            
+
+        # P1：在 DataFrame 上挂行情元数据，供 Bark 推送生成"⏱️ 行情 HH:MM · 源"标注。
+        # 沿用 scanner.py:1246 已有的 df.attrs['data_date'] 范式（pandas 2.2.2 支持）。
+        df.attrs = {'fetched_at': datetime.now(), 'source': _last_snapshot_source}
+
         # 存入缓存
         set_cached_data('market_snapshot', df)
         return df
-    
-    logger.error("All real-time snapshot sources failed.")
+
+    # P0：所有实时源失败时，退回函数开头持有的过期快照（stale），而非空 DF。
+    # 用 stale_fallback（函数开头已持有），因为此时 get_cached_data 可能已删除过期 key。
+    # 不刷新缓存时间戳，保持其"过期"属性；attrs.source 标记为过期，供 P1 加 ⚠️。
+    if stale_fallback is not None and not stale_fallback.empty:
+        logger.warning("All real-time sources failed. Falling back to stale snapshot (may lag minutes).")
+        stale_fallback.attrs = {'fetched_at': getattr(stale_fallback, 'attrs', {}).get('fetched_at'),
+                                'source': STALE_SNAPSHOT_WARN}
+        return stale_fallback
+
+    logger.error("All real-time snapshot sources failed and no stale cache available.")
     return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1：行情新鲜度辅助函数（供 Bark 推送生成"⏱️ 行情 HH:MM · 源"标注）
+# 消除 5 处内联 set_index().to_dict() 重复（复用优先），并统一暴露 attrs 元数据。
+# ─────────────────────────────────────────────────────────────────────────────
+
+def snapshot_lookup(snapshot, code: str, column: str = 'price'):
+    """统一"从快照查某只股票某字段"的入口。
+
+    替换散落在 sentinel/tasks/watchlist/paper_trade 的 set_index().to_dict() 模式。
+    Args:
+        snapshot: get_market_snapshot() 返回的 DataFrame
+        code: 6 位股票代码
+        column: 字段名（默认 'price'）
+    Returns:
+        (value, fetched_at, source)：value 为 None 表示快照中无此票；
+        fetched_at/source 来自 df.attrs（可能为 None，如旧缓存或测试 mock）。
+    """
+    if snapshot is None or (hasattr(snapshot, 'empty') and snapshot.empty):
+        return None, None, None
+    attrs = getattr(snapshot, 'attrs', {}) or {}
+    fetched_at = attrs.get('fetched_at')
+    source = attrs.get('source')
+    if column not in getattr(snapshot, 'columns', []):
+        return None, fetched_at, source
+    match = snapshot[snapshot['code'] == code]
+    if match.empty:
+        return None, fetched_at, source
+    try:
+        val = match.iloc[0][column]
+        # NaN 视为缺失
+        if val != val:  # noqa: PLR0124  (NaN != NaN)
+            val = None
+    except Exception:
+        val = None
+    return val, fetched_at, source
+
+
+def format_freshness(snapshot=None, threshold_min: float = None, *, attrs: dict = None) -> str:
+    """生成 Bark 推送用的行情新鲜度行，遵循现有 emoji 规范。
+
+    Args:
+        snapshot: 已抓取的快照 DataFrame（读其 .attrs）；或传 None 配合 attrs。
+        attrs: 直接传入 attrs dict（优先级高于 snapshot）。用于推送点的"价格"与
+               "时间戳"必须同源——调用方用已有快照的价格时，应传同一快照的 attrs，
+               而非重新调 get_market_snapshot()（否则时间戳会来自新快照，与旧价格矛盾）。
+    Returns: 形如 "⏱️ 行情 14:32 (滞后2分) · akshare东财"
+             过期超阈值或 stale 兜底时前缀 ⚠️，如 "⚠️ ⏱️ 行情 14:30 · 过期快照(可能滞后)"
+    """
+    if threshold_min is None:
+        threshold_min = FRESHNESS_WARN_THRESHOLD_MIN
+    a = attrs if attrs is not None else (getattr(snapshot, 'attrs', {}) or {})
+    fetched_at = a.get('fetched_at')
+    src = a.get('source') or "未知源"
+    if fetched_at is None:
+        return f"⏱️ 行情时间未知 · {src}"
+    now = datetime.now()
+    lag_min = (now - fetched_at).total_seconds() / 60.0
+    time_str = fetched_at.strftime("%H:%M")
+    is_stale = src == STALE_SNAPSHOT_WARN or lag_min > threshold_min
+    prefix = "⚠️ " if is_stale else ""
+    lag_text = "实时" if lag_min < 1 else f"滞后{int(lag_min)}分"
+    return f"{prefix}⏱️ 行情 {time_str} ({lag_text}) · {src}"
+
+
+def is_snapshot_stale(snapshot=None, threshold_min: float = None, *, attrs: dict = None) -> bool:
+    """Return True when a market snapshot is unsuitable for live-only Bark pushes."""
+    if threshold_min is None:
+        threshold_min = FRESHNESS_WARN_THRESHOLD_MIN
+    a = attrs if attrs is not None else (getattr(snapshot, 'attrs', {}) or {})
+    if a.get('source') == STALE_SNAPSHOT_WARN:
+        return True
+    fetched_at = a.get('fetched_at')
+    if fetched_at is None:
+        return False
+    return (datetime.now() - fetched_at).total_seconds() / 60.0 > threshold_min
+
 
 def sync_stock(code: str, name: str, engine=None) -> bool:
     """
@@ -412,6 +586,19 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
 
     res = {}
 
+    def _valid_index_quote(name: str, price: float) -> bool:
+        min_price = {
+            "上证": 1000,
+            "创业板": 500,
+            "沪深300": 1000,
+            "科创50": 500,
+            "中证1000": 1000,
+        }.get(name, 100)
+        if price < min_price:
+            logger.warning(f"[index_data] Reject suspicious {name} quote: {price}")
+            return False
+        return True
+
     # 1. 优先尝试腾讯极速合并实时源 (海外IP畅通无阻，毫秒级返回，彻底避免多线程并发超时)
     try:
         symbols = list(indices.values())
@@ -430,8 +617,11 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
                     parts = content.split('~')
                     if len(parts) >= 33:
                         name = code_to_name[line_prefix]
+                        price = float(parts[3]) if parts[3] else 0.0
+                        if not _valid_index_quote(name, price):
+                            continue
                         res[name] = {
-                            'price': float(parts[3]) if parts[3] else 0.0,
+                            'price': price,
                             'pct': float(parts[32]) if parts[32] else 0.0
                         }
             if len(res) == len(indices):
@@ -467,7 +657,10 @@ def get_index_data() -> Dict[str, Dict[str, float]]:
             match = em_snapshot[em_snapshot['代码'] == numeric_code]
             if not match.empty:
                 row = match.iloc[0]
-                return {'price': float(row['最新价']), 'pct': float(row['涨跌幅'])}
+                price = float(row['最新价'])
+                if not _valid_index_quote(name, price):
+                    return None
+                return {'price': price, 'pct': float(row['涨跌幅'])}
             return None
         
         result = resilient_fetch([_tx, _em], timeout=15, label=f"index_{name}")
@@ -742,6 +935,13 @@ def get_index_hist(code: str) -> pd.DataFrame:
     if cached is not None:
         return cached
 
+    def _min_valid_index_close(index_code: str) -> float:
+        return {
+            "000001": 1000,  # 上证指数
+            "000300": 1000,  # 沪深300
+            "399006": 500,   # 创业板指
+        }.get(index_code, 100)
+
     # 1. 第一级：优先采用极速且避开所有代理阻碍的新浪纯 HTTP 接口 (最实时，2026年数据完整)
     try:
         df = _fetch_index_hist_sina(code)
@@ -776,10 +976,22 @@ def get_index_hist(code: str) -> pd.DataFrame:
                     df_local = pd.read_sql(query, conn, params={"code": index_code})
                     df_local = df_local.sort_values("日期").reset_index(drop=True)
                     if not df_local.empty:
-                        logger.info(f"Loaded index {index_code} from local database as fallback (rows: {len(df_local)})")
-                        return df_local
-            logger.warning(f"Index {code} not in known index codes or no local data, returning None (no stock-substitute fallback)")
-            return None
+                        # 关键修复：指数 6 位代码会与个股代码冲突。
+                        # 例如 000001 在指数语境是上证，在个股语境是平安银行。
+                        # 用合理点位下限识别污染数据，绝不把个股当指数。
+                        latest_close = float(df_local["收盘"].iloc[-1])
+                        min_close = _min_valid_index_close(index_code)
+                        if latest_close < min_close:
+                            logger.warning(
+                                f"Local index fallback for {index_code} is suspicious "
+                                f"(close={latest_close:.2f}, expected >= {min_close:.0f}). "
+                                "Refusing to use it as benchmark; returning empty."
+                            )
+                        else:
+                            logger.info(f"Loaded index {index_code} from local database as fallback (rows: {len(df_local)})")
+                            return df_local
+            logger.warning(f"Index {code} not in known index codes or no local data, returning empty (no stock-substitute fallback)")
+            return pd.DataFrame()
     except Exception as e:
         logger.warning(f"Fallback loading 000001 from local database failed: {e}")
 

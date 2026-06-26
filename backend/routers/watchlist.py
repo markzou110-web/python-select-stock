@@ -97,6 +97,13 @@ def _send_trigger_notification(alerts) -> Dict[str, bool]:
         )
     if len(alerts) > 8:
         lines.append(f"另有 {len(alerts) - 8} 条触发记录，请打开观察池查看。")
+    # P1：标注行情新鲜度。用缓存里与 current_price 同源的快照 attrs，避免重新抓取
+    # 导致价格(来自触发检查时的快照)与时间戳(新快照)矛盾。
+    try:
+        from core.data import get_stale_cache, format_freshness
+        lines.append(format_freshness(get_stale_cache("market_snapshot")))
+    except Exception:
+        pass
     body = "\n".join(lines)
 
     try:
@@ -117,13 +124,15 @@ def _refresh_items_with_snapshot(items, require_live_snapshot: bool = False):
     if not items:
         return []
     try:
-        from core.data import get_market_snapshot
+        from core.data import get_market_snapshot, is_snapshot_stale
 
         snapshot = get_market_snapshot()
         if snapshot is None or snapshot.empty:
             if require_live_snapshot:
                 return None
             return items
+        if require_live_snapshot and is_snapshot_stale(snapshot):
+            return None
         snapshot_map = snapshot.set_index("code")["price"].to_dict()
         from core.data import get_market_regime
         from core.decision_layer import build_market_decision_context, load_market_cycle_history
@@ -253,6 +262,13 @@ def send_watchlist_status_report(slot: str) -> Dict[str, Any]:
 
     title = "Alpha Vision 观察池晨间计划" if slot == "morning" else "Alpha Vision 观察池尾盘结论"
     body = _build_watchlist_status_body(items, slot)
+    # P1：标注行情新鲜度。用缓存里与 items 现价同源的快照 attrs（_refresh_items_with_snapshot
+    # 刚抓的快照就在缓存里），避免重新抓取导致价格与时间戳矛盾。
+    try:
+        from core.data import get_stale_cache, format_freshness
+        body = body + "\n" + format_freshness(get_stale_cache("market_snapshot"))
+    except Exception:
+        pass
     try:
         try:
             loop = asyncio.get_running_loop()

@@ -2,7 +2,7 @@ from .celery_app import celery_app
 from .logging_config import logger
 from .notifier import notifier
 from .db import get_db_engine
-from .data import get_market_snapshot
+from .data import get_market_snapshot, is_snapshot_stale
 from .indicators import calculate_indicators
 from core.strategy import evaluate_exit_signals
 from core.risk_engine import safe_float
@@ -96,6 +96,8 @@ def check_realtime_alerts():
         snapshot = get_market_snapshot()
         if snapshot.empty:
             return "Failed to fetch snapshot"
+        if is_snapshot_stale(snapshot):
+            return "Failed to fetch fresh snapshot"
             
         snapshot_map = snapshot.set_index('code')['price'].to_dict()
         snapshot_high_map = snapshot.set_index('code')['high'].to_dict() if 'high' in snapshot.columns else {}
@@ -159,11 +161,15 @@ def check_realtime_alerts():
         # 5. 发送推送
         if alerts_triggered:
             title = f"⚠️ 盘中风控建议 ({len(alerts_triggered)}个)"
+            # P1：body 末尾标注行情新鲜度（snapshot 已在作用域内），让用户知晓现价可信度
+            from core.data import format_freshness
+            freshness_tail = format_freshness(snapshot)
             # 为保证移动端通知显示美观，若多于 5 个预警，仅展示前 5 个并做优雅截断，避免消息堆叠
             if len(alerts_triggered) > 5:
                 body = "\n".join(alerts_triggered[:5]) + f"\n... 等共 {len(alerts_triggered)} 个风控预警信号，请点击查看仪表板。"
             else:
                 body = "\n".join(alerts_triggered)
+            body = body + "\n" + freshness_tail
                 
             # 这是一个异步操作，但不等待结果
             import asyncio

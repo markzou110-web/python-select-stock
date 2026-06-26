@@ -45,6 +45,21 @@ CAPITAL_PROTECT_THRESHOLD_PCT = 5.0
 # 保本底线：跌回至成本线 +1% 以内则触发
 CAPITAL_PROTECT_FLOOR_PCT = 1.0
 
+# ── 保本移动止损 (Breakeven Trailing) ──
+# 改动 #14：原保本机制门槛是 +5%，利润区间 [0%, 5%) 没有任何止损上移，
+# 导致股票从 +4% 回撤到 -9% 会损失 13%、浮盈全部回吐。这里补一个更早触发的
+# 保本档：浮盈达 +3% 即把止损上移到成本线附近（-0.5%），守住绝大部分本金。
+# 档位优先级：保本移动(3%) < 保本保护(5%) < 移动风控(10%) < 强盈利收紧(20%)。
+# 因 active_stop = max(candidates)，更高档自动覆盖低档，符合"只收紧不放宽"语义。
+BREAKEVEN_TRIGGER_PCT = 3.0       # 浮盈达 +3% 触发保本移动
+BREAKEVEN_FLOOR_PCT = -0.5        # 保本底线：成本 -0.5%（略低于成本，避免被分时噪音扫出）
+
+# ── 持仓追高保护 (Position Spike Protection) ──
+# 改动 #13 持仓侧：已持有的票当日冲高(涨幅>7%)但已从高点回落时，收紧止损锁定脉冲利润，
+# 避免"冲高 → 全回吐"。只在 pl_pct（当前浮盈）满足且已确认回落（high>curr*1.01）时触发。
+POSITION_SPIKE_PCT = 7.0          # 当前浮盈 >7% 视为脉冲冲高
+POSITION_SPIKE_TRAIL_RATIO = 0.97 # 冲高回撤时止损收紧到现价 -3%
+
 # ── 分级预警 (Tiered Early-Warning for Bark users) ──
 # 上班族无法盯盘，依赖 Bark 推送。原逻辑只在跌破 -9% 止损线才预警，
 # 导致 -3%~-9% 的恶化过程完全静默。分级预警在恶化早期就提醒：
@@ -103,6 +118,28 @@ TIME_STOP_REVIEW_REDUCE_RATIO = 1.0 / 3.0
 BACKTEST_MAX_HOLD_DAYS = 10         # 最大持有天数 (从 5 改为 10，更适合均线粘合中线策略)
 BACKTEST_TRAILING_ATR_MULT = 2.2    # ATR 移动止盈倍数
 BACKTEST_RISK_PER_TRADE = 0.02      # 单笔交易最大风险占总资金比例 (2%)
+# 改动：回测止损必须与实盘 FIXED_STOP_LOSS_PCT 一致，否则历史胜率反映的不是真实交易规则。
+# 历史代码硬编码 -8.0，而实盘止损是 -9.0，导致回测胜率系统性失真（更早止损=更多假亏损）。
+BACKTEST_STOP_LOSS_PCT = FIXED_STOP_LOSS_PCT  # -9.0，与实盘硬止损同源
 
 # ── 量能见顶检测 (Volume Climax) ──
 VOLUME_CLIMAX_MULTIPLIER = 3.0      # 成交量超过 MA20 的倍数阈值
+
+# ── 市场宽度降级 (Breadth-based Regime Downgrade) ──
+# get_market_regime 只看宽基指数 vs EMA20 的趋势，对"指数被权重股托住但个股
+# 大面积跌停"的结构性行情失明（如 2026-06-23：上证仅 -1.37% 但 39 家跌停）。
+# 当跌停家数达到阈值时，强制把指数判定的 OFFENSIVE 降级，联动收紧扫描/降仓。
+# 降级规则（只降不升）：
+#   跌停 >= BREADTH_DOWNGRADE_CRITICAL  → CRITICAL（极端恐慌，空仓防守）
+#   跌停 >= BREADTH_DOWNGRADE_DEFENSIVE → DEFENSIVE（跌停潮，减仓观望）
+# 取值依据：A 股常态跌停 5~15 家，>20 家即为结构恶化，>40 家为恐慌扩散。
+BREADTH_DOWNGRADE_DEFENSIVE = 20    # 跌停家数 >= 此值：OFFENSIVE → DEFENSIVE
+BREADTH_DOWNGRADE_CRITICAL = 40     # 跌停家数 >= 此值：直接 → CRITICAL
+
+# ── 行情数据新鲜度 (Snapshot Freshness for Bark push) ──
+# 解决"Bark 推送用过期数据/被封后断数据"两大痛点：
+# 1. P0：所有实时源失败时，退回最近一次成功的过期快照而非空 DF，避免推送空白。
+# 2. P1：在 Bark 推送 body 标注行情时间 + 源，让用户一眼看出这价是几秒/几分钟前的。
+# stale 兜底虽牺牲实时性，但比"断数据"对上班族盯盘更友好（有价可看 > 没价报错）。
+STALE_SNAPSHOT_WARN = "过期快照(可能滞后)"  # stale 兜底分支的 source 标记，P1 据此加 ⚠️
+FRESHNESS_WARN_THRESHOLD_MIN = 5    # 行情滞后超过此分钟数，Bark 推送前置 ⚠️ 提醒

@@ -11,7 +11,7 @@ import pandas as pd
 
 from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db
-from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache
+from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache, is_snapshot_stale
 from core.indicators import calculate_indicators
 from core.price_action import analyze_price_action
 from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
@@ -268,11 +268,13 @@ _REAL_STOP_ALERT_DATE: Dict[str, str] = {}  # 记录推送日期，跨日重置
 
 def _tier_early_warning(*, code: str, name: str, trade_mode: str,
                         entry_price: float, curr_price: float, pl_pct: float,
-                        regime_desc: str) -> None:
+                        regime_desc: str, snapshot=None) -> None:
     """持仓浮亏分级预警（-3% 轻度 / -5% 中度）。
 
     仅对亏损持仓（pl_pct < 0）触发；每级每天最多推一次（去重防 30 分钟循环刷屏）。
     -9% 紧急预警由原有止损逻辑处理，此处不重复。
+    snapshot: curr_price 来源的同一份快照（用其 attrs 标注新鲜度，避免重新抓取导致
+              价格与时间戳不同源）。
     """
     if pl_pct >= 0 or entry_price <= 0:
         return
@@ -299,6 +301,12 @@ def _tier_early_warning(*, code: str, name: str, trade_mode: str,
             f"当前浮亏：{pl_pct:+.2f}%\n"
             f"大盘状态：{regime_desc}"
         )
+        # P1：标注行情新鲜度，用 curr_price 同源的 snapshot attrs（避免重新抓取导致价格与时间戳矛盾）
+        try:
+            from core.data import format_freshness
+            body = body + "\n" + format_freshness(snapshot)
+        except Exception:
+            pass
         send_paper_trade_notification(title, body)
     except Exception as exc:
         logger.warning(f"分级预警推送异常({code},tier{tier}): {exc}")
@@ -674,7 +682,7 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
         snapshot_map: Dict[str, Dict[str, float]] = {}
         try:
             snapshot = get_market_snapshot()
-            if not snapshot.empty:
+            if not snapshot.empty and not is_snapshot_stale(snapshot):
                 for _, row in snapshot.iterrows():
                     code = str(row.get("code") or "")
                     price = safe_float(row.get("price"))
@@ -1366,6 +1374,8 @@ def run_wind_control() -> Dict[str, Any]:
         from core.data import get_market_snapshot
         snapshot = get_market_snapshot()
         if snapshot.empty: return {"status": "error", "detail": "市场行情不可用"}
+        if is_snapshot_stale(snapshot):
+            return {"status": "error", "detail": "实时行情已过期，风控暂停，避免使用过时行情。"}
         
         # 获取当前大盘环境
         from core.data import get_market_regime
@@ -1426,6 +1436,7 @@ def run_wind_control() -> Dict[str, Any]:
                 code=code, name=row.get('name') or code, trade_mode=_wt_trade_mode,
                 entry_price=entry_price, curr_price=curr_price, pl_pct=pl_pct,
                 regime_desc=regime.get('desc', 'N/A') if isinstance(regime, dict) else 'N/A',
+                snapshot=snapshot,
             )
 
             # --- 风控逻辑判定 (按优先级, 使用统一风控引擎) ---
@@ -1606,6 +1617,12 @@ def run_wind_control() -> Dict[str, Any]:
                     f"{_ts_line}"
                     f"大盘状态：{regime.get('desc', 'N/A')}"
                 )
+                # P1：标注行情新鲜度。snapshot 与 curr_price 同源（均为外层 1367 行快照），无矛盾。
+                try:
+                    from core.data import format_freshness
+                    body = body + "\n" + format_freshness(snapshot)
+                except Exception:
+                    pass
                 send_paper_trade_notification(title, body)
         
         # 批量执行所有平仓更新 (一次连接，一次 commit)
