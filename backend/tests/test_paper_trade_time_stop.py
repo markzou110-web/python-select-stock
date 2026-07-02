@@ -8,12 +8,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.models import Base
 from routers.paper_trade import (
+    close_paper_trade,
     _count_holding_trading_days,
     _evaluate_time_stop,
     _wind_control_decision,
     _tier_early_warning,
     _tier_alert_sent,
 )
+from schemas.paper_trade import PaperTradeClose
 
 
 def test_holding_days_use_trading_days_from_daily_k():
@@ -40,6 +42,51 @@ def test_holding_days_use_trading_days_from_daily_k():
     )
 
     assert hold_days == 5
+
+
+def test_close_paper_trade_supports_partial_sell(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    events = []
+    notifications = []
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_trading (
+                id, code, name, entry_price, entry_date, current_price, status,
+                strategy_type, trade_mode, shares, capital_used, theme
+            ) VALUES (
+                1, '603259', '药明康德', 117.22, '2026-06-25', 121.30, 'OPEN',
+                'tv_dual', 'REAL', 300, 35166.0, '化学制药'
+            )
+        """))
+
+    monkeypatch.setattr("routers.paper_trade.get_db_engine", lambda: engine)
+    monkeypatch.setattr(
+        "routers.paper_trade.send_paper_trade_notification",
+        lambda title, body: notifications.append((title, body)),
+    )
+    monkeypatch.setattr(
+        "routers.paper_trade.record_lifecycle_event",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    result = close_paper_trade(1, PaperTradeClose(close_price=121.30, close_shares=200))
+
+    assert result["status"] == "success"
+    assert result["partial"] is True
+    assert result["closed_shares"] == 200
+    assert result["remaining_shares"] == 100
+    assert result["pnl_pct"] == 3.48
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT status, shares, capital_used, plan_adherence FROM paper_trading WHERE id = 1")).mappings().one()
+    assert row["status"] == "OPEN"
+    assert row["shares"] == 100
+    assert row["capital_used"] == 11722.0
+    assert row["plan_adherence"] == "PARTIAL_TAKE_PROFIT"
+    assert notifications and "实盘减仓" in notifications[0][0]
+    assert events[0][0][0] == "PARTIAL_SELL"
+    assert events[0][1]["payload"]["sell_shares"] == 200
 
 
 def test_time_stop_warning_does_not_force_close():
@@ -347,3 +394,48 @@ def test_real_stop_alert_escalation_logic():
     if _REAL_STOP_ALERT_DATE.get(_alert_key) != _today:
         _real_stop_alert_state[_alert_key] = 0
     assert _real_stop_alert_state[_alert_key] == 0, "跨日应重置计数"
+
+
+# ── 保本移动止损决策（改动 #14）：operation_plan 对"保本移动"档返回 REDUCE ──
+
+def test_operation_plan_reduce_on_breakeven_stage():
+    """改动 #14：risk_stage='保本移动' 时跌破风控线应 REDUCE（减仓），而非 CLOSE（全平）。
+
+    否则保本档触发的止损会全平仓位，与"保本减仓、留住底仓"的语义冲突。
+    """
+    from core.operation_plan import build_position_decision_snapshot
+
+    # entry=10, 保本线 9.95（浮盈+3%触发），现价 9.90 跌破保本线
+    risk = {
+        "active_stop_price": 9.95,
+        "structure_stop_price": 0.0,
+        "initial_stop_price": 9.1,
+        "max_pl_pct": 3.5,
+        "risk_stage": "保本移动",
+    }
+    decision = build_position_decision_snapshot(
+        current_price=9.90,
+        entry_price=10.0,
+        risk=risk,
+    )
+    assert decision["action"] == "REDUCE", f"保本移动应 REDUCE，实际 {decision['action']}"
+    assert "保本移动" in decision["trigger"]
+
+
+def test_operation_plan_close_on_initial_stage_not_breakeven():
+    """对照：初始/结构防守档跌破止损线应 CLOSE（全平），区别于保本档的 REDUCE。"""
+    from core.operation_plan import build_position_decision_snapshot
+
+    risk = {
+        "active_stop_price": 9.1,
+        "structure_stop_price": 0.0,
+        "initial_stop_price": 9.1,
+        "max_pl_pct": 0.0,
+        "risk_stage": "初始/结构防守",
+    }
+    decision = build_position_decision_snapshot(
+        current_price=9.05,
+        entry_price=10.0,
+        risk=risk,
+    )
+    assert decision["action"] == "CLOSE", f"初始档应 CLOSE，实际 {decision['action']}"

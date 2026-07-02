@@ -10,6 +10,9 @@ from core.sentinel import (
     _position_breakout_confirmation,
     _build_after_close_watchlist_body,
     _candidate_action_label,
+    _candidate_brief_lines,
+    _format_market_line,
+    _format_regime_line,
     _real_position_action,
     _select_after_close_watchlist,
     _select_intraday_push_stocks,
@@ -28,6 +31,40 @@ def test_intraday_push_keeps_sector_watch_quota():
     selected = _select_intraday_push_stocks(stocks, executable_limit=1, sector_watch_limit=1)
 
     assert [s["代码"] for s in selected] == ["000001", "000003"]
+
+
+def test_bark_market_line_prefers_decision_context_over_offensive_regime():
+    stocks = [{
+        "market_sentiment_label": "退潮",
+        "market_sentiment_score": 45.8,
+        "portfolio_position_cap_pct": 10,
+    }]
+    regime = {
+        "status": "OFFENSIVE",
+        "indices": {
+            "上证": {"chg_pct": -1.37},
+            "创业": {"chg_pct": -3.84},
+        },
+    }
+
+    line = _format_market_line(stocks, regime)
+
+    assert line.startswith("退潮 45.8分 | 总仓上限 10%")
+    assert "进攻模式" not in line
+    assert "指数急跌" in line
+
+
+def test_regime_line_does_not_show_offensive_during_sharp_index_drop():
+    line = _format_regime_line({
+        "status": "OFFENSIVE",
+        "indices": {
+            "上证": {"chg_pct": -1.37},
+            "创业": {"chg_pct": -3.84},
+        },
+    })
+
+    assert "进攻模式" not in line
+    assert "指数急跌" in line
 
 
 def test_sector_watch_action_is_observation_only():
@@ -68,6 +105,11 @@ def test_after_close_watchlist_keeps_observe_candidate_and_excludes_block():
             "final_trade_score": 72,
             "现价": 5.62,
             "entry_price": 5.72,
+            "pa_pullback_support_price": 5.36,
+            "pa_pullback_confirmation_price": 5.72,
+            "pa_pullback_invalidation_price": 4.31,
+            "pa_pullback_status": "PENDING_CONFIRMATION",
+            "pa_pullback_status_label": "回踩待确认",
             "plan_stop_price": 4.31,
             "trade_blockers": ["涨停/近涨停，等待隔日确认"],
         },
@@ -84,10 +126,34 @@ def test_after_close_watchlist_keeps_observe_candidate_and_excludes_block():
     body = _build_after_close_watchlist_body(selected, "2026-06-09")
 
     assert [stock["代码"] for stock in selected] == ["300145"]
+    assert "关键价：现价 5.62 | 确认 >5.72 | 支撑 5.36 | 失效 <4.31" in body
     assert "站稳 >5.72" in body
     assert "跌破 <4.31" in body
+    assert "回踩状态: 回踩待确认：支撑暂守住，等放量站上确认价" in body
+    assert "不追高；回踩不破支撑5.36，放量站上确认价5.72再考虑" in body
     assert "涨停/近涨停，等待隔日确认" in body
     assert "不是买入指令" in body
+
+
+def test_intraday_candidate_line_shows_support_and_no_chase_rule():
+    stock = {
+        "代码": "300145",
+        "名称": "南方泵业",
+        "sop_grade": "M",
+        "trade_bucket": "OBSERVE",
+        "trade_eligible": False,
+        "现价": 5.62,
+        "entry_price": 5.72,
+        "pa_pullback_support_price": 5.36,
+        "plan_stop_price": 4.31,
+        "涨幅%": 8.1,
+        "trade_blockers": ["涨幅偏高且质量未确认，等待回踩/次日确认"],
+    }
+
+    body = "\n".join(_candidate_brief_lines(stock))
+
+    assert "现价5.62｜确认>5.72｜支撑5.36｜失效<4.31" in body
+    assert "不追高；回踩不破支撑5.36，放量站上确认价5.72再考虑" in body
 
 
 def test_after_close_watchlist_keeps_high_opportunity_d_grade_as_observation_only():

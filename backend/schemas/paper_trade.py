@@ -32,4 +32,5 @@ class PaperTradeCreate(BaseModel):
 
 class PaperTradeClose(BaseModel):
     close_price: float = Field(gt=0, description="卖出价格，必须大于 0")
+    close_shares: Optional[int] = Field(default=None, gt=0, description="部分卖出股数；为空则全部平仓")
     execution_note: Optional[str] = None

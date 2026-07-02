@@ -704,6 +704,7 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             }
 
         alerts: List[Dict[str, Any]] = []
+        price_updates: List[Dict[str, Any]] = []
         for _, row in df.iterrows():
             code = str(row.get("code") or "")
             entry = safe_float(row.get("entry_price"))
@@ -720,6 +721,12 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                 safe_float(live.get("high"), current),
                 row.get("entry_date"),
             )
+            price_updates.append({
+                "id": int(row["id"]),
+                "current_price": round(current, 2),
+                "high_since_entry": round(high, 2),
+                "updated_at": datetime.now(),
+            })
             risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, code), code)
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             trigger = evaluate_operation_trigger(current, plan)
@@ -737,6 +744,20 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                 "instruction": plan.get("instruction"),
             }
             alerts.append(alert)
+
+        if price_updates:
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        UPDATE paper_trading
+                        SET current_price = :current_price,
+                            high_since_entry = :high_since_entry,
+                            updated_at = :updated_at
+                        WHERE id = :id
+                    """), price_updates)
+                    conn.commit()
+            except Exception as exc:
+                logger.warning(f"Failed to refresh paper trading live prices: {exc}")
 
         if alerts and notify:
             _send_operation_trigger_notification(alerts)
@@ -1263,7 +1284,11 @@ def remove_paper_trade(id: int) -> Dict[str, str]:
 
 @router.post("/close/{id}")
 def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
-    """平仓: 记录卖出价格和日期，将交易标记为 CLOSED"""
+    """平仓或部分卖出。
+
+    不传 close_shares 时保持原有全平行为；传入小于当前持仓的 close_shares
+    时，只更新剩余股数，并用 lifecycle_events 记录已卖出部分。
+    """
     close_price = data.close_price
 
     engine = get_db_engine()
@@ -1282,6 +1307,80 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
             name = t_map["name"]
             entry_price = float(t_map["entry_price"])
             trade_mode = t_map.get("trade_mode", "SIMULATED") or "SIMULATED"
+            current_shares = int(t_map.get("shares") or 0)
+            close_shares = data.close_shares
+            if close_shares is not None and current_shares <= 0:
+                raise HTTPException(status_code=400, detail="当前记录没有持仓股数，不能部分卖出")
+            if close_shares is not None and close_shares > current_shares:
+                raise HTTPException(status_code=400, detail="卖出股数不能大于当前持仓")
+            is_partial_close = close_shares is not None and close_shares < current_shares
+
+            if is_partial_close:
+                remaining_shares = current_shares - int(close_shares)
+                existing_note = t_map.get("execution_note") or t_map.get("remark") or ""
+                partial_note = (
+                    data.execution_note
+                    or f"手动部分卖出{close_shares}股，卖出价{float(close_price):.2f}，剩余{remaining_shares}股继续持有。"
+                )
+                merged_note = f"{existing_note}；{partial_note}".strip("；")
+                conn.execute(text("""
+                    UPDATE paper_trading
+                    SET shares = :remaining_shares,
+                        capital_used = :capital_used,
+                        current_price = :close_price,
+                        execution_note = :execution_note,
+                        plan_adherence = 'PARTIAL_TAKE_PROFIT',
+                        logic_last_review_at = :updated_at,
+                        updated_at = :updated_at
+                    WHERE id = :id
+                """), {
+                    "remaining_shares": remaining_shares,
+                    "capital_used": round(entry_price * remaining_shares, 2),
+                    "close_price": float(close_price),
+                    "execution_note": merged_note,
+                    "updated_at": datetime.now(),
+                    "id": id,
+                })
+                conn.commit()
+
+                pl_pct = 0.0 if entry_price <= 0 else (float(close_price) - entry_price) / entry_price * 100
+                realized_amount = (float(close_price) - entry_price) * int(close_shares)
+                mode_label = "实盘减仓" if trade_mode == "REAL" else "模拟仓减仓"
+                send_paper_trade_notification(
+                    f"【{mode_label}】{name} ({code})",
+                    (
+                        f"交易模式：{'🔴 实盘' if trade_mode == 'REAL' else '🔵 模拟盘'}\n"
+                        f"买入价格：¥{entry_price:.2f}\n"
+                        f"卖出价格：¥{float(close_price):.2f}\n"
+                        f"卖出股数：{int(close_shares)}股\n"
+                        f"剩余股数：{remaining_shares}股\n"
+                        f"本次盈亏：{pl_pct:+.2f}%"
+                    ),
+                )
+                record_lifecycle_event(
+                    "PARTIAL_SELL",
+                    source="paper_trade",
+                    code=code,
+                    name=name,
+                    trade_id=id,
+                    strategy_type=t_map.get("strategy_type"),
+                    theme=t_map.get("theme"),
+                    payload={
+                        "sell_shares": int(close_shares),
+                        "remaining_shares": remaining_shares,
+                        "close_price": float(close_price),
+                        "pnl_pct": round(pl_pct, 2),
+                        "realized_pnl_amount": round(realized_amount, 2),
+                    },
+                )
+                return {
+                    "status": "success",
+                    "partial": True,
+                    "closed_shares": int(close_shares),
+                    "remaining_shares": remaining_shares,
+                    "pnl_pct": round(pl_pct, 2),
+                    "realized_pnl_amount": round(realized_amount, 2),
+                }
 
             conn.execute(text("""
                 UPDATE paper_trading

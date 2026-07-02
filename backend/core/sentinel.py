@@ -69,6 +69,98 @@ def _candidate_push_bucket(stock: Dict[str, Any]) -> str:
     return "观察"
 
 
+def _candidate_brief_action(stock: Dict[str, Any]) -> str:
+    if stock.get('trade_bucket') == 'TRADE' or stock.get('trade_eligible') is True:
+        return "可小仓复核"
+    if stock.get('trade_bucket') == 'BLOCK' or stock.get('trade_eligible') is False:
+        return "禁止买入"
+    action = stock.get('pa_trade_action')
+    if action == "READY":
+        return "等确认"
+    if action in {"WATCH", "WAIT"}:
+        return "只观察"
+    if action == "AVOID":
+        return "回避"
+    return "只观察"
+
+
+def _candidate_brief_reason(stock: Dict[str, Any]) -> str:
+    blockers = stock.get('trade_blockers') or []
+    if isinstance(blockers, str):
+        text = blockers.strip("[]'\" ")
+        return text[:42]
+    if blockers:
+        return "；".join(str(item) for item in blockers[:2])
+    instruction = stock.get("execution_instruction")
+    if instruction:
+        return str(instruction)[:42]
+    if stock.get("pa_pullback_status_label"):
+        return str(stock.get("pa_pullback_status_label"))
+    return "等待触发价站稳"
+
+
+def _pullback_status_text(status: Any, label: Any = "") -> str:
+    status_text = str(status or "").upper()
+    if status_text == "CONFIRMED":
+        return "回踩已确认：可小仓复核，不高开追价"
+    if status_text == "PENDING_CONFIRMATION":
+        return "回踩待确认：支撑暂守住，等放量站上确认价"
+    if status_text == "INVALIDATED":
+        return "结构失效：跌破失效价，取消买入计划"
+    if status_text == "WAITING_PULLBACK":
+        return "等待回踩：尚未到健康回踩买点"
+    if label:
+        return str(label)
+    return "等待回踩确认"
+
+
+def _is_high_extension(stock: Dict[str, Any]) -> bool:
+    blockers = stock.get("trade_blockers") or []
+    blocker_text = blockers if isinstance(blockers, str) else "；".join(str(item) for item in blockers)
+    try:
+        pct = float(stock.get("涨幅%") or stock.get("pct_chg") or 0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    try:
+        pct_5d = float(stock.get("pct_5d") or 0)
+    except (TypeError, ValueError):
+        pct_5d = 0.0
+    return pct >= 7 or pct_5d >= 15 or "涨幅偏高" in blocker_text or "涨停/近涨停" in blocker_text
+
+
+def _no_chase_line(stock: Dict[str, Any]) -> Optional[str]:
+    if not _is_high_extension(stock):
+        return None
+    support = stock.get("pa_pullback_support_price")
+    entry = stock.get("entry_price") or stock.get("pa_entry_price") or stock.get("pa_pullback_confirmation_price")
+    support_text = support if support else "--"
+    entry_text = entry if entry else "--"
+    return f"  追高规则：不追高；回踩不破支撑{support_text}，放量站上确认价{entry_text}再考虑"
+
+
+def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
+    grade = stock.get('sop_grade', '?')
+    name = stock.get('名称', stock.get('name', ''))
+    code = stock.get('代码', stock.get('code', ''))
+    action = _candidate_brief_action(stock)
+    price = stock.get('现价') or stock.get('price')
+    entry = stock.get('entry_price') or stock.get('pa_entry_price')
+    support = stock.get('pa_pullback_support_price')
+    stop = stock.get('plan_stop_price') or stock.get('stop_price') or stock.get('pa_stop_price')
+    final_score = stock.get('final_trade_score')
+    score_text = f" | 交易分{final_score}" if final_score is not None else ""
+    lines = [f"{action}｜{grade}级 {name}({code}){score_text}"]
+    lines.append(
+        f"  现价{price if price else '--'}｜确认>{entry if entry else '--'}"
+        f"｜支撑{support if support else '--'}｜失效<{stop if stop else '--'}"
+    )
+    lines.append(f"  原因：{_candidate_brief_reason(stock)}")
+    chase_line = _no_chase_line(stock)
+    if chase_line:
+        lines.append(chase_line)
+    return lines
+
+
 def _brooks_alert_line(stock: Dict[str, Any]) -> Optional[str]:
     alerts = []
     if stock.get('pa_h2_quality') == '强':
@@ -93,6 +185,7 @@ def _pullback_alert_line(stock: Dict[str, Any]) -> Optional[str]:
     label = stock.get("pa_pullback_status_label")
     if not label:
         return None
+    status = stock.get("pa_pullback_status")
     support = stock.get("pa_pullback_support_price")
     confirmation = stock.get("pa_pullback_confirmation_price")
     invalidation = stock.get("pa_pullback_invalidation_price")
@@ -103,7 +196,8 @@ def _pullback_alert_line(stock: Dict[str, Any]) -> Optional[str]:
         prices.append(f"确认>{confirmation}")
     if invalidation:
         prices.append(f"失效<{invalidation}")
-    return f"  回踩判断: {label}{' | ' + ' / '.join(prices) if prices else ''}"
+    translated = _pullback_status_text(status, label)
+    return f"  回踩状态: {translated}{' | ' + ' / '.join(prices) if prices else ''}"
 
 
 def _sector_alignment_line(stock: Dict[str, Any]) -> Optional[str]:
@@ -340,7 +434,8 @@ def _build_after_close_watchlist_body(stock_list: List[Dict[str, Any]], scan_dat
         grade = stock.get('sop_grade') or '?'
         current = _after_close_price(stock, '现价', 'price')
         entry = _after_close_price(stock, 'entry_price', 'pa_entry_price')
-        stop = _after_close_price(stock, 'plan_stop_price', 'stop_price', 'pa_stop_price')
+        support = _after_close_price(stock, 'pa_pullback_support_price')
+        stop = _after_close_price(stock, 'plan_stop_price', 'stop_price', 'pa_stop_price', 'pa_pullback_invalidation_price')
         blockers = stock.get('trade_blockers') or []
         if isinstance(blockers, str):
             blocker_text = blockers.strip("[]'\" ")
@@ -352,9 +447,16 @@ def _build_after_close_watchlist_body(stock_list: List[Dict[str, Any]], scan_dat
             f"  定位：{stock.get('sector_mainline', '--')} / {stock.get('sector_role', '--')}"
             f" | 机会分 {stock.get('trade_opportunity_score', '--')} | {stock.get('trade_opportunity_label', '观望')}"
         )
+        lines.append(
+            f"  关键价：现价 {current if current else '--'} | 确认 >{entry if entry else '--'}"
+            f" | 支撑 {support if support else '--'} | 失效 <{stop if stop else '--'}"
+        )
         lines.append(f"  确认：站稳 >{entry if entry else '--'} 且量能确认，再考虑小仓复核")
         lines.append(f"  失效：跌破 <{stop if stop else '--'}，取消观察/不得买入")
         lines.append(f"  当前：等待确认，不追高{f'；原因：{blocker_text}' if blocker_text else ''}")
+        chase_line = _no_chase_line(stock)
+        if chase_line:
+            lines.append(chase_line)
         if stock.get("execution_instruction"):
             lines.append(f"  指令：{stock['execution_instruction']}")
         brooks_line = _brooks_alert_line(stock)
@@ -549,7 +651,7 @@ def _append_real_position_status(lines: List[str]) -> None:
         return
 
     import pandas as pd
-    from core.data import get_market_snapshot, get_index_hist
+    from core.data import get_market_snapshot, get_index_hist, format_freshness
     from core.indicators import calculate_indicators
     from core.strategy import evaluate_exit_signals
     from core.risk_engine import compute_paper_risk_levels_with_context, safe_float
@@ -567,6 +669,8 @@ def _append_real_position_status(lines: List[str]) -> None:
         lines.append("【🔴 实盘持仓状态】")
 
         snapshot = get_market_snapshot()
+        # P1：实盘持仓块顶部标注行情新鲜度（滞后/stale 时带 ⚠️，让用户知道现价可信度）
+        lines.append(format_freshness(snapshot))
         snap_map = snapshot.set_index('code')['price'].to_dict() if not snapshot.empty else {}
         snap_high_map = snapshot.set_index('code')['high'].to_dict() if not snapshot.empty and 'high' in snapshot.columns else {}
         bench_df = get_index_hist('000001')
@@ -594,7 +698,7 @@ def _append_real_position_status(lines: List[str]) -> None:
             suggestion = "持股观望"
             if len(df_hist) >= 20:
                 df_labeled = calculate_indicators(df_hist, current_price=curr, bench_df=bench_df)
-                signals = evaluate_exit_signals(df_labeled, entry, high)
+                signals = evaluate_exit_signals(df_labeled, entry, high, code=code)
                 risk = compute_paper_risk_levels_with_context(entry, high, curr, None, code)
                 pa = analyze_price_action(df_hist)
                 active_stop = risk.get("active_stop_price") or risk.get("stop_price") or 0
@@ -608,6 +712,61 @@ def _append_real_position_status(lines: List[str]) -> None:
         logger.error(f"Error appending real stock status: {e}")
 
 
+_REGIME_EMOJI = {"OFFENSIVE": "🚀 进攻模式", "DEFENSIVE": "⚠️ 防守模式", "CRITICAL": "🛡️ 严格防守"}
+
+
+def _first_market_context(stock_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for stock in stock_list or []:
+        if stock.get("market_sentiment_label") or stock.get("market_sentiment_stage"):
+            return stock
+    return {}
+
+
+def _format_regime_line(regime: Dict[str, Any]) -> str:
+    """拼成 '🚀 进攻模式 | 上证 -1.37% / 创业 -3.84% | 跌停39家'。
+    regime 判定基于 EMA20 趋势（慢变量）+ 市场宽度（跌停家数）降级；
+    追加当日涨跌幅与跌停家数，让文案对结构性行情（指数失真但个股惨烈）有感知。"""
+    status = regime.get("status", "")
+    indices = regime.get("indices") or {}
+    parts = []
+    sharp_drop = False
+    for name in ("上证", "创业"):
+        chg = (indices.get(name) or {}).get("chg_pct")
+        if chg is not None:
+            sharp_drop = sharp_drop or float(chg) <= -1.0
+            parts.append(f"{name} {chg:+.2f}%")
+    if status == "OFFENSIVE" and sharp_drop:
+        base = "⚠️ 指数急跌"
+    else:
+        base = _REGIME_EMOJI.get(status, "❓ 未知")
+    tail = (" | " + " / ".join(parts)) if parts else ""
+    limit_down = regime.get("limit_down_count")
+    if isinstance(limit_down, int):
+        tail += f" | 跌停{limit_down}家"
+    return f"{base}{tail}"
+
+
+def _format_market_line(stock_list: List[Dict[str, Any]], regime: Dict[str, Any]) -> str:
+    """Use the scan decision context for Bark market wording when available.
+
+    The regime model is a slow EMA20 trend label. The scan decision layer is the
+    execution gate used for position sizing, so Bark must prefer it to avoid
+    contradictory messages such as "进攻模式" and "退潮" in one push.
+    """
+    ctx = _first_market_context(stock_list)
+    if not ctx:
+        return _format_regime_line(regime)
+
+    label = ctx.get("market_sentiment_label") or ctx.get("market_sentiment_stage") or "--"
+    score = ctx.get("market_sentiment_score", "--")
+    cap = ctx.get("portfolio_position_cap_pct", "--")
+    line = f"{label} {score}分 | 总仓上限 {cap}%"
+    regime_tail = _format_regime_line(regime)
+    if regime_tail and regime_tail != "❓ 未知":
+        line += f" | {regime_tail}"
+    return line
+
+
 def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Optional[str]:
     """
     Sends a Sentinel heartbeat when the scheduled scan runs but has no actionable A/B candidates.
@@ -616,10 +775,9 @@ def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Op
         logger.info("Sentinel: Market is closed, skip Bark heartbeat.")
         return None
 
-    from core.data import get_market_regime
-    regime_emoji = {"OFFENSIVE": "🚀 进攻模式", "DEFENSIVE": "⚠️ 防守模式", "CRITICAL": "🛡️ 严格防守"}
+    from core.data import get_market_regime, get_market_snapshot, format_freshness
     regime = get_market_regime()
-    regime_str = regime_emoji.get(regime.get('status', ''), '❓ 未知')
+    market_line = _format_market_line(stock_list, regime)
 
     now_str = datetime.now().strftime("%H:%M")
     total = len(stock_list)
@@ -633,9 +791,11 @@ def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Op
         for s in stock_list[:3]
     )
 
+    # P1：用真实行情时间戳替换静态"实时快照"行（走 60s 缓存，成本极低）
+    freshness_line = format_freshness(get_market_snapshot())
     lines = [
-        f"大盘：{regime_str}",
-        "策略：TV双策略强共振 | 数据：实时快照",
+        f"大盘：{market_line}",
+        f"策略：TV双策略强共振 | {freshness_line}",
         f"结果：{reason}",
         f"统计：强共振命中 {total} 只 | {grade_text}",
         "执行：无A/B级不买入；等待14:30尾盘确认，不追D级和冲高回落票。",
@@ -666,10 +826,9 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         return None
 
     # 获取大盘状态
-    regime_emoji = {"OFFENSIVE": "🚀 进攻模式", "DEFENSIVE": "⚠️ 防守模式", "CRITICAL": "🛡️ 严格防守"}
-    from core.data import get_market_regime
+    from core.data import get_market_regime, get_market_snapshot, format_freshness
     regime = get_market_regime()
-    regime_str = regime_emoji.get(regime.get('status', ''), '❓ 未知')
+    market_line = _format_market_line(push_stocks, regime)
     try:
         from core.db import get_db_engine, save_recommendation_events
         save_recommendation_events(
@@ -698,25 +857,24 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     primary_strategy = stock_list[0].get('strategy_type') if stock_list else None
     strategy_label = strategy_names.get(primary_strategy, primary_strategy or '系统策略')
 
+    # P1：用真实行情时间戳替换静态"实时快照"行（走 60s 缓存）
+    freshness_line = format_freshness(get_market_snapshot())
     lines = [
-        f"大盘：{regime_str}",
+        f"大盘：{market_line}",
         (
             f"情绪：{push_stocks[0].get('market_sentiment_label', '--')}"
             f" {push_stocks[0].get('market_sentiment_score', '--')}分"
             f" | 总仓上限 {push_stocks[0].get('portfolio_position_cap_pct', '--')}%"
         ),
-        f"策略：{strategy_label} | 数据：实时快照",
-        "执行：候选≠指令；买入只在14:40-14:55确认，14:57后不追单",
-        "确认：接近入场价、未跌破失效价、无冲高回落长上影",
+        f"策略：{strategy_label} | {freshness_line}",
+        "先看动作：可小仓复核才考虑；只观察/禁止买入都不下单。",
+        "买入条件：站稳确认价 + 量能确认 + 无冲高回落。",
         "",
     ]
-    sector_emoji = {'LEAD': '🚀领涨', 'FOLLOW': '📈跟涨', 'FLAT': '➖横盘', 'DOWN': '📉下跌'}
-
-    grade_icons = {'A': '🟢', 'B': '🔵', 'M': '🟠', 'C': '⚪'}
     section_titles = {
         "可交易": "【可交易候选】",
-        "观察": "【观察池】",
-        "禁止追买": "【禁止追买/风险样本】",
+        "观察": "【只观察】",
+        "禁止追买": "【禁止买入】",
     }
     grouped = {"可交易": [], "观察": [], "禁止追买": []}
     for s in push_stocks[:10]:
@@ -728,56 +886,12 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
             continue
         lines.append(section_titles[section])
         for s in stocks:
-            grade = s.get('sop_grade', '?')
-            grade_icon = grade_icons.get(grade, '⚪')
-            name = s.get('名称', s.get('name', ''))
-            code = s.get('代码', s.get('code', ''))
-            sector = s.get('行业', '')
-            s_trend = sector_emoji.get(s.get('sector_trend', ''), '')
-            s_pct = s.get('sector_pct', 0)
-            entry = s.get('entry_price', 0)
-            stop = s.get('plan_stop_price') or s.get('stop_price', 0)
-            target = s.get('target_price') or s.get('pa_target_price')
-            win_rate = s.get('历史胜率', 'N/A')
-            pf = s.get('回测统计', {}).get('profit_factor', 'N/A')
-            final_score = s.get('final_trade_score')
-
-            score_text = f" | 交易分: {final_score}" if final_score is not None else ""
-            lines.append(f"{grade_icon} {grade}级 {name} ({code}){score_text}")
-            lines.append(
-                f"  定位: {s.get('sector_mainline', '--')} / {s.get('sector_role', '--')}"
-                f" | 机会分 {s.get('trade_opportunity_score', '--')} | {s.get('trade_opportunity_label', '观望')}"
-            )
-            lines.append(f"  {_candidate_action_label(s)}")
-            if s.get("execution_instruction"):
-                lines.append(f"  明确指令: {s['execution_instruction']}")
+            lines.extend(_candidate_brief_lines(s))
             if s.get('sector_watch_only'):
                 lines.extend(_sector_watch_advice_lines(s))
-            if sector:
-                lines.append(f"  板块: {sector} {s_trend}{'+' if s_pct >= 0 else ''}{s_pct}%")
-            target_text = f" | 目标: {target}" if target else ""
-            lines.append(f"  入场: {entry} | 失效: {stop}{target_text}")
-            lines.append(f"  胜率: {win_rate} | 盈亏比: {pf}")
-            sector_line = _sector_alignment_line(s)
-            if sector_line:
-                lines.append(sector_line)
-            brooks_line = _brooks_alert_line(s)
-            if brooks_line:
-                lines.append(brooks_line)
-            pullback_line = _pullback_alert_line(s)
-            if pullback_line:
-                lines.append(pullback_line)
-            eight_rule = s.get("pa_eight_rule_primary") or {}
-            if eight_rule:
-                trigger = eight_rule.get("trigger_price")
-                invalidation = eight_rule.get("invalidation_price")
-                lines.append(
-                    f"  八诀: {eight_rule.get('label')} {eight_rule.get('confidence')}%"
-                    f" | 确认>{trigger if trigger else '--'} | 失效<{invalidation if invalidation else '--'}"
-                )
             bonuses = s.get('sop_bonuses', [])
             if bonuses:
-                lines.append(f"  ⭐ {'、'.join(bonuses)}")
+                lines.append(f"  加分：{'、'.join(str(item) for item in bonuses[:2])}")
             lines.append("")
 
     total_a = sum(1 for s in stock_list if s.get('sop_grade') == 'A')
@@ -908,7 +1022,7 @@ class IntradaySentinel:
                             pushed_body = send_intraday_notification(self.last_top_5)
                             if not pushed_body:
                                 send_intraday_heartbeat(
-                                    self.last_top_5,
+                                    results,
                                     "强共振有命中，但没有达到A/B/M/C推送级别，今日暂不操作。"
                                 )
                         else:
