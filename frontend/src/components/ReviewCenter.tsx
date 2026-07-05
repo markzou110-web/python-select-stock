@@ -6,8 +6,36 @@ import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxi
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
 
+type LayerMetric = {
+    signals?: number;
+    win_rate?: number;
+    avg_return?: number;
+};
+
+type ProfitabilityLayer = {
+    key: string;
+    label: string;
+    source: string;
+    rows: number;
+    metrics?: Record<string, LayerMetric>;
+    verdict?: {
+        status?: string;
+        action?: string;
+    };
+};
+
+type ProfitabilityPayload = {
+    summary?: {
+        best_layer?: string;
+        positive_layers?: number;
+        weak_layers?: number;
+    };
+    layers?: ProfitabilityLayer[];
+};
+
 export default function ReviewCenter() {
     const [data, setData] = useState<any>(null);
+    const [profitability, setProfitability] = useState<ProfitabilityPayload | null>(null);
     const [followup, setFollowup] = useState<any>(null);
     const [loading, setLoading] = useState(true);
     const [followupLoading, setFollowupLoading] = useState(false);
@@ -18,8 +46,12 @@ export default function ReviewCenter() {
     const fetchData = async () => {
         setLoading(true);
         try {
-            const res = await api.get(`/api/review/scan-performance?days=${days}`);
-            setData(res.data);
+            const [performanceRes, profitabilityRes] = await Promise.all([
+                api.get(`/api/review/scan-performance?days=${days}`),
+                api.get(`/api/review/profitability-dashboard?days=${days}`),
+            ]);
+            setData(performanceRes.data);
+            setProfitability(profitabilityRes.data);
         } finally {
             setLoading(false);
         }
@@ -95,6 +127,8 @@ export default function ReviewCenter() {
                 <Stat label="优势板块" value={summary.best_bucket || "暂无"} sub="按5日胜率排序" icon={<BarChart3 size={20} />} />
                 <Stat label="薄弱板块" value={summary.worst_bucket || "暂无"} sub="建议降低权重" icon={<Activity size={20} />} />
             </div>
+
+            <ProfitabilityLayerCard data={profitability} />
 
             <div className="glass-card p-5">
                 <div className="flex items-center justify-between mb-4">
@@ -220,6 +254,97 @@ function RecommendationEventCard({ rows }: { rows: any[] }) {
                 ))}
                 {rows.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无推荐事件</div>}
             </div>
+        </div>
+    );
+}
+
+function ProfitabilityLayerCard({ data }: { data: ProfitabilityPayload | null }) {
+    const layers = data?.layers || [];
+    const summary = data?.summary || {};
+    const priority = ['bark', 'strong_sector', 'tv_dual_strict', 'early_a_minus', 'trade_a', 'real_trade', 'scan_all'];
+    const rows = [...layers].sort((a, b) => {
+        const ai = priority.indexOf(a.key);
+        const bi = priority.indexOf(b.key);
+        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+
+    return (
+        <div className="glass-card p-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between mb-5">
+                <div>
+                    <h3 className="font-black text-slate-800">盈利能力分层</h3>
+                    <p className="text-xs font-bold text-slate-400 mt-1">按扫描、Bark、A/A-、实盘买入分别验证 1/3/5/10 日收益</p>
+                </div>
+                <div className="grid grid-cols-3 gap-2 min-w-[260px]">
+                    <MiniStat label="最佳层" value={summary.best_layer || '样本不足'} hot />
+                    <MiniStat label="正期望层" value={`${summary.positive_layers || 0}`} hot={(summary.positive_layers || 0) > 0} />
+                    <MiniStat label="弱势层" value={`${summary.weak_layers || 0}`} />
+                </div>
+            </div>
+
+            <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                    <thead>
+                        <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                            <th className="py-2 pr-3">分层</th>
+                            <th className="py-2 pr-3">样本</th>
+                            <th className="py-2 pr-3">1日</th>
+                            <th className="py-2 pr-3">3日</th>
+                            <th className="py-2 pr-3">5日</th>
+                            <th className="py-2 pr-3">10日</th>
+                            <th className="py-2 pr-3">状态</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows.map((layer: ProfitabilityLayer) => {
+                            const m1 = layer.metrics?.['1d'] || {};
+                            const m3 = layer.metrics?.['3d'] || {};
+                            const m5 = layer.metrics?.['5d'] || {};
+                            const m10 = layer.metrics?.['10d'] || {};
+                            return (
+                                <tr key={layer.key} className="border-b border-slate-50 last:border-b-0 text-xs">
+                                    <td className="py-3 pr-3">
+                                        <div className="font-black text-slate-800">{layer.label}</div>
+                                        <div className="text-[10px] font-bold text-slate-400">{layer.source}</div>
+                                    </td>
+                                    <td className="py-3 pr-3 font-black text-slate-700">{m5.signals || 0}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m1)}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m3)}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m5)}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m10)}</td>
+                                    <td className="py-3 pr-3 min-w-[150px]">
+                                        <span className={cn("px-2 py-1 rounded-md border text-[10px] font-black", verdictTone(layer.verdict?.status))}>
+                                            {layer.verdict?.status || 'UNKNOWN'}
+                                        </span>
+                                        <div className="mt-1 text-[10px] font-bold text-slate-400">{layer.verdict?.action || '--'}</div>
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+                {rows.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无盈利能力分层数据</div>}
+            </div>
+        </div>
+    );
+}
+
+function verdictTone(status?: string) {
+    if (status === 'POSITIVE') return 'bg-rose-50 text-rose-600 border-rose-100';
+    if (status === 'WATCH') return 'bg-indigo-50 text-indigo-600 border-indigo-100';
+    if (status === 'WEAK') return 'bg-slate-100 text-slate-700 border-slate-200';
+    return 'bg-amber-50 text-amber-700 border-amber-100';
+}
+
+function formatLayerMetric(metric?: LayerMetric) {
+    const value = Number(metric?.avg_return || 0);
+    const signals = Number(metric?.signals || 0);
+    const winRate = Number(metric?.win_rate || 0);
+    const color = value >= 0 ? 'text-rose-600' : 'text-emerald-600';
+    return (
+        <div>
+            <div className={cn("font-black", color)}>{signals ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '--'}</div>
+            <div className="text-[10px] font-bold text-slate-400">{signals ? `${winRate}%胜` : '无样本'}</div>
         </div>
     );
 }

@@ -76,6 +76,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE(price_action_detail->>'pa_weekly_context', '未知') AS pa_weekly_context,
                 COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
                 COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
+                COALESCE((price_action_detail->>'early_trade_candidate')::boolean, false) AS early_trade_candidate,
+                COALESCE(price_action_detail->>'early_trade_grade', '') AS early_trade_grade,
                 COALESCE((price_action_detail->>'final_trade_score')::float, score, 0) AS final_trade_score,
                 COALESCE((price_action_detail->>'calibrated_score')::float, score, 0) AS calibrated_score,
                 COALESCE((price_action_detail->>'research_eligible')::boolean, false) AS research_eligible,
@@ -127,6 +129,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.pa_weekly_context,
                 s.trade_bucket,
                 s.trade_eligible,
+                s.early_trade_candidate,
+                s.early_trade_grade,
                 s.final_trade_score,
                 s.calibrated_score,
                 s.research_eligible,
@@ -266,6 +270,200 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
         labels=["低开<-2%", "平开-2~1%", "高开1~3%", "高开>3%"],
     ).astype(str).replace("nan", "未知")
     return df
+
+
+def _layer_verdict(metrics_5d: Dict[str, Any]) -> Dict[str, Any]:
+    signals = int(metrics_5d.get("signals") or 0)
+    expected = float(metrics_5d.get("expected_return") or 0)
+    ci_low = float(metrics_5d.get("ci95_low") or 0)
+    if signals < 10:
+        return {"status": "INSUFFICIENT", "action": "样本不足，只观察，不作为调参依据"}
+    if expected > 0 and ci_low >= 0:
+        return {"status": "POSITIVE", "action": "正期望较明确，可作为优先交易层"}
+    if expected > 0:
+        return {"status": "WATCH", "action": "均值为正但置信度不足，适合小仓复核"}
+    return {"status": "WEAK", "action": "期望为负，避免直接交易或继续降权"}
+
+
+def _profitability_layer_row(
+    key: str,
+    label: str,
+    df: pd.DataFrame,
+    source: str = "scan_history",
+) -> Dict[str, Any]:
+    horizon_metrics = {}
+    for horizon in [1, 3, 5, 10]:
+        col = f"ret_{horizon}d"
+        horizon_metrics[f"{horizon}d"] = return_metrics(df[col]) if col in df.columns else return_metrics(pd.Series(dtype=float))
+    metrics_5d = horizon_metrics["5d"]
+    return {
+        "key": key,
+        "label": label,
+        "source": source,
+        "rows": int(len(df)),
+        "latest_date": str(df["signal_date"].max()) if "signal_date" in df.columns and not df.empty else None,
+        "metrics": horizon_metrics,
+        "verdict": _layer_verdict(metrics_5d),
+    }
+
+
+def _build_profitability_layers(scan_df: pd.DataFrame, event_df: pd.DataFrame | None = None) -> List[Dict[str, Any]]:
+    if scan_df.empty:
+        return []
+
+    df = scan_df[scan_df["performance_eligible"].fillna(False)].copy()
+    trade_eligible = df["trade_eligible"].astype(str).str.lower().eq("true")
+    early_candidate = (
+        df.get("early_trade_candidate", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+        | df.get("early_trade_grade", pd.Series("", index=df.index)).astype(str).eq("A-")
+    )
+    strong_sector = pd.to_numeric(df["sector_alignment_score"], errors="coerce").fillna(0).ge(70)
+
+    layers = [
+        _profitability_layer_row("scan_all", "全量有效扫描", df),
+        _profitability_layer_row("trade_a", "A/正式买点", df[df["trade_bucket"].eq("TRADE") | trade_eligible]),
+        _profitability_layer_row("early_a_minus", "A-提前复核", df[early_candidate]),
+        _profitability_layer_row("observe", "观察池", df[df["trade_bucket"].eq("OBSERVE")]),
+        _profitability_layer_row("block", "禁止/过滤", df[df["trade_bucket"].eq("BLOCK")]),
+        _profitability_layer_row("tv_dual_strict", "严格双策略", df[df["strategy_type"].eq("tv_dual_strict")]),
+        _profitability_layer_row("strong_sector", "强板块联动>70", df[strong_sector]),
+    ]
+
+    if event_df is not None and not event_df.empty:
+        bark_df = event_df[event_df["source"].astype(str).str.startswith("bark")].copy()
+        if "event_date" in bark_df.columns:
+            bark_df["signal_date"] = bark_df["event_date"]
+        layers.append(_profitability_layer_row("bark", "Bark推送", bark_df, source="recommendation_events"))
+
+    return layers
+
+
+def _load_recommendation_event_performance_df(days: int) -> pd.DataFrame:
+    engine = get_db_engine()
+    if not engine:
+        return pd.DataFrame()
+    df = pd.read_sql(text("""
+        SELECT
+            e.source,
+            e.code,
+            e.name,
+            e.event_date AS signal_date,
+            e.recommendation_price AS price,
+            e.strategy_type,
+            e.trade_bucket,
+            e.trade_eligible,
+            h1.close AS close_1d,
+            h3.close AS close_3d,
+            h5.close AS close_5d,
+            h10.close AS close_10d
+        FROM recommendation_events e
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 0 LIMIT 1
+        ) h1 ON true
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 2 LIMIT 1
+        ) h3 ON true
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 4 LIMIT 1
+        ) h5 ON true
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = e.code AND d.date > e.event_date ORDER BY d.date ASC OFFSET 9 LIMIT 1
+        ) h10 ON true
+        WHERE e.event_date >= CURRENT_DATE - (:days || ' days')::interval
+          AND e.recommendation_price IS NOT NULL
+          AND e.recommendation_price > 0
+    """), engine, params={"days": int(days)})
+    if df.empty:
+        return df
+    for horizon in [1, 3, 5, 10]:
+        df[f"ret_{horizon}d"] = (
+            pd.to_numeric(df[f"close_{horizon}d"], errors="coerce") - pd.to_numeric(df["price"], errors="coerce")
+        ) / pd.to_numeric(df["price"], errors="coerce") * 100
+    return df
+
+
+def _load_real_trade_performance_df(days: int) -> pd.DataFrame:
+    engine = get_db_engine()
+    if not engine:
+        return pd.DataFrame()
+    df = pd.read_sql(text("""
+        SELECT
+            'real_trade' AS source,
+            p.code,
+            p.name,
+            p.entry_date AS signal_date,
+            COALESCE(p.actual_entry_price, p.entry_price) AS price,
+            p.strategy_type,
+            p.status,
+            h1.close AS close_1d,
+            h3.close AS close_3d,
+            h5.close AS close_5d,
+            h10.close AS close_10d
+        FROM paper_trading p
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = p.code AND d.date > p.entry_date ORDER BY d.date ASC OFFSET 0 LIMIT 1
+        ) h1 ON true
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = p.code AND d.date > p.entry_date ORDER BY d.date ASC OFFSET 2 LIMIT 1
+        ) h3 ON true
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = p.code AND d.date > p.entry_date ORDER BY d.date ASC OFFSET 4 LIMIT 1
+        ) h5 ON true
+        LEFT JOIN LATERAL (
+            SELECT close FROM daily_k d WHERE d.code = p.code AND d.date > p.entry_date ORDER BY d.date ASC OFFSET 9 LIMIT 1
+        ) h10 ON true
+        WHERE p.trade_mode = 'REAL'
+          AND p.entry_date >= CURRENT_DATE - (:days || ' days')::interval
+          AND COALESCE(p.actual_entry_price, p.entry_price) IS NOT NULL
+          AND COALESCE(p.actual_entry_price, p.entry_price) > 0
+    """), engine, params={"days": int(days)})
+    if df.empty:
+        return df
+    for horizon in [1, 3, 5, 10]:
+        df[f"ret_{horizon}d"] = (
+            pd.to_numeric(df[f"close_{horizon}d"], errors="coerce") - pd.to_numeric(df["price"], errors="coerce")
+        ) / pd.to_numeric(df["price"], errors="coerce") * 100
+    return df
+
+
+@router.get("/profitability-dashboard")
+def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
+    """Layered profitability view for scan, Bark, and real-trade outcomes."""
+    engine = get_db_engine()
+    if not engine:
+        return {"summary": {"days": int(days), "layers": 0}, "layers": [], "notes": ["数据库未连接"]}
+    try:
+        scan_df = _load_scan_performance_df(days)
+        event_df = _load_recommendation_event_performance_df(days)
+        real_trade_df = _load_real_trade_performance_df(days)
+        layers = _build_profitability_layers(scan_df, event_df)
+        if not real_trade_df.empty:
+            layers.append(_profitability_layer_row("real_trade", "实盘买入", real_trade_df, source="paper_trading"))
+
+        ranked = [
+            layer for layer in layers
+            if int((layer.get("metrics", {}).get("5d", {}) or {}).get("signals") or 0) >= 10
+        ]
+        ranked.sort(
+            key=lambda layer: float((layer["metrics"]["5d"] or {}).get("expected_return") or 0),
+            reverse=True,
+        )
+        summary = {
+            "days": int(days),
+            "layers": len(layers),
+            "best_layer": ranked[0]["label"] if ranked else "样本不足",
+            "positive_layers": sum(1 for layer in layers if layer.get("verdict", {}).get("status") == "POSITIVE"),
+            "weak_layers": sum(1 for layer in layers if layer.get("verdict", {}).get("status") == "WEAK"),
+        }
+        notes = [
+            "5日收益是主要判断口径；1/3日用于看买点效率，10日用于看持有延展。",
+            "A-提前复核为新规则，历史样本可能不足；下一个交易日开始重点观察。",
+            "回测统计不等于未来收益，仍需结合仓位、滑点和实际执行纪律。",
+        ]
+        return {"summary": summary, "layers": layers, "notes": notes}
+    except Exception as exc:
+        logger.error(f"Profitability dashboard error: {exc}")
+        return {"summary": {"days": int(days), "layers": 0}, "layers": [], "notes": [], "error": str(exc)}
 
 
 @router.get("/scan-performance")
@@ -587,13 +785,17 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
 
             scan_df = pd.read_sql(
                 text("""
-                    SELECT code, name, industry, date, price, score, strategy_type,
-                           pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
-                           COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
-                           COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
-                           COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers
-                    FROM scan_history
-                    WHERE date = :date
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (code)
+                               code, name, industry, date, price, score, strategy_type,
+                               pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
+                               COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
+                               COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
+                               COALESCE(price_action_detail->>'trade_blockers', '') AS trade_blockers
+                        FROM scan_history
+                        WHERE date = :date
+                        ORDER BY code, score DESC
+                    ) t
                     ORDER BY score DESC
                     LIMIT :limit
                 """),
@@ -719,6 +921,157 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
     except Exception as exc:
         logger.error(f"Next-day followup error: {exc}")
         return {"date": date, "items": [], "summary": {}, "error": str(exc)}
+
+
+def _daily_ops_bucket(item: Dict[str, Any]) -> str:
+    action = str(item.get("execution_action") or "")
+    status = str(item.get("followup_status") or "")
+    bucket = str(item.get("trade_bucket") or "")
+    blockers = str(item.get("trade_blockers") or "")
+    if "风控" in status or "取消" in action:
+        return "invalidated"
+    if bucket == "BLOCK" or "禁止" in action or "不追" in action or "冲高回落" in action:
+        return "no_chase"
+    if "尾盘确认可试" in action:
+        return "confirm_candidate"
+    if "回踩" in action or "观察" in action or "涨幅偏高" in blockers:
+        return "wait_pullback"
+    return "watch"
+
+
+def _daily_ops_instruction(item: Dict[str, Any]) -> str:
+    entry = item.get("entry_line")
+    stop = item.get("stop_line")
+    bucket = _daily_ops_bucket(item)
+    if bucket == "confirm_candidate":
+        return f"只在站稳确认价 {entry or '--'} 且量能确认时小仓复核；跌破 {stop or '--'} 取消。"
+    if bucket == "wait_pullback":
+        return f"不追高；等回踩不破支撑/失效价 {stop or '--'} 后，重新站上确认价 {entry or '--'}。"
+    if bucket == "no_chase":
+        return "只复盘不交易；若次日高开或冲高回落，继续排除，等待二次确认。"
+    if bucket == "invalidated":
+        return f"已触发风控或结构失效；跌破 {stop or '--'} 后移出主动买入计划。"
+    return f"继续观察；未站稳确认价 {entry or '--'} 前不下单。"
+
+
+def _summarize_daily_ops_items(items: List[Dict[str, Any]], limit_per_bucket: int = 8) -> Dict[str, Any]:
+    buckets = {
+        "confirm_candidate": [],
+        "wait_pullback": [],
+        "no_chase": [],
+        "invalidated": [],
+        "watch": [],
+    }
+    for item in items:
+        enriched = dict(item)
+        enriched["ops_bucket"] = _daily_ops_bucket(enriched)
+        enriched["ops_instruction"] = _daily_ops_instruction(enriched)
+        buckets.setdefault(enriched["ops_bucket"], []).append(enriched)
+
+    def rank_key(row: Dict[str, Any]) -> tuple:
+        return (
+            -float(row.get("max_gain_pct") or 0),
+            -float(row.get("score") or 0),
+            str(row.get("code") or ""),
+        )
+
+    return {
+        key: sorted(value, key=rank_key)[:limit_per_bucket]
+        for key, value in buckets.items()
+    }
+
+
+def _daily_ops_suggestions(summary: Dict[str, Any]) -> List[str]:
+    counts = summary.get("bucket_counts") or {}
+    suggestions = []
+    if counts.get("no_chase", 0) >= counts.get("confirm_candidate", 0):
+        suggestions.append("继续强化不追高规则：高开、涨停附近、冲高回落票默认进入观察，不给买入动作。")
+    if counts.get("wait_pullback", 0) > 0:
+        suggestions.append("把回踩确认作为主要执行入口：支撑不破、放量站上确认价、尾盘不回落三项同时满足。")
+    if counts.get("confirm_candidate", 0) == 0:
+        suggestions.append("今日没有明确买点，次日以观察池复核为主，不为了交易而交易。")
+    else:
+        suggestions.append("可试票只允许小仓，且必须写明确认价和失效价，避免信号变成追单。")
+    if counts.get("invalidated", 0) > 0:
+        suggestions.append("失效票应自动降权，后续重新入选必须等待新的策略信号，而不是凭题材反抽。")
+    return suggestions[:5]
+
+
+def _find_missed_strong_stocks(engine, date: Optional[str], selected_codes: set[str], limit: int = 12) -> List[Dict[str, Any]]:
+    if not engine or not date:
+        return []
+    try:
+        if engine.dialect.name == "sqlite":
+            return []
+        df = pd.read_sql(text("""
+            WITH priced AS (
+                SELECT
+                    code, date, close,
+                    LAG(close) OVER (PARTITION BY code ORDER BY date) AS prev_close
+                FROM daily_k
+                WHERE date <= CAST(:date AS DATE)
+                  AND date >= CAST(:date AS DATE) - INTERVAL '10 days'
+            )
+            SELECT p.code, COALESCE(b.name, p.code) AS name, p.close, p.prev_close,
+                   (close - prev_close) / NULLIF(prev_close, 0) * 100 AS pct_chg
+            FROM priced p
+            LEFT JOIN stock_basic b ON b.code = p.code
+            WHERE p.date = CAST(:date AS DATE)
+              AND p.prev_close IS NOT NULL
+              AND p.prev_close > 0
+              AND (p.close - p.prev_close) / p.prev_close * 100 >= 7
+            ORDER BY pct_chg DESC
+            LIMIT :limit
+        """), engine, params={"date": date, "limit": max(1, min(int(limit) * 3, 100))})
+        if df.empty:
+            return []
+        rows = []
+        for _, row in df.iterrows():
+            code = str(row.get("code") or "").zfill(6)
+            if code in selected_codes:
+                continue
+            rows.append({
+                "code": code,
+                "name": row.get("name"),
+                "close": round(float(row.get("close") or 0), 2),
+                "pct_chg": round(float(row.get("pct_chg") or 0), 2),
+                "miss_reason": "当日涨幅>=7%但未进入扫描/推送候选，建议复盘是否属于强趋势加速或题材扩散。",
+            })
+            if len(rows) >= limit:
+                break
+        return rows
+    except Exception as exc:
+        logger.warning(f"Missed strong stock review skipped: {exc}")
+        return []
+
+
+@router.get("/daily-ops-review")
+def get_daily_ops_review(date: Optional[str] = None, limit: int = 80) -> Dict[str, Any]:
+    """A concise end-of-day decision report for improving selection and execution quality."""
+    followup = get_next_day_followup(date=date, limit=limit)
+    items = followup.get("items") or []
+    grouped = _summarize_daily_ops_items(items)
+    bucket_counts = {key: len(value) for key, value in grouped.items()}
+    engine = get_db_engine()
+    selected_codes = {str(item.get("code") or "").zfill(6) for item in items}
+    missed = _find_missed_strong_stocks(engine, followup.get("date"), selected_codes)
+    summary = {
+        "date": followup.get("date"),
+        "signals": len(items),
+        "tracked": int((followup.get("summary") or {}).get("tracked") or 0),
+        "bucket_counts": bucket_counts,
+        "missed_strong_count": len(missed),
+        "principle": "主线优先、买点确认、不追高、失效即取消",
+    }
+    return {
+        "date": followup.get("date"),
+        "summary": summary,
+        "groups": grouped,
+        "missed_strong": missed,
+        "suggestions": _daily_ops_suggestions(summary),
+        "source": "next_day_followup",
+        "error": followup.get("error"),
+    }
 
 
 @router.get("/scan-performance/export")

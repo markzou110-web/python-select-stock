@@ -8,9 +8,11 @@ import os
 import sys
 import asyncio
 import numpy as np
+import pandas as pd
 from fastapi import HTTPException
 from kombu.utils.json import dumps
 from sqlalchemy import create_engine
+from sqlalchemy import text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -35,6 +37,139 @@ def test_review_returns_empty_payload_without_database(monkeypatch):
     assert payload["summary"]["signals"] == 0
     assert payload["horizons"] == []
     assert payload["by_strategy"] == []
+
+    dashboard = review.get_profitability_dashboard()
+    assert dashboard["summary"]["layers"] == 0
+    assert "数据库未连接" in dashboard["notes"]
+
+
+def test_profitability_layers_include_early_and_bark():
+    scan_df = pd.DataFrame([
+        {
+            "signal_date": "2026-07-01",
+            "performance_eligible": True,
+            "trade_eligible": "false",
+            "trade_bucket": "OBSERVE",
+            "early_trade_candidate": True,
+            "early_trade_grade": "A-",
+            "strategy_type": "tv_dual_strict",
+            "sector_alignment_score": 88,
+            "ret_1d": 1.0,
+            "ret_3d": 2.0,
+            "ret_5d": 3.0,
+            "ret_10d": 4.0,
+        },
+        {
+            "signal_date": "2026-07-01",
+            "performance_eligible": True,
+            "trade_eligible": "true",
+            "trade_bucket": "TRADE",
+            "early_trade_candidate": False,
+            "early_trade_grade": "",
+            "strategy_type": "tv_dual",
+            "sector_alignment_score": 20,
+            "ret_1d": -1.0,
+            "ret_3d": -2.0,
+            "ret_5d": -3.0,
+            "ret_10d": -4.0,
+        },
+    ])
+    event_df = pd.DataFrame([
+        {
+            "source": "bark",
+            "event_date": "2026-07-01",
+            "ret_1d": 0.5,
+            "ret_3d": 1.5,
+            "ret_5d": 2.5,
+            "ret_10d": 3.5,
+        }
+    ])
+
+    layers = {row["key"]: row for row in review._build_profitability_layers(scan_df, event_df)}
+
+    assert layers["early_a_minus"]["metrics"]["5d"]["signals"] == 1
+    assert layers["early_a_minus"]["metrics"]["5d"]["avg_return"] == 3.0
+    assert layers["trade_a"]["metrics"]["5d"]["avg_return"] == -3.0
+    assert layers["bark"]["source"] == "recommendation_events"
+    assert layers["bark"]["metrics"]["5d"]["avg_return"] == 2.5
+
+
+def test_daily_ops_review_groups_execution_decisions(monkeypatch):
+    monkeypatch.setattr(review, "get_db_engine", lambda: None)
+    monkeypatch.setattr(
+        review,
+        "get_next_day_followup",
+        lambda date=None, limit=80: {
+            "date": "2026-07-02",
+            "summary": {"tracked": 4},
+            "items": [
+                {
+                    "code": "000001",
+                    "name": "确认票",
+                    "execution_action": "尾盘确认可试：小仓、贴近入场线",
+                    "followup_status": "触发入场线",
+                    "entry_line": 10.2,
+                    "stop_line": 9.6,
+                    "max_gain_pct": 4.2,
+                    "score": 88,
+                },
+                {
+                    "code": "000002",
+                    "name": "回踩票",
+                    "execution_action": "观察：等回踩/放量站稳",
+                    "followup_status": "触发观察",
+                    "entry_line": 8.1,
+                    "stop_line": 7.5,
+                    "trade_bucket": "WATCH",
+                    "trade_blockers": "涨幅偏高且质量未确认",
+                },
+                {
+                    "code": "000003",
+                    "name": "追高票",
+                    "execution_action": "不追：高开超过3%，等回踩",
+                    "followup_status": "大涨验证",
+                    "trade_bucket": "BLOCK",
+                },
+                {
+                    "code": "000004",
+                    "name": "失效票",
+                    "execution_action": "取消：已触发风控线",
+                    "followup_status": "风控触发",
+                    "stop_line": 6.6,
+                },
+            ],
+        },
+    )
+
+    payload = review.get_daily_ops_review(date="2026-07-02")
+
+    assert payload["summary"]["bucket_counts"]["confirm_candidate"] == 1
+    assert payload["summary"]["bucket_counts"]["wait_pullback"] == 1
+    assert payload["summary"]["bucket_counts"]["no_chase"] == 1
+    assert payload["summary"]["bucket_counts"]["invalidated"] == 1
+    assert "站稳确认价 10.2" in payload["groups"]["confirm_candidate"][0]["ops_instruction"]
+    assert any("不追高" in item for item in payload["suggestions"])
+
+
+def test_missed_strong_review_excludes_selected_codes():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO stock_basic (code, name, industry)
+            VALUES ('000001', '已选强势', '测试'), ('000002', '漏选强势', '测试')
+        """))
+        conn.execute(text("""
+            INSERT INTO daily_k (code, date, open, high, low, close, vol)
+            VALUES
+            ('000001', '2026-07-01', 10, 10, 10, 10, 100),
+            ('000001', '2026-07-02', 11, 11, 11, 11, 100),
+            ('000002', '2026-07-01', 10, 10, 10, 10, 100),
+            ('000002', '2026-07-02', 10.8, 10.8, 10.8, 10.8, 100)
+        """))
+
+    # SQLite path intentionally skips the SQL window query used in production.
+    assert review._find_missed_strong_stocks(engine, "2026-07-02", {"000001"}) == []
 
 
 def test_scan_history_does_not_fetch_market_snapshot_when_cache_is_empty(monkeypatch):

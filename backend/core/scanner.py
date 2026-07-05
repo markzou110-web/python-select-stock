@@ -71,6 +71,9 @@ TRAP_MA20_BREAK_DAYS = 3             # MA20下方停留天数阈值（>=此值�
 # 改动(上班族Bark)：实盘信号门槛收紧。True 时仅 A 级 + 多重共振(🔥核心热点)判为可交易，
 # B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。False 回退到原 A/B 均可交易逻辑。
 STRICT_REAL_SIGNAL_GATE = True
+REVIVAL_LOOKBACK_DAYS = 10
+REVIVAL_SOURCE_STRATEGIES = ("tv_dual", "tv_dual_strict", "squeeze", "tv_zp")
+MOMENTUM_ACCEL_LOOKBACK_DAYS = 5
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
 from core.decision_layer import apply_decision_layer
@@ -92,6 +95,14 @@ HIGH_TURNOVER_MKT_CAP_YI = 150.0
 HIGH_TURNOVER_MIN_PCT = 1.5
 LOW_TURNOVER_MKT_CAP_YI = 300.0
 LOW_TURNOVER_MIN_PCT = 1.0
+SMALL_CAP_MIN_EXECUTION_YI = 50.0
+MID_CAP_MIN_EXECUTION_YI = 50.0
+LARGE_CAP_TURNOVER_CONFIRM_YI = 500.0
+EARLY_ENTRY_MAX_CONFIRM_GAP_PCT = 0.8
+CORE_TRADE_STRATEGIES = {"tv_dual_strict"}
+DISCOVERY_ONLY_STRATEGIES = {"tv_dual"}
+H1_STRONG_SECTOR_ALIGNMENT = 85.0
+H1_EARLY_SECTOR_ALIGNMENT = 90.0
 CAPITAL_EVENT_KEYWORDS = ("定增", "增发", "非公开发行", "限售股解禁", "解禁", "减持")
 
 
@@ -108,6 +119,59 @@ def _money_flow_label(item: Dict[str, Any]) -> str:
     if amount < 0:
         return f"{prefix}流出{amount:.2f}亿"
     return "资金中性"
+
+
+def _market_cap_bucket(mkt_cap_yi: float) -> str:
+    if mkt_cap_yi <= 0:
+        return "UNKNOWN"
+    if mkt_cap_yi < 30:
+        return "MICRO"
+    if mkt_cap_yi < SMALL_CAP_MIN_EXECUTION_YI:
+        return "SMALL"
+    if mkt_cap_yi < 150:
+        return "MID"
+    if mkt_cap_yi < LARGE_CAP_TURNOVER_CONFIRM_YI:
+        return "LARGE"
+    return "MEGA"
+
+
+def _is_trend_continuation_candidate(res: Dict[str, Any]) -> bool:
+    """Identify right-side trend continuation candidates without making them direct buys."""
+    mkt_cap_yi = float(res.get("mkt_cap_yi") or 0)
+    cap_bucket = _market_cap_bucket(mkt_cap_yi)
+    if cap_bucket in {"UNKNOWN", "MICRO", "SMALL"}:
+        return False
+
+    trend_phase = str(res.get("pa_trend_phase") or "")
+    setup = str(res.get("pa_trade_setup") or res.get("price_action_pattern") or "")
+    regime = str(res.get("price_action_regime") or "")
+    sector_alignment = float(res.get("sector_alignment_score") or 0)
+    sector_phase = str(res.get("sector_phase") or "")
+    close_position = float(res.get("pa_close_position") or 0)
+    upper_shadow_pct = float(res.get("pa_upper_shadow_pct") or 0)
+    volume_ok = bool(res.get("pa_volume_confirmed")) or str(res.get("pa_volume_pattern") or "") in {"放量突破", "量能确认"}
+    structure_ok = (
+        "二次入场" in trend_phase
+        or "H2" in setup
+        or str(res.get("pa_h2_quality") or "") in {"强", "中"}
+    )
+    trend_ok = regime in {"多头趋势", "向上突破"} and sector_phase in {"SECTOR_EARLY", "SECTOR_CONFIRM"}
+    close_ok = close_position >= 0.6 and upper_shadow_pct < 3
+    return trend_ok and structure_ok and sector_alignment >= 75 and close_ok and (volume_ok or sector_alignment >= 85)
+
+
+def _is_h1_first_entry(setup: str) -> bool:
+    return "H1" in setup or "首次入场" in setup
+
+
+def _h1_execution_confirmed(res: Dict[str, Any], sector_alignment: float) -> bool:
+    return (
+        sector_alignment >= H1_STRONG_SECTOR_ALIGNMENT
+        and _has_volume_confirmation(res)
+        and _has_stable_close_confirmation(res)
+        and float(res.get('涨幅%', 0) or 0) < _near_limit_pct(res.get('代码'))
+        and float(res.get('pct_5d', 0) or 0) <= 15
+    )
 
 
 def _build_scan_money_flow_map(limit: int = 6000) -> Dict[str, Dict[str, Any]]:
@@ -192,6 +256,279 @@ def _candidate_price(res: Dict[str, Any]) -> float:
     return _as_float(res.get('现价') or res.get('price') or res.get('收盘'))
 
 
+def _has_volume_confirmation(res: Dict[str, Any]) -> bool:
+    return bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') == '放量突破'
+
+
+def _has_stable_close_confirmation(res: Dict[str, Any]) -> bool:
+    close_position = _as_float(res.get('pa_close_position'), -1.0)
+    upper_shadow_pct = _as_float(res.get('pa_upper_shadow_pct'), -1.0)
+    close_ok = close_position < 0 or close_position >= 0.6
+    shadow_ok = upper_shadow_pct < 0 or upper_shadow_pct < 3
+    return close_ok and shadow_ok
+
+
+def _revival_action_label(level: str) -> str:
+    if level == "MOMENTUM_ACCELERATION":
+        return "历史信号复活：动量加速，次日小仓复核"
+    if level == "FOLLOW_SMALL":
+        return "历史信号复活：可小仓复核"
+    if level == "NEXT_DAY_CONFIRM":
+        return "历史信号复活：等次日确认"
+    return "历史信号复活：禁止追涨"
+
+
+def _fetch_recent_signal_map(
+    engine,
+    codes: List[str],
+    data_date: str,
+    lookback_days: int = REVIVAL_LOOKBACK_DAYS,
+) -> Dict[str, Dict[str, Any]]:
+    if not codes:
+        return {}
+    code_params = {f"code_{idx}": str(code).zfill(6) for idx, code in enumerate(codes)}
+    placeholders = ", ".join(f":code_{idx}" for idx in range(len(code_params)))
+    strategy_params = {f"strategy_{idx}": strategy for idx, strategy in enumerate(REVIVAL_SOURCE_STRATEGIES)}
+    strategy_placeholders = ", ".join(f":strategy_{idx}" for idx in range(len(strategy_params)))
+    params = {
+        **code_params,
+        **strategy_params,
+        "data_date": str(data_date)[:10],
+        "lookback_days": int(lookback_days),
+    }
+    query = text(f"""
+        WITH ranked AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY code
+                       ORDER BY COALESCE(data_date, date) DESC, scanned_at DESC NULLS LAST
+                   ) AS rn
+            FROM scan_history
+            WHERE code IN ({placeholders})
+              AND COALESCE(data_date, date) < CAST(:data_date AS date)
+              AND COALESCE(data_date, date) >= CAST(:data_date AS date) - (CAST(:lookback_days AS integer) * interval '1 day')
+              AND COALESCE(strategy_type, 'squeeze') IN ({strategy_placeholders})
+        )
+        SELECT code, name, COALESCE(data_date, date) AS signal_date, scanned_at, strategy_type,
+               price, pct, score, industry, resonance, price_action_score, price_action_summary,
+               pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup
+        FROM ranked
+        WHERE rn = 1
+    """)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return {str(row._mapping["code"]).zfill(6): dict(row._mapping) for row in rows}
+    except Exception as exc:
+        logger.warning(f"Historical revival lookup skipped: {exc}")
+        return {}
+
+
+def _classify_historical_revival(res: Dict[str, Any], history: Dict[str, Any]) -> Dict[str, Any]:
+    current = _candidate_price(res)
+    pct = _as_float(res.get('涨幅%'))
+    pa_entry = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
+    pa_stop = _as_float(res.get('pa_stop_price') or res.get('stop_price'))
+    old_entry = _as_float(history.get('pa_entry_price') or history.get('price'))
+    old_stop = _as_float(history.get('pa_stop_price'))
+    old_price = _as_float(history.get('price'))
+    volume_ok = _has_volume_confirmation(res)
+    close_ok = _has_stable_close_confirmation(res)
+    sector_alignment = _as_float(res.get('sector_alignment_score'), 50)
+    sector_ok = sector_alignment >= MIN_EXECUTION_SECTOR_ALIGNMENT
+    not_broken = current > 0 and current >= max(old_stop, pa_stop, 0)
+    confirm_price = max(pa_entry, old_entry, 0)
+    price_ok = current > 0 and current >= confirm_price
+    near_price_ok = current > 0 and confirm_price > 0 and current >= confirm_price * 0.997
+    strong_day = pct >= 7 or res.get('limit_up_status') in {"SEALED", "BROKEN"}
+    momentum_accel = (
+        not_broken
+        and strong_day
+        and near_price_ok
+        and volume_ok
+        and close_ok
+        and sector_alignment >= 85
+        and _as_float(res.get('price_action_score')) >= 70
+        and _as_float(res.get('pa_trap_risk')) < 60
+        and (_as_float(res.get('pct_5d')) >= 15 or pct >= 9)
+    )
+
+    blockers = []
+    if not not_broken:
+        blockers.append("跌破历史信号失效位")
+    if not strong_day:
+        blockers.append("当日强度不足")
+    if not price_ok and not momentum_accel:
+        blockers.append("未站稳历史/今日确认价")
+    if not volume_ok:
+        blockers.append("量能未确认")
+    if not close_ok:
+        blockers.append("冲高回落风险")
+    if not sector_ok:
+        blockers.append("板块联动不足")
+    if _as_float(res.get('pa_trap_risk')) >= 70:
+        blockers.append("多头陷阱风险偏高")
+    if res.get('pa_position_strategy') == '区间上沿不追价':
+        blockers.append("交易区间上沿不追价")
+
+    if momentum_accel:
+        level = "MOMENTUM_ACCELERATION"
+    elif not_broken and strong_day and price_ok and volume_ok and close_ok and sector_ok and not blockers:
+        level = "FOLLOW_SMALL"
+    elif not_broken and strong_day:
+        level = "NEXT_DAY_CONFIRM"
+    else:
+        level = "AVOID_CHASE"
+
+    return {
+        "revival_level": level,
+        "revival_action": _revival_action_label(level),
+        "revival_blockers": blockers,
+        "revival_source_date": str(history.get("signal_date") or "")[:10],
+        "revival_source_strategy": history.get("strategy_type"),
+        "revival_source_price": round(old_price, 2) if old_price else None,
+        "revival_source_entry": round(old_entry, 2) if old_entry else None,
+        "revival_source_stop": round(old_stop, 2) if old_stop else None,
+        "revival_reason": "历史入选后未破位，今日出现强势再启动" if level != "AVOID_CHASE" else "历史信号已失效或强度不足",
+    }
+
+
+def _build_historical_revival_candidates(
+    candidates: pd.DataFrame,
+    existing_codes: set,
+    hist_map: Dict[str, pd.DataFrame],
+    signal_map: Dict[str, Dict[str, Any]],
+    strategy_type: str,
+) -> List[Dict[str, Any]]:
+    if candidates is None or candidates.empty or not signal_map:
+        return []
+
+    revival: List[Dict[str, Any]] = []
+    for _, row in candidates.iterrows():
+        code = str(row.get('code', '')).zfill(6)
+        if not code or code in existing_codes:
+            continue
+        history = signal_map.get(code)
+        df_hist = hist_map.get(code)
+        if not history or df_hist is None or df_hist.empty:
+            continue
+
+        price = _as_float(row.get('price'))
+        pct = _as_float(row.get('pct_chg'))
+        old_stop = _as_float(history.get('pa_stop_price'))
+        old_entry = _as_float(history.get('pa_entry_price') or history.get('price'))
+        if price <= 0 or price < max(old_stop, 0):
+            continue
+        if pct < 7 and (old_entry <= 0 or price < old_entry):
+            continue
+
+        base_score = _as_float(history.get('score'), 55)
+        revival_score = round(max(base_score, 55) + min(max(pct, 0), 12) * 1.2, 1)
+        revival.append({
+            "代码": code,
+            "名称": row.get('name') or history.get('name') or code,
+            "现价": round(price, 2),
+            "涨幅%": round(pct, 2),
+            "Score": revival_score,
+            "raw_score": revival_score,
+            "strategy_type": strategy_type,
+            "signal": "历史信号复活",
+            "reason": f"近{REVIVAL_LOOKBACK_DAYS}日历史入选后再启动",
+            "revival_watch_only": True,
+            "revival_history": history,
+            "历史信号日期": str(history.get("signal_date") or "")[:10],
+            "历史信号策略": history.get("strategy_type"),
+            "历史入选价": round(_as_float(history.get("price")), 2) if history.get("price") is not None else None,
+        })
+    return revival
+
+
+def _build_momentum_acceleration_candidates(
+    candidates: pd.DataFrame,
+    existing_codes: set,
+    hist_map: Dict[str, pd.DataFrame],
+    sector_map: Dict[str, str],
+    sector_strength: Dict[str, Dict[str, Any]],
+    strategy_type: str,
+) -> List[Dict[str, Any]]:
+    """Find strong limit-up/large-candle acceleration names missed by base TV signals."""
+    if candidates is None or candidates.empty:
+        return []
+
+    watch: List[Dict[str, Any]] = []
+    for _, row in candidates.iterrows():
+        code = str(row.get('code', '')).zfill(6)
+        if not code or code in existing_codes:
+            continue
+        df_hist = hist_map.get(code)
+        if df_hist is None or df_hist.empty or len(df_hist) < 30:
+            continue
+
+        price = _as_float(row.get('price'))
+        pct = _as_float(row.get('pct_chg'))
+        turnover = _as_float(row.get('turnover'))
+        if price <= 0 or pct < 7:
+            continue
+
+        work = df_hist.copy().reset_index(drop=True)
+        close = pd.to_numeric(work.get('收盘'), errors='coerce')
+        high = pd.to_numeric(work.get('最高'), errors='coerce')
+        low = pd.to_numeric(work.get('最低'), errors='coerce')
+        open_ = pd.to_numeric(work.get('开盘'), errors='coerce')
+        vol = pd.to_numeric(work.get('成交量'), errors='coerce')
+        if close.isna().tail(6).any() or high.isna().tail(6).any():
+            continue
+
+        recent_close = close.tail(MOMENTUM_ACCEL_LOOKBACK_DAYS + 1)
+        pct_5d = (float(recent_close.iloc[-1]) / float(recent_close.iloc[0]) - 1) * 100 if float(recent_close.iloc[0]) > 0 else 0
+        daily_pct = close.pct_change().tail(MOMENTUM_ACCEL_LOOKBACK_DAYS) * 100
+        strong_days = int((daily_pct >= 7).sum())
+        limit_like_days = int((daily_pct >= _near_limit_pct(code) - 0.2).sum())
+        prior_high_60 = float(high.iloc[:-1].tail(60).max()) if len(high) > 1 else 0
+        near_new_high = prior_high_60 > 0 and price >= prior_high_60 * 0.98
+        day_range = max(_as_float(high.iloc[-1]) - _as_float(low.iloc[-1]), 0.01)
+        close_position = (price - _as_float(low.iloc[-1])) / day_range
+        upper_shadow_pct = max(0.0, _as_float(high.iloc[-1]) - max(_as_float(open_.iloc[-1]), price)) / max(price, 0.01) * 100
+        vol_ma20 = float(vol.iloc[:-1].tail(20).mean()) if len(vol) > 20 else 0
+        volume_ratio = float(vol.iloc[-1]) / vol_ma20 if vol_ma20 > 0 else 0
+
+        sector = sector_map.get(code, row.get('industry') or '未知')
+        strength = sector_strength.get(sector, {})
+        sector_alignment = _as_float(strength.get('sector_momentum_score'), 50) * 0.55 + _as_float(strength.get('sector_breadth'), 50) * 0.25
+        strong_momentum = pct_5d >= 15 or strong_days >= 2 or limit_like_days >= 1
+        execution_shape = close_position >= 0.65 and upper_shadow_pct < 4
+        liquidity_ok = turnover <= 0 or turnover >= 3
+        if not (strong_momentum and near_new_high and execution_shape and liquidity_ok):
+            continue
+
+        score = round(55 + min(max(pct, 0), 12) * 1.5 + min(max(pct_5d, 0), 30) * 0.45 + min(volume_ratio, 3) * 4, 1)
+        watch.append({
+            "代码": code,
+            "名称": row.get('name') or code,
+            "现价": round(price, 2),
+            "涨幅%": round(pct, 2),
+            "Score": score,
+            "raw_score": score,
+            "strategy_type": strategy_type,
+            "signal": "强趋势涨停加速",
+            "reason": "强趋势涨停/大阳加速，进入高动量观察池",
+            "momentum_acceleration_watch_only": True,
+            "momentum_acceleration_action": "强趋势涨停加速：次日确认后小仓复核",
+            "momentum_acceleration_reason": f"{MOMENTUM_ACCEL_LOOKBACK_DAYS}日涨幅{pct_5d:.1f}%，强势日{strong_days}天，接近/突破阶段新高",
+            "momentum_acceleration_metrics": {
+                "pct_5d": round(pct_5d, 2),
+                "strong_days": strong_days,
+                "limit_like_days": limit_like_days,
+                "volume_ratio": round(volume_ratio, 2),
+                "close_position": round(close_position, 2),
+                "upper_shadow_pct": round(upper_shadow_pct, 2),
+                "near_new_high": near_new_high,
+                "sector_alignment_proxy": round(sector_alignment, 1),
+            },
+        })
+    return watch
+
+
 def _right_side_quality_confirmed(res: Dict[str, Any]) -> bool:
     """Right-side entries may be extended, but must prove quality and execution control."""
     action = _pa_plan_action(res)
@@ -200,14 +537,15 @@ def _right_side_quality_confirmed(res: Dict[str, Any]) -> bool:
     risk_pct = _as_float(res.get('pa_risk_pct'))
     current_price = _candidate_price(res)
     entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
-    has_volume = bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') == '放量突破'
+    has_volume = _has_volume_confirmation(res)
+    stable_close = _has_stable_close_confirmation(res)
     strong_structure = (
         res.get('price_action_signal') == '强多头趋势K'
         or res.get('pa_h2_quality') == '强'
         or res.get('pa_breakout_quality') == '强突破'
     )
     sector_ok = _as_float(res.get('sector_alignment_score'), 50) >= MIN_EXECUTION_SECTOR_ALIGNMENT
-    price_confirmed = not entry_price or not current_price or current_price >= entry_price * 0.995
+    price_confirmed = not entry_price or not current_price or current_price >= entry_price
     risk_ok = risk_pct <= 0 or risk_pct <= MAX_EXECUTION_RISK_PCT
     return (
         action == "READY"
@@ -215,9 +553,55 @@ def _right_side_quality_confirmed(res: Dict[str, Any]) -> bool:
         and pa_score >= 70
         and risk_ok
         and price_confirmed
+        and stable_close
         and sector_ok
         and (has_volume or strong_structure)
     )
+
+
+def _early_entry_candidate(res: Dict[str, Any], cap_bucket: str) -> bool:
+    """Allow a small, explicit pre-confirmation watchlist before the strict A entry."""
+    action = _pa_plan_action(res)
+    if action != "READY":
+        return False
+    strategy_type = str(res.get('strategy_type') or "")
+    if strategy_type not in CORE_TRADE_STRATEGIES:
+        return False
+    current_price = _candidate_price(res)
+    entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
+    if current_price <= 0 or entry_price <= 0:
+        return False
+    confirm_gap_pct = (entry_price - current_price) / entry_price * 100
+    if confirm_gap_pct < 0 or confirm_gap_pct > EARLY_ENTRY_MAX_CONFIRM_GAP_PCT:
+        return False
+    if float(res.get('涨幅%', 0) or 0) >= _near_limit_pct(res.get('代码')):
+        return False
+    raw_score = _as_float(res.get('raw_score') or res.get('Score') or res.get('score'))
+    pa_score = _as_float(res.get('price_action_score'))
+    risk_pct = _as_float(res.get('pa_risk_pct'))
+    sector_alignment = _as_float(res.get('sector_alignment_score'))
+    if raw_score < MIN_RAW_EXECUTION_SCORE or pa_score < 70:
+        return False
+    if risk_pct > 0 and risk_pct > MAX_EXECUTION_RISK_PCT:
+        return False
+    if sector_alignment < 82:
+        return False
+    setup = str(res.get('pa_trade_setup') or "")
+    if _is_h1_first_entry(setup) and sector_alignment < H1_EARLY_SECTOR_ALIGNMENT:
+        return False
+    if cap_bucket in {"MICRO", "UNKNOWN"}:
+        return False
+    if cap_bucket == "SMALL" and sector_alignment < 90:
+        return False
+    if not _has_stable_close_confirmation(res):
+        return False
+    has_volume_or_structure = (
+        _has_volume_confirmation(res)
+        or res.get('price_action_signal') == '强多头趋势K'
+        or res.get('pa_h2_quality') == '强'
+        or res.get('pa_breakout_quality') == '强突破'
+    )
+    return bool(has_volume_or_structure)
 
 
 def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
@@ -275,8 +659,18 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     entry_price = _as_float(res.get('pa_entry_price') or res.get('entry_price'))
     turnover = _as_float(res.get('换手率') or res.get('turnover'))
     mkt_cap_yi = _as_float(res.get('mkt_cap_yi'))
+    cap_bucket = _market_cap_bucket(mkt_cap_yi)
+    res['mkt_cap_bucket'] = cap_bucket
     sector_alignment = _as_float(res.get('sector_alignment_score'))
     right_side_quality = _right_side_quality_confirmed(res)
+    trend_continuation = _is_trend_continuation_candidate(res)
+    early_entry = _early_entry_candidate(res, cap_bucket)
+    if trend_continuation:
+        res['trend_continuation_candidate'] = True
+    if early_entry:
+        res['early_trade_candidate'] = True
+        res['early_trade_grade'] = "A-"
+        res['early_trade_reason'] = f"距确认价<{EARLY_ENTRY_MAX_CONFIRM_GAP_PCT:.1f}%，主线强联动，允许小仓提前复核"
 
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
         blockers.append("异常价格跳变，排除交易")
@@ -286,6 +680,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("交易计划未确认")
     elif not action and strategy_type in {"tv_dual", "tv_dual_strict"}:
         blockers.append("缺少价格行为交易计划")
+    if strategy_type in DISCOVERY_ONLY_STRATEGIES:
+        blockers.append("普通tv_dual仅用于发现，需严格双策略确认")
     if setup in BLOCKED_PA_SETUPS:
         blockers.append(f"{setup}结构不进入交易池")
     if res.get('pa_pullback_status') == 'INVALIDATED':
@@ -302,18 +698,39 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append(f"结构风险>{HARD_EXECUTION_RISK_PCT:.0f}%，禁止实盘")
     elif risk_pct > MAX_EXECUTION_RISK_PCT:
         blockers.append(f"结构风险>{MAX_EXECUTION_RISK_PCT:.0f}%，等待更优买点")
-    if entry_price > 0 and current_price > 0 and current_price < entry_price * 0.995:
-        blockers.append("未站上确认价，等待突破确认")
+    if entry_price > 0 and current_price > 0:
+        if current_price < entry_price:
+            blockers.append("未站上确认价，等待突破确认")
+        else:
+            if not _has_volume_confirmation(res):
+                blockers.append("站上确认价但量能未确认")
+            if not _has_stable_close_confirmation(res):
+                blockers.append("冲高回落，站稳未确认")
     if mkt_cap_yi >= LOW_TURNOVER_MKT_CAP_YI and 0 < turnover < LOW_TURNOVER_MIN_PCT:
         blockers.append("大市值低换手，右侧弹性不足")
     elif mkt_cap_yi >= HIGH_TURNOVER_MKT_CAP_YI and 0 < turnover < HIGH_TURNOVER_MIN_PCT:
         blockers.append("高市值换手不足，等待放量确认")
+    if cap_bucket == "SMALL" and not (right_side_quality and sector_alignment >= 85):
+        blockers.append("小市值弹性票，需主线强联动和价量确认")
+    if cap_bucket == "MEGA" and 0 < turnover < 1.2:
+        blockers.append("超大市值换手不足，等待机构资金确认")
     if res.get('money_flow_status') == 'missing':
         blockers.append("资金流数据缺失，降级观察")
     elif res.get('money_flow_status') == 'negative':
         blockers.append("主力资金流出，等待资金回流")
     if res.get('capital_event_risk'):
         blockers.append("近期资本事件利好兑现，等待二次确认")
+    if res.get('revival_level') == "MOMENTUM_ACCELERATION":
+        blockers.append("动量加速票，次日不高开追价后小仓复核")
+    elif res.get('revival_level') == "NEXT_DAY_CONFIRM":
+        blockers.append("历史信号复活仅观察，等次日确认")
+    elif res.get('revival_level') == "AVOID_CHASE":
+        blockers.append("历史信号复活但禁止追涨")
+    if res.get('momentum_acceleration_watch_only'):
+        blockers.append("强趋势加速观察，次日确认后小仓复核")
+    for blocker in res.get('revival_blockers') or []:
+        if blocker not in blockers:
+            blockers.append(blocker)
     # 改动 #13 扫描端增强：涨停/近涨停默认加 blocker（等待隔日确认，防追高）。
     # 但若 apply_limit_up_features 注入的 limit_up_status='BROKEN'（曾封板但已开板），
     # 说明抛压已释放、未真正封死，反而是低吸机会——不加 blocker 并标记，后续可加分。
@@ -327,6 +744,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("涨幅偏高且质量未确认，等待回踩/次日确认")
     if float(res.get('pct_5d', 0) or 0) > 15 and not right_side_quality:
         blockers.append("5日涨幅偏高且质量未确认")
+    if _is_h1_first_entry(setup) and not _h1_execution_confirmed(res, sector_alignment):
+        blockers.append("H1首次入场仅强主线放量确认可小仓复核")
 
     score = float(res.get('final_rank_score', res.get('Score', 0)) or 0)
     if action == "READY":
@@ -344,6 +763,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         score += 5
     if (res.get('sector_alignment_score') or 0) >= 75:
         score += 5
+    if trend_continuation:
+        score += 6
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
         score -= 25
     if float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
@@ -351,12 +772,20 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     # 改动 #13：曾封板但已开板（limit_up_unsealed）= 抛压释放，反而是低吸机会，加分鼓励
     if res.get('limit_up_unsealed'):
         score += 4
+    if early_entry:
+        score += 5
     if raw_score and raw_score < MIN_RAW_EXECUTION_SCORE:
         score -= 15
     if risk_pct > MAX_EXECUTION_RISK_PCT:
         score -= 10
     if res.get('capital_event_risk'):
         score -= 10
+    if cap_bucket == "MICRO":
+        score -= 18
+    elif cap_bucket == "SMALL":
+        score -= 8
+    elif cap_bucket == "MEGA" and turnover >= 1.2:
+        score += 3
 
     grade = res.get('sop_grade')
     fatal_markers = ("回避", "结构不进入交易池", "异常价格跳变", "板块下跌", "禁止实盘")
@@ -365,12 +794,14 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     # (🔥核心热点) 判为可交易；B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。
     if STRICT_REAL_SIGNAL_GATE:
         trade_eligible = (grade == "A" and not blockers
-                          and strategy_type != "sector_watch"
+                          and strategy_type in CORE_TRADE_STRATEGIES
                           and res.get('共振') == "🔥 核心热点")
     else:
-        trade_eligible = grade in {"A", "B"} and not blockers and strategy_type != "sector_watch"
+        trade_eligible = grade in {"A", "B"} and not blockers and strategy_type in CORE_TRADE_STRATEGIES
     if trade_eligible:
         bucket = "TRADE"
+    elif early_entry and not has_fatal_blocker:
+        bucket = "EARLY"
     elif has_fatal_blocker:
         bucket = "BLOCK"
     else:
@@ -623,6 +1054,9 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         _yoy = float(res.get('净利YOY') or 0)
         _pa_struct = float(res.get('pa_structure_score') or res.get('price_action_score') or 50)
         _sector_align = float(res.get('sector_alignment_score') or 50)
+        _mkt_cap_yi = float(res.get('mkt_cap_yi') or 0)
+        _cap_bucket = _market_cap_bucket(_mkt_cap_yi)
+        res['mkt_cap_bucket'] = _cap_bucket
 
         # 7维加权评分（各维度映射到0-100，再按权重加权求和）
         # 改动 A5：胜率权重 0.25→0.18（胜率受样本量影响大，且在 score_calibration
@@ -635,10 +1069,11 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         _d_regime = {"OFFENSIVE": 100, "DEFENSIVE": 50, "UNKNOWN": 50}.get(regime_status, 0)
         _d_brooks = max(0, min(100, _pa_struct))
         _d_sector = max(0, min(100, _sector_align))
+        _d_cap = {"UNKNOWN": 80, "MICRO": 10, "SMALL": 45, "MID": 85, "LARGE": 80, "MEGA": 65}.get(_cap_bucket, 80)
 
         quality_score = round(
-            _d_win * 0.18 + _d_pf * 0.22 + _d_sig * 0.18 + _d_fund * 0.15
-            + _d_regime * 0.10 + _d_brooks * 0.10 + _d_sector * 0.07, 1
+            _d_win * 0.17 + _d_pf * 0.21 + _d_sig * 0.17 + _d_fund * 0.14
+            + _d_regime * 0.09 + _d_brooks * 0.10 + _d_sector * 0.08 + _d_cap * 0.04, 1
         )
         # 期望收益惩罚：expectancy < 0 说明策略长期亏钱，扣10分（不论胜率多高）
         if _expectancy < 0:
@@ -664,10 +1099,20 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             bonuses.append(f"业绩{_yoy:.0f}%")
         if _sector_align >= 75:
             bonuses.append("个股强于板块")
+        if _cap_bucket in {"MID", "LARGE"}:
+            bonuses.append("市值流动性适中")
+        elif _cap_bucket == "MEGA":
+            risks.append("超大市值需换手确认")
+        elif _cap_bucket == "SMALL":
+            risks.append("小市值需主线强联动")
+        if _is_trend_continuation_candidate(res):
+            bonuses.append("主线趋势中继二买")
+            res['trend_continuation_candidate'] = True
 
         res['sop_quality_dimensions'] = {
             "win_rate": _d_win, "profit_factor": _d_pf, "signal_strength": _d_sig,
             "fundamental": _d_fund, "regime": _d_regime, "brooks": _d_brooks, "sector": _d_sector,
+            "market_cap": _d_cap,
         }
 
         # ── 评分映射分级 ──
@@ -698,6 +1143,12 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         res['brooks_rank_adjustment'] = brooks_adjustment
         res['final_rank_score'] = round(float(res.get('Score') or 0) + brooks_adjustment, 2)
         res['final_rank_score'] = round(res['final_rank_score'] + min(12, max(0, float(res.get('sector_alignment_score') or 0) - 50) * 0.24), 2)
+        if res.get('trend_continuation_candidate'):
+            res['final_rank_score'] = round(res['final_rank_score'] + 6, 2)
+        if _cap_bucket == "SMALL":
+            res['final_rank_score'] = round(res['final_rank_score'] - 5, 2)
+        elif _cap_bucket == "MICRO":
+            res['final_rank_score'] = round(res['final_rank_score'] - 12, 2)
         if res.get('pct_5d', 0) > 15:
             res['final_rank_score'] = round(res['final_rank_score'] - 6, 2)
         if brooks_adjustment >= 6:
@@ -709,6 +1160,32 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             res['sop_grade'] = "D" if vetoes else "C"
             res['sop_checks'].append("等待TV-ZP确认")
             res['sop_bonuses'].append("早期异动观察")
+        elif res.get('revival_watch_only'):
+            res['sop_bonuses'].append("历史信号复活")
+            level = res.get('revival_level')
+            if level == "MOMENTUM_ACCELERATION":
+                res['sop_checks'].append("复活动量加速")
+                res['sop_bonuses'].append("连续强势加速")
+                if res['sop_grade'] == "C":
+                    res['sop_grade'] = "B"
+            elif level == "FOLLOW_SMALL":
+                res['sop_checks'].append("复活信号可复核")
+            elif level == "NEXT_DAY_CONFIRM":
+                res['sop_checks'].append("复活信号等次日确认")
+                if res['sop_grade'] == "A":
+                    res['sop_grade'] = "B"
+            else:
+                res['sop_checks'].append("复活信号禁止追涨")
+                res['sop_grade'] = "D" if vetoes else "C"
+        elif res.get('momentum_acceleration_watch_only'):
+            res['sop_grade'] = "M"
+            res['sop_checks'].append("强趋势加速")
+            res['sop_bonuses'].append("涨停/大阳加速观察")
+            res['momentum_watch_only'] = True
+            res['momentum_watch_reason'] = res.get(
+                'momentum_acceleration_reason',
+                "强趋势加速，不追买；次日确认后小仓复核",
+            )
         elif res.get('sector_watch_only'):
             fatal_vetoes = {"地雷预警", "板块下跌", "板块扩散转弱", "Brooks风险偏高"}
             res['sop_grade'] = "D" if any(v in fatal_vetoes for v in vetoes) else "C"
@@ -937,30 +1414,6 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 require_both=(strategy_type == "tv_dual_strict"),
                 fund_data=fund_data,
             )
-            if not match and strategy_type == "tv_dual_strict":
-                relaxed_match, relaxed_stats = check_tv_dual_strategy(
-                    df,
-                    threshold=threshold,
-                    vol_multiplier=vol_multiplier,
-                    rsi_min=rsi_min,
-                    use_macd_filter=use_macd_filter,
-                    sqz_lookback=sqz_lookback,
-                    require_both=False,
-                    fund_data=fund_data,
-                )
-                if (
-                    relaxed_match
-                    and relaxed_stats.get('tv_ma_signal') == 'B共振'
-                    and relaxed_stats.get('tv_zp_signal') == '无'
-                ):
-                    relaxed_stats['代码'] = code
-                    relaxed_stats['名称'] = name
-                    relaxed_stats['strategy_type'] = strategy_type
-                    relaxed_stats['early_watch_only'] = True
-                    relaxed_stats['early_watch_reason'] = "均线B共振领先，等待TV-ZP long确认"
-                    relaxed_stats['signal'] = "早期观察"
-                    relaxed_stats['reason'] = "早期观察：均线B共振领先，等待TV-ZP long确认"
-                    return relaxed_stats
             if match:
                 stats['代码'] = code
                 stats['名称'] = name
@@ -1566,6 +2019,36 @@ def perform_market_scan(
                 logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
                 results.extend(sector_watch)
 
+        if strategy_type in {"tv_dual", "tv_dual_strict"}:
+            existing_codes = {str(res.get('代码', '')).zfill(6) for res in results}
+            signal_map = _fetch_recent_signal_map(
+                engine,
+                [str(code).zfill(6) for code in candidates['code'].tolist()],
+                str(max_date or datetime.now().strftime("%Y-%m-%d")),
+            )
+            revival_candidates = _build_historical_revival_candidates(
+                candidates,
+                existing_codes,
+                hist_map,
+                signal_map,
+                strategy_type,
+            )
+            if revival_candidates:
+                logger.info(f"Added {len(revival_candidates)} historical revival candidates.")
+                results.extend(revival_candidates)
+                existing_codes.update(str(res.get('代码', '')).zfill(6) for res in revival_candidates)
+            momentum_candidates = _build_momentum_acceleration_candidates(
+                candidates,
+                existing_codes,
+                hist_map,
+                sector_map,
+                sector_strength,
+                strategy_type,
+            )
+            if momentum_candidates:
+                logger.info(f"Added {len(momentum_candidates)} momentum acceleration candidates.")
+                results.extend(momentum_candidates)
+
         # 补充增强 data (行业, 胜率) - 并发处理 Top 100 + 板块观察
         logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
 
@@ -1816,13 +2299,18 @@ def perform_market_scan(
                 res['warnings'] = warnings
 
         _apply_money_flow_to_results(results, money_flow_map)
+        for res in results:
+            history = res.get('revival_history')
+            if history:
+                res.update(_classify_historical_revival(res, history))
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)
         for res in results:
             res['market_regime'] = market_regime.get('status', 'UNKNOWN')
         from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
-        apply_limit_up_features(results, load_limit_up_event_map(str(max_date), engine))
+        scan_event_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
+        apply_limit_up_features(results, load_limit_up_event_map(scan_event_date, engine))
         from core.decision_layer import load_market_cycle_history
         decision_context = apply_decision_layer(
             results,
