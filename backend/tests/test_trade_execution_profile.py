@@ -166,6 +166,53 @@ def test_h1_first_entry_can_trade_when_mainline_volume_confirmed():
     assert not any("H1首次入场" in blocker for blocker in result["trade_blockers"])
 
 
+def test_weak_sector_alignment_blocks_real_trade():
+    results = [_base_candidate(sector_alignment_score=45)]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "BLOCK"
+    assert "弱板块联动，禁止实盘" in result["trade_blockers"]
+    assert "弱板块联动胜率偏低" in result["sop_risks"]
+
+
+def test_neutral_weekly_range_downgrades_to_observe():
+    results = [_base_candidate(pa_weekly_context="周线交易区间")]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert "周线交易区间，降级观察" in result["trade_blockers"]
+    assert "周线交易区间，等待右侧确认" in result["sop_risks"]
+
+
+def test_pullback_reversal_volume_counts_as_confirmation_and_bonus():
+    results = [_base_candidate(pa_volume_confirmed=False, pa_volume_pattern="缩量回调后放量反包")]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["trade_eligible"] is True
+    assert "站上确认价但量能未确认" not in result["trade_blockers"]
+    assert "缩量回调后放量反包" in result["sop_bonuses"]
+    assert result["bark_success_profile_match"] is True
+
+
+def test_opportunity_70_79_strong_linkage_gets_sweet_spot_model():
+    results = [_base_candidate(trade_opportunity_score=75, sector_alignment_score=82)]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["sweet_spot_trade_candidate"] is True
+    assert "70-79机会分强联动买点" in result["sop_bonuses"]
+    assert "机会分70-79" in result["sweet_spot_reason"]
+
+
 def test_near_limit_threshold_respects_board_limit():
     main = _base_candidate(代码="000001", **{"涨幅%": 9.8})
     chinext = _base_candidate(代码="300001", **{"涨幅%": 9.8, "pa_volume_confirmed": False, "price_action_signal": "普通突破"})

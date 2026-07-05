@@ -338,6 +338,66 @@ def _build_profitability_layers(scan_df: pd.DataFrame, event_df: pd.DataFrame | 
     return layers
 
 
+def _feature_success_rows(df: pd.DataFrame, feature: str, label: str) -> List[Dict[str, Any]]:
+    if df.empty or feature not in df.columns:
+        return []
+    rows: List[Dict[str, Any]] = []
+    clean = df[[feature, "ret_5d"]].copy()
+    clean[feature] = clean[feature].fillna("未知").astype(str)
+    clean["ret_5d"] = pd.to_numeric(clean["ret_5d"], errors="coerce")
+    clean = clean.dropna(subset=["ret_5d"])
+    baseline = float((clean["ret_5d"] > 0).mean() * 100) if not clean.empty else 0
+    for value, group in clean.groupby(feature):
+        if not value or value == "nan":
+            continue
+        signals = int(len(group))
+        if signals < 2:
+            continue
+        win_rate = float((group["ret_5d"] > 0).mean() * 100)
+        avg_return = float(group["ret_5d"].mean())
+        rows.append({
+            "feature": feature,
+            "label": label,
+            "value": value,
+            "signals": signals,
+            "win_rate_5d": round(win_rate, 1),
+            "avg_return_5d": round(avg_return, 2),
+            "lift_vs_bark_win_rate": round(win_rate - baseline, 1),
+        })
+    rows.sort(key=lambda row: (row["avg_return_5d"], row["win_rate_5d"], row["signals"]), reverse=True)
+    return rows[:5]
+
+
+def _build_bark_success_profile(event_df: pd.DataFrame) -> Dict[str, Any]:
+    if event_df.empty:
+        return {"sample": 0, "features": [], "notes": ["暂无Bark样本"]}
+    bark_df = event_df[event_df["source"].astype(str).str.startswith("bark")].copy()
+    bark_df["ret_5d"] = pd.to_numeric(bark_df.get("ret_5d"), errors="coerce")
+    bark_df = bark_df.dropna(subset=["ret_5d"])
+    if bark_df.empty:
+        return {"sample": 0, "features": [], "notes": ["Bark样本暂无5日收益数据"]}
+    features: List[Dict[str, Any]] = []
+    for col, label in [
+        ("strategy_type", "策略"),
+        ("trade_bucket", "交易桶"),
+        ("pa_trade_setup", "价格行为"),
+        ("sector_phase", "板块阶段"),
+        ("market_regime", "大盘环境"),
+    ]:
+        features.extend(_feature_success_rows(bark_df, col, label))
+    features.sort(key=lambda row: (row["avg_return_5d"], row["lift_vs_bark_win_rate"], row["signals"]), reverse=True)
+    return {
+        "sample": int(len(bark_df)),
+        "win_rate_5d": round(float((bark_df["ret_5d"] > 0).mean() * 100), 1),
+        "avg_return_5d": round(float(bark_df["ret_5d"].mean()), 2),
+        "features": features[:12],
+        "scoring_hint": [
+            "强联动、严格双策略、H2/缩量反包若持续正期望，保留加权。",
+            "弱联动、周线中性/交易区间、震荡观察若持续低胜率，继续降权。",
+        ],
+    }
+
+
 def _load_recommendation_event_performance_df(days: int) -> pd.DataFrame:
     engine = get_db_engine()
     if not engine:
@@ -352,6 +412,10 @@ def _load_recommendation_event_performance_df(days: int) -> pd.DataFrame:
             e.strategy_type,
             e.trade_bucket,
             e.trade_eligible,
+            e.pa_trade_action,
+            e.pa_trade_setup,
+            e.sector_phase,
+            e.market_regime,
             h1.close AS close_1d,
             h3.close AS close_3d,
             h5.close AS close_5d,
@@ -393,6 +457,11 @@ def _load_real_trade_performance_df(days: int) -> pd.DataFrame:
             p.name,
             p.entry_date AS signal_date,
             COALESCE(p.actual_entry_price, p.entry_price) AS price,
+            p.planned_entry_price,
+            p.actual_entry_price,
+            p.entry_slippage_pct,
+            p.plan_adherence,
+            p.entry_source,
             p.strategy_type,
             p.status,
             h1.close AS close_1d,
@@ -426,6 +495,77 @@ def _load_real_trade_performance_df(days: int) -> pd.DataFrame:
     return df
 
 
+def _build_real_trade_execution_review(real_trade_df: pd.DataFrame, event_df: pd.DataFrame) -> Dict[str, Any]:
+    if real_trade_df.empty:
+        return {"sample": 0, "notes": ["暂无实盘买入样本"]}
+    real = real_trade_df.copy()
+    real["ret_5d"] = pd.to_numeric(real.get("ret_5d"), errors="coerce")
+    real["entry_slippage_pct"] = pd.to_numeric(real.get("entry_slippage_pct"), errors="coerce")
+    planned = pd.to_numeric(real.get("planned_entry_price"), errors="coerce")
+    actual = pd.to_numeric(real.get("actual_entry_price"), errors="coerce")
+    missing_slip = real["entry_slippage_pct"].isna() & planned.gt(0) & actual.gt(0)
+    real.loc[missing_slip, "entry_slippage_pct"] = (actual[missing_slip] - planned[missing_slip]) / planned[missing_slip] * 100
+
+    bark = pd.DataFrame()
+    if not event_df.empty:
+        bark = event_df[event_df["source"].astype(str).str.startswith("bark")].copy()
+        bark["ret_5d"] = pd.to_numeric(bark.get("ret_5d"), errors="coerce")
+
+    real_ret = real["ret_5d"].dropna()
+    bark_ret = bark["ret_5d"].dropna() if not bark.empty else pd.Series(dtype=float)
+    by_adherence: List[Dict[str, Any]] = []
+    if "plan_adherence" in real.columns:
+        for value, group in real.groupby(real["plan_adherence"].fillna("UNKNOWN").astype(str)):
+            returns = pd.to_numeric(group.get("ret_5d"), errors="coerce").dropna()
+            by_adherence.append({
+                "plan_adherence": value,
+                "trades": int(len(group)),
+                "avg_return_5d": round(float(returns.mean()), 2) if not returns.empty else None,
+                "win_rate_5d": round(float((returns > 0).mean() * 100), 1) if not returns.empty else None,
+            })
+
+    real_avg = float(real_ret.mean()) if not real_ret.empty else None
+    bark_avg = float(bark_ret.mean()) if not bark_ret.empty else None
+    return {
+        "sample": int(len(real)),
+        "system_bark_sample": int(len(bark_ret)),
+        "real_trade_avg_return_5d": round(real_avg, 2) if real_avg is not None else None,
+        "system_bark_avg_return_5d": round(bark_avg, 2) if bark_avg is not None else None,
+        "execution_gap_5d": round(real_avg - bark_avg, 2) if real_avg is not None and bark_avg is not None else None,
+        "avg_entry_slippage_pct": round(float(real["entry_slippage_pct"].dropna().mean()), 2)
+        if not real["entry_slippage_pct"].dropna().empty else None,
+        "by_plan_adherence": by_adherence,
+        "notes": ["execution_gap_5d = 实盘买入5日均值 - Bark系统样本5日均值，用于区分系统胜率和执行胜率"],
+    }
+
+
+def _high_open_buyability(
+    first_open_gap: Optional[float],
+    entry_line: float,
+    stop_line: float,
+    base_price: float,
+    min_low: float,
+    latest_close: float,
+    latest_gain: float,
+) -> Optional[Dict[str, Any]]:
+    if first_open_gap is None or first_open_gap <= 3:
+        return None
+    if first_open_gap >= 9.5:
+        return {"state": "LIMIT_OPEN", "action": "不追：涨停/一字高开"}
+    confirm_line = entry_line if entry_line > 0 else base_price
+    support_line = stop_line if stop_line > 0 else base_price * 0.97
+    pulled_back = min_low <= confirm_line * 1.01
+    held_support = min_low >= support_line * 0.995
+    stood_back = latest_close >= confirm_line and latest_gain >= 0
+    if not held_support:
+        return {"state": "FAILED", "action": "高开回落跌破支撑：取消"}
+    if pulled_back and stood_back:
+        return {"state": "CONFIRMED", "action": "高开回踩后站稳：尾盘小仓确认"}
+    if pulled_back:
+        return {"state": "PENDING_CONFIRM", "action": "高开已回踩：等重新站回确认价"}
+    return {"state": "WAIT_PULLBACK", "action": "高开不追：等回踩确认或尾盘站稳"}
+
+
 @router.get("/profitability-dashboard")
 def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
     """Layered profitability view for scan, Bark, and real-trade outcomes."""
@@ -439,6 +579,8 @@ def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
         layers = _build_profitability_layers(scan_df, event_df)
         if not real_trade_df.empty:
             layers.append(_profitability_layer_row("real_trade", "实盘买入", real_trade_df, source="paper_trading"))
+        bark_success_profile = _build_bark_success_profile(event_df)
+        real_trade_execution = _build_real_trade_execution_review(real_trade_df, event_df)
 
         ranked = [
             layer for layer in layers
@@ -454,13 +596,20 @@ def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
             "best_layer": ranked[0]["label"] if ranked else "样本不足",
             "positive_layers": sum(1 for layer in layers if layer.get("verdict", {}).get("status") == "POSITIVE"),
             "weak_layers": sum(1 for layer in layers if layer.get("verdict", {}).get("status") == "WEAK"),
+            "execution_gap_5d": real_trade_execution.get("execution_gap_5d"),
         }
         notes = [
             "5日收益是主要判断口径；1/3日用于看买点效率，10日用于看持有延展。",
             "A-提前复核为新规则，历史样本可能不足；下一个交易日开始重点观察。",
             "回测统计不等于未来收益，仍需结合仓位、滑点和实际执行纪律。",
         ]
-        return {"summary": summary, "layers": layers, "notes": notes}
+        return {
+            "summary": summary,
+            "layers": layers,
+            "bark_success_profile": bark_success_profile,
+            "real_trade_execution": real_trade_execution,
+            "notes": notes,
+        }
     except Exception as exc:
         logger.error(f"Profitability dashboard error: {exc}")
         return {"summary": {"days": int(days), "layers": 0}, "layers": [], "notes": [], "error": str(exc)}
@@ -860,6 +1009,15 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
             latest_gain = (latest_close - base_price) / base_price * 100
             first_open = float(group.iloc[0].get("open") or 0)
             first_open_gap = (first_open - base_price) / base_price * 100 if first_open > 0 else None
+            high_open_buyability = _high_open_buyability(
+                first_open_gap,
+                entry_line,
+                stop_line,
+                base_price,
+                min_low,
+                latest_close,
+                latest_gain,
+            )
 
             if stop_line and min_low <= stop_line:
                 status = "风控触发"
@@ -883,8 +1041,8 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
                 action = "取消：已触发风控线"
             elif first_open_gap is not None and first_open_gap >= 9.5:
                 action = "不追：涨停/一字高开"
-            elif first_open_gap is not None and first_open_gap > 3:
-                action = "不追：高开超过3%，等回踩"
+            elif high_open_buyability is not None:
+                action = high_open_buyability["action"]
             elif entry_line and max_high >= entry_line and latest_gain >= 0:
                 action = "尾盘确认可试：小仓、贴近入场线"
             elif max_gain >= 3 and latest_gain < 1:
@@ -900,6 +1058,7 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
                 "max_gain_pct": round(max_gain, 2),
                 "latest_gain_pct": round(latest_gain, 2),
                 "first_open_gap_pct": round(first_open_gap, 2) if first_open_gap is not None else None,
+                "high_open_buyability": high_open_buyability,
                 "latest_close": round(latest_close, 2),
                 "latest_date": str(latest.get("date")),
                 "days_tracked": int(len(group)),

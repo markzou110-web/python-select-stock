@@ -94,6 +94,56 @@ def test_profitability_layers_include_early_and_bark():
     assert layers["bark"]["metrics"]["5d"]["avg_return"] == 2.5
 
 
+def test_bark_success_profile_extracts_common_winning_features():
+    event_df = pd.DataFrame([
+        {
+            "source": "bark",
+            "strategy_type": "tv_dual_strict",
+            "trade_bucket": "TRADE",
+            "pa_trade_setup": "H2二次入场",
+            "sector_phase": "SECTOR_CONFIRM",
+            "market_regime": "OFFENSIVE",
+            "ret_5d": 4.0,
+        },
+        {
+            "source": "bark_intraday",
+            "strategy_type": "tv_dual_strict",
+            "trade_bucket": "TRADE",
+            "pa_trade_setup": "H2二次入场",
+            "sector_phase": "SECTOR_CONFIRM",
+            "market_regime": "OFFENSIVE",
+            "ret_5d": 2.0,
+        },
+        {
+            "source": "scan",
+            "strategy_type": "tv_dual",
+            "trade_bucket": "OBSERVE",
+            "pa_trade_setup": "震荡观察",
+            "sector_phase": "SECTOR_FADE",
+            "market_regime": "DEFENSIVE",
+            "ret_5d": -3.0,
+        },
+    ])
+
+    profile = review._build_bark_success_profile(event_df)
+
+    assert profile["sample"] == 2
+    assert profile["win_rate_5d"] == 100.0
+    values = {(row["feature"], row["value"]) for row in profile["features"]}
+    assert ("strategy_type", "tv_dual_strict") in values
+    assert ("pa_trade_setup", "H2二次入场") in values
+
+
+def test_high_open_buyability_waits_for_pullback_or_confirms_stand():
+    waiting = review._high_open_buyability(5.0, 10.0, 9.4, 9.8, 10.2, 10.4, 6.1)
+    confirmed = review._high_open_buyability(5.0, 10.0, 9.4, 9.8, 9.95, 10.15, 3.6)
+    failed = review._high_open_buyability(5.0, 10.0, 9.4, 9.8, 9.2, 9.6, -2.0)
+
+    assert waiting["state"] == "WAIT_PULLBACK"
+    assert confirmed["state"] == "CONFIRMED"
+    assert failed["state"] == "FAILED"
+
+
 def test_daily_ops_review_groups_execution_decisions(monkeypatch):
     monkeypatch.setattr(review, "get_db_engine", lambda: None)
     monkeypatch.setattr(

@@ -91,6 +91,7 @@ MAX_EXECUTION_RISK_PCT = 16.0
 STRONG_SIGNAL_RAW_THRESHOLD = 95.0
 HARD_EXECUTION_RISK_PCT = 20.0
 MIN_EXECUTION_SECTOR_ALIGNMENT = 70.0
+WEAK_SECTOR_ALIGNMENT = 50.0
 HIGH_TURNOVER_MKT_CAP_YI = 150.0
 HIGH_TURNOVER_MIN_PCT = 1.5
 LOW_TURNOVER_MKT_CAP_YI = 300.0
@@ -103,6 +104,9 @@ CORE_TRADE_STRATEGIES = {"tv_dual_strict"}
 DISCOVERY_ONLY_STRATEGIES = {"tv_dual"}
 H1_STRONG_SECTOR_ALIGNMENT = 85.0
 H1_EARLY_SECTOR_ALIGNMENT = 90.0
+SWEET_SPOT_OPPORTUNITY_LOW = 70.0
+SWEET_SPOT_OPPORTUNITY_HIGH = 80.0
+SWEET_SPOT_SECTOR_ALIGNMENT = 70.0
 CAPITAL_EVENT_KEYWORDS = ("定增", "增发", "非公开发行", "限售股解禁", "解禁", "减持")
 
 
@@ -257,7 +261,7 @@ def _candidate_price(res: Dict[str, Any]) -> float:
 
 
 def _has_volume_confirmation(res: Dict[str, Any]) -> bool:
-    return bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') == '放量突破'
+    return bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') in {'放量突破', '缩量回调后放量反包'}
 
 
 def _has_stable_close_confirmation(res: Dict[str, Any]) -> bool:
@@ -266,6 +270,27 @@ def _has_stable_close_confirmation(res: Dict[str, Any]) -> bool:
     close_ok = close_position < 0 or close_position >= 0.6
     shadow_ok = upper_shadow_pct < 0 or upper_shadow_pct < 3
     return close_ok and shadow_ok
+
+
+def _is_h2_second_entry(setup: str, res: Dict[str, Any]) -> bool:
+    trend_phase = str(res.get('pa_trend_phase') or "")
+    return "H2" in setup or "二次入场" in setup or "二次入场" in trend_phase
+
+
+def _has_pullback_reversal_volume(res: Dict[str, Any]) -> bool:
+    return str(res.get('pa_volume_pattern') or "") == "缩量回调后放量反包"
+
+
+def _is_sweet_spot_trade_model(res: Dict[str, Any], sector_alignment: float) -> bool:
+    opportunity = _as_float(res.get('trade_opportunity_score'))
+    setup = str(res.get('pa_trade_setup') or "")
+    return (
+        str(res.get('strategy_type') or "") in CORE_TRADE_STRATEGIES
+        and SWEET_SPOT_OPPORTUNITY_LOW <= opportunity < SWEET_SPOT_OPPORTUNITY_HIGH
+        and sector_alignment >= SWEET_SPOT_SECTOR_ALIGNMENT
+        and _pa_plan_action(res) == "READY"
+        and (_is_h2_second_entry(setup, res) or _has_pullback_reversal_volume(res))
+    )
 
 
 def _revival_action_label(level: str) -> str:
@@ -690,8 +715,16 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("板块下跌")
     if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
         blockers.append("板块扩散转弱")
+    if 0 < sector_alignment < WEAK_SECTOR_ALIGNMENT:
+        blockers.append("弱板块联动，禁止实盘")
     if 0 < sector_alignment < MIN_EXECUTION_SECTOR_ALIGNMENT:
         blockers.append(f"板块联动<{MIN_EXECUTION_SECTOR_ALIGNMENT:.0f}，降级观察")
+    weekly_context = str(res.get('pa_weekly_context') or "")
+    trend_phase = str(res.get('pa_trend_phase') or "")
+    if weekly_context in {"周线中性", "周线交易区间"}:
+        blockers.append(f"{weekly_context}，降级观察")
+    if trend_phase == "震荡观察":
+        blockers.append("震荡观察胜率偏低，降级观察")
     if raw_score and raw_score < MIN_RAW_EXECUTION_SCORE:
         blockers.append(f"原始策略分<{MIN_RAW_EXECUTION_SCORE:.0f}，只观察")
     if risk_pct > HARD_EXECUTION_RISK_PCT:
@@ -765,6 +798,24 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         score += 5
     if trend_continuation:
         score += 6
+    if _has_pullback_reversal_volume(res):
+        score += 6
+        res['bark_success_profile_match'] = True
+    if _is_h2_second_entry(setup, res):
+        score += 4
+        res['h2_second_entry_boost'] = True
+    if _is_sweet_spot_trade_model(res, sector_alignment):
+        score += 8
+        res['sweet_spot_trade_candidate'] = True
+        res['sweet_spot_reason'] = "机会分70-79 + 强联动 + 严格双策略，按专门买点模型复核"
+    if 0 < sector_alignment < WEAK_SECTOR_ALIGNMENT:
+        score -= 12
+    elif 0 < sector_alignment < MIN_EXECUTION_SECTOR_ALIGNMENT:
+        score -= 6
+    if weekly_context in {"周线中性", "周线交易区间"}:
+        score -= 6
+    if trend_phase == "震荡观察":
+        score -= 5
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
         score -= 25
     if float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
@@ -1099,6 +1150,32 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             bonuses.append(f"业绩{_yoy:.0f}%")
         if _sector_align >= 75:
             bonuses.append("个股强于板块")
+        elif 0 < _sector_align < WEAK_SECTOR_ALIGNMENT:
+            quality_score -= 8
+            risks.append("弱板块联动胜率偏低")
+        elif 0 < _sector_align < MIN_EXECUTION_SECTOR_ALIGNMENT:
+            quality_score -= 4
+            risks.append("板块联动不足，降低仓位优先级")
+        weekly_context = str(res.get('pa_weekly_context') or "")
+        trend_phase = str(res.get('pa_trend_phase') or "")
+        if weekly_context in {"周线中性", "周线交易区间"}:
+            quality_score -= 5
+            risks.append(f"{weekly_context}，等待右侧确认")
+        if trend_phase == "震荡观察":
+            quality_score -= 4
+            risks.append("震荡观察，避免提前重仓")
+        setup = str(res.get('pa_trade_setup') or "")
+        if _has_pullback_reversal_volume(res):
+            quality_score += 5
+            bonuses.append("缩量回调后放量反包")
+        if _is_h2_second_entry(setup, res):
+            quality_score += 4
+            bonuses.append("H2二次入场")
+        if _is_sweet_spot_trade_model(res, _sector_align):
+            quality_score += 5
+            bonuses.append("70-79机会分强联动买点")
+            res['sweet_spot_trade_candidate'] = True
+            res['sweet_spot_reason'] = "机会分70-79 + 强联动 + 严格双策略，按专门买点模型复核"
         if _cap_bucket in {"MID", "LARGE"}:
             bonuses.append("市值流动性适中")
         elif _cap_bucket == "MEGA":
@@ -1145,6 +1222,16 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         res['final_rank_score'] = round(res['final_rank_score'] + min(12, max(0, float(res.get('sector_alignment_score') or 0) - 50) * 0.24), 2)
         if res.get('trend_continuation_candidate'):
             res['final_rank_score'] = round(res['final_rank_score'] + 6, 2)
+        if _has_pullback_reversal_volume(res):
+            res['final_rank_score'] = round(res['final_rank_score'] + 5, 2)
+        if res.get('h2_second_entry_boost') or _is_h2_second_entry(str(res.get('pa_trade_setup') or ""), res):
+            res['final_rank_score'] = round(res['final_rank_score'] + 4, 2)
+        if res.get('sweet_spot_trade_candidate'):
+            res['final_rank_score'] = round(res['final_rank_score'] + 5, 2)
+        if 0 < _sector_align < WEAK_SECTOR_ALIGNMENT:
+            res['final_rank_score'] = round(res['final_rank_score'] - 8, 2)
+        elif 0 < _sector_align < MIN_EXECUTION_SECTOR_ALIGNMENT:
+            res['final_rank_score'] = round(res['final_rank_score'] - 4, 2)
         if _cap_bucket == "SMALL":
             res['final_rank_score'] = round(res['final_rank_score'] - 5, 2)
         elif _cap_bucket == "MICRO":
