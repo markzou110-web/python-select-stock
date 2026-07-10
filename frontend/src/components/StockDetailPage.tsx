@@ -24,7 +24,13 @@ import {
     XCircle,
     MinusCircle,
     PlusCircle,
-    Star
+    Star,
+    RefreshCw,
+    FileText,
+    Newspaper,
+    ExternalLink,
+    BookOpen,
+    Save
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
@@ -92,12 +98,31 @@ interface MoneyFlowData {
     };
 }
 
+interface StockResearchData {
+    status?: 'ok' | 'partial' | string;
+    cache_hit?: boolean;
+    updated_at?: string;
+    errors?: Record<string, string>;
+    summary?: {
+        label?: string;
+        risk_flags?: string[];
+        opportunity_flags?: string[];
+    };
+    announcements?: Array<{ title?: string; date?: string; type?: string; url?: string }>;
+    news?: Array<{ title?: string; time?: string; source?: string; url?: string }>;
+    reports?: Array<{ title?: string; publish_date?: string; org?: string; rating?: string }>;
+    lockup?: { upcoming?: Array<{ date?: string; ratio?: number }> };
+    holder_count?: Array<{ date?: string; change_ratio?: number }>;
+}
+
 export default function StockDetailPage({ code, name, onBack }: StockDetailPageProps) {
     const [data, setData] = useState<FullAnalysisData | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [addingAction, setAddingAction] = useState<'paper' | 'watchlist' | null>(null);
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+    const [research, setResearch] = useState<StockResearchData | null>(null);
+    const [researchLoading, setResearchLoading] = useState(false);
 
     const showToast = useCallback((message: string, type: 'success' | 'error' = 'success') => {
         setToast({ message, type });
@@ -149,11 +174,30 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
         }
     }, [code]);
 
+    const fetchResearch = useCallback(async (forceRefresh = false) => {
+        setResearchLoading(true);
+        try {
+            const res = await api.get(`/api/stock/${code}/research`, {
+                params: { force_refresh: forceRefresh },
+            });
+            setResearch(res.data);
+        } catch (researchErr) {
+            console.warn('Stock research fetch failed:', researchErr);
+        } finally {
+            setResearchLoading(false);
+        }
+    }, [code]);
+
     useEffect(() => {
         fetchData(true);
         const timer = window.setInterval(() => fetchData(false), 30000);
         return () => window.clearInterval(timer);
     }, [fetchData]);
+
+    useEffect(() => {
+        setResearch(null);
+        fetchResearch(false);
+    }, [fetchResearch]);
 
     if (loading) {
         return (
@@ -699,6 +743,14 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 </div>
             </div>
 
+            <StockResearchCard
+                data={research}
+                loading={researchLoading}
+                onRefresh={() => fetchResearch(true)}
+            />
+
+            <ResearchThesisPanel code={code} strategyType={chartStrategy} research={research} />
+
             {/* ═══ AI Operation Suggestion ═══ */}
             <div className={cn(
                 "glass-card p-6 border-2 shadow-xl transition-all",
@@ -879,6 +931,203 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
 }
 
 // ── Sub-components ──
+
+function StockResearchCard({
+    data,
+    loading,
+    onRefresh,
+}: {
+    data: StockResearchData | null;
+    loading: boolean;
+    onRefresh: () => void;
+}) {
+    const summary = data?.summary || {};
+    const opportunities = summary.opportunity_flags || [];
+    const risks = summary.risk_flags || [];
+    const evidence: Array<{ title?: string; meta: string; url?: string; kind: string }> = [
+        ...(data?.announcements || []).slice(0, 3).map(item => ({
+            title: item.title,
+            meta: `${item.date || '--'} · ${item.type || '公告'}`,
+            url: item.url,
+            kind: '公告',
+        })),
+        ...(data?.news || []).slice(0, 3).map(item => ({
+            title: item.title,
+            meta: `${item.time || '--'} · ${item.source || '新闻'}`,
+            url: item.url,
+            kind: '新闻',
+        })),
+        ...(data?.reports || []).slice(0, 2).map(item => ({
+            title: item.title,
+            meta: `${item.publish_date || '--'} · ${item.org || '研报'}${item.rating ? ` · ${item.rating}` : ''}`,
+            kind: '研报',
+        })),
+    ];
+
+    return (
+        <div className="glass-card p-5 border border-slate-200">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div className="flex items-start gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
+                        <FileText size={20} />
+                    </div>
+                    <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <h4 className="text-xs font-black uppercase tracking-widest text-slate-400">事件与基本面研究</h4>
+                            {data?.status && (
+                                <span className={cn(
+                                    "rounded-md border px-2 py-0.5 text-[10px] font-black",
+                                    data.status === 'ok' ? "border-emerald-100 bg-emerald-50 text-emerald-700" : "border-amber-100 bg-amber-50 text-amber-700"
+                                )}>
+                                    {data.status === 'ok' ? '数据完整' : '部分数据可用'}
+                                </span>
+                            )}
+                            {data?.cache_hit && <span className="rounded-md border border-slate-100 bg-slate-50 px-2 py-0.5 text-[10px] font-black text-slate-500">缓存</span>}
+                        </div>
+                        <p className="mt-1 text-base font-black text-slate-800">{summary.label || (loading ? '正在加载研究证据' : '暂无研究结论')}</p>
+                        <p className="mt-1 text-xs font-semibold text-slate-500">
+                            仅作证据展示，不参与A级、交易分或买卖资格计算
+                            {data?.updated_at ? ` · ${String(data.updated_at).slice(0, 19)}` : ''}
+                        </p>
+                    </div>
+                </div>
+                <button
+                    type="button"
+                    onClick={onRefresh}
+                    disabled={loading}
+                    className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-600 hover:text-indigo-600 disabled:opacity-50"
+                    title="刷新研究数据"
+                >
+                    <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+                    刷新证据
+                </button>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
+                <ResearchFlagList title="催化证据" items={opportunities} tone="opportunity" />
+                <ResearchFlagList title="风险证据" items={risks} tone="risk" />
+                <div>
+                    <div className="mb-2 flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-slate-400">
+                        <Newspaper size={13} /> 最新公告 / 新闻 / 研报
+                    </div>
+                    <div className="space-y-2">
+                        {evidence.slice(0, 6).map((item, idx) => (
+                            <div key={`${item.kind}-${item.title}-${idx}`} className="border-b border-slate-100 pb-2 last:border-b-0">
+                                <div className="flex items-start gap-2">
+                                    <span className="mt-0.5 shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[9px] font-black text-slate-500">{item.kind}</span>
+                                    <div className="min-w-0">
+                                        {item.url ? (
+                                            <a href={item.url} target="_blank" rel="noreferrer" className="flex items-start gap-1 text-xs font-black text-slate-700 hover:text-indigo-600">
+                                                <span>{item.title || '未命名证据'}</span><ExternalLink size={10} className="mt-0.5 shrink-0" />
+                                            </a>
+                                        ) : <p className="text-xs font-black text-slate-700">{item.title || '未命名证据'}</p>}
+                                        <p className="mt-0.5 text-[10px] font-bold text-slate-400">{item.meta}</p>
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                        {!evidence.length && <p className="text-xs font-bold text-slate-400">暂无最新公开证据</p>}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function ResearchFlagList({ title, items, tone }: { title: string; items: string[]; tone: 'opportunity' | 'risk' }) {
+    const opportunity = tone === 'opportunity';
+    return (
+        <div>
+            <div className={cn("mb-2 flex items-center gap-2 text-[10px] font-black uppercase tracking-widest", opportunity ? "text-rose-500" : "text-amber-600")}>
+                {opportunity ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}{title}
+            </div>
+            <div className="space-y-2">
+                {items.slice(0, 6).map((item, idx) => (
+                    <div key={`${item}-${idx}`} className={cn(
+                        "rounded-md border px-3 py-2 text-xs font-bold leading-relaxed",
+                        opportunity ? "border-rose-100 bg-rose-50 text-rose-700" : "border-amber-100 bg-amber-50 text-amber-800"
+                    )}>{item}</div>
+                ))}
+                {!items.length && <p className="text-xs font-bold text-slate-400">暂无明确{title}</p>}
+            </div>
+        </div>
+    );
+}
+
+function ResearchThesisPanel({ code, strategyType, research }: { code: string; strategyType: string; research: StockResearchData | null }) {
+    const [items, setItems] = useState<any[]>([]);
+    const [open, setOpen] = useState(false);
+    const [saving, setSaving] = useState(false);
+    const [draft, setDraft] = useState({ thesis: '', confirmation: '', invalidation: '' });
+
+    const load = useCallback(async () => {
+        try {
+            const res = await api.get(`/api/stock/${code}/research-theses`);
+            setItems(res.data?.items || []);
+        } catch (err) {
+            console.warn('Research theses fetch failed:', err);
+        }
+    }, [code]);
+
+    useEffect(() => { load(); }, [load]);
+
+    const save = async () => {
+        if (!draft.thesis.trim()) return;
+        setSaving(true);
+        try {
+            await api.post(`/api/stock/${code}/research-theses`, {
+                title: `研究论点 ${new Date().toISOString().slice(0, 10)}`,
+                thesis_text: draft.thesis,
+                confirmation_condition: draft.confirmation,
+                invalidation_condition: draft.invalidation,
+                catalysts: research?.summary?.opportunity_flags || [],
+                risks: research?.summary?.risk_flags || [],
+                strategy_type: strategyType,
+            });
+            setDraft({ thesis: '', confirmation: '', invalidation: '' });
+            setOpen(false);
+            await load();
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    return (
+        <div className="glass-card p-5 border border-slate-200">
+            <div className="flex items-start justify-between gap-3">
+                <div>
+                    <div className="flex items-center gap-2"><BookOpen size={16} className="text-indigo-600" /><h4 className="text-xs font-black uppercase tracking-widest text-slate-400">研究论点快照</h4></div>
+                    <p className="mt-1 text-xs font-semibold text-slate-500">保存当时的判断、确认条件、失效条件和当前研究证据</p>
+                </div>
+                <button type="button" onClick={() => setOpen(value => !value)} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-600 hover:text-indigo-600">
+                    {open ? '取消' : '新建论点'}
+                </button>
+            </div>
+
+            {open && (
+                <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
+                    <textarea value={draft.thesis} onChange={event => setDraft({ ...draft, thesis: event.target.value })} placeholder="核心研究判断" className="min-h-24 rounded-md border border-slate-200 bg-white p-3 text-sm font-semibold text-slate-700 outline-none focus:border-indigo-400 lg:col-span-3" />
+                    <input value={draft.confirmation} onChange={event => setDraft({ ...draft, confirmation: event.target.value })} placeholder="确认条件，例如放量站回确认价" className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-400" />
+                    <input value={draft.invalidation} onChange={event => setDraft({ ...draft, invalidation: event.target.value })} placeholder="失效条件，例如跌破结构止损" className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-400" />
+                    <button type="button" onClick={save} disabled={saving || !draft.thesis.trim()} className="inline-flex items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-black text-white disabled:opacity-50">
+                        <Save size={14} />{saving ? '保存中' : '保存快照'}
+                    </button>
+                </div>
+            )}
+
+            <div className="mt-4 space-y-2">
+                {items.slice(0, 5).map(item => (
+                    <div key={item.id} className="grid grid-cols-1 gap-2 border-t border-slate-100 pt-3 first:border-t-0 first:pt-0 lg:grid-cols-[140px_1fr_1fr]">
+                        <div><p className="text-xs font-black text-slate-700">{item.thesis_date}</p><p className="text-[10px] font-bold text-slate-400">{item.strategy_type || '未关联策略'} · {item.status}</p></div>
+                        <div><p className="text-sm font-black text-slate-800">{item.thesis_text}</p><p className="mt-1 text-[10px] font-bold text-slate-400">确认：{item.confirmation_condition || '未记录'}</p></div>
+                        <p className="text-xs font-bold text-rose-600">失效：{item.invalidation_condition || '未记录'}</p>
+                    </div>
+                ))}
+                {!items.length && !open && <p className="py-3 text-center text-xs font-bold text-slate-400">尚未保存研究论点</p>}
+            </div>
+        </div>
+    );
+}
 
 function MetricCard({ label, value, color, icon }: { label: string; value: string; color: string; icon: React.ReactNode }) {
     return (

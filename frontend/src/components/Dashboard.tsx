@@ -23,6 +23,7 @@ import OperationsCenter from '@/components/OperationsCenter';
 import BacktestLab from '@/components/BacktestLab';
 import StockDetailPage from '@/components/StockDetailPage';
 import SectorRadarView from '@/components/SectorRadarView';
+import ResearchRadarView from '@/components/ResearchRadarView';
 import { Download, LayoutGrid, List, Search, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
@@ -164,6 +165,15 @@ export default function Dashboard() {
                             ) : activeView === 'sector-radar' ? (
                                 <ErrorBoundary fallbackTitle="板块雷达加载异常">
                                     <SectorRadarView />
+                                </ErrorBoundary>
+                            ) : activeView === 'research-radar' ? (
+                                <ErrorBoundary fallbackTitle="资讯雷达加载异常">
+                                    <ResearchRadarView
+                                        onOpenStock={(stock) => {
+                                            setSelectedStock(null);
+                                            setSearchDetailStock(stock);
+                                        }}
+                                    />
                                 </ErrorBoundary>
                             ) : activeView === 'templates' ? (
                                 <ErrorBoundary fallbackTitle="策略模板加载异常">

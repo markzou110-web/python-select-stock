@@ -20,6 +20,7 @@ from core.data import (
 from core.db import get_db_engine, get_scan_dates, get_scan_history_by_date
 from core.sector_strength import build_sector_strength, build_sector_leaders, build_sector_history_context, classify_sector_role
 from core.sector_push_analysis import build_hot_sector_push_gap_analysis
+from core.research_radar import build_candidate_research_radar
 
 router = APIRouter(prefix="/api", tags=["market"])
 
@@ -265,6 +266,16 @@ def get_sector_push_gaps(limit: int = 8, date: str = "", force: bool = False):
     except Exception as e:
         logger.error(f"Error building sector push gap analysis: {e}")
         return {"items": [], "updated_at": datetime.now().isoformat(), "error": str(e)}
+
+
+@router.get("/market/research-radar")
+def get_research_radar(limit: int = 10, force_refresh: bool = False):
+    """Return news and announcement evidence linked to positions, watchlist, and scan candidates."""
+    return build_candidate_research_radar(
+        get_db_engine(),
+        limit=limit,
+        force_refresh=force_refresh,
+    )
 
 
 @router.get("/market/regime")

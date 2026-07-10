@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, CalendarDays, Download, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
+import { Activity, BarChart3, CalendarDays, Copy, Download, Globe2, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -204,6 +204,23 @@ type DailyStrategyReport = {
     next_actions?: string[];
 };
 
+type ResearchContext = {
+    as_of?: string;
+    contract_version?: string;
+    policy?: string;
+    market?: {
+        global_indices?: {
+            status?: string;
+            source?: string;
+            items?: Array<{ name?: string; price?: number | null; pct?: number | null; market_time?: string }>;
+        };
+    };
+    decision?: { scan_date?: string; summary?: { trade_count?: number; early_count?: number; observe_count?: number } };
+    strategy_health?: Record<string, { status?: string; signals?: number; expected_return?: number }>;
+    candidate_evidence?: { summary?: { targets?: number; evidence?: number; risk?: number; catalyst?: number } };
+    analysis_framework?: string[];
+};
+
 export default function ReviewCenter() {
     const [data, setData] = useState<any>(null);
     const [profitability, setProfitability] = useState<ProfitabilityPayload | null>(null);
@@ -211,6 +228,7 @@ export default function ReviewCenter() {
     const [recommendationLoop, setRecommendationLoop] = useState<RecommendationOutcomeLoop | null>(null);
     const [dailyReport, setDailyReport] = useState<DailyStrategyReport | null>(null);
     const [calibration, setCalibration] = useState<CalibrationPayload | null>(null);
+    const [researchContext, setResearchContext] = useState<ResearchContext | null>(null);
     const [followup, setFollowup] = useState<any>(null);
     const [loading, setLoading] = useState(true);
     const [followupLoading, setFollowupLoading] = useState(false);
@@ -221,13 +239,14 @@ export default function ReviewCenter() {
     const fetchData = async () => {
         setLoading(true);
         try {
-            const [performanceRes, profitabilityRes, sectorWatchRes, recommendationLoopRes, dailyReportRes, calibrationRes] = await Promise.all([
+            const [performanceRes, profitabilityRes, sectorWatchRes, recommendationLoopRes, dailyReportRes, calibrationRes, researchContextRes] = await Promise.all([
                 api.get(`/api/review/scan-performance?days=${days}`),
                 api.get(`/api/review/profitability-dashboard?days=${days}`),
                 api.get(`/api/review/sector-watch-performance?days=${days}`),
                 api.get(`/api/review/recommendation-outcome-loop?days=${days}`),
                 api.get('/api/review/daily-strategy-report'),
                 api.get(`/api/review/strategy-calibration-report?days=${days}`),
+                api.get('/api/review/research-context'),
             ]);
             setData(performanceRes.data);
             setProfitability(profitabilityRes.data);
@@ -235,6 +254,7 @@ export default function ReviewCenter() {
             setRecommendationLoop(recommendationLoopRes.data);
             setDailyReport(dailyReportRes.data);
             setCalibration(calibrationRes.data);
+            setResearchContext(researchContextRes.data);
         } finally {
             setLoading(false);
         }
@@ -312,6 +332,8 @@ export default function ReviewCenter() {
             </div>
 
             <DailyStrategyReportCard data={dailyReport} />
+
+            <ResearchContextCard data={researchContext} />
 
             <ProfitabilityLayerCard data={profitability} />
 
@@ -446,6 +468,73 @@ function RecommendationEventCard({ rows }: { rows: any[] }) {
                     </div>
                 ))}
                 {rows.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无推荐事件</div>}
+            </div>
+        </div>
+    );
+}
+
+function ResearchContextCard({ data }: { data: ResearchContext | null }) {
+    const [copied, setCopied] = useState(false);
+    const globalItems = data?.market?.global_indices?.items || [];
+    const healthRows = Object.entries(data?.strategy_health || {});
+    const evidence = data?.candidate_evidence?.summary || {};
+
+    const copyContext = async () => {
+        if (!data) return;
+        await navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1800);
+    };
+
+    return (
+        <div className="glass-card p-5">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <div className="flex items-center gap-2"><Globe2 size={18} className="text-indigo-600" /><h3 className="font-black text-slate-800">AI 研究上下文</h3></div>
+                    <p className="mt-1 text-xs font-bold text-slate-400">模型中立的市场、策略健康、候选与资讯证据快照</p>
+                </div>
+                <button type="button" onClick={copyContext} disabled={!data} className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-600 hover:text-indigo-600 disabled:opacity-50">
+                    <Copy size={14} />{copied ? '已复制' : '复制上下文'}
+                </button>
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
+                <div>
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">全球市场</div>
+                    <div className="grid grid-cols-2 gap-2">
+                        {globalItems.map(item => (
+                            <div key={item.name} className="rounded-md border border-slate-100 bg-white px-3 py-2">
+                                <p className="text-[10px] font-black text-slate-400">{item.name}</p>
+                                <p className={cn("mt-1 text-sm font-black", Number(item.pct || 0) >= 0 ? 'text-rose-600' : 'text-emerald-600')}>
+                                    {item.price ?? '--'} · {item.pct == null ? '--' : `${item.pct >= 0 ? '+' : ''}${item.pct}%`}
+                                </p>
+                            </div>
+                        ))}
+                        {!globalItems.length && <p className="col-span-2 text-xs font-bold text-slate-400">全球指数暂不可用，不影响A股策略运行</p>}
+                    </div>
+                </div>
+                <div>
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">策略健康</div>
+                    <div className="space-y-2">
+                        {healthRows.slice(0, 6).map(([strategy, row]) => (
+                            <div key={strategy} className="flex items-center justify-between border-b border-slate-100 pb-2 text-xs last:border-b-0">
+                                <span className="font-black text-slate-700">{strategy}</span>
+                                <span className={cn("font-black", row.status === 'ACTIVE' ? 'text-rose-600' : row.status === 'PAUSED' ? 'text-emerald-700' : 'text-amber-700')}>{row.status || 'UNKNOWN'} · {row.signals || 0}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+                <div>
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">候选证据</div>
+                    <div className="grid grid-cols-2 gap-2">
+                        <MiniStat label="关联标的" value={`${evidence.targets || 0}`} />
+                        <MiniStat label="证据" value={`${evidence.evidence || 0}`} />
+                        <MiniStat label="风险" value={`${evidence.risk || 0}`} />
+                        <MiniStat label="催化" value={`${evidence.catalyst || 0}`} hot={(evidence.catalyst || 0) > 0} />
+                    </div>
+                </div>
+            </div>
+            <div className="mt-3 rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2 text-[10px] font-bold text-slate-400">
+                {data?.policy || '只读研究上下文，不修改策略参数、评分、A级或交易资格'}{data?.as_of ? ` · ${String(data.as_of).slice(0, 19)}` : ''}
             </div>
         </div>
     );

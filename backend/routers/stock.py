@@ -5,6 +5,8 @@ Extracted from api.py.
 """
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 import math
 import akshare as ak
@@ -20,8 +22,22 @@ from core.risk_constants import FIXED_STOP_LOSS_PCT  # 实盘硬止损，与回�
 from core.operation_plan import build_position_decision_snapshot, operation_bands, price_instruction
 from core.money_flow import get_stock_money_flow
 from core.audit_log import get_position_decision_timeline, record_position_decision_change
+from core.stock_research import build_stock_research_signals
+from core.stock_research import get_cached_stock_research_signals
+from core.models import ResearchThesis
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
+
+
+class ResearchThesisCreate(BaseModel):
+    title: str = Field(default="研究论点", max_length=200)
+    thesis_text: str = Field(min_length=1, max_length=5000)
+    catalysts: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    confirmation_condition: str = Field(default="", max_length=1000)
+    invalidation_condition: str = Field(default="", max_length=1000)
+    strategy_type: str | None = Field(default=None, max_length=30)
+    signal_id: int | None = None
 
 
 def _json_safe_response(value):
@@ -65,6 +81,67 @@ def _get_live_snapshot_price(code: str) -> dict | None:
     except Exception as exc:
         logger.warning(f"Live snapshot unavailable for {code}: {exc}")
         return None
+
+
+@router.get("/{code}/research")
+def get_stock_research(code: str, force_refresh: bool = False):
+    """Return read-only event and fundamental research evidence for one stock."""
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code format")
+    return _json_safe_response(
+        build_stock_research_signals(code, force_refresh=force_refresh)
+    )
+
+
+@router.post("/{code}/research-theses")
+def create_research_thesis(code: str, payload: ResearchThesisCreate):
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code format")
+    engine = get_db_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    cached_research = get_cached_stock_research_signals(code) or {}
+    thesis = ResearchThesis(
+        code=code,
+        title=payload.title.strip() or "研究论点",
+        thesis_date=datetime.now().date(),
+        thesis_text=payload.thesis_text.strip(),
+        catalysts=payload.catalysts[:20],
+        risks=payload.risks[:20],
+        confirmation_condition=payload.confirmation_condition.strip() or None,
+        invalidation_condition=payload.invalidation_condition.strip() or None,
+        source_snapshot=_json_safe_response(cached_research),
+        strategy_type=payload.strategy_type,
+        signal_id=payload.signal_id,
+        status="ACTIVE",
+    )
+    with Session(engine) as session:
+        session.add(thesis)
+        session.commit()
+        session.refresh(thesis)
+        return {"status": "ok", "id": thesis.id, "code": code, "thesis_date": str(thesis.thesis_date)}
+
+
+@router.get("/{code}/research-theses")
+def list_research_theses(code: str, limit: int = 20):
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code format")
+    engine = get_db_engine()
+    if engine is None:
+        return {"items": [], "count": 0}
+    safe_limit = max(1, min(int(limit), 100))
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT id, code, title, thesis_date, thesis_text, catalysts, risks,
+                   confirmation_condition, invalidation_condition, strategy_type,
+                   signal_id, status, created_at
+            FROM research_theses
+            WHERE code = :code
+            ORDER BY thesis_date DESC, created_at DESC
+            LIMIT :limit
+        """), {"code": code, "limit": safe_limit}).mappings().all()
+    items = [_json_safe_response(dict(row)) for row in rows]
+    return {"items": items, "count": len(items)}
 
 
 @router.get("/{code}/kline")

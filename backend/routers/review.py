@@ -13,6 +13,10 @@ from core.logging_config import logger
 from core.outcome_calibration import build_blocker_report, build_calibration_report, load_scan_outcomes
 from core.performance_metrics import return_metrics
 from core.pro_workflow import classify_strategy_health
+from core.research_context import build_ai_research_context, get_global_market_context
+from core.research_radar import build_candidate_research_radar
+from core.strategy_health import build_strategy_health
+from core.data import get_index_data
 
 router = APIRouter(prefix="/api/review", tags=["review"])
 
@@ -1285,6 +1289,20 @@ def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"Profitability dashboard error: {exc}")
         return {"summary": {"days": int(days), "layers": 0}, "layers": [], "notes": [], "error": str(exc)}
+
+
+@router.get("/research-context")
+def get_research_context(force_refresh: bool = False) -> Dict[str, Any]:
+    """Build a model-neutral, read-only snapshot for AI-assisted market review."""
+    engine = get_db_engine()
+    daily_report = get_daily_strategy_report()
+    return build_ai_research_context(
+        domestic_indices=get_index_data(),
+        global_market=get_global_market_context(force_refresh=force_refresh),
+        daily_report=daily_report,
+        strategy_health=build_strategy_health(engine),
+        research_radar=build_candidate_research_radar(engine, limit=10, force_refresh=force_refresh),
+    )
 
 
 @router.get("/recommendation-outcome-loop")

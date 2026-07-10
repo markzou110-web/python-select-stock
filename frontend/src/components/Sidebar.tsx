@@ -16,7 +16,8 @@ import {
     ClipboardList,
     SlidersHorizontal,
     ServerCog,
-    BarChart3
+    BarChart3,
+    Newspaper
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAlertStore } from '@/stores/alertStore';
@@ -72,6 +73,12 @@ export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamen
                         label="板块雷达"
                         active={activeView === 'sector-radar'}
                         onClick={() => onNavigate('sector-radar')}
+                    />
+                    <NavItem
+                        icon={<Newspaper size={20} />}
+                        label="资讯雷达"
+                        active={activeView === 'research-radar'}
+                        onClick={() => onNavigate('research-radar')}
                     />
                     <NavItem
                         icon={<PieChart size={20} />}

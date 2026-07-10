@@ -185,6 +185,24 @@ class ScanAuditLog(Base):
     error_message = Column(Text, nullable=True)
 
 
+class ResearchThesis(Base):
+    __tablename__ = "research_theses"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(20), nullable=False)
+    title = Column(String(200), nullable=False)
+    thesis_date = Column(Date, nullable=False)
+    thesis_text = Column(Text, nullable=False)
+    catalysts = Column(JSON, nullable=True)
+    risks = Column(JSON, nullable=True)
+    confirmation_condition = Column(Text, nullable=True)
+    invalidation_condition = Column(Text, nullable=True)
+    source_snapshot = Column(JSON, nullable=True)
+    strategy_type = Column(String(30), nullable=True)
+    signal_id = Column(Integer, nullable=True)
+    status = Column(String(20), default="ACTIVE", nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class FailureSample(Base):
     __tablename__ = "failure_samples"
     id = Column(Integer, primary_key=True, autoincrement=True)

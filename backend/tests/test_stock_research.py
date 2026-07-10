@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core import stock_research
+from routers import stock as stock_router
 from core.data import CACHE
 
 
@@ -95,3 +96,18 @@ def test_apply_research_adjustment_updates_scan_candidate():
     assert stock["final_trade_score"] == 67
     assert stock["final_rank_score"] == 66
     assert "研究事件风险，降级观察" in stock["trade_blockers"]
+
+
+def test_stock_research_endpoint_is_read_only(monkeypatch):
+    captured = {}
+
+    def fake_build(code, force_refresh=False):
+        captured.update({"code": code, "force_refresh": force_refresh})
+        return {"status": "ok", "code": code, "summary": {"label": "中性"}}
+
+    monkeypatch.setattr(stock_router, "build_stock_research_signals", fake_build)
+
+    payload = stock_router.get_stock_research("000001", force_refresh=True)
+
+    assert payload["summary"]["label"] == "中性"
+    assert captured == {"code": "000001", "force_refresh": True}
