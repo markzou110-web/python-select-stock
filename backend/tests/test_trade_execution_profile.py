@@ -7,11 +7,74 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.scanner import (
+    _apply_frozen_execution_plan,
     _apply_sop_filter,
     _build_momentum_acceleration_candidates,
     _classify_historical_revival,
+    _combined_sector_alignment,
+    _confirmation_price_reached,
+    _dedupe_trade_blockers,
+    _sector_strength_score,
+    _strong_sector_core_candidate,
+    _strong_sector_rear_candidate,
+    _stock_sector_fit_score,
+    _trade_setup_quality,
     single_stock_task,
 )
+
+
+def test_confirmation_tolerance_accepts_one_tick_rounding_gap():
+    assert _confirmation_price_reached(85.99, 86.00) is True
+    assert _confirmation_price_reached(85.80, 86.00) is False
+
+
+def test_frozen_plan_preserves_prior_trigger_and_keeps_generated_plan_for_audit():
+    result = {"现价": 93.67, "pa_entry_price": 94.39, "pa_stop_price": 90.35}
+    plan = {
+        "plan_date": "2026-07-09",
+        "pa_entry_price": 86.00,
+        "pa_stop_price": 82.02,
+        "pa_target_price": 94.40,
+    }
+
+    _apply_frozen_execution_plan(result, plan)
+
+    assert result["frozen_confirmation_price"] == 86.00
+    assert result["generated_confirmation_price"] == 94.39
+    assert result["frozen_entry_extension_pct"] == 8.92
+    assert result["frozen_confirmation_triggered"] is True
+    assert result["execution_plan_frozen"] is True
+
+
+def test_frozen_plan_above_three_percent_is_observe_only():
+    result = _base_candidate(现价=10.4, pa_entry_price=10.5)
+    _apply_frozen_execution_plan(result, {
+        "plan_date": "2026-07-01",
+        "pa_entry_price": 10.0,
+        "pa_stop_price": 9.5,
+        "pa_target_price": 11.0,
+    })
+
+    _apply_sop_filter([result], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert result["trade_eligible"] is False
+    assert any("距冻结确认价涨幅>3%" in blocker for blocker in result["trade_blockers"])
+
+
+def test_correlated_trade_blockers_are_counted_once_per_category():
+    blockers = _dedupe_trade_blockers([
+        "未站上确认价，等待突破确认",
+        "未站稳历史/今日确认价",
+        "涨停/近涨停，等待隔日确认",
+        "5日涨幅偏高且质量未确认",
+        "策略近期负期望，自动暂停",
+    ])
+
+    assert blockers == [
+        "未站上确认价，等待突破确认",
+        "涨停/近涨停，等待隔日确认",
+        "策略近期负期望，自动暂停",
+    ]
 
 
 def _base_candidate(**overrides):
@@ -30,6 +93,7 @@ def _base_candidate(**overrides):
         "strategy_type": "tv_dual_strict",
         "pa_trade_plan": {"action": "READY"},
         "pa_trade_setup": "H2二次入场",
+        "pa_h2_quality": "强",
         "price_action_score": 72,
         "price_action_signal": "强多头趋势K",
         "pa_volume_confirmed": True,
@@ -40,7 +104,10 @@ def _base_candidate(**overrides):
         "现价": 10.05,
         "sector_momentum_score": 82,
         "sector_breadth": 70,
+        "sector_strength_score": 82,
+        "stock_sector_fit_score": 72,
         "sector_alignment_score": 80,
+        "sector_role": "CORE",
         "共振": "🔥 核心热点",  # 多重共振标记（调整3 严格门槛要求）
     }
     candidate.update(overrides)
@@ -70,6 +137,10 @@ def test_ready_candidate_enters_trade_bucket():
     assert result["sop_grade"] == "A"
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
+    assert result["trade_execution_policy"] == "BARK_CONFIRMED_TRADE"
+    assert result["requires_bark_confirmation"] is False
+    assert result["sector_core_role_candidate"] is True
+    assert result["sector_core_role_label"] == "强板块核心股"
     assert result["trade_blockers"] == []
     assert result["final_trade_score"] > result["final_rank_score"]
 
@@ -83,6 +154,8 @@ def test_plain_tv_dual_is_discovery_only_not_trade():
     assert result["sop_grade"] == "A"
     assert result["trade_eligible"] is False
     assert result["trade_bucket"] == "OBSERVE"
+    assert result["trade_execution_policy"] == "WAIT_CONFIRMATION"
+    assert result["requires_bark_confirmation"] is True
     assert "普通tv_dual仅用于发现，需严格双策略确认" in result["trade_blockers"]
 
 
@@ -152,6 +225,7 @@ def test_h1_first_entry_requires_strong_mainline_confirmation():
     result = results[0]
     assert result["trade_eligible"] is False
     assert result["trade_bucket"] == "OBSERVE"
+    assert result["pa_trade_setup_quality"] == "H1_RAW"
     assert "H1首次入场仅强主线放量确认可小仓复核" in result["trade_blockers"]
 
 
@@ -163,6 +237,7 @@ def test_h1_first_entry_can_trade_when_mainline_volume_confirmed():
     result = results[0]
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
+    assert result["pa_trade_setup_quality"] == "H1_TRADABLE"
     assert not any("H1首次入场" in blocker for blocker in result["trade_blockers"])
 
 
@@ -176,6 +251,148 @@ def test_weak_sector_alignment_blocks_real_trade():
     assert result["trade_bucket"] == "BLOCK"
     assert "弱板块联动，禁止实盘" in result["trade_blockers"]
     assert "弱板块联动胜率偏低" in result["sop_risks"]
+
+
+def test_sector_strength_and_stock_fit_are_separate_dimensions():
+    candidate = _base_candidate(
+        sector_momentum_score=82,
+        sector_breadth=76,
+        sector_phase="SECTOR_CONFIRM",
+        sector_relative_pct=3.2,
+        stock_rank_in_sector=2,
+        sector_role="LEADER",
+        **{"涨幅%": 4.5},
+    )
+
+    sector_strength = _sector_strength_score(candidate)
+    stock_fit = _stock_sector_fit_score(candidate)
+    combined = _combined_sector_alignment(sector_strength, stock_fit)
+
+    assert sector_strength >= 75
+    assert stock_fit >= 70
+    assert combined >= 75
+
+
+def test_strong_stock_in_weak_sector_is_watch_not_trade():
+    results = [_base_candidate(
+        sector_strength_score=45,
+        stock_sector_fit_score=82,
+        sector_alignment_score=60,
+        trade_opportunity_score=68,
+    )]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "BLOCK"
+    assert "板块强度弱，禁止实盘" in result["trade_blockers"]
+    assert "板块强度弱，个股强势不直接交易" in result["sop_risks"]
+
+
+def test_strong_sector_weak_stock_fit_is_observe_not_trade():
+    results = [_base_candidate(
+        sector_strength_score=82,
+        stock_sector_fit_score=42,
+        sector_alignment_score=72,
+    )]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert "强板块但个股适配不足，降级观察" in result["trade_blockers"]
+    assert "板块强但个股适配不足，偏补涨观察" in result["sop_risks"]
+
+
+def test_strong_sector_rear_role_is_observe_not_trade():
+    results = [_base_candidate(
+        sector_strength_score=82,
+        stock_sector_fit_score=68,
+        sector_alignment_score=76,
+        sector_role="FOLLOWER",
+    )]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["sector_rear_role_watch"] is True
+    assert result["sector_core_role_label"] == "强板块后排观察"
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert "强板块后排角色，等待转强为核心股" in result["trade_blockers"]
+    assert "强板块后排角色，等待转强为核心股" in result["sop_risks"]
+
+
+def test_strong_sector_core_role_helpers_require_core_or_leader():
+    core = _base_candidate(sector_role="LEADER", stock_sector_fit_score=66)
+    rear = _base_candidate(sector_role="LAGGARD", stock_sector_fit_score=80)
+    legacy = _base_candidate(sector_role="", stock_sector_fit_score=72)
+
+    assert _strong_sector_core_candidate(core, 82, 66) is True
+    assert _strong_sector_rear_candidate(core, 82) is False
+    assert _strong_sector_core_candidate(rear, 82, 80) is False
+    assert _strong_sector_rear_candidate(rear, 82) is True
+    assert _strong_sector_core_candidate(legacy, 82, 72) is True
+
+
+def test_h2_boost_requires_volume_and_quality_confirmation():
+    weak_h2 = [_base_candidate(
+        pa_h2_quality="弱",
+        pa_volume_confirmed=False,
+        pa_volume_pattern="缩量",
+        sector_strength_score=82,
+    )]
+    strong_h2 = [_base_candidate(
+        pa_h2_quality="强",
+        pa_volume_confirmed=True,
+        sector_strength_score=82,
+    )]
+
+    _apply_sop_filter(weak_h2, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+    _apply_sop_filter(strong_h2, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert weak_h2[0].get("h2_second_entry_boost") is not True
+    assert "H2二次入场" not in weak_h2[0]["sop_bonuses"]
+    assert weak_h2[0]["pa_trade_setup_quality"] == "H2_RAW"
+    assert strong_h2[0].get("h2_second_entry_boost") is True
+    assert strong_h2[0]["pa_trade_setup_quality"] == "H2_TRADABLE"
+    assert "H2二次入场" in strong_h2[0]["sop_bonuses"]
+
+
+def test_h2_raw_shape_is_observe_even_when_other_conditions_look_ready():
+    results = [_base_candidate(
+        pa_h2_quality="弱",
+        pa_volume_confirmed=True,
+        pa_volume_pattern="放量突破",
+        sector_strength_score=82,
+        stock_sector_fit_score=72,
+        sector_alignment_score=82,
+        pa_risk_pct=6.0,
+        pa_close_position=0.75,
+        pa_upper_shadow_pct=1.0,
+    )]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["pa_trade_setup_quality"] == "H2_RAW"
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert "H2二次入场未满足量能/质量/风险确认，仅观察" in result["trade_blockers"]
+
+
+def test_trade_setup_quality_helper_classifies_raw_and_tradable_shapes():
+    h2_raw = _base_candidate(pa_h2_quality="弱")
+    h2_tradable = _base_candidate(pa_h2_quality="中")
+    h1_raw = _base_candidate(pa_trade_setup="H1首次入场", sector_alignment_score=82)
+    h1_tradable = _base_candidate(pa_trade_setup="H1首次入场", sector_alignment_score=90)
+
+    assert _trade_setup_quality(h2_raw, "H2二次入场", 80, 82) == "H2_RAW"
+    assert _trade_setup_quality(h2_tradable, "H2二次入场", 80, 82) == "H2_TRADABLE"
+    assert _trade_setup_quality(h1_raw, "H1首次入场", 82, 82) == "H1_RAW"
+    assert _trade_setup_quality(h1_tradable, "H1首次入场", 90, 82) == "H1_TRADABLE"
 
 
 def test_neutral_weekly_range_downgrades_to_observe():
@@ -213,6 +430,39 @@ def test_opportunity_70_79_strong_linkage_gets_sweet_spot_model():
     assert "机会分70-79" in result["sweet_spot_reason"]
 
 
+def test_observe_candidate_gets_promotion_action_when_near_confirm_line():
+    results = [_base_candidate(
+        现价=9.94,
+        pa_entry_price=10.0,
+        trade_opportunity_score=65,
+        sector_alignment_score=78,
+        pa_trade_setup="H2二次入场",
+    )]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] in {"EARLY", "OBSERVE"}
+    assert result["observe_promotion_candidate"] is True
+    assert "观察转可买" in result["observe_promotion_action"]
+
+
+def test_bark_success_profile_features_add_scoring_bonus():
+    results = [_base_candidate(
+        sector_phase="SECTOR_CONFIRM",
+        pa_trade_setup="H1首次入场",
+        sector_alignment_score=92,
+    )]
+
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    result = results[0]
+    assert result["bark_success_profile_match"] is True
+    assert "Bark高胜率板块阶段" in result["sop_bonuses"]
+    assert "Bark高胜率价格结构" in result["sop_bonuses"]
+
+
 def test_near_limit_threshold_respects_board_limit():
     main = _base_candidate(代码="000001", **{"涨幅%": 9.8})
     chinext = _base_candidate(代码="300001", **{"涨幅%": 9.8, "pa_volume_confirmed": False, "price_action_signal": "普通突破"})
@@ -232,7 +482,7 @@ def test_five_day_surge_is_ranking_risk_not_sop_veto():
 
     assert surged["sop_grade"] == "A"
     assert "5日涨>15%" not in surged["sop_vetoes"]
-    assert surged["sop_risks"] == ["5日涨幅>15%，排序扣分"]
+    assert "5日涨幅>15%，排序扣分" in surged["sop_risks"]
     assert surged["trade_eligible"] is False
     assert "5日涨幅偏高且质量未确认" in surged["trade_blockers"]
 

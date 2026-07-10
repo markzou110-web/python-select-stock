@@ -108,7 +108,17 @@ fi
 # 启动前端开发服务器
 echo "前端启动中... (http://localhost:3000)"
 npm run dev &
-FRONTEND_PID=$!
+FRONTEND_NPM_PID=$!
+sleep 2
+FRONTEND_PID=$(pgrep -P "$FRONTEND_NPM_PID" -f "next" | head -n 1)
+if [ -z "$FRONTEND_PID" ]; then
+    FRONTEND_PID=$FRONTEND_NPM_PID
+fi
+if curl -fsS http://localhost:3000 >/dev/null 2>&1; then
+    echo "前端健康检查: OK (http://localhost:3000)"
+else
+    echo "⚠️ 前端健康检查未通过，请查看 npm/Next.js 输出"
+fi
 echo "前端 PID: $FRONTEND_PID"
 
 cd "$PROJECT_DIR"
@@ -116,6 +126,7 @@ cd "$PROJECT_DIR"
 # 保存PID
 echo "$BACKEND_PID" > .backend_pid
 echo "$FRONTEND_PID" > .frontend_pid
+echo "http://localhost:3000" > .frontend_url
 if [ ! -z "$CELERY_PID" ]; then
     echo "$CELERY_PID" > .celery_pid
 fi

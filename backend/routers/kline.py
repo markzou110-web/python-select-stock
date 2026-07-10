@@ -73,6 +73,25 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         # 3. 动态加载策略特有的买卖点明细 (均线粘合、多指标共振或Azul共识突破)
         from core.strategy import get_signal_details
         signals = get_signal_details(df, strategy_type=strategy_type)
+
+        strategy_sets = {}
+        for overlay_strategy in ("squeeze", "tv_zp"):
+            try:
+                overlay_signals = get_signal_details(df, strategy_type=overlay_strategy)
+                overlay_signals["buy_count"] = len(overlay_signals.get("buy_signals", []))
+                overlay_signals["sell_count"] = len(overlay_signals.get("sell_signals", []))
+                overlay_signals["strategy_type"] = overlay_strategy
+                strategy_sets[overlay_strategy] = overlay_signals
+            except Exception as exc:
+                logger.warning(f"K-line overlay signals for {code} with {overlay_strategy} failed: {exc}")
+                strategy_sets[overlay_strategy] = {
+                    "buy_signals": [],
+                    "sell_signals": [],
+                    "trailing_stops": [],
+                    "strategy_type": overlay_strategy,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                }
         
         # 记录已添加标记的日期，避免多线程重叠
         added_dates = set()
@@ -184,6 +203,7 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             "rf_filter": rf_filter_data,
             "markers": markers_data,
             "trailing_stops": trailing_stops_data,
+            "strategy_sets": strategy_sets,
             "price_action": price_action.get("summary", {}),
             "price_action_lines": price_action.get("lines", []),
             "chart_context": chart_context,

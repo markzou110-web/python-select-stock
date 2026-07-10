@@ -16,6 +16,7 @@ from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
 from core.price_action import build_price_action_annotations
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context, safe_float, track_high_since_entry
+from core.risk_constants import FIXED_STOP_LOSS_PCT  # 实盘硬止损，与回测同源
 from core.operation_plan import build_position_decision_snapshot, operation_bands, price_instruction
 from core.money_flow import get_stock_money_flow
 from core.audit_log import get_position_decision_timeline, record_position_decision_change
@@ -965,6 +966,7 @@ def get_stock_full_analysis(code: str):
         latest_trade_bucket = None
         latest_trade_eligible = None
         latest_final_trade_score = None
+        latest_display_trade_score = None
         latest_trade_blockers = None
         hold_days = 0
         pl_pct = 0.0
@@ -1078,6 +1080,7 @@ def get_stock_full_analysis(code: str):
                 latest_trade_bucket = detail.get("trade_bucket")
                 latest_trade_eligible = detail.get("trade_eligible")
                 latest_final_trade_score = detail.get("final_trade_score")
+                latest_display_trade_score = detail.get("display_trade_score")
                 latest_trade_blockers = detail.get("trade_blockers")
 
         close = current_price
@@ -1131,6 +1134,7 @@ def get_stock_full_analysis(code: str):
             "trade_bucket": latest_trade_bucket,
             "trade_eligible": latest_trade_eligible,
             "final_trade_score": latest_final_trade_score,
+            "display_trade_score": latest_display_trade_score,
             "trade_blockers": latest_trade_blockers,
             "sector_phase": latest_sector_phase,
             "sector_momentum_score": latest_sector_momentum_score,
@@ -1261,7 +1265,7 @@ def get_stock_full_analysis(code: str):
 def get_stock_signals(
     code: str,
     strategy: str = "squeeze",
-    stop_loss_pct: float = -8.0,
+    stop_loss_pct: float = FIXED_STOP_LOSS_PCT,
     take_profit_pct: float = 5.0,
     max_hold_days: int = 5,
 ):

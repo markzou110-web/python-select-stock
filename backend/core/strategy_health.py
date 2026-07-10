@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import json
 from typing import Any, Dict
 
 import pandas as pd
@@ -9,24 +10,38 @@ from core.pro_workflow import classify_strategy_health
 from core.risk_constants import FIXED_STOP_LOSS_PCT, TAKE_PROFIT_PCT
 
 
-def _apply_stop_take_model(price: float, future_closes: list[float]) -> float:
+def _apply_stop_take_model(price: float, future_bars: list[tuple[float, float, float]]) -> float:
     """简化止损/止盈模型：返回受保护后的 5 日收益（百分比）。
 
-    - 若 5 日内任一日收盘 ≤ 止损线（price * (1 + FIXED_STOP_LOSS_PCT/100)）→ 计为止损。
-    - 否则若 5 日内任一日收盘 ≥ 止盈线（price * (1 + TAKE_PROFIT_PCT/100)）→ 计为止盈。
+    - 按交易日顺序，用最低价/最高价判断止损和止盈。
+    - 同一交易日同时触发止损和止盈时按保守原则计为止损。
     - 否则取第 5 日实际收益。
     这样熔断指标反映"止损保护的经济性"，而非裸价格波动。
     """
-    if not future_closes or price <= 0:
+    if not future_bars or price <= 0:
         return 0.0
     stop_line = price * (1.0 + FIXED_STOP_LOSS_PCT / 100.0)   # e.g. 0.91 * price
     take_line = price * (1.0 + TAKE_PROFIT_PCT / 100.0)       # e.g. 1.15 * price
-    if any(c <= stop_line for c in future_closes):
-        return float(FIXED_STOP_LOSS_PCT)
-    if any(c >= take_line for c in future_closes):
-        return float(TAKE_PROFIT_PCT)
-    last = future_closes[-1]
+    for low, high, _close in future_bars:
+        if low <= stop_line:
+            return float(FIXED_STOP_LOSS_PCT)
+        if high >= take_line:
+            return float(TAKE_PROFIT_PCT)
+    last = future_bars[-1][2]
     return (last - price) / price * 100.0
+
+
+def _detail_value(value: Any, key: str, default: str = "UNKNOWN") -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = {}
+    return str((value or {}).get(key) or default)
+
+
+def _segment_key(strategy: str, regime: str, sector_phase: str) -> str:
+    return f"{strategy}|{regime}|{sector_phase}"
 
 
 def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
@@ -47,15 +62,21 @@ def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
         dialect = getattr(engine, "dialect", None)
         is_sqlite = bool(dialect) and dialect.name == "sqlite"
         if is_sqlite:
-            future_subquery = """(SELECT GROUP_CONCAT(d.close, ',')
-                    FROM daily_k d
-                    WHERE d.code = s.code AND d.date > s.date
-                    ORDER BY d.date ASC LIMIT 5) AS future_csv"""
+            future_subquery = """(SELECT GROUP_CONCAT(
+                        printf('%f:%f:%f', sub.low, sub.high, sub.close), ','
+                    ) FROM (
+                        SELECT d.low, d.high, d.close
+                        FROM daily_k d
+                        WHERE d.code = s.code AND d.date > s.date
+                        ORDER BY d.date ASC LIMIT 5
+                    ) sub) AS future_csv"""
         else:
             # PG: 先取5行（有序），再 string_agg
-            future_subquery = """(SELECT string_agg(sub.close::text, ',')
+            future_subquery = """(SELECT string_agg(
+                        CONCAT_WS(':', sub.low::text, sub.high::text, sub.close::text), ','
+                    )
                     FROM (
-                        SELECT d2.close
+                        SELECT d2.low, d2.high, d2.close
                         FROM daily_k d2
                         WHERE d2.code = s.code AND d2.date > s.date
                         ORDER BY d2.date ASC LIMIT 5
@@ -68,7 +89,7 @@ def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
             else "AND COALESCE((s.price_action_detail->>'research_eligible')::boolean, false) = true"
         )
         df = pd.read_sql(text(f"""
-            SELECT s.strategy_type, s.code, s.date, s.price,
+            SELECT s.strategy_type, s.code, s.date, s.price, s.price_action_detail,
                    {future_subquery}
             FROM scan_history s
             WHERE s.date >= :cutoff
@@ -79,26 +100,58 @@ def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
         return {"status": "error", "strategies": {}, "error": str(exc)}
 
     # 在 Python 端应用止损/止盈模型（跨库一致、易测试）
-    df["ret_5d"] = [
-        _apply_stop_take_model(float(p), [float(x) for x in csv.split(",")] if csv else [])
-        for p, csv in zip(df["price"], df.get("future_csv", []))
+    future_bars = [
+        [tuple(float(value) for value in bar.split(":")) for bar in csv.split(",")]
+        if csv else []
+        for csv in df.get("future_csv", [])
     ]
+    # 未满 5 个未来交易日的信号不参与健康判定，避免把未成熟样本记成 0% 收益。
+    df["ret_5d"] = [
+        _apply_stop_take_model(float(price), bars) if len(bars) >= 5 else None
+        for price, bars in zip(df["price"], future_bars)
+    ]
+    df["market_regime"] = df["price_action_detail"].apply(lambda value: _detail_value(value, "market_regime"))
+    df["sector_phase"] = df["price_action_detail"].apply(lambda value: _detail_value(value, "sector_phase"))
 
     strategies = {}
     for strategy, group in df.groupby("strategy_type", dropna=False):
         metrics = return_metrics(group["ret_5d"])
         strategies[str(strategy or "unknown")] = {**metrics, **classify_strategy_health(metrics)}
-    return {"status": "ok", "strategies": strategies}
+    segments = {}
+    for (strategy, regime, sector_phase), group in df.groupby(
+        ["strategy_type", "market_regime", "sector_phase"], dropna=False
+    ):
+        metrics = return_metrics(group["ret_5d"])
+        strategy_name = str(strategy or "unknown")
+        regime_name = str(regime or "UNKNOWN")
+        phase_name = str(sector_phase or "UNKNOWN")
+        segments[_segment_key(strategy_name, regime_name, phase_name)] = {
+            "strategy_type": strategy_name,
+            "market_regime": regime_name,
+            "sector_phase": phase_name,
+            **metrics,
+            **classify_strategy_health(metrics),
+        }
+    return {"status": "ok", "strategies": strategies, "segments": segments}
 
 
 def apply_strategy_health_controls(results: list[dict], health: Dict[str, Any]) -> None:
     strategies = health.get("strategies") or {}
+    segments = health.get("segments") or {}
     for row in results:
         strategy = str(row.get("strategy_type") or "unknown")
-        strategy_health = strategies.get(strategy)
+        segment_key = _segment_key(
+            strategy,
+            str(row.get("market_regime") or "UNKNOWN"),
+            str(row.get("sector_phase") or "UNKNOWN"),
+        )
+        segment_health = segments.get(segment_key)
+        strategy_health = segment_health if int((segment_health or {}).get("signals") or 0) >= 20 else strategies.get(strategy)
         if not strategy_health:
             continue
         row["strategy_health"] = strategy_health
+        row["strategy_health_segment"] = segment_key if strategy_health is segment_health else None
+        row["strategy_health_scope"] = "segment" if strategy_health is segment_health else "strategy"
         status = strategy_health.get("status")
         if status == "PAUSED":
             row["trade_eligible"] = False

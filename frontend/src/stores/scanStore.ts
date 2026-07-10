@@ -42,6 +42,8 @@ export interface ScanResult {
     sop_checks?: string[];
     sop_bonuses?: string[];
     sop_risks?: string[];
+    sop_quality_score?: number;
+    sop_subgrade?: string;
     entry_price?: number;
     stop_price?: number;
     plan_stop_price?: number;
@@ -187,7 +189,7 @@ export interface BacktestStats {
 }
 
 export interface ScanParams {
-    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp';
+    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp';
     pine_min_signals: number;
     min_data_days: number;
     threshold: number;

@@ -327,6 +327,24 @@ def test_stop_price_uses_signal_bar_low():
         assert stop < entry, "止损应低于入场价"
 
 
+def test_limit_up_bar_gets_executable_stop_distance():
+    from core.price_action import analyze_price_action
+    from core.indicators import calculate_indicators
+
+    closes = [60 + i * 0.15 for i in range(55)] + [68.0, 69.0, 70.0, 71.06, 78.17]
+    df = _ohlc_from_closes(closes)
+    last_idx = df.index[-1]
+    df.loc[last_idx, ["开盘", "最高", "最低", "收盘"]] = 78.17
+    df = calculate_indicators(df, periods=[5, 10, 20, 60])
+
+    summary = analyze_price_action(df)
+    entry = float(summary["pa_entry_price"])
+    stop = float(summary["pa_stop_price"])
+    risk_pct = (entry - stop) / entry * 100
+
+    assert 2.4 <= risk_pct <= 6.1
+
+
 def test_measured_move_target():
     """修复3: 有有效推力时目标 = entry + 推力距离（Brooks ME）。"""
     from core.price_action import analyze_price_action

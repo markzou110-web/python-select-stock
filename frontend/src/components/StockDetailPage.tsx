@@ -463,6 +463,13 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                 )}>
                                     {data.price_action.pa_trade_plan.action_label}
                                 </span>
+                                {data.price_action.pa_trade_plan.action === 'READY'
+                                    && info.trade_bucket
+                                    && info.trade_bucket !== 'TRADE' && (
+                                    <span className="text-[10px] font-bold text-slate-400">
+                                        (待执行确认)
+                                    </span>
+                                )}
                             </div>
                             <div className="text-base font-black text-slate-800">{data.price_action.pa_trade_plan.setup}</div>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-semibold text-slate-600">
@@ -595,9 +602,9 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                             {info.trade_bucket}
                                         </span>
                                     )}
-                                    {info.final_trade_score != null && (
+                                    {(info.display_trade_score ?? info.final_trade_score) != null && (
                                         <span className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-100 text-[10px] font-black text-slate-500">
-                                            交易分 {Number(info.final_trade_score).toFixed(0)}
+                                            交易分 {Number(info.display_trade_score ?? Math.min(100, info.final_trade_score)).toFixed(0)}
                                         </span>
                                     )}
                                 </div>

@@ -59,6 +59,13 @@ class ScanHistory(Base):
     pa_trade_action = Column(String(20), nullable=True)
     pa_trade_setup = Column(String(80), nullable=True)
     pa_risk_pct = Column(Float, nullable=True)
+    sop_grade = Column(String(10), nullable=True)
+    sop_quality_score = Column(Float, nullable=True)
+    sop_subgrade = Column(String(10), nullable=True)
+    sop_vetoes = Column(JSON, nullable=True)
+    sop_checks = Column(JSON, nullable=True)
+    sop_bonuses = Column(JSON, nullable=True)
+    sop_risks = Column(JSON, nullable=True)
     price_action_detail = Column(JSON, nullable=True)
 
 class PaperTrading(Base):
@@ -214,6 +221,9 @@ class RecommendationEvent(Base):
     pa_trade_setup = Column(String(80), nullable=True)
     pa_entry_price = Column(Float, nullable=True)
     pa_stop_price = Column(Float, nullable=True)
+    sector_strength_score = Column(Float, nullable=True)
+    stock_sector_fit_score = Column(Float, nullable=True)
+    sector_alignment_score = Column(Float, nullable=True)
     sector_phase = Column(String(40), nullable=True)
     market_regime = Column(String(30), nullable=True)
     blockers = Column(JSON, nullable=True)

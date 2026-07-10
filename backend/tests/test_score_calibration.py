@@ -88,3 +88,22 @@ def test_small_sample_win_rate_discount():
     assert SMALL_SAMPLE_WIN_RATE_DISCOUNT == 0.7
     # 样本3笔胜率100% → 折扣后 70%（原逻辑用100%严重高估）
     assert 100 * SMALL_SAMPLE_WIN_RATE_DISCOUNT == 70.0
+
+
+def test_parse_win_rate_prefers_reliability_adjusted():
+    """提高胜率区分度：优先用 Wilson 下界胜率，避免小样本虚高。
+
+    2 笔交易 100% 胜率 → Wilson 下界 ≈ 42.9%（而非虚高的 100%）。
+    回测统计缺失时才回退到原始 历史胜率 字符串。
+    """
+    from core.score_calibration import _parse_win_rate
+
+    # 优先用 adjusted_win_rate
+    row = {"历史胜率": "100%", "回测统计": {"adjusted_win_rate": 42.9}}
+    assert _parse_win_rate(row) == 42.9
+
+    # 回测统计缺失 → 回退原始字符串
+    assert _parse_win_rate({"历史胜率": "75%"}) == 75.0
+
+    # 无任何数据 → 中性 50
+    assert _parse_win_rate({}) == 50.0

@@ -32,6 +32,7 @@ from core.strategy import (
     check_strategy, check_pine_strategy, check_consensus_strategy,
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
 )
+from core.risk_constants import BACKTEST_STOP_LOSS_PCT  # 与实盘硬止损同源，保证回测胜率反映真实规则
 from core.celery_app import celery_app
 from core.scan_preflight import build_scan_preflight
 from core.audit_log import record_lifecycle_event, record_task_run
@@ -72,7 +73,7 @@ def run_market_scan_task(
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期 (10/20/30/60)
-    stop_loss_pct: float = -8.0,
+    stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
     require_live_snapshot: bool = False,
 ):
     from core.scanner import perform_market_scan
@@ -134,7 +135,7 @@ def scan_market(
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期
-    stop_loss_pct: float = -8.0
+    stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT
 ):
     """
     API Endpoint for market scan (Asynchronous via Celery)

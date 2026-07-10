@@ -7,6 +7,7 @@ config.setup_no_proxy()
 from celery.schedules import crontab
 from celery.signals import task_failure, task_postrun, task_prerun
 from datetime import datetime
+import json
 
 import redis
 
@@ -63,10 +64,39 @@ celery_app.conf.update(
             'schedule': crontab(hour=9, minute=35),
             'kwargs': {'slot': 'open_risk'},
         },
+        'theme-momentum-watch-0935': {
+            'task': 'tasks.theme_momentum_watch',
+            'schedule': crontab(hour=9, minute=35, day_of_week='1-5'),
+            'kwargs': {'slot': '09:35'},
+        },
+        'theme-momentum-watch-0945': {
+            'task': 'tasks.theme_momentum_watch',
+            'schedule': crontab(hour=9, minute=45, day_of_week='1-5'),
+            'kwargs': {'slot': '09:45'},
+        },
+        'theme-momentum-watch-1000': {
+            'task': 'tasks.theme_momentum_watch',
+            'schedule': crontab(hour=10, minute=0, day_of_week='1-5'),
+            'kwargs': {'slot': '10:00'},
+        },
         'intraday-morning-confirm-1030': {
             'task': 'tasks.intraday_monitor_checkpoint',
             'schedule': crontab(hour=10, minute=30),
             'kwargs': {'slot': 'morning_confirm'},
+        },
+        'noon-sync-1135': {
+            'task': 'tasks.noon_sync_scan_review',
+            'schedule': crontab(hour=11, minute=35, day_of_week='1-5'),
+            'kwargs': {'sync_first': True, 'run_review': False},
+        },
+        'noon-scan-review-1305': {
+            'task': 'tasks.noon_sync_scan_review',
+            'schedule': crontab(hour=13, minute=5, day_of_week='1-5'),
+            'kwargs': {'sync_first': False, 'run_review': True},
+        },
+        'early-value-independent-scan-1315': {
+            'task': 'tasks.early_value_scan',
+            'schedule': crontab(hour=13, minute=15, day_of_week='1-5'),
         },
         'intraday-candidate-scan-1420': {
             'task': 'tasks.intraday_monitor_checkpoint',
@@ -108,13 +138,14 @@ def audit_task_started(task_id=None, task=None, **kwargs):
 @task_postrun.connect
 def audit_task_finished(task_id=None, task=None, state=None, retval=None, **kwargs):
     from .audit_log import record_task_run
-    summary = f"{type(retval).__name__}"
-    if isinstance(retval, (list, dict)):
-        summary += f" count={len(retval)}"
+    summary = _task_result_summary(retval)
+    audit_status = str(state or "SUCCESS")
+    if audit_status == "SUCCESS" and isinstance(retval, dict) and retval.get("errors"):
+        audit_status = "SUCCESS_WITH_ERRORS"
     record_task_run(
         str(task_id or ""),
         getattr(task, "name", None),
-        str(state or "SUCCESS"),
+        audit_status,
         finished_at=datetime.now(),
         result_summary=summary,
     )
@@ -130,6 +161,38 @@ def audit_task_failed(task_id=None, sender=None, exception=None, **kwargs):
         finished_at=datetime.now(),
         error_message=str(exception or "unknown task failure"),
     )
+
+def _task_result_summary(retval) -> str:
+    if not isinstance(retval, dict):
+        summary = f"{type(retval).__name__}"
+        if isinstance(retval, list):
+            summary += f" count={len(retval)}"
+        return summary
+
+    keep_keys = (
+        "status", "reason", "slot", "sync", "scan_count", "scan_push",
+        "operation_alerts", "watch_alerts", "watch_status_push",
+        "pruned", "next_day_push", "bark_self_check", "codes", "bars",
+        "snapshot_bars", "eastmoney_bars", "errors", "source_paused", "sealed", "broken", "saved",
+        "notification", "count", "bark",
+    )
+    compact = {}
+    for key in keep_keys:
+        if key not in retval:
+            continue
+        value = retval.get(key)
+        if key == "sync" and value is not None:
+            value = str(value)[:160]
+        if key == "notification" and isinstance(value, dict):
+            value = {k: bool(v) for k, v in value.items()}
+        compact[key] = value
+    if not compact:
+        compact = {"type": "dict", "count": len(retval)}
+    try:
+        return json.dumps(compact, ensure_ascii=False, default=str)[:1000]
+    except Exception:
+        return f"dict count={len(retval)}"
+
 
 if __name__ == "__main__":
     celery_app.start()

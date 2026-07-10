@@ -45,6 +45,26 @@ def _insert_signal(engine, code, signal_date, price, future_closes, strategy="tv
             })
 
 
+def _insert_signal_bars(engine, code, signal_date, price, future_bars, strategy="tv_dual_strict"):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO scan_history (code, date, price, strategy_type, price_action_detail)
+            VALUES (:code, :date, :price, :st, '{"research_eligible": true}')
+        """), {"code": code, "date": signal_date, "price": price, "st": strategy})
+        for i, (open_, high, low, close) in enumerate(future_bars, start=1):
+            conn.execute(text("""
+                INSERT INTO daily_k (code, date, open, high, low, close, vol)
+                VALUES (:code, :date, :open, :high, :low, :close, 100000)
+            """), {
+                "code": code,
+                "date": signal_date + timedelta(days=i),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+            })
+
+
 def test_stop_loss_floor_applied_when_dropping_below_9pct():
     """信号后 5 日内跌破 -9% → ret_5d 计为 -9%（止损），而非实际更差的收益。
 
@@ -95,3 +115,60 @@ def test_normal_return_unchanged_within_bounds():
     assert strat is not None
     # 应为实际 +5%
     assert abs(strat["expected_return"] - 5.0) < 0.5
+
+
+def test_immature_signal_does_not_count_as_flat_return():
+    engine = _setup_engine()
+    _insert_signal(
+        engine,
+        "000004",
+        date.today() - timedelta(days=3),
+        10.0,
+        future_closes=[10.5, 10.6],
+    )
+
+    health = build_strategy_health(engine, days=30)
+
+    assert health["strategies"]["tv_dual_strict"]["signals"] == 0
+
+
+def test_take_profit_before_later_stop_is_counted_chronologically():
+    engine = _setup_engine()
+    _insert_signal_bars(
+        engine,
+        "000005",
+        date.today() - timedelta(days=10),
+        10.0,
+        future_bars=[
+            (10.2, 11.6, 10.1, 11.5),
+            (11.4, 11.5, 8.9, 9.0),
+            (9.0, 9.2, 8.8, 9.1),
+            (9.1, 9.3, 9.0, 9.2),
+            (9.2, 9.4, 9.1, 9.3),
+        ],
+    )
+
+    health = build_strategy_health(engine, days=30)
+
+    assert abs(health["strategies"]["tv_dual_strict"]["expected_return"] - TAKE_PROFIT_PCT) < 0.5
+
+
+def test_same_day_stop_and_take_uses_conservative_stop():
+    engine = _setup_engine()
+    _insert_signal_bars(
+        engine,
+        "000006",
+        date.today() - timedelta(days=10),
+        10.0,
+        future_bars=[
+            (10.0, 11.6, 9.0, 10.5),
+            (10.5, 10.8, 10.2, 10.6),
+            (10.6, 10.9, 10.4, 10.7),
+            (10.7, 11.0, 10.5, 10.8),
+            (10.8, 11.1, 10.6, 10.9),
+        ],
+    )
+
+    health = build_strategy_health(engine, days=30)
+
+    assert abs(health["strategies"]["tv_dual_strict"]["expected_return"] - FIXED_STOP_LOSS_PCT) < 0.5

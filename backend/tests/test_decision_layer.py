@@ -271,6 +271,30 @@ def test_risk_reward_score_no_data_fallback_neutral():
 
 
 # ---------------------------------------------------------------------------
+# 改动 D1: leadership relative 维度缩放过激修复（消除 46% 饱和）
+# ---------------------------------------------------------------------------
+def test_leadership_relative_score_not_saturated_at_5pct():
+    """D1: sector_relative_pct=5% 不应让 relative 维度撞顶满分。
+
+    原公式 *10 缩放：5% → 50+50=100 满分，实测 46% 股票饱和。
+    修复为 *5：5% → 75（中位），10% → 100，区分度大幅提升。
+    """
+    from core.decision_layer import _leadership_score
+
+    # 5% 跑赢板块（实际数据中位数 4.66%）
+    stock = _stock(sector_relative_pct=5.0, limit_up_status=None)
+    _leadership_score(stock)
+    comp = stock["leadership_components"]
+    assert comp["relative_strength"] < 100, f"5% 跑赢不应撞顶，实际 {comp['relative_strength']}"
+    assert 70 <= comp["relative_strength"] <= 85, f"5% 应落在 70-85 区间，实际 {comp['relative_strength']}"
+
+    # 10% 跑赢才接近满分
+    stock2 = _stock(sector_relative_pct=10.0, limit_up_status=None)
+    _leadership_score(stock2)
+    assert stock2["leadership_components"]["relative_strength"] >= 95
+
+
+# ---------------------------------------------------------------------------
 # 改动 A2: money_flow 评分市值归一化（消除大盘股系统性虚高）
 # ---------------------------------------------------------------------------
 

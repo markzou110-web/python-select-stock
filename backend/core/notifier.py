@@ -7,6 +7,7 @@ the Bark key is read from the BARK_KEY environment variable.
 """
 
 import os
+import time
 from typing import List, Optional
 
 import requests
@@ -20,6 +21,8 @@ from core.db import get_setting
 
 _BARK_ICON_URL = "https://i.imgur.com/8p4jA4w.png"
 _REQUEST_TIMEOUT = 10  # seconds
+_BARK_MAX_ATTEMPTS = 2
+_BARK_RETRY_DELAY_SECONDS = 0.4
 
 # Mapping from canonical channel name to the DB setting key that holds its
 # webhook URL.  Bark is excluded because its key comes from an env var.
@@ -157,19 +160,19 @@ class Notifier:
         if group:
             payload["group"] = group
 
-        try:
-            # Force bypass system proxies to avoid SSL handshake issues (like UNEXPECTED_EOF_WHILE_READING)
-            resp = requests.post(bark_url, json=payload, timeout=_REQUEST_TIMEOUT, proxies={"http": None, "https": None})
-            if resp.ok:
-                logger.info("Bark POST push sent successfully.")
-                return True
-            logger.warning(
-                f"Bark push returned HTTP {resp.status_code}: {resp.text}"
-            )
-            return False
-        except requests.RequestException as exc:
-            logger.error(f"Bark push failed: {exc}")
-            return False
+        for attempt in range(1, _BARK_MAX_ATTEMPTS + 1):
+            try:
+                # Force bypass system proxies to avoid SSL handshake issues (like UNEXPECTED_EOF_WHILE_READING)
+                resp = requests.post(bark_url, json=payload, timeout=_REQUEST_TIMEOUT, proxies={"http": None, "https": None})
+                if resp.ok:
+                    logger.info("Bark POST push sent successfully.")
+                    return True
+                logger.warning(f"Bark push returned HTTP {resp.status_code}: {resp.text}")
+            except requests.RequestException as exc:
+                logger.error(f"Bark push attempt {attempt} failed: {exc}")
+            if attempt < _BARK_MAX_ATTEMPTS:
+                time.sleep(_BARK_RETRY_DELAY_SECONDS)
+        return False
 
     @staticmethod
     def _send_feishu(title: str, body: str, url: Optional[str]) -> bool:

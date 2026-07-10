@@ -7,6 +7,8 @@ from datetime import datetime
 import time
 import threading
 import asyncio
+import hashlib
+import json
 
 from core.config import config
 from core.logging_config import logger
@@ -64,14 +66,72 @@ def _candidate_push_bucket(stock: Dict[str, Any]) -> str:
         return "可交易"
     if stock.get('trade_bucket') == 'BLOCK' or stock.get('trade_eligible') is False:
         return "禁止追买"
-    if stock.get('sop_grade') in ('A', 'B'):
-        return "可交易"
     return "观察"
+
+
+def _load_recommendation_priority_adjustments(days: int = 120) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Load closed-loop adjustment advice for Bark display ranking only."""
+    try:
+        from routers.review import get_recommendation_outcome_loop
+
+        payload = get_recommendation_outcome_loop(days=days)
+        adjustments = payload.get("adjustments") or {}
+
+        def useful(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+            return {
+                str(item.get("value") or "UNKNOWN"): item
+                for item in items
+                if item.get("action") in {"BOOST", "DOWNWEIGHT"} and item.get("score_delta")
+            }
+
+        return {
+            "source": useful(adjustments.get("by_source") or []),
+            "strategy": useful(adjustments.get("by_strategy") or []),
+        }
+    except Exception as exc:
+        logger.debug(f"Recommendation priority adjustment unavailable: {exc}")
+        return {"source": {}, "strategy": {}}
+
+
+def _push_priority_adjustment(
+    stock: Dict[str, Any],
+    push_source: str,
+    adjustments: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    if not adjustments:
+        return {"delta": 0, "notes": []}
+    source_item = (adjustments.get("source") or {}).get(push_source)
+    strategy = str(stock.get("strategy_type") or "UNKNOWN")
+    strategy_item = (adjustments.get("strategy") or {}).get(strategy)
+    items = [item for item in (source_item, strategy_item) if item]
+    delta = sum(int(item.get("score_delta") or 0) for item in items)
+    notes = []
+    for item in items:
+        score_delta = int(item.get("score_delta") or 0)
+        if score_delta:
+            notes.append(f"{item.get('dimension')} {item.get('value')} {score_delta:+d}")
+    return {"delta": delta, "notes": notes}
+
+
+def _annotate_push_priority(
+    stock: Dict[str, Any],
+    push_source: str,
+    adjustments: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    adjustment = _push_priority_adjustment(stock, push_source, adjustments)
+    if not adjustment["delta"]:
+        return stock
+    annotated = dict(stock)
+    annotated["bark_priority_delta"] = adjustment["delta"]
+    annotated["bark_priority_note"] = "；".join(adjustment["notes"])
+    return annotated
 
 
 def _candidate_brief_action(stock: Dict[str, Any]) -> str:
     if stock.get('trade_bucket') == 'TRADE' or stock.get('trade_eligible') is True:
         return "可小仓复核"
+    if stock.get('trade_bucket') == 'EARLY' or stock.get('early_trade_candidate'):
+        return "提前复核"
     if stock.get('trade_bucket') == 'BLOCK' or stock.get('trade_eligible') is False:
         return "禁止买入"
     action = stock.get('pa_trade_action')
@@ -82,6 +142,28 @@ def _candidate_brief_action(stock: Dict[str, Any]) -> str:
     if action == "AVOID":
         return "回避"
     return "只观察"
+
+
+def _candidate_grade_label(stock: Dict[str, Any]) -> str:
+    explicit = str(stock.get("grade_label") or "").strip()
+    if explicit:
+        return explicit
+    grade = str(stock.get("early_trade_grade") or stock.get("sop_grade") or "?").upper()
+    if stock.get("trade_bucket") == "TRADE" or stock.get("trade_eligible") is True:
+        return f"{grade}级可交易"
+    if stock.get("trade_bucket") == "EARLY" or stock.get("early_trade_candidate"):
+        return f"{grade}级提前复核"
+    return f"{grade}级结构"
+
+
+def _candidate_display_score(stock: Dict[str, Any]) -> Optional[float]:
+    value = stock.get("display_trade_score")
+    if value is None:
+        value = stock.get("final_trade_score")
+    try:
+        return round(max(0.0, min(100.0, float(value))), 1) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _candidate_brief_reason(stock: Dict[str, Any]) -> str:
@@ -131,34 +213,73 @@ def _is_high_extension(stock: Dict[str, Any]) -> bool:
 def _no_chase_line(stock: Dict[str, Any]) -> Optional[str]:
     if not _is_high_extension(stock):
         return None
-    support = stock.get("pa_pullback_support_price")
     entry = stock.get("entry_price") or stock.get("pa_entry_price") or stock.get("pa_pullback_confirmation_price")
-    support_text = support if support else "--"
+    stop = stock.get("plan_stop_price") or stock.get("stop_price") or stock.get("pa_stop_price")
     entry_text = entry if entry else "--"
-    return f"  追高规则：不追高；回踩不破支撑{support_text}，放量站上确认价{entry_text}再考虑"
+    stop_text = stop if stop else "--"
+    return f"  追高规则：不追高；等待回踩后重新站上{entry_text}，跌破{stop_text}取消"
 
 
 def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
-    grade = stock.get('sop_grade', '?')
+    grade_label = _candidate_grade_label(stock)
     name = stock.get('名称', stock.get('name', ''))
     code = stock.get('代码', stock.get('code', ''))
     action = _candidate_brief_action(stock)
     price = stock.get('现价') or stock.get('price')
     entry = stock.get('entry_price') or stock.get('pa_entry_price')
-    support = stock.get('pa_pullback_support_price')
     stop = stock.get('plan_stop_price') or stock.get('stop_price') or stock.get('pa_stop_price')
-    final_score = stock.get('final_trade_score')
-    score_text = f" | 交易分{final_score}" if final_score is not None else ""
-    lines = [f"{action}｜{grade}级 {name}({code}){score_text}"]
+    display_score = _candidate_display_score(stock)
+    score_text = f" | 展示分{display_score:g}" if display_score is not None else ""
+    lines = [f"{action}｜{grade_label} {name}({code}){score_text}"]
     lines.append(
         f"  现价{price if price else '--'}｜确认>{entry if entry else '--'}"
-        f"｜支撑{support if support else '--'}｜失效<{stop if stop else '--'}"
+        f"｜有效失效<{stop if stop else '--'}"
     )
     lines.append(f"  原因：{_candidate_brief_reason(stock)}")
+    if stock.get("bark_priority_note"):
+        lines.append(f"  闭环调权：{stock['bark_priority_note']}，仅影响推送排序")
+    if stock.get("early_trade_candidate") and stock.get("early_trade_reason"):
+        lines.append(f"  提前复核：{stock['early_trade_reason']}；仅小仓，不追高")
     chase_line = _no_chase_line(stock)
     if chase_line:
         lines.append(chase_line)
     return lines
+
+
+def _intraday_state_fingerprint(stocks: List[Dict[str, Any]], regime: Dict[str, Any]) -> str:
+    state = []
+    for stock in sorted(stocks, key=lambda item: str(item.get("代码") or item.get("code") or "")):
+        blockers = stock.get("trade_blockers") or []
+        if isinstance(blockers, str):
+            blockers = [blockers]
+        state.append({
+            "code": stock.get("代码") or stock.get("code"),
+            "action": _candidate_brief_action(stock),
+            "bucket": stock.get("trade_bucket"),
+            "grade": stock.get("grade_stage") or stock.get("sop_grade"),
+            "blockers": [str(item) for item in blockers[:2]],
+            "health": (stock.get("strategy_health") or {}).get("status"),
+        })
+    payload = {"regime": regime.get("status"), "stocks": state}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _should_send_intraday_state(fingerprint: str, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if (
+        get_setting("sentinel_bark_state_date") == today
+        and get_setting("sentinel_bark_state_fingerprint") == fingerprint
+    ):
+        return False
+    return True
+
+
+def _mark_intraday_state_sent(fingerprint: str, now: Optional[datetime] = None) -> None:
+    now = now or datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    save_setting("sentinel_bark_state_date", today)
+    save_setting("sentinel_bark_state_fingerprint", fingerprint)
 
 
 def _brooks_alert_line(stock: Dict[str, Any]) -> Optional[str]:
@@ -329,18 +450,26 @@ def _position_price_instruction(
     )
 
 
-def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_limit: int = 5, sector_watch_limit: int = 3) -> List[Dict[str, Any]]:
+def _select_intraday_push_stocks(
+    stock_list: List[Dict[str, Any]],
+    executable_limit: int = 5,
+    sector_watch_limit: int = 3,
+    priority_adjustments: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    push_source: str = "bark",
+) -> List[Dict[str, Any]]:
     """
     Keep executable candidates and sector-confirmed observation candidates in Bark.
     Sector-watch stocks are observation-only, so they get a separate quota instead of
     competing with A/B/M executable names.
     """
-    grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4, '?': 5}
+    grade_order = {'A': 0, 'A-': 1, 'B': 2, 'M': 3, 'C': 4, 'D': 5, '?': 6}
 
     def rank_key(stock: Dict[str, Any]):
+        adjustment = _push_priority_adjustment(stock, push_source, priority_adjustments)
+        effective_score = float(stock.get('final_rank_score', stock.get('Score', 0)) or 0) + float(adjustment["delta"] or 0)
         return (
             grade_order.get(stock.get('sop_grade', '?'), 5),
-            -float(stock.get('final_rank_score', stock.get('Score', 0)) or 0),
+            -effective_score,
         )
 
     executable = [
@@ -348,8 +477,14 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
         if (
             not s.get('sector_watch_only')
             and s.get('sop_grade') in ('A', 'B', 'M', 'C')
-            and s.get('trade_bucket') != 'BLOCK'
-            and s.get('trade_eligible') is not False
+            and (s.get('trade_bucket') == 'TRADE' or s.get('trade_eligible') is True)
+        )
+    ]
+    early = [
+        s for s in stock_list
+        if (
+            not s.get('sector_watch_only')
+            and (s.get('trade_bucket') == 'EARLY' or s.get('early_trade_candidate'))
         )
     ]
     blocked = [
@@ -369,6 +504,7 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
     seen_codes = set()
     for group, limit in (
         (sorted(executable, key=rank_key), executable_limit),
+        (sorted(early, key=rank_key), max(1, sector_watch_limit)),
         (sorted(sector_watch, key=rank_key), sector_watch_limit),
         (sorted(blocked, key=rank_key), max(1, sector_watch_limit)),
     ):
@@ -377,7 +513,7 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
             code = stock.get('代码') or stock.get('code')
             if code in seen_codes:
                 continue
-            selected.append(stock)
+            selected.append(_annotate_push_priority(stock, push_source, priority_adjustments))
             seen_codes.add(code)
             picked += 1
             if picked >= limit:
@@ -385,7 +521,12 @@ def _select_intraday_push_stocks(stock_list: List[Dict[str, Any]], executable_li
     return selected
 
 
-def _select_after_close_watchlist(stock_list: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
+def _select_after_close_watchlist(
+    stock_list: List[Dict[str, Any]],
+    limit: int = 5,
+    priority_adjustments: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    push_source: str = "bark_next_day",
+) -> List[Dict[str, Any]]:
     """Select next-day observation candidates without presenting blocked stocks as opportunities."""
     grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4}
     candidates = [
@@ -399,13 +540,17 @@ def _select_after_close_watchlist(stock_list: List[Dict[str, Any]], limit: int =
             and not stock.get('sector_watch_only')
         )
     ]
-    return sorted(
+    selected = sorted(
         candidates,
         key=lambda stock: (
             grade_order.get(stock.get('sop_grade'), 4),
-            -float(stock.get('final_trade_score', stock.get('Score', 0)) or 0),
+            -(
+                float(stock.get('final_trade_score', stock.get('Score', 0)) or 0)
+                + float(_push_priority_adjustment(stock, push_source, priority_adjustments)["delta"] or 0)
+            ),
         ),
     )[:limit]
+    return [_annotate_push_priority(stock, push_source, priority_adjustments) for stock in selected]
 
 
 def _after_close_price(stock: Dict[str, Any], *keys: str) -> Optional[float]:
@@ -419,7 +564,28 @@ def _after_close_price(stock: Dict[str, Any], *keys: str) -> Optional[float]:
     return None
 
 
-def _build_after_close_watchlist_body(stock_list: List[Dict[str, Any]], scan_date: str) -> str:
+def _sector_push_gap_lines(gap_items: Optional[List[Dict[str, Any]]], limit: int = 3) -> List[str]:
+    if not gap_items:
+        return []
+    gaps = [item for item in gap_items if not item.get("has_push_candidate")]
+    if not gaps:
+        return []
+    lines = ["热门板块未推原因："]
+    for item in gaps[:limit]:
+        industry = item.get("industry") or "--"
+        reason = item.get("primary_reason_label") or "继续观察"
+        score = item.get("sector_momentum_score", "--")
+        candidate_count = item.get("scan_candidate_count", 0)
+        lines.append(f"  {industry}：{reason} | 板块分 {score} | 候选 {candidate_count}只")
+    lines.append("")
+    return lines
+
+
+def _build_after_close_watchlist_body(
+    stock_list: List[Dict[str, Any]],
+    scan_date: str,
+    sector_gap_analysis: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     first = stock_list[0] if stock_list else {}
     lines = [
         f"数据日期：{scan_date}",
@@ -428,13 +594,13 @@ def _build_after_close_watchlist_body(stock_list: List[Dict[str, Any]], scan_dat
         "执行：次日仅在触发价上方站稳且量能确认后复核，跌破失效价立即取消计划。",
         "",
     ]
+    lines.extend(_sector_push_gap_lines(sector_gap_analysis))
     for stock in stock_list:
         name = stock.get('名称') or stock.get('name') or ''
         code = stock.get('代码') or stock.get('code') or ''
-        grade = stock.get('sop_grade') or '?'
+        grade_label = _candidate_grade_label(stock)
         current = _after_close_price(stock, '现价', 'price')
         entry = _after_close_price(stock, 'entry_price', 'pa_entry_price')
-        support = _after_close_price(stock, 'pa_pullback_support_price')
         stop = _after_close_price(stock, 'plan_stop_price', 'stop_price', 'pa_stop_price', 'pa_pullback_invalidation_price')
         blockers = stock.get('trade_blockers') or []
         if isinstance(blockers, str):
@@ -442,18 +608,20 @@ def _build_after_close_watchlist_body(stock_list: List[Dict[str, Any]], scan_dat
         else:
             blocker_text = "、".join(str(item) for item in blockers[:2])
 
-        lines.append(f"【{grade}级观察】{name} ({code}) | 收盘 {current if current else '--'}")
+        lines.append(f"【{grade_label}｜等待确认】{name} ({code}) | 收盘 {current if current else '--'}")
         lines.append(
             f"  定位：{stock.get('sector_mainline', '--')} / {stock.get('sector_role', '--')}"
             f" | 机会分 {stock.get('trade_opportunity_score', '--')} | {stock.get('trade_opportunity_label', '观望')}"
         )
         lines.append(
             f"  关键价：现价 {current if current else '--'} | 确认 >{entry if entry else '--'}"
-            f" | 支撑 {support if support else '--'} | 失效 <{stop if stop else '--'}"
+            f" | 有效失效 <{stop if stop else '--'}"
         )
         lines.append(f"  确认：站稳 >{entry if entry else '--'} 且量能确认，再考虑小仓复核")
         lines.append(f"  失效：跌破 <{stop if stop else '--'}，取消观察/不得买入")
         lines.append(f"  当前：等待确认，不追高{f'；原因：{blocker_text}' if blocker_text else ''}")
+        if stock.get("bark_priority_note"):
+            lines.append(f"  闭环调权：{stock['bark_priority_note']}，仅影响推送排序")
         chase_line = _no_chase_line(stock)
         if chase_line:
             lines.append(chase_line)
@@ -485,12 +653,32 @@ def send_after_close_watchlist(
         logger.info("Sentinel: after-close watchlist already pushed today.")
         return None
 
-    selected = _select_after_close_watchlist(stock_list, limit=limit)
+    priority_adjustments = _load_recommendation_priority_adjustments()
+    selected = _select_after_close_watchlist(
+        stock_list,
+        limit=limit,
+        priority_adjustments=priority_adjustments,
+        push_source="bark_next_day",
+    )
     if not selected:
         logger.info("Sentinel: no qualified after-close observation candidates.")
         return None
 
-    body = _build_after_close_watchlist_body(selected, today)
+    sector_gap_analysis: List[Dict[str, Any]] = []
+    try:
+        from core.sector_push_analysis import build_hot_sector_push_gap_analysis
+        from routers.market import get_sector_strength
+
+        sector_payload = get_sector_strength(limit=20, force=False)
+        sector_gap_analysis = build_hot_sector_push_gap_analysis(
+            sector_payload.get("items", []),
+            stock_list,
+            limit=5,
+        )
+    except Exception as exc:
+        logger.warning(f"After-close sector push gap analysis skipped: {exc}")
+
+    body = _build_after_close_watchlist_body(selected, today, sector_gap_analysis)
     try:
         from core.db import get_db_engine, save_recommendation_events
         save_recommendation_events(
@@ -513,8 +701,8 @@ def _send_bark_message(title: str, body: str) -> bool:
 
     from core.notifier import notifier
     try:
-        asyncio.run(notifier.send(title, body, channels=["bark"]))
-        return True
+        result = asyncio.run(notifier.send(title, body, channels=["bark"]))
+        return bool(result.get("bark"))
     except Exception as e:
         logger.error(f"Push notification failed: {e}")
         return False
@@ -820,7 +1008,12 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         logger.info("Sentinel: Market is closed, skip Bark intraday notification.")
         return None
 
-    push_stocks = _select_intraday_push_stocks(stock_list)
+    priority_adjustments = _load_recommendation_priority_adjustments()
+    push_stocks = _select_intraday_push_stocks(
+        stock_list,
+        priority_adjustments=priority_adjustments,
+        push_source="bark",
+    )
     if not push_stocks:
         logger.info("Sentinel: No A/B/M/C or sector-watch stocks to push.")
         return None
@@ -829,6 +1022,10 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     from core.data import get_market_regime, get_market_snapshot, format_freshness
     regime = get_market_regime()
     market_line = _format_market_line(push_stocks, regime)
+    fingerprint = _intraday_state_fingerprint(push_stocks, regime)
+    if not _should_send_intraday_state(fingerprint):
+        logger.info("Sentinel: Bark state unchanged, skip duplicate intraday push.")
+        return None
     try:
         from core.db import get_db_engine, save_recommendation_events
         save_recommendation_events(
@@ -859,6 +1056,10 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
 
     # P1：用真实行情时间戳替换静态"实时快照"行（走 60s 缓存）
     freshness_line = format_freshness(get_market_snapshot())
+    all_paused = bool(push_stocks) and all(
+        (stock.get("strategy_health") or {}).get("status") == "PAUSED"
+        for stock in push_stocks
+    )
     lines = [
         f"大盘：{market_line}",
         (
@@ -867,8 +1068,16 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
             f" | 总仓上限 {push_stocks[0].get('portfolio_position_cap_pct', '--')}%"
         ),
         f"策略：{strategy_label} | {freshness_line}",
-        "先看动作：可小仓复核才考虑；只观察/禁止买入都不下单。",
-        "买入条件：站稳确认价 + 量能确认 + 无冲高回落。",
+        (
+            "模式：策略暂停研究模式；以下仅用于跟踪，不产生买入指令。"
+            if all_paused
+            else "先看动作：仅“可小仓复核”属于执行候选；其余不下单。"
+        ),
+        (
+            "恢复条件：分层健康度恢复且当日交易条件全部通过。"
+            if all_paused
+            else "买入条件：站稳确认价 + 量能确认 + 无冲高回落。"
+        ),
         "",
     ]
     section_titles = {
@@ -905,7 +1114,8 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     _append_real_position_status(lines)
 
     body = "\n".join(lines)
-    _send_bark_message(title, body)
+    if _send_bark_message(title, body):
+        _mark_intraday_state_sent(fingerprint)
     return body
 
 

@@ -126,7 +126,7 @@ def build_position_decision_snapshot(
         confidence = 0.95
     elif active_stop > 0 and current <= active_stop:
         threshold = active_stop
-        if risk_stage in {"保本保护", "移动风控", "强盈利收紧"}:
+        if risk_stage in {"保本移动", "保本保护", "移动风控", "强盈利收紧"}:
             action = "REDUCE"
             trigger = f"现价 {current:.2f} 跌破{risk_stage}线 {active_stop:.2f}"
         else:

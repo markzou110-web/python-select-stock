@@ -5,11 +5,12 @@ from core.risk_constants import (
     FIXED_STOP_LOSS_PCT, TIER_HIGH_PROFIT_PCT,
     VOLUME_CLIMAX_MULTIPLIER, BACKTEST_MAX_HOLD_DAYS,
     BACKTEST_TRAILING_ATR_MULT,
-    ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT
+    ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT,
+    BACKTEST_STOP_LOSS_PCT,
 )
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context
 
-STRATEGY_LOGIC_VERSION = "2026.05-brooks-pine5"
+STRATEGY_LOGIC_VERSION = "2026.07-tv-source-aligned"
 BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
 EXIT_RULE_VERSION = "fixed-stop-atr-trailing-time-stop"
 
@@ -60,7 +61,7 @@ def _wilson_lower_win_rate(wins: int, total: int, z: float = 2.58) -> float:
 def get_signal_details(
     df: pd.DataFrame,
     strategy_type: str = "squeeze",
-    stop_loss_pct: float = -8.0,
+    stop_loss_pct: float = FIXED_STOP_LOSS_PCT,
     take_profit_pct: float = 5.0,
     max_hold_days: int = 5,
     threshold: float = 0.12,
@@ -261,9 +262,9 @@ def _find_all_signal_indices(
 
 def _squeeze_tv_macd(df: pd.DataFrame) -> pd.DataFrame:
     close = df['收盘']
-    dif = close.ewm(span=8, adjust=False).mean() - close.ewm(span=15, adjust=False).mean()
+    dif = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
     dea = dif.ewm(span=9, adjust=False).mean()
-    hist = (dif - dea) * 2
+    hist = dif - dea
     return pd.DataFrame({"dif": dif, "dea": dea, "hist": hist}, index=df.index)
 
 
@@ -281,6 +282,29 @@ def _squeeze_tv_rsi(df: pd.DataFrame) -> pd.Series:
     return rsi
 
 
+def _squeeze_weekly_trend_ok(df: pd.DataFrame) -> pd.Series:
+    """Replicate request.security(..., "W", ta.ema(close, n)[1]) for the MA strategy."""
+    if '日期' not in df.columns or '收盘' not in df.columns:
+        return pd.Series(True, index=df.index)
+
+    dated = df[['日期', '收盘']].copy()
+    dated['_date'] = pd.to_datetime(dated['日期'], errors='coerce')
+    valid = dated.dropna(subset=['_date']).sort_values('_date')
+    if valid.empty:
+        return pd.Series(True, index=df.index)
+
+    weekly_close = valid.set_index('_date')['收盘'].astype(float).resample('W-FRI').last().dropna()
+    if weekly_close.empty:
+        return pd.Series(True, index=df.index)
+
+    ma10w = weekly_close.ewm(span=10, adjust=False).mean().shift(1)
+    ma30w = weekly_close.ewm(span=30, adjust=False).mean().shift(1)
+    weekly_ok = (ma10w > ma30w).reindex(valid['_date'], method='ffill').astype("boolean").fillna(False).astype(bool)
+    mapped = pd.Series(False, index=valid.index)
+    mapped.loc[valid.index] = weekly_ok.to_numpy()
+    return mapped.reindex(df.index).fillna(False).astype(bool)
+
+
 def _find_squeeze_signal_indices(
     df: pd.DataFrame,
     threshold: float,
@@ -289,29 +313,34 @@ def _find_squeeze_signal_indices(
     use_macd_filter: bool = True,
     use_bb_sqz: bool = False,
     sqz_lookback: int = 10,
-    use_rs_filter: bool = False,
+    use_rs_filter: bool = True,
+    use_weekly_filter: bool = True,
 ) -> List[int]:
     """均线粘合策略的信号索引，对齐 TradingView MACD 优化版。"""
-    ma_cols = ['EMA5', 'EMA20', 'EMA60']
+    ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
     if not all(c in df.columns for c in ma_cols):
         return []
 
     ma_max = df[ma_cols].max(axis=1)
-    c_breakout = (df['收盘'] >= ma_max) & (df['收盘'] > df['开盘'])
-    c_volume = (df['成交量'] / df['Vol_MA20'].replace(0, np.nan)) >= vol_multiplier
-    c_rsi = _squeeze_tv_rsi(df) >= rsi_min
+    c_weekly = _squeeze_weekly_trend_ok(df) if use_weekly_filter else pd.Series(True, index=df.index)
+    c_breakout = (df['收盘'] > ma_max) & (df['收盘'] > df['EMA5'])
+    c_volume = ((df['成交量'] > df['Vol_MA20'].replace(0, np.nan) * vol_multiplier) & (df['收盘'] > df['开盘'])).fillna(False)
+    c_rsi = _squeeze_tv_rsi(df) > rsi_min
     macd = _squeeze_tv_macd(df)
-    c_macd = ((macd['hist'] > 0) & (macd['hist'].shift(1) <= 0)) if use_macd_filter else pd.Series(True, index=df.index)
+    c_macd = (macd['dif'] > macd['dea']) if use_macd_filter else pd.Series(True, index=df.index)
     sqz_ratio = (df[ma_cols].max(axis=1) - df[ma_cols].min(axis=1)) / df[ma_cols].min(axis=1).replace(0, np.nan)
-    c_sqz = sqz_ratio.rolling(sqz_lookback).min() < threshold
+    c_sqz = sqz_ratio.rolling(sqz_lookback + 1, min_periods=1).min() < threshold
     c_bb = pd.Series(True, index=df.index)
     if use_bb_sqz and 'BB_Width' in df.columns:
         c_bb = df['BB_Width'] <= df['BB_Width'].rolling(120).quantile(0.2)
-    c_rs = pd.Series(True, index=df.index)
-    if use_rs_filter and 'RS' in df.columns and 'RS_MA50' in df.columns:
+    if use_rs_filter:
+        if 'RS' not in df.columns or 'RS_MA50' not in df.columns:
+            return []
         c_rs = df['RS'] > df['RS_MA50']
+    else:
+        c_rs = pd.Series(True, index=df.index)
 
-    mask = c_breakout & c_volume & c_rsi & c_macd & c_sqz & c_bb & c_rs
+    mask = c_weekly & c_sqz & c_breakout & c_volume & c_rsi & c_rs & c_macd & c_bb
     valid = df.index[mask & (df.index >= 120)]
     return valid.tolist()
 
@@ -367,7 +396,7 @@ def _tv_rsi(close: pd.Series, length: int) -> pd.Series:
     return rsi.fillna(50)
 
 
-def _tv_zp_range_filter_default(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+def _tv_zp_range_filter_default(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
     """TradingView ZP 默认 Range Filter: per=100, mult=3."""
     close = df["收盘"].astype(float).reset_index(drop=True)
     abs_diff = close.diff().abs().fillna(0)
@@ -382,7 +411,7 @@ def _tv_zp_range_filter_default(df: pd.DataFrame) -> tuple[pd.Series, pd.Series,
     downward = np.zeros(len(close), dtype=int)
     if len(close) == 0:
         empty = pd.Series(dtype=bool, index=df.index)
-        return empty, empty, pd.Series(dtype=float, index=df.index)
+        return empty, empty, pd.Series(dtype=float, index=df.index), pd.Series(dtype=int, index=df.index), pd.Series(dtype=int, index=df.index)
 
     filt[0] = close.iloc[0]
     for i in range(1, len(close)):
@@ -410,6 +439,8 @@ def _tv_zp_range_filter_default(df: pd.DataFrame) -> tuple[pd.Series, pd.Series,
         pd.Series(rf_up.to_numpy(), index=df.index).fillna(False),
         pd.Series(rf_down.to_numpy(), index=df.index).fillna(False),
         pd.Series(filt, index=df.index),
+        pd.Series(upward, index=df.index),
+        pd.Series(downward, index=df.index),
     )
 
 
@@ -499,22 +530,41 @@ def _apply_tv_zp_expiry_and_alternate(
     long_cond: pd.Series,
     short_cond: pd.Series,
     expiry: int = 3,
+    alternate_signal: bool = True,
+    long_expiry_count: Optional[pd.Series] = None,
+    short_expiry_count: Optional[pd.Series] = None,
 ) -> tuple[List[int], List[int]]:
-    long_count = _count_consecutive_true(leading_long)
-    short_count = _count_consecutive_true(leading_short)
+    long_count = long_expiry_count if long_expiry_count is not None else _count_consecutive_true(leading_long)
+    short_count = short_expiry_count if short_expiry_count is not None else _count_consecutive_true(leading_short)
     long_with_expiry = long_cond.fillna(False).astype(bool) & (long_count <= expiry)
     short_with_expiry = short_cond.fillna(False).astype(bool) & (short_count <= expiry)
 
     long_indices: List[int] = []
     short_indices: List[int] = []
-    state = 0
+    cond_ini = 0
+    prev_long_condition = False
     for idx, (is_long, is_short) in enumerate(zip(long_with_expiry, short_with_expiry)):
-        if is_long and state != 1:
+        prev_cond_ini = cond_ini
+        if alternate_signal:
+            long_condition = bool(is_long and prev_cond_ini == -1)
+            short_condition = bool(is_short and prev_cond_ini == 1)
+        else:
+            long_condition = bool(is_long)
+            short_condition = bool(is_short)
+
+        # TradingView 源码对 long plotshape 有 longCondition[1] 抑制，short 没有同样抑制。
+        if long_condition and not prev_long_condition:
             long_indices.append(int(long_with_expiry.index[idx]))
-            state = 1
-        elif is_short and state != -1:
+        if short_condition:
             short_indices.append(int(short_with_expiry.index[idx]))
-            state = -1
+
+        if is_long:
+            cond_ini = 1
+        elif is_short:
+            cond_ini = -1
+        else:
+            cond_ini = prev_cond_ini
+        prev_long_condition = long_condition
 
     return long_indices, short_indices
 
@@ -528,7 +578,7 @@ def _find_tv_zp_signal_indices(df: pd.DataFrame) -> tuple[List[int], List[int], 
     if df is None or df.empty or not {"收盘", "成交量"}.issubset(df.columns):
         return [], [], {}
 
-    leading_long, leading_short, rf_filter = _tv_zp_range_filter_default(df)
+    leading_long, leading_short, rf_filter, rf_up_age, rf_down_age = _tv_zp_range_filter_default(df)
     vol_ma = df.get("Vol_MA20", df["成交量"].rolling(20).mean()).replace(0, np.nan)
     volume_confirm = (df["成交量"] > vol_ma).fillna(False)
     qqe_long, qqe_short = _tv_zp_qqe_line_bar_series(df)
@@ -541,12 +591,16 @@ def _find_tv_zp_signal_indices(df: pd.DataFrame) -> tuple[List[int], List[int], 
         long_cond=long_cond,
         short_cond=short_cond,
         expiry=3,
+        long_expiry_count=rf_up_age,
+        short_expiry_count=rf_down_age,
     )
 
     long_indices = [idx for idx in long_indices if idx >= 120]
     short_indices = [idx for idx in short_indices if idx >= 120]
     return long_indices, short_indices, {
         "rf_filter": rf_filter,
+        "rf_up_age": rf_up_age,
+        "rf_down_age": rf_down_age,
         "leading_long": leading_long,
         "leading_short": leading_short,
         "volume_confirm": volume_confirm,
@@ -623,7 +677,9 @@ def run_optimization_grid(
     if param_x_values is None:
         param_x_values = [50, 55, 60, 65]
     if param_y_values is None:
-        param_y_values = [-5, -8, -10, -12]
+        # 改动：网格必须覆盖实盘止损 FIXED_STOP_LOSS_PCT(-9.0)，否则"最优"参数与真实交易脱节，
+        # 且对 -8% 这种已被弃用的值寻优会产生误导性的"最优止损"。
+        param_y_values = [-5, -7, -9, -11, -13]
 
     x_labels = [str(v) for v in param_x_values]
     y_labels = [str(v) for v in param_y_values]
@@ -642,7 +698,8 @@ def run_optimization_grid(
                 low_vals=df['最低'].values,
                 signal_indices=signal_indices,
                 stop_loss_pct=float(y_val),
-                atr_vals=df['ATR'].values if 'ATR' in df.columns else None
+                atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+                open_vals=df['开盘'].values if '开盘' in df.columns else None
             )
             row_results.append(bt["win_rate"])
         values.append(row_results)
@@ -693,28 +750,33 @@ def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param
 
 
 def _simulate_backtest(
-    close_vals, high_vals, low_vals, signal_indices, 
-    stop_loss_pct=-8.0, max_hold_days=BACKTEST_MAX_HOLD_DAYS,
+    close_vals, high_vals, low_vals, signal_indices,
+    stop_loss_pct=BACKTEST_STOP_LOSS_PCT, max_hold_days=BACKTEST_MAX_HOLD_DAYS,
     atr_vals=None, vol_vals=None,
     use_trailing_stop=True, trailing_multiplier=BACKTEST_TRAILING_ATR_MULT, capital=100000,
-    vol_cap_pct=0.05, time_stop_days=None,
+    vol_cap_pct=0.05, time_stop_days=None, open_vals=None,
 ) -> Dict[str, Any]:
     """
     通用回测模拟引擎 (v7.0 - 真实摩擦模型)
-    
+
     对每个信号点模拟买入，按以下规则退出：
     1. 止损: 持仓期间某日最低价跌破入场价 stop_loss_pct%
     2. 移动止盈: 收盘价跌破 (持仓期最高收盘 - N*ATR)
     3. 时间止损: 持有 time_stop_days 天且未盈利 → 强制平仓
     4. 超时: 持有 max_hold_days 天后按收盘价结算
-    
+
+    入场时机（改动：消除前视偏差）：
+    - A 股 T+1 且信号在收盘才确认，真实可执行价是**次日开盘**，而非信号日收盘。
+    - 旧逻辑用 close[idx] 作为入场价，系统性低估成本、高估胜率（实测次日开盘平均
+      高于信号日收盘 ~0.75%）。传入 open_vals 时改用 open[idx+1] 作为入场价，
+      持仓窗口相应后移一天（从 idx+1 起计算止损/止盈）。不传时保持原行为兼容。
+
     Args:
         close_vals: 收盘价 numpy array
-        high_vals: 最高价 numpy array  
+        high_vals: 最高价 numpy array
         low_vals: 最低价 numpy array
         signal_indices: 信号点索引列表
-        stop_loss_pct: 止损百分比 (负数, 如 -8.0)
-        take_profit_pct: 止盈百分比 (正数, 如 5.0)
+        stop_loss_pct: 止损百分比 (负数, 如 -9.0)
         max_hold_days: 最大持有天数
         atr_vals: ATR 序列 (用于移动止损和头寸计算)
         vol_vals: 成交量序列 (用于流动性约束)
@@ -723,7 +785,8 @@ def _simulate_backtest(
         capital: 初始模拟资金 (用于头寸计算)
         vol_cap_pct: 成交额占比上限 (默认 5%)
         time_stop_days: 时间止损天数 (None=不启用; 如设为 5 则持仓 5 天未盈利自动平仓)
-        
+        open_vals: 开盘价序列；提供则用次日开盘作真实入场价（消除前视偏差）
+
     Returns:
         回测统计字典
     """
@@ -741,6 +804,7 @@ def _simulate_backtest(
     total_loss = 0.0
     stop_loss_hits = 0
     vol_skipped = 0
+    limit_up_skipped = 0
     time_stopped = 0
     max_drawdown = 0.0
     returns = []
@@ -750,18 +814,38 @@ def _simulate_backtest(
     stop_loss_ratio = stop_loss_pct / 100.0   # e.g. -0.08
     
     for idx in signal_indices:
-        entry_price = close_vals[idx]
+        # 入场时机：A 股 T+1，信号在收盘确认，真实可执行价是次日开盘。
+        # 传入 open_vals 时用 open[idx+1] 作入场价并从 idx+1 起算持仓窗口（消除前视偏差）；
+        # 否则保持旧行为（信号日收盘价入场）。
+        use_next_open = open_vals is not None and (idx + 1) <= max_idx and open_vals[idx + 1] > 0
+        if use_next_open:
+            entry_idx = idx + 1
+            entry_price = open_vals[entry_idx]
+            vol_idx = entry_idx  # 流动性约束按入场日而非信号日
+            # 涨停跳过：A 股 T+1 入场日开盘若相对信号日收盘涨停（主板≥+9.5%，创业板/科创板≥+19.5%），
+            # 实盘根本买不到（封板无卖盘）。回测若把这些算成可成交信号会系统性高估胜率。
+            prev_close = close_vals[idx]
+            if prev_close > 0:
+                open_chg = (entry_price - prev_close) / prev_close
+                # 0.185 阈值兼容 20% 板（300/301/688）与 10% 板（其余，按 9.5% 实际涨停价容差）
+                if open_chg >= 0.095:
+                    limit_up_skipped += 1
+                    continue
+        else:
+            entry_idx = idx
+            entry_price = close_vals[idx]
+            vol_idx = idx
         if entry_price <= 0:
             continue
-            
+
         # --- 头寸计算 (2% 风险模型) ---
         atr = atr_vals[idx] if atr_vals is not None and not np.isnan(atr_vals[idx]) else entry_price * 0.03
-        risk_per_share = max(atr * 2, entry_price * 0.05) 
+        risk_per_share = max(atr * 2, entry_price * 0.05)
         ideal_shares = int((capital * 0.02) / risk_per_share) if risk_per_share > 0 else 0
-        
+
         # --- 成交量约束 (Volume Constraint) ---
-        if vol_vals is not None and idx < len(vol_vals):
-            day_vol = vol_vals[idx]
+        if vol_vals is not None and vol_idx < len(vol_vals):
+            day_vol = vol_vals[vol_idx]
             if day_vol > 0:
                 day_turnover = day_vol * entry_price  # 近似日成交额
                 max_invest = day_turnover * vol_cap_pct
@@ -772,22 +856,23 @@ def _simulate_backtest(
                     vol_skipped += 1
                     continue
                 ideal_shares = actual_shares
-        
+
         # 确保至少一手
         shares = max(ideal_shares, 100)
-        
+
         exit_return = 0.0
         hold_days = max_hold_days
         hit_stop = False
-        max_close_since_entry = entry_price
+        # 移动止盈基线：T+1 开盘入场时含入场日（idx+1）的收盘；否则等于入场价（旧行为）
+        max_close_since_entry = close_vals[entry_idx] if use_next_open else entry_price
         exit_price = entry_price
-        
+
         for day in range(1, max_hold_days + 1):
-            future_idx = idx + day
+            future_idx = entry_idx + day
             if future_idx > max_idx:
                 hold_days = day - 1
                 if hold_days > 0:
-                    exit_price = close_vals[min(idx + hold_days, max_idx)]
+                    exit_price = close_vals[min(entry_idx + hold_days, max_idx)]
                     exit_return = (exit_price - entry_price) / entry_price
                 break
             
@@ -904,6 +989,7 @@ def _simulate_backtest(
         "profit_factor": min(profit_factor, 99.0),
         "stop_loss_hits": stop_loss_hits,
         "vol_skipped": vol_skipped,
+        "limit_up_skipped": limit_up_skipped,
         "time_stopped": time_stopped
     }
 
@@ -937,47 +1023,43 @@ def _calculate_fundamental_score(fund_data: Optional[Dict[str, Any]]) -> tuple[f
     }
 
 
-def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10, use_rs_filter=False, fund_data: dict = None):
+def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10, use_rs_filter=True, fund_data: dict = None):
     """执行无门问禅：A股均线粘合战法 (Optimized)"""
     if len(df) < 120: return False, {"reason": f"历史数据不足 ({len(df)}天)"}
 
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # --- 1. 均线系统：对齐 TradingView 图例 EMA5/EMA20/EMA60 ---
-    ma_cols = ['EMA5', 'EMA20', 'EMA60']
+    # --- 1. 均线系统：对齐 TradingView 源码 EMA5/EMA10/EMA20/EMA60 ---
+    ma_cols = ['EMA5', 'EMA10', 'EMA20', 'EMA60']
+    if not all(c in df.columns for c in ma_cols):
+        return False, {"reason": "缺少 EMA5/EMA10/EMA20/EMA60"}
     ma_max_series = df[ma_cols].max(axis=1)
     ma_min_series = df[ma_cols].min(axis=1).replace(0, np.nan)
     sqz_ratio = (ma_max_series - ma_min_series) / ma_min_series
     
     # 粘合判断 (最近 N 天内出现过粘合)
-    was_squeeze_recent = sqz_ratio.iloc[-sqz_lookback:].min() < threshold
+    was_squeeze_recent = sqz_ratio.iloc[-(sqz_lookback + 1):].min() < threshold
+    is_weekly_ok = bool(_squeeze_weekly_trend_ok(df).iloc[-1])
     
     # --- 2. 突破动作 ---
     curr_ma_max = ma_max_series.iloc[-1]
-    is_breakout = (curr['收盘'] >= curr_ma_max) and (curr['收盘'] > curr['开盘'])
+    is_breakout = (curr['收盘'] > curr_ma_max) and (curr['收盘'] > curr['EMA5'])
     
     # --- 3. 趋势与量能 ---
     vol_ratio = curr['成交量'] / curr['Vol_MA20'] if curr['Vol_MA20'] > 0 else 0
-    is_volume = (vol_ratio >= vol_multiplier)
+    is_volume = (vol_ratio > vol_multiplier) and (curr['收盘'] > curr['开盘'])
     
     # --- 5. RSI 强度 ---
     tv_rsi = _squeeze_tv_rsi(df)
     curr_rsi = float(tv_rsi.iloc[-1])
-    is_rsi_ok = curr_rsi >= rsi_min
+    is_rsi_ok = curr_rsi > rsi_min
     
     # --- 6. MACD ---
-    # 修复 L2: 原逻辑要求精确同日金叉(hist[-1]>0 AND hist[-2]<=0)，拒绝了大量有效突破
-    # (MACD 1-2日前金叉、当前已确认多头)。改为"近3日内曾金叉且当前hist>0"。
+    # TradingView 源码：macdLine > signalLine（红柱状态），不是“最近金叉”。
     tv_macd = _squeeze_tv_macd(df)
     if use_macd_filter:
-        hist_now = tv_macd['hist'].iloc[-1]
-        # 近3日内是否有金叉(hist从<=0翻正)
-        recent_cross = any(
-            tv_macd['hist'].iloc[i] > 0 and tv_macd['hist'].iloc[i - 1] <= 0
-            for i in range(max(1, len(tv_macd) - 3), len(tv_macd))
-        )
-        is_macd_ok = hist_now > 0 and recent_cross
+        is_macd_ok = tv_macd['dif'].iloc[-1] > tv_macd['dea'].iloc[-1]
     else:
         is_macd_ok = True
     
@@ -985,6 +1067,8 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     is_rs_ok = True
     if use_rs_filter and 'RS' in df.columns and 'RS_MA50' in df.columns:
         is_rs_ok = curr['RS'] > curr['RS_MA50']
+    elif use_rs_filter:
+        is_rs_ok = False
     
     # --- 8. 波动率收缩 ---
     is_bb_ok = True
@@ -1000,10 +1084,15 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
         "is_volume": is_volume,
         "is_rsi_ok": is_rsi_ok,
         "is_macd_ok": is_macd_ok,
+        "is_weekly_ok": is_weekly_ok,
         "is_bb_ok": is_bb_ok,
         "was_sqz_recent": was_squeeze_recent,
         "is_rs_ok": is_rs_ok
     }
+
+    if not is_weekly_ok:
+        debug_info["reason"] = "周线趋势未通过"
+        return False, debug_info
 
     if not was_squeeze_recent:
         debug_info["reason"] = "近期未现均线粘合"
@@ -1044,9 +1133,9 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
     
     reasons = []
     if not is_breakout: reasons.append("未突破均线簇")
-    if not is_volume: reasons.append("量能未爆发")
+    if not is_volume: reasons.append("量能/阳线未满足")
     if not is_rsi_ok: reasons.append("强度不足(RSI)")
-    if not is_macd_ok: reasons.append("MACD未金叉")
+    if not is_macd_ok: reasons.append("MACD未处于红柱")
     if not is_bb_ok: reasons.append("布林带未收缩")
     if not is_rs_ok: reasons.append("弱于大盘(RS)")
     
@@ -1055,14 +1144,14 @@ def check_strategy(df, threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_
 
 def calculate_historical_win_rate(
     df,
-    stop_loss_pct=-8.0,
+    stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
     threshold=0.12,
     vol_multiplier=1.5,
     rsi_min=55,
     use_macd_filter=True,
     use_bb_sqz=False,
     sqz_lookback=10,
-    use_rs_filter=False,
+    use_rs_filter=True,
 ):
     """向量化计算回测统计 (Enhanced v6.0 - 含止损/回撤/盈亏比)"""
     empty_result = _empty_backtest_result()
@@ -1080,6 +1169,7 @@ def calculate_historical_win_rate(
                 use_bb_sqz=use_bb_sqz,
                 sqz_lookback=sqz_lookback,
                 use_rs_filter=use_rs_filter,
+                use_weekly_filter=True,
             )
             if idx < len(df) - 5
         ]
@@ -1094,7 +1184,8 @@ def calculate_historical_win_rate(
             signal_indices=final_signal_indices,
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
-            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None,
+            open_vals=df['开盘'].values if '开盘' in df.columns else None
         )
 
     except Exception as e:
@@ -1291,7 +1382,8 @@ def check_tv_dual_strategy(
         use_macd_filter=use_macd_filter,
         use_bb_sqz=False,
         sqz_lookback=sqz_lookback,
-        use_rs_filter=False,
+        use_rs_filter=True,
+        use_weekly_filter=True,
     )
     zp_long_indices, zp_short_indices, _debug = _find_tv_zp_signal_indices(df)
 
@@ -1348,7 +1440,7 @@ def check_tv_dual_strategy(
     return True, res
 
 
-def calculate_tv_zp_win_rate(df, stop_loss_pct=-8.0):
+def calculate_tv_zp_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
     empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
@@ -1365,7 +1457,8 @@ def calculate_tv_zp_win_rate(df, stop_loss_pct=-8.0):
             signal_indices=signal_indices,
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
-            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None,
+            open_vals=df['开盘'].values if '开盘' in df.columns else None
         )
     except Exception:
         return empty_result
@@ -1373,7 +1466,7 @@ def calculate_tv_zp_win_rate(df, stop_loss_pct=-8.0):
 
 def calculate_tv_dual_win_rate(
     df,
-    stop_loss_pct=-8.0,
+    stop_loss_pct=BACKTEST_STOP_LOSS_PCT,
     threshold=0.12,
     vol_multiplier=1.5,
     rsi_min=55,
@@ -1398,31 +1491,50 @@ def calculate_tv_dual_win_rate(
             use_rs_filter=False,
         )
         zp_indices, _short_indices, _debug = _find_tv_zp_signal_indices(df)
+        union_indices = sorted({idx for idx in ma_indices + zp_indices if idx < len(df) - 5})
+        used_fallback = False
         if require_both:
-            signal_indices = sorted({
+            # "双策略强共振" 在实时筛选里要求最近 3 根 K 线同时出现均线 B 共振 + TV-ZP long，
+            # 但把它原样套到 4 年历史回测上会得到几乎为 0 的样本（均线与 ZP 很难在 3 天内对齐），
+            # 导致历史胜率恒为 0%。因此这里先按严格配对取样本；若样本不足（< 5 笔），
+            # 则退回到 TV 双策略的"任意单信号"并集，保证胜率有统计意义，并在 sample_warning 里标注。
+            paired = sorted({
                 max(ma_idx, zp_idx)
                 for ma_idx in ma_indices
                 for zp_idx in zp_indices
                 if abs(ma_idx - zp_idx) < max(1, int(signal_window)) and max(ma_idx, zp_idx) < len(df) - 5
             })
+            min_meaningful = 5
+            if len(paired) >= min_meaningful:
+                signal_indices = paired
+            else:
+                signal_indices = union_indices
+                used_fallback = True
         else:
-            signal_indices = sorted({idx for idx in ma_indices + zp_indices if idx < len(df) - 5})
+            signal_indices = union_indices
         if len(signal_indices) == 0:
             return empty_result
-        return _simulate_backtest(
+        result = _simulate_backtest(
             close_vals=df['收盘'].values,
             high_vals=df['最高'].values,
             low_vals=df['最低'].values,
             signal_indices=signal_indices,
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
-            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None,
+            open_vals=df['开盘'].values if '开盘' in df.columns else None
         )
+        if used_fallback:
+            # 标注本次回测用的是"任意单信号"并集样本（因严格双共振样本不足），区别于实时强共振筛选。
+            base_warn = result.get("sample_warning", "")
+            note = "历史双共振样本不足，胜率基于TV双策略任意单信号回测"
+            result["sample_warning"] = f"{note}；{base_warn}" if base_warn else note
+        return result
     except Exception:
         return empty_result
 
 
-def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
+def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
     """
     计算 Pine Script 策略的回测统计 (Enhanced v6.0)
     """
@@ -1446,7 +1558,8 @@ def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=-8.0):
             signal_indices=signal_indices,
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
-            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None,
+            open_vals=df['开盘'].values if '开盘' in df.columns else None
         )
 
     except Exception as e:
@@ -1536,7 +1649,7 @@ def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8, fund_dat
         return False, debug_info
 
 
-def calculate_consensus_win_rate(df, stop_loss_pct=-8.0):
+def calculate_consensus_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
     """
     计算 Azul 共识策略的回测统计 (Enhanced v6.0)
     """
@@ -1573,7 +1686,8 @@ def calculate_consensus_win_rate(df, stop_loss_pct=-8.0):
             signal_indices=signal_indices,
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
-            vol_vals=df['成交量'].values if '成交量' in df.columns else None
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None,
+            open_vals=df['开盘'].values if '开盘' in df.columns else None
         )
     except Exception:
         return empty_result
@@ -1582,7 +1696,8 @@ def evaluate_exit_signals(
     df: pd.DataFrame, 
     entry_price: float, 
     high_since_entry: float,
-    stop_loss_pct: float = FIXED_STOP_LOSS_PCT
+    stop_loss_pct: float = FIXED_STOP_LOSS_PCT,
+    code: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """
     高度优化的卖出/预警评估引擎。

@@ -530,6 +530,9 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     last_range = max(_safe_float(last["最高"] - last["最低"]), 0.01)
     last_body_ratio = _safe_float(body_ratio.iloc[-1])
     last_close_position = _safe_float((last["收盘"] - last["最低"]) / last_range, 0.5)
+    last_upper_shadow_pct = (
+        _safe_float(upper_shadow.iloc[-1]) / max(_safe_float(last["收盘"]), 0.01) * 100
+    )
     atr20 = _safe_float(bar_range.tail(20).mean(), 0.01)
     avg_volume_20 = _safe_float(volumes.tail(20).mean())
     last_volume = _safe_float(volumes.iloc[-1])
@@ -998,6 +1001,18 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     # 修复2: Brooks 止损 = 信号棒低点 - 1 tick（不再取 5 根最低 widening）。
     # 原逻辑 min(last_low, 5bar_low) 总是取更远者 → risk% 虚高 → 触发下游阻断。
     stop_price = round(_safe_float(last["最低"]) - 0.01, 2)
+    raw_risk_pct = (entry_price - stop_price) / entry_price * 100 if entry_price > 0 else 0
+    if entry_price > 0 and raw_risk_pct < 2.5:
+        prior = work.iloc[:-1].tail(14)
+        prior_close = work["收盘"].shift(1).iloc[:-1].tail(14)
+        true_range = pd.concat([
+            prior["最高"] - prior["最低"],
+            (prior["最高"] - prior_close).abs(),
+            (prior["最低"] - prior_close).abs(),
+        ], axis=1).max(axis=1)
+        typical_range = _safe_float(true_range.median(), entry_price * 0.025)
+        stop_distance = min(max(entry_price * 0.025, typical_range), entry_price * 0.06)
+        stop_price = round(entry_price - stop_distance, 2)
     # 兜底：若止损 >= 入场价（信号棒倒置等异常），用 -3% 紧急止损
     if stop_price >= entry_price and entry_price > 0:
         stop_price = round(entry_price * 0.97, 2)
@@ -1229,6 +1244,8 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_volume_ratio_percentile": volume_ratio_percentile,
         "pa_breakout_volume_threshold": round(breakout_volume_threshold, 2),
         "pa_confirmation_volume_threshold": round(confirmation_volume_threshold, 2),
+        "pa_close_position": round(last_close_position, 2),
+        "pa_upper_shadow_pct": round(last_upper_shadow_pct, 2),
         "pa_volume_risk": volume_risk,
         "pa_failed_second_entry": failed_second_entry,
         "pa_second_entry_risk": second_entry_risk,

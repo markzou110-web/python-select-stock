@@ -86,6 +86,20 @@ def test_market_snapshot_prefers_tencent_direct_source(monkeypatch):
     assert snapshot.iloc[0]["vol_ratio"] == 1.8
 
 
+def test_market_snapshot_force_refresh_skips_fresh_cache(monkeypatch):
+    import pandas as pd
+
+    cached_df = pd.DataFrame({"code": ["000001"], "name": ["旧"], "price": [9.0]})
+    fresh_df = pd.DataFrame({"code": ["000001"], "name": ["新"], "price": [10.0]})
+    data.set_cached_data("market_snapshot", cached_df)
+    monkeypatch.setattr(data, "resilient_fetch", lambda *args, **kwargs: fresh_df)
+
+    snapshot = data.get_market_snapshot(force_refresh=True)
+
+    assert snapshot.iloc[0]["name"] == "新"
+    assert snapshot.iloc[0]["price"] == 10.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # P0/P1/P2 新增测试：stale 兜底 / attrs 元数据 / 东财直连 / 新浪直连
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,3 +221,28 @@ def test_format_freshness_handles_stale_and_fresh(monkeypatch):
     assert "⚠️" in format_freshness(lagged)
     assert "⚠️" in format_freshness(stale)
     assert "未知" in format_freshness(noattrs)
+
+
+def test_market_regime_uses_realtime_index_pct_for_wording(monkeypatch):
+    """盘中日线源可能停在上一交易日，Bark 大盘涨跌应优先使用实时指数快照。"""
+    import pandas as pd
+
+    hist = pd.DataFrame({"close": [4120.281, 4027.265]})
+
+    def fake_resilient_fetch(_funcs, timeout=8, label="data", min_rows=0):
+        if label in {"regime_上证", "regime_创业"}:
+            return hist
+        return None
+
+    monkeypatch.setattr(data, "get_index_data", lambda: {
+        "上证": {"price": 4073.90, "pct": 1.16},
+        "创业板": {"price": 4216.70, "pct": 0.54},
+    })
+    monkeypatch.setattr(data, "resilient_fetch", fake_resilient_fetch)
+
+    regime = data.get_market_regime()
+
+    assert regime["indices"]["上证"]["close"] == 4073.9
+    assert regime["indices"]["上证"]["chg_pct"] == 1.16
+    assert regime["indices"]["创业"]["close"] == 4216.7
+    assert regime["indices"]["创业"]["chg_pct"] == 0.54

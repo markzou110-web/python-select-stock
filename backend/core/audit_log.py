@@ -81,6 +81,59 @@ def record_position_decision_change(**values: Any) -> bool:
         return False
 
 
+def record_watchlist_theme_state_change(**values: Any) -> bool:
+    engine = get_db_engine()
+    if not engine:
+        return False
+    code = values.get("code")
+    watchlist_id = values.get("watchlist_id")
+    state = values.get("state")
+    if not code or not state:
+        return False
+    try:
+        with engine.connect() as conn:
+            latest = conn.execute(text("""
+                SELECT payload
+                FROM lifecycle_events
+                WHERE event_type = 'WATCHLIST_THEME_STATE_CHANGED'
+                  AND code = :code
+                  AND (
+                    (:watchlist_id IS NULL AND watchlist_id IS NULL)
+                    OR watchlist_id = :watchlist_id
+                  )
+                ORDER BY event_time DESC
+                LIMIT 1
+            """), {"code": code, "watchlist_id": watchlist_id}).fetchone()
+        latest_payload = latest[0] if latest else {}
+        if isinstance(latest_payload, str):
+            latest_payload = json.loads(latest_payload)
+        if latest_payload and latest_payload.get("state") == state:
+            return False
+        payload = {
+            "state": state,
+            "label": values.get("label"),
+            "action": values.get("action"),
+            "current_price": values.get("current_price"),
+            "watch_price": values.get("watch_price"),
+            "target_price": values.get("target_price"),
+            "stop_price": values.get("stop_price"),
+            "pl_pct": values.get("pl_pct"),
+        }
+        return record_lifecycle_event(
+            "WATCHLIST_THEME_STATE_CHANGED",
+            source=values.get("source") or "watchlist_theme_state",
+            code=code,
+            name=values.get("name"),
+            watchlist_id=watchlist_id,
+            strategy_type=values.get("strategy_type"),
+            theme=values.get("theme"),
+            payload=payload,
+        )
+    except Exception as exc:
+        logger.warning(f"Watchlist theme state audit skipped: {exc}")
+        return False
+
+
 def get_position_decision_timeline(code: str, limit: int = 20) -> list[Dict[str, Any]]:
     engine = get_db_engine()
     if not engine:

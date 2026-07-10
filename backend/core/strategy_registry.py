@@ -66,6 +66,15 @@ _STRATEGIES: Dict[str, Dict[str, Any]] = {
         "explain_fields": ["sector_watch_reason", "sector_phase"],
         "default_params": {},
     },
+    "early_value": {
+        "name": "早期性价比追踪",
+        "description": "追踪距20日低点10%-20%、板块刚启动、回踩不破且量能开始确认的观察候选。",
+        "supports_scan": True,
+        "supports_backtest": False,
+        "required_indicators": ["EMA20", "EMA60", "Vol_MA20", "sector_phase"],
+        "explain_fields": ["early_value_metrics", "early_value_action", "sector_phase"],
+        "default_params": {},
+    },
 }
 
 

@@ -95,9 +95,16 @@ def get_market_regime() -> Dict[str, Any]:
     获取大盘环境：结合上证指数 (000001) 和 创业板指 (399006)
     """
     indices_tx = {"sh000001": "上证", "sz399006": "创业"}
+    realtime_index_alias = {"上证": "上证", "创业": "创业板"}
+    realtime_indices = {}
     states = {}
     
     try:
+        try:
+            realtime_indices = get_index_data()
+        except Exception as exc:
+            logger.debug(f"Realtime index quote unavailable for regime wording: {exc}")
+
         for code, name in indices_tx.items():
             def _fetch_sina(c=code):
                 # 新浪指数日线在海外IP仅需 0.1~0.3 秒，极其稳定且数据完整
@@ -129,6 +136,13 @@ def get_market_regime() -> Dict[str, Any]:
                 prev_close = float(df_regime.iloc[-2]['收盘'])
                 if prev_close > 0:
                     chg_pct = round((close - prev_close) / prev_close * 100, 2)
+
+            # 盘中 Bark 文案必须使用实时指数涨跌。历史日线源在收盘前常只返回
+            # 上一交易日，导致 14:50 仍显示昨天跌幅；EMA20 趋势仍沿用日线序列。
+            realtime_quote = realtime_indices.get(realtime_index_alias.get(name, name), {})
+            if realtime_quote:
+                close = float(realtime_quote.get("price") or close)
+                chg_pct = round(float(realtime_quote.get("pct")), 2) if realtime_quote.get("pct") is not None else chg_pct
 
             states[name] = {
                 "close": round(close, 2),
@@ -233,14 +247,14 @@ def get_stale_cache(key: str) -> Optional[Any]:
             return CACHE[key][0]
         return None
 
-def get_market_snapshot() -> pd.DataFrame:
+def get_market_snapshot(force_refresh: bool = False) -> pd.DataFrame:
     """获取全市场实时快照 (v6.0 - 引入 resilient_fetch 多源容灾弹性重构)"""
     # P0：在 get_cached_data 调用前先持有 stale 引用。因为 get_cached_data 命中过期条目时
     # 会 del CACHE[key]，导致后续 get_stale_cache 取不到全失败兜底用的旧快照。
     # 提前持有引用可避免这个时序问题，且对新启动（无缓存）场景无副作用。
     stale_fallback = get_stale_cache('market_snapshot')
     # 增加 60 秒的高速缓存，防止双策略或并发扫描时频繁高负荷请求
-    cached = get_cached_data('market_snapshot', 60)
+    cached = None if force_refresh else get_cached_data('market_snapshot', 60)
     if cached is not None:
         logger.info("Using cached market snapshot data.")
         return cached

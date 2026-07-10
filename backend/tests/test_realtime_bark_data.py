@@ -26,6 +26,81 @@ def test_bark_scan_requires_live_snapshot(monkeypatch):
     assert "实时行情快照不可用" in exc.value.detail
 
 
+def test_intraday_bark_groups_only_confirmed_trades_as_executable():
+    from core.sentinel import _candidate_push_bucket, _select_intraday_push_stocks
+
+    plain_a = {
+        "代码": "000001",
+        "sop_grade": "A",
+        "trade_bucket": "OBSERVE",
+        "trade_eligible": False,
+        "final_rank_score": 90,
+    }
+    early = {
+        "代码": "000002",
+        "sop_grade": "A",
+        "trade_bucket": "EARLY",
+        "early_trade_candidate": True,
+        "final_rank_score": 80,
+    }
+    trade = {
+        "代码": "000003",
+        "sop_grade": "A",
+        "trade_bucket": "TRADE",
+        "trade_eligible": True,
+        "final_rank_score": 70,
+    }
+
+    selected = _select_intraday_push_stocks([plain_a, early, trade], executable_limit=3)
+
+    assert _candidate_push_bucket(plain_a) == "禁止追买"
+    assert _candidate_push_bucket(early) == "观察"
+    assert [item["代码"] for item in selected] == ["000003", "000002", "000001"]
+
+
+def test_bark_scan_fetches_live_snapshot_even_when_local_only(monkeypatch):
+    from core import scanner
+
+    called = {"force_refresh": None}
+    snapshot = pd.DataFrame({
+        "code": ["000001"],
+        "name": ["平安银行"],
+        "price": [10.0],
+        "open": [9.9],
+        "high": [10.2],
+        "low": [9.8],
+        "pct_chg": [1.0],
+        "vol": [1000],
+        "turnover": [3.0],
+        "mkt_cap": [10000000000],
+    })
+
+    def fake_snapshot(force_refresh=False):
+        called["force_refresh"] = force_refresh
+        return snapshot
+
+    monkeypatch.setattr(scanner, "get_market_regime", lambda: {"status": "UNKNOWN"})
+    monkeypatch.setattr(scanner, "get_db_engine", lambda: object())
+    monkeypatch.setattr(scanner, "build_scan_preflight", lambda *args, **kwargs: {"blocking": False})
+    monkeypatch.setattr(scanner, "get_market_snapshot", fake_snapshot)
+    monkeypatch.setattr(scanner, "get_sector_map", lambda: {"000001": "银行"})
+    monkeypatch.setattr(scanner, "get_sector_trends", lambda: {})
+    monkeypatch.setattr(scanner, "get_suspected_adjustment_gap_codes", lambda *args, **kwargs: set())
+
+    try:
+        result = scanner.perform_market_scan(
+            local_only=True,
+            require_live_snapshot=True,
+            turnover_min=0,
+            mkt_cap_min=0,
+        )
+    except Exception:
+        result = []
+
+    assert called["force_refresh"] is True
+    assert result == []
+
+
 def test_bark_scan_rejects_stale_snapshot(monkeypatch):
     from datetime import datetime, timedelta
     from core import scanner

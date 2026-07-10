@@ -218,6 +218,10 @@ function formatDateLabel(value: any) {
     return date ? date.slice(5) : '';
 }
 
+function formatPct(value: number | null | undefined) {
+    return value != null && Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '--';
+}
+
 function getPaperLinePrice(paperLines: { price: number; label: string; color: string; date?: string }[] | undefined, label: string) {
     return validNumber((paperLines || []).find((line) => line.label.includes(label))?.price);
 }
@@ -354,6 +358,8 @@ export default function SplitKLineCharts({
     const priceActionRef = useRef<HTMLDivElement>(null);
     const strategyOverlayRef = useRef<HTMLDivElement>(null);
     const priceActionOverlayRef = useRef<HTMLDivElement>(null);
+    const strategyTooltipRef = useRef<HTMLDivElement>(null);
+    const priceActionTooltipRef = useRef<HTMLDivElement>(null);
     const strategyVisibleRangeRef = useRef<any>(null);
     const priceActionVisibleRangeRef = useRef<any>(null);
 
@@ -574,6 +580,38 @@ export default function SplitKLineCharts({
             paMarkerPlugin.setMarkers(priceActionMarkers);
         }
 
+        const candleByTime = new Map(sortedCandles.map((c, index) => [String(c.time), { candle: c, index }]));
+        const renderHoverTooltip = (tooltip: HTMLDivElement | null, param: any, chart: IChartApi) => {
+            if (!tooltip) return;
+            if (!param?.time || !param?.point) {
+                tooltip.style.display = 'none';
+                return;
+            }
+            const match = candleByTime.get(String(param.time));
+            if (!match) {
+                tooltip.style.display = 'none';
+                return;
+            }
+            const { candle, index } = match;
+            const prev = index > 0 ? sortedCandles[index - 1] : null;
+            const base = prev?.close && prev.close > 0 ? prev.close : candle.open;
+            const dayPct = base > 0 ? ((candle.close - base) / base) * 100 : null;
+            const isUp = (dayPct || 0) >= 0;
+            tooltip.innerHTML = `
+                <div class="text-[10px] font-black text-slate-400">${String(candle.time)}</div>
+                <div class="mt-1 flex items-center gap-3">
+                    <span class="font-black text-slate-700">最新价 ${formatPrice(candle.close)}</span>
+                    <span class="font-black ${isUp ? 'text-rose-600' : 'text-emerald-600'}">涨幅 ${formatPct(dayPct)}</span>
+                </div>
+            `;
+            const containerWidth = chart.options().width || 0;
+            const left = Math.min(Math.max(param.point.x + 12, 8), Math.max(8, Number(containerWidth) - 170));
+            const top = Math.max(8, Math.min(height - 56, param.point.y + 12));
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
+            tooltip.style.display = 'block';
+        };
+
         (priceActionLines || []).forEach((line) => {
             const points = (line.points || [])
                 .map((point: any) => ({ time: String(point.time), value: validNumber(point.value) }))
@@ -698,6 +736,11 @@ export default function SplitKLineCharts({
         strategyChart.timeScale().subscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
         paChart.timeScale().subscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
 
+        const handleStrategyCrosshairMove = (param: any) => renderHoverTooltip(strategyTooltipRef.current, param, strategyChart);
+        const handlePriceActionCrosshairMove = (param: any) => renderHoverTooltip(priceActionTooltipRef.current, param, paChart);
+        strategyChart.subscribeCrosshairMove(handleStrategyCrosshairMove);
+        paChart.subscribeCrosshairMove(handlePriceActionCrosshairMove);
+
         const handleResize = () => {
             if (strategyRef.current) strategyChart.applyOptions({ width: strategyRef.current.clientWidth });
             if (priceActionRef.current) paChart.applyOptions({ width: priceActionRef.current.clientWidth });
@@ -710,6 +753,8 @@ export default function SplitKLineCharts({
             window.removeEventListener('resize', handleResize);
             strategyChart.timeScale().unsubscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
             paChart.timeScale().unsubscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
+            strategyChart.unsubscribeCrosshairMove(handleStrategyCrosshairMove);
+            paChart.unsubscribeCrosshairMove(handlePriceActionCrosshairMove);
             strategyChart.remove();
             paChart.remove();
         };
@@ -740,6 +785,10 @@ export default function SplitKLineCharts({
                     )}
                     <div ref={strategyRef} className="absolute inset-0" />
                     <div ref={strategyOverlayRef} className="absolute inset-0 z-10 pointer-events-none" />
+                    <div
+                        ref={strategyTooltipRef}
+                        className="pointer-events-none absolute z-30 hidden rounded-md border border-slate-200 bg-white/95 px-3 py-2 text-xs shadow-lg ring-1 ring-slate-900/5"
+                    />
                 </div>
                 <SummaryBox {...strategySummary} priceRows={priceRows} />
             </div>
@@ -751,6 +800,10 @@ export default function SplitKLineCharts({
                 <div className="relative w-full" style={{ height }}>
                     <div ref={priceActionRef} className="absolute inset-0" />
                     <div ref={priceActionOverlayRef} className="absolute inset-0 z-10 pointer-events-none" />
+                    <div
+                        ref={priceActionTooltipRef}
+                        className="pointer-events-none absolute z-30 hidden rounded-md border border-slate-200 bg-white/95 px-3 py-2 text-xs shadow-lg ring-1 ring-slate-900/5"
+                    />
                 </div>
                 <SummaryBox {...paSummary} />
             </div>

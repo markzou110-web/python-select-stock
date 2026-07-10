@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.decision_layer import _leadership_score
-from core.limit_up_leadership import collect_limit_up_events, load_limit_up_event_map, save_minute_bars
+from core.limit_up_leadership import collect_candidate_minute_bars, collect_limit_up_events, load_limit_up_event_map, save_minute_bars
 
 
 def _engine():
@@ -133,3 +133,125 @@ def test_minute_bars_are_saved_idempotently():
         row = conn.execute(text("SELECT COUNT(*), MAX(close) FROM intraday_minute_bars")).fetchone()
 
     assert row == (1, 10.2)
+
+
+def test_candidate_minute_bar_failures_do_not_pause_future_collections(monkeypatch):
+    engine = _engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE scan_history (
+                code VARCHAR(20),
+                date DATE,
+                score FLOAT
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO scan_history (code, date, score)
+            VALUES ('000001', '2026-06-12', 90), ('000002', '2026-06-12', 80), ('000003', '2026-06-12', 70)
+        """))
+        conn.commit()
+
+    def fail_fetch(*args, **kwargs):
+        raise RuntimeError("source down")
+
+    monkeypatch.setattr("core.limit_up_leadership.ak.stock_zh_a_hist_min_em", fail_fetch)
+
+    result = collect_candidate_minute_bars("2026-06-12", engine, max_codes=3)
+
+    assert result == {
+        "codes": 3,
+        "bars": 0,
+        "snapshot_bars": 0,
+        "eastmoney_bars": 0,
+        "errors": 3,
+        "empty": 0,
+        "source_paused": 0,
+    }
+
+
+def test_candidate_minute_bar_fetch_retries_once(monkeypatch):
+    engine = _engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE scan_history (
+                code VARCHAR(20),
+                date DATE,
+                score FLOAT
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO scan_history (code, date, score)
+            VALUES ('000001', '2026-06-12', 90)
+        """))
+        conn.commit()
+
+    calls = {"count": 0}
+    frame = pd.DataFrame([{
+        "时间": "2026-06-12 09:31:00",
+        "开盘": 10.0, "收盘": 10.1, "最高": 10.2, "最低": 9.9,
+        "成交量": 1000, "成交额": 10100, "均价": 10.05,
+    }])
+
+    def flaky_fetch(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("temporary source error")
+        return frame
+
+    monkeypatch.setattr("core.limit_up_leadership.ak.stock_zh_a_hist_min_em", flaky_fetch)
+
+    result = collect_candidate_minute_bars("2026-06-12", engine, max_codes=1)
+
+    assert calls["count"] == 2
+    assert result == {
+        "codes": 1,
+        "bars": 1,
+        "snapshot_bars": 0,
+        "eastmoney_bars": 1,
+        "errors": 0,
+        "empty": 0,
+        "source_paused": 0,
+    }
+
+
+def test_candidate_minute_bar_prefers_live_snapshot_over_eastmoney(monkeypatch):
+    today = datetime.now().strftime("%Y-%m-%d")
+    engine = _engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE scan_history (
+                code VARCHAR(20),
+                date DATE,
+                score FLOAT
+            )
+        """))
+        conn.execute(
+            text("INSERT INTO scan_history (code, date, score) VALUES ('000001', :today, 90)"),
+            {"today": today},
+        )
+        conn.commit()
+
+    snapshot = pd.DataFrame([{
+        "code": "000001",
+        "price": 10.2,
+        "open": 10.0,
+        "high": 10.3,
+        "low": 9.9,
+        "vol": 1000,
+        "amount": 10200,
+    }])
+    snapshot.attrs["fetched_at"] = datetime.now()
+
+    monkeypatch.setattr("core.data.get_market_snapshot", lambda: snapshot)
+    monkeypatch.setattr("core.data.is_snapshot_stale", lambda frame: False)
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("Eastmoney should not be called when live snapshot is available")
+
+    monkeypatch.setattr("core.limit_up_leadership.ak.stock_zh_a_hist_min_em", fail_fetch)
+
+    result = collect_candidate_minute_bars(today, engine, max_codes=1)
+
+    assert result["snapshot_bars"] == 1
+    assert result["eastmoney_bars"] == 0
+    assert result["errors"] == 0

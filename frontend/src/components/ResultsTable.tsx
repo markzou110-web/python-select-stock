@@ -164,8 +164,16 @@ export default function ResultsTable({
         return score ? `${quality} · ${score}分` : quality;
     };
 
-    const toggleRow = (code: string) => {
-        setExpandedRow(expandedRow === code ? null : code);
+    const getRowKey = (res: ScanResult, index: number) => [
+        res.代码,
+        res.strategy_type || 'strategy',
+        res.date || res.日期 || 'latest',
+        res.行业 || 'sector',
+        index,
+    ].join('-');
+
+    const toggleRow = (rowKey: string) => {
+        setExpandedRow(expandedRow === rowKey ? null : rowKey);
     };
 
     const openChart = (code: string) => {
@@ -266,18 +274,20 @@ export default function ResultsTable({
     };
 
     // ── Render a single stock row (shared between flat & grouped modes) ──
-    const renderStockRow = (res: ScanResult) => {
+    const renderStockRow = (res: ScanResult, index: number) => {
         const isVetoed = res.sop_grade === 'D';
+        const sopHint = buildSopUpgradeHint(res);
+        const rowKey = getRowKey(res, index);
         return (
-        <React.Fragment key={res.代码}>
+        <React.Fragment key={rowKey}>
             <tr
                 onClick={() => {
                     onSelectStock?.(res);
-                    toggleRow(res.代码);
+                    toggleRow(rowKey);
                 }}
                 className={cn(
                     "group transition-all cursor-pointer border-b border-slate-50",
-                    expandedRow === res.代码 ? "bg-indigo-50/50" : "hover:bg-indigo-50/20",
+                    expandedRow === rowKey ? "bg-indigo-50/50" : "hover:bg-indigo-50/20",
                     selectedCode === res.代码 && "bg-indigo-50/50 ring-1 ring-inset ring-indigo-100",
                     isVetoed && "opacity-40"
                 )}
@@ -285,7 +295,7 @@ export default function ResultsTable({
                 <td className="px-4 py-5">
                     <div className="flex items-center gap-3">
                         <div className="text-slate-400 transition-colors">
-                            {expandedRow === res.代码 ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                            {expandedRow === rowKey ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                         </div>
                         <div className="flex flex-col">
                             <div className="flex items-center gap-1.5">
@@ -334,7 +344,7 @@ export default function ResultsTable({
                 {/* SOP 等级列 */}
                 <td className="px-3 py-5">
                     <div className="flex flex-col items-center gap-1">
-                        <SopGradeBadge grade={res.sop_grade} />
+                        <SopGradeBadge grade={res.sop_grade} detail={buildSopDetail(res)} />
                         {isVetoed && res.sop_vetoes && res.sop_vetoes.length > 0 && (
                             <span className="text-[8px] text-rose-400 font-bold text-center leading-tight max-w-[60px]">
                                 {res.sop_vetoes[0]}
@@ -342,6 +352,20 @@ export default function ResultsTable({
                         )}
                         {res.sop_grade === 'A' && res.sop_bonuses && res.sop_bonuses.length > 0 && (
                             <span className="text-[8px] text-amber-500 font-bold">⭐{res.sop_bonuses.length}</span>
+                        )}
+                        {sopHint && (
+                            <span
+                                title={sopHint.detail}
+                                className={cn(
+                                    "max-w-[84px] rounded-md px-1.5 py-0.5 text-center text-[8px] font-black leading-tight cursor-help",
+                                    sopHint.tone === 'rose' ? "bg-rose-50 text-rose-600 border border-rose-100" :
+                                        sopHint.tone === 'amber' ? "bg-amber-50 text-amber-700 border border-amber-100" :
+                                            sopHint.tone === 'emerald' ? "bg-emerald-50 text-emerald-700 border border-emerald-100" :
+                                                "bg-slate-50 text-slate-500 border border-slate-100"
+                                )}
+                            >
+                                {sopHint.label}
+                            </span>
                         )}
                     </div>
                 </td>
@@ -562,10 +586,10 @@ export default function ResultsTable({
                             <ExternalLink size={18} />
                         </button>
                         <button
-                            onClick={(e) => { e.stopPropagation(); toggleRow(res.代码); }}
+                            onClick={(e) => { e.stopPropagation(); toggleRow(rowKey); }}
                             className={cn(
                                 "p-2 rounded-xl transition-all",
-                                expandedRow === res.代码 ? "text-indigo-600 bg-indigo-50" : "text-slate-300 hover:text-rose-600 hover:bg-rose-50"
+                                expandedRow === rowKey ? "text-indigo-600 bg-indigo-50" : "text-slate-300 hover:text-rose-600 hover:bg-rose-50"
                             )}
                             title="查看K线"
                         >
@@ -574,7 +598,7 @@ export default function ResultsTable({
                     </div>
                 </td>
             </tr>
-            {expandedRow === res.代码 && (
+            {expandedRow === rowKey && (
                 <tr className="bg-slate-50/30 animate-in fade-in slide-in-from-top-2 duration-300">
                     <td colSpan={10} className="px-8 py-6">
                         <div className="flex flex-col gap-4">
@@ -590,9 +614,14 @@ export default function ResultsTable({
                                             <div><span className="text-slate-400 text-xs">流通市值</span><div className="font-bold text-slate-600">{res.mkt_cap_yi ? `${res.mkt_cap_yi}亿` : '---'}</div></div>
                                         </div>
                                     </div>
-                                    {res.sop_checks && res.sop_checks.length > 0 && (
+                                    {hasSopDetail(res) && (
                                         <div className="flex-1 min-w-[200px] p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                                            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">SOP 检查明细</div>
+                                            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">SOP 评级原因</div>
+                                            {sopHint && (
+                                                <div className="mb-2 rounded-lg bg-white px-3 py-2 text-xs font-bold text-slate-600 border border-slate-100">
+                                                    {sopHint.detail}
+                                                </div>
+                                            )}
                                             <div className="flex flex-wrap gap-1.5">
                                                 {res.sop_checks?.map((c, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-emerald-50 text-emerald-600 rounded-full font-bold border border-emerald-100">✅ {c}</span>)}
                                                 {res.sop_bonuses?.map((b, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-amber-50 text-amber-600 rounded-full font-bold border border-amber-100">⭐ {b}</span>)}
@@ -734,7 +763,7 @@ export default function ResultsTable({
                                         东财详情
                                     </button>
                                     <button
-                                        onClick={(e) => { e.stopPropagation(); toggleRow(res.代码); }}
+                                        onClick={(e) => { e.stopPropagation(); toggleRow(rowKey); }}
                                         className="text-xs font-bold text-slate-400 hover:text-slate-600 transition-colors"
                                     >
                                         收起图表
@@ -1069,35 +1098,97 @@ function ConfidenceBadge({ score }: { score: number }) {
     return <span className="text-[9px] font-bold text-slate-400 bg-slate-100 px-2 rounded-md mt-1">🔍 持续观察</span>;
 }
 
-function SopGradeBadge({ grade }: { grade?: string }) {
+// 汇总 SOP 判定明细（veto/risk/check/bonus）为 tooltip 文本，让用户 hover 评级徽章即可看"为什么是这个评级"
+function buildSopDetail(res: ScanResult): string | undefined {
+    const parts: string[] = [];
+    if (res.sop_vetoes?.length) parts.push(`❌ 否决: ${res.sop_vetoes.join('、')}`);
+    if (res.sop_risks?.length) parts.push(`⚠️ 风险: ${res.sop_risks.join('、')}`);
+    if (res.sop_checks?.length) parts.push(`🔍 待确认: ${res.sop_checks.join('、')}`);
+    if (res.sop_bonuses?.length) parts.push(`⭐ 加分: ${res.sop_bonuses.join('、')}`);
+    if (res.sop_quality_score != null) parts.push(`质量分: ${res.sop_quality_score}`);
+    return parts.length ? parts.join('\n') : undefined;
+}
+
+function hasSopDetail(res: ScanResult): boolean {
+    return Boolean(res.sop_vetoes?.length || res.sop_risks?.length || res.sop_checks?.length || res.sop_bonuses?.length);
+}
+
+function buildSopUpgradeHint(res: ScanResult): { label: string; detail: string; tone: 'rose' | 'amber' | 'emerald' | 'slate' } | null {
+    if (res.sop_grade === 'A') {
+        if (!res.sop_bonuses?.length) return null;
+        return {
+            label: 'A级确认',
+            detail: `A级条件已满足；加分项：${res.sop_bonuses.join('、')}`,
+            tone: 'emerald',
+        };
+    }
+
+    if (res.sop_vetoes?.length) {
+        return {
+            label: `未达A：${res.sop_vetoes[0]}`,
+            detail: `当前首要阻碍是“${res.sop_vetoes[0]}”。升级到 A 级需要先消除否决项，再重新确认风险和买点。`,
+            tone: 'rose',
+        };
+    }
+
+    if (res.sop_risks?.length) {
+        return {
+            label: `控风险：${res.sop_risks[0]}`,
+            detail: `当前主要风险是“${res.sop_risks[0]}”。升级到 A 级需要风险收敛，且失效价/仓位计划可执行。`,
+            tone: 'amber',
+        };
+    }
+
+    if (res.sop_checks?.length) {
+        return {
+            label: `等确认：${res.sop_checks[0]}`,
+            detail: `当前不是否决，而是等待确认：“${res.sop_checks[0]}”。完成待确认项后，可重新评估是否升到 A/B 级。`,
+            tone: 'slate',
+        };
+    }
+
+    if (res.sop_grade) {
+        return {
+            label: '未达A：强度不足',
+            detail: '当前没有明确否决项，但综合质量分、板块联动、买点成熟度或风险收益比尚未达到 A 级。',
+            tone: 'slate',
+        };
+    }
+
+    return null;
+}
+
+function SopGradeBadge({ grade, detail }: { grade?: string; detail?: string }) {
+    // detail: 汇总的 SOP 判定明细（veto/risk/check/bonus），hover 时展示"为什么是这个评级"
+    const tooltipProps = detail ? { title: detail } : {};
     switch (grade) {
         case 'A':
             return (
-                <div className="flex items-center gap-1 px-2.5 py-1 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-lg shadow-sm shadow-emerald-200 font-black text-xs">
+                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-lg shadow-sm shadow-emerald-200 font-black text-xs cursor-help">
                     🟢 A
                 </div>
             );
         case 'B':
             return (
-                <div className="flex items-center gap-1 px-2.5 py-1 bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-lg shadow-sm shadow-blue-200 font-black text-xs">
+                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-lg shadow-sm shadow-blue-200 font-black text-xs cursor-help">
                     🔵 B
                 </div>
             );
         case 'M':
             return (
-                <div className="flex items-center gap-1 px-2.5 py-1 bg-orange-100 text-orange-600 rounded-lg font-black text-xs border border-orange-200">
+                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-orange-100 text-orange-600 rounded-lg font-black text-xs border border-orange-200 cursor-help">
                     🟠 M
                 </div>
             );
         case 'C':
             return (
-                <div className="flex items-center gap-1 px-2.5 py-1 bg-slate-200 text-slate-500 rounded-lg font-black text-xs">
+                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-slate-200 text-slate-500 rounded-lg font-black text-xs cursor-help">
                     ⚪ C
                 </div>
             );
         case 'D':
             return (
-                <div className="flex items-center gap-1 px-2.5 py-1 bg-rose-100 text-rose-500 rounded-lg font-black text-xs border border-rose-200">
+                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-rose-100 text-rose-500 rounded-lg font-black text-xs border border-rose-200 cursor-help">
                     🔴 D
                 </div>
             );

@@ -9,6 +9,37 @@ interface WatchlistViewProps {
     onOpenStock?: (stock: { code: string; name: string }) => void;
 }
 
+type WatchlistSortMode = 'priority' | 'gain';
+
+const WATCHLIST_VIEW_PREF_KEY = 'alpha_vision_watchlist_view_v1';
+const THEME_STATE_OPTIONS = [
+    { value: 'ALL', label: '全部状态' },
+    { value: 'PULLBACK_CONFIRMED', label: '回踩放量确认' },
+    { value: 'APPROACH_CONFIRM', label: '接近确认价' },
+    { value: 'PULLBACK_NEEDS_VOLUME', label: '回踩待放量' },
+    { value: 'WAIT_PULLBACK', label: '涨幅偏高等回踩' },
+    { value: 'THEME_TRACKING', label: '题材跟踪中' },
+    { value: 'TRIGGERED', label: '已触发' },
+    { value: 'INVALIDATED', label: '逻辑失效' },
+    { value: 'BOOSTED', label: '复盘加权' },
+    { value: 'PENALIZED', label: '复盘降权' },
+];
+
+function readWatchlistViewPrefs(): { themeStateFilter: string; sortMode: WatchlistSortMode } {
+    if (typeof window === 'undefined') return { themeStateFilter: 'ALL', sortMode: 'priority' };
+    try {
+        const raw = window.localStorage.getItem(WATCHLIST_VIEW_PREF_KEY);
+        if (!raw) return { themeStateFilter: 'ALL', sortMode: 'priority' };
+        const parsed = JSON.parse(raw) as { themeStateFilter?: string; sortMode?: WatchlistSortMode };
+        return {
+            themeStateFilter: THEME_STATE_OPTIONS.some(option => option.value === parsed.themeStateFilter) ? parsed.themeStateFilter! : 'ALL',
+            sortMode: parsed.sortMode === 'gain' ? 'gain' : 'priority',
+        };
+    } catch {
+        return { themeStateFilter: 'ALL', sortMode: 'priority' };
+    }
+}
+
 export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
     const [items, setItems] = useState<any[]>([]);
     const [stats, setStats] = useState<any>({});
@@ -17,6 +48,11 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
     const [notice, setNotice] = useState<string>('');
     const [status, setStatus] = useState<'WATCHING' | 'ALL'>('WATCHING');
     const [transferringId, setTransferringId] = useState<number | null>(null);
+    const [viewPrefs, setViewPrefs] = useState(readWatchlistViewPrefs);
+    const themeStateFilter = viewPrefs.themeStateFilter;
+    const sortMode = viewPrefs.sortMode;
+    const setThemeStateFilter = (themeStateFilter: string) => setViewPrefs(prev => ({ ...prev, themeStateFilter }));
+    const setSortMode = (sortMode: WatchlistSortMode) => setViewPrefs(prev => ({ ...prev, sortMode }));
 
     const fetchItems = async () => {
         setLoading(true);
@@ -30,6 +66,13 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
     };
 
     useEffect(() => { fetchItems(); }, [status]);
+    useEffect(() => {
+        try {
+            window.localStorage.setItem(WATCHLIST_VIEW_PREF_KEY, JSON.stringify(viewPrefs));
+        } catch {
+            // 忽略无痕模式或浏览器限制下的写入失败，视图仍按当前状态工作。
+        }
+    }, [viewPrefs]);
 
     const archive = async (id: number) => {
         await api.post(`/api/watchlist/archive/${id}`);
@@ -109,6 +152,18 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
         }
     };
 
+    const filteredItems = items
+        .filter(item => {
+            if (themeStateFilter === 'ALL') return true;
+            if (themeStateFilter === 'BOOSTED') return Number(item.theme_priority_boost || 0) > 0;
+            if (themeStateFilter === 'PENALIZED') return Number(item.theme_priority_boost || 0) < 0;
+            return item.theme_tracking_state === themeStateFilter;
+        })
+        .sort((a, b) => {
+            if (sortMode === 'gain') return Number(b.pl_pct || 0) - Number(a.pl_pct || 0);
+            return 0;
+        });
+
     return (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="flex items-center justify-between">
@@ -144,6 +199,40 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                 <Summary label="平均表现" value={`${stats.avg_pl_pct >= 0 ? '+' : ''}${stats.avg_pl_pct || 0}%`} hot={(stats.avg_pl_pct || 0) >= 0} />
             </div>
 
+            <div className="flex flex-col gap-3 rounded-md border border-slate-100 bg-white/80 px-4 py-3 md:flex-row md:items-center md:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                    {THEME_STATE_OPTIONS.map(option => (
+                        <button
+                            key={option.value}
+                            onClick={() => setThemeStateFilter(option.value)}
+                            className={cn(
+                                "rounded-md border px-3 py-1.5 text-[10px] font-black transition-colors",
+                                themeStateFilter === option.value
+                                    ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                                    : "border-slate-100 bg-white text-slate-500 hover:bg-slate-50"
+                            )}
+                        >
+                            {option.label}
+                        </button>
+                    ))}
+                </div>
+                <div className="flex items-center gap-2">
+                    <button
+                        onClick={() => setSortMode('priority')}
+                        className={cn("rounded-md border px-3 py-1.5 text-[10px] font-black", sortMode === 'priority' ? "border-indigo-200 bg-indigo-50 text-indigo-700" : "border-slate-100 bg-white text-slate-500")}
+                    >
+                        优先级
+                    </button>
+                    <button
+                        onClick={() => setSortMode('gain')}
+                        className={cn("rounded-md border px-3 py-1.5 text-[10px] font-black", sortMode === 'gain' ? "border-indigo-200 bg-indigo-50 text-indigo-700" : "border-slate-100 bg-white text-slate-500")}
+                    >
+                        涨幅
+                    </button>
+                    <span className="text-[10px] font-bold text-slate-400">{filteredItems.length}/{items.length}</span>
+                </div>
+            </div>
+
             <div className="glass-card overflow-hidden">
                 {loading ? (
                     <div className="p-20 text-center text-slate-400 font-bold"><Loader2 className="animate-spin inline mr-2" /> 正在刷新观察池...</div>
@@ -159,7 +248,7 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-50">
-                            {items.map(item => (
+                            {filteredItems.map(item => (
                                 <tr key={item.id} className="hover:bg-slate-50/50 transition-colors">
                                     <td className="px-6 py-5">
                                         <div className="flex items-center gap-3">
@@ -205,6 +294,20 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                                             </p>
                                             <p className="mt-1 text-[10px] font-bold text-slate-500">{item.watch_action || item.computed_action || '等待系统刷新'}</p>
                                         </div>
+                                        {item.theme_tracking_label && (
+                                            <div className={cn("mt-2 rounded-md border px-3 py-2", themeTrackingTone(item.theme_tracking_state))}>
+                                                <p className="text-[10px] font-black">{item.theme_tracking_label}</p>
+                                                <p className="mt-1 text-[10px] font-bold">{item.theme_tracking_action}</p>
+                                                {item.theme_priority_note && (
+                                                    <p className={cn(
+                                                        "mt-1 text-[10px] font-black",
+                                                        Number(item.theme_priority_boost || 0) >= 0 ? "text-emerald-700" : "text-rose-700"
+                                                    )}>
+                                                        {item.theme_priority_note}
+                                                    </p>
+                                                )}
+                                            </div>
+                                        )}
                                         {item.pa_trade_action && (
                                             <div className="mt-2 flex flex-wrap gap-1.5">
                                                 <span className={cn(
@@ -249,8 +352,8 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                                     </td>
                                 </tr>
                             ))}
-                            {items.length === 0 && (
-                                <tr><td colSpan={5} className="px-6 py-20 text-center text-slate-400 font-bold">暂无观察标的，可从扫描结果或代码检索加入</td></tr>
+                            {filteredItems.length === 0 && (
+                                <tr><td colSpan={5} className="px-6 py-20 text-center text-slate-400 font-bold">{items.length === 0 ? '暂无观察标的，可从扫描结果或代码检索加入' : '当前筛选下暂无观察标的'}</td></tr>
                             )}
                         </tbody>
                     </table>
@@ -265,11 +368,27 @@ function decisionLabel(decision?: string) {
         PROMOTE: '转可交易',
         INVALIDATE: '失效移除',
         NEAR_TRIGGER: '接近触发',
+        READY_WAIT: '结构就绪',
         RISK: '贴近失效',
         WATCH_PULLBACK: '等回踩',
+        TRIGGERED: '已触发',
         KEEP_WATCH: '继续观察',
     };
     return labels[decision || ''] || '继续观察';
+}
+
+function themeTrackingTone(state?: string) {
+    const tones: Record<string, string> = {
+        THEME_TRACKING: 'border-sky-100 bg-sky-50 text-sky-700',
+        WAIT_BUY_POINT: 'border-amber-100 bg-amber-50 text-amber-700',
+        APPROACH_CONFIRM: 'border-amber-100 bg-amber-50 text-amber-700',
+        WAIT_PULLBACK: 'border-orange-100 bg-orange-50 text-orange-700',
+        PULLBACK_NEEDS_VOLUME: 'border-yellow-100 bg-yellow-50 text-yellow-700',
+        PULLBACK_CONFIRMED: 'border-emerald-100 bg-emerald-50 text-emerald-700',
+        TRIGGERED: 'border-emerald-100 bg-emerald-50 text-emerald-700',
+        INVALIDATED: 'border-rose-100 bg-rose-50 text-rose-700',
+    };
+    return tones[state || ''] || 'border-slate-100 bg-slate-50 text-slate-600';
 }
 
 function Summary({ label, value, hot = false }: { label: string; value: React.ReactNode; hot?: boolean }) {

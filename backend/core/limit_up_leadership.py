@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 import akshare as ak
@@ -7,8 +7,9 @@ from sqlalchemy import text
 
 from core.db import get_db_engine
 from core.logging_config import logger
+from core.config import config
 
-_minute_source_blocked_until: Optional[datetime] = None
+config.setup_no_proxy()
 
 
 def _value(row: pd.Series, key: str, default: Any = None) -> Any:
@@ -217,32 +218,103 @@ def save_minute_bars(code: str, frame: pd.DataFrame, engine=None, collected_at: 
     return len(rows)
 
 
-def collect_candidate_minute_bars(event_date: Optional[str] = None, engine=None, max_codes: int = 30) -> Dict[str, int]:
-    global _minute_source_blocked_until
-    now = datetime.now()
-    if _minute_source_blocked_until and now < _minute_source_blocked_until:
-        return {"codes": 0, "bars": 0, "errors": 0, "source_paused": 1}
-    engine = engine or get_db_engine()
-    if not engine:
-        return {"codes": 0, "bars": 0, "errors": 1}
-    event_date = event_date or datetime.now().strftime("%Y-%m-%d")
-    codes = _candidate_codes(event_date, engine, max_codes)
-    bars = 0
-    errors = 0
-    for code in codes:
+def _fetch_minute_bars(code: str, event_date: str, retries: int = 1) -> pd.DataFrame:
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, retries + 1)):
         try:
-            frame = ak.stock_zh_a_hist_min_em(
+            return ak.stock_zh_a_hist_min_em(
                 symbol=code,
                 period="1",
                 start_date=f"{event_date} 09:25:00",
                 end_date=f"{event_date} 15:05:00",
                 adjust="",
             )
-            bars += save_minute_bars(code, frame, engine=engine)
+        except Exception as exc:
+            last_exc = exc
+            config.setup_no_proxy()
+    raise last_exc or RuntimeError("minute bars unavailable")
+
+
+def _snapshot_minute_frame(codes: List[str], event_date: str) -> pd.DataFrame:
+    if event_date != datetime.now().strftime("%Y-%m-%d"):
+        return pd.DataFrame()
+    from core.data import get_market_snapshot, is_snapshot_stale
+
+    snapshot = get_market_snapshot()
+    if snapshot is None or snapshot.empty or is_snapshot_stale(snapshot):
+        return pd.DataFrame()
+
+    frame = snapshot[snapshot["code"].isin(codes)].copy()
+    if frame.empty:
+        return pd.DataFrame()
+
+    fetched_at = snapshot.attrs.get("fetched_at") or datetime.now()
+    try:
+        bar_time = pd.Timestamp(fetched_at).floor("min").strftime("%Y-%m-%d %H:%M:00")
+    except Exception:
+        bar_time = datetime.now().strftime("%Y-%m-%d %H:%M:00")
+
+    def numeric_series(column: str, fallback: str = "price") -> pd.Series:
+        source = frame[column] if column in frame.columns else frame.get(fallback, pd.Series([0] * len(frame), index=frame.index))
+        return pd.to_numeric(source, errors="coerce").fillna(0)
+
+    return pd.DataFrame({
+        "代码": frame["code"].astype(str).str.zfill(6),
+        "时间": bar_time,
+        "开盘": numeric_series("open"),
+        "收盘": numeric_series("price"),
+        "最高": numeric_series("high"),
+        "最低": numeric_series("low"),
+        "成交量": numeric_series("vol"),
+        "成交额": numeric_series("amount"),
+        "均价": numeric_series("price"),
+    })
+
+
+def collect_candidate_minute_bars(event_date: Optional[str] = None, engine=None, max_codes: int = 30) -> Dict[str, int]:
+    engine = engine or get_db_engine()
+    if not engine:
+        return {"codes": 0, "bars": 0, "errors": 1}
+    event_date = event_date or datetime.now().strftime("%Y-%m-%d")
+    codes = _candidate_codes(event_date, engine, max_codes)
+    bars = 0
+    snapshot_bars = 0
+    eastmoney_bars = 0
+    errors = 0
+    empty = 0
+    snapshot_frame = _snapshot_minute_frame(codes, event_date)
+    if not snapshot_frame.empty:
+        for code, group in snapshot_frame.groupby("代码"):
+            saved = save_minute_bars(str(code), group, engine=engine)
+            snapshot_bars += saved
+            bars += saved
+        return {
+            "codes": len(codes),
+            "bars": bars,
+            "snapshot_bars": snapshot_bars,
+            "eastmoney_bars": eastmoney_bars,
+            "errors": errors,
+            "empty": empty,
+            "source_paused": 0,
+        }
+
+    for code in codes:
+        try:
+            frame = _fetch_minute_bars(code, event_date, retries=1)
+            saved = save_minute_bars(code, frame, engine=engine)
+            if saved == 0:
+                empty += 1
+            eastmoney_bars += saved
+            bars += saved
         except Exception as exc:
             errors += 1
             logger.debug(f"Minute bars unavailable for {code}: {exc}")
-            if errors >= 3 and bars == 0:
-                _minute_source_blocked_until = now + timedelta(minutes=30)
-                break
-    return {"codes": len(codes), "bars": bars, "errors": errors, "source_paused": int(errors >= 3 and bars == 0)}
+    return {
+        "codes": len(codes),
+        "bars": bars,
+        "snapshot_bars": snapshot_bars,
+        "eastmoney_bars": eastmoney_bars,
+        "errors": errors,
+        "empty": empty,
+        "source_paused": 0,
+    }

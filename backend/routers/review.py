@@ -3,18 +3,57 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import text, bindparam
 from typing import Dict, Any, List, Optional
 import io
+import json
 import pandas as pd
 
 from core.db import get_db_engine
+from core.db import get_scan_dates, get_scan_history_by_date
+from core.daily_strategy_report import build_daily_strategy_report, build_daily_strategy_report_body
 from core.logging_config import logger
+from core.outcome_calibration import build_blocker_report, build_calibration_report, load_scan_outcomes
 from core.performance_metrics import return_metrics
 from core.pro_workflow import classify_strategy_health
 
 router = APIRouter(prefix="/api/review", tags=["review"])
 
 
+def _measurement_contract(scope: str) -> Dict[str, Any]:
+    contracts = {
+        "scan": {
+            "sample_unit": "code + signal_date + strategy_type scan snapshot",
+            "entry_price": "scan_history.price",
+            "risk_model": "raw future close; execution filters reported separately",
+        },
+        "recommendation_event": {
+            "sample_unit": "one persisted recommendation event",
+            "entry_price": "recommendation_events.recommendation_price",
+            "risk_model": "raw future close; no stop/take simulation",
+        },
+        "calibration": {
+            "sample_unit": "latest code + signal_date + strategy_type snapshot",
+            "entry_price": "daily_k signal-date close",
+            "risk_model": "raw future close; blocker comparison is diagnostic",
+        },
+        "profitability_layers": {
+            "sample_unit": "layer-specific scan, recommendation event, or real trade",
+            "entry_price": "scan price / recommendation price / actual trade price by layer",
+            "risk_model": "raw future close; layers are not directly interchangeable",
+        },
+    }
+    return {
+        "scope": scope,
+        **contracts[scope],
+        "horizons": [1, 3, 5, 10],
+        "maturity_rule": "future Nth trading-day close must exist",
+        "return_type": "absolute_return_pct",
+        "benchmark_adjusted": False,
+        "version": "measurement-contract-v1",
+    }
+
+
 def _empty_response() -> Dict[str, Any]:
     return {
+        "measurement_contract": _measurement_contract("scan"),
         "summary": {
             "signals": 0,
             "win_rate_5d": 0,
@@ -46,6 +85,8 @@ def _empty_response() -> Dict[str, Any]:
         "by_trade_state": [],
         "by_opportunity_bucket": [],
         "by_sector_alignment": [],
+        "by_sector_strength": [],
+        "by_stock_sector_fit": [],
         "data_quality": {},
         "path_metrics": {},
         "score_buckets": {},
@@ -56,6 +97,22 @@ def _empty_response() -> Dict[str, Any]:
         "by_industry": [],
         "recent_dates": [],
     }
+
+
+def _count_recommendation_events_for_date(scan_date: str) -> int:
+    engine = get_db_engine()
+    if not engine or not scan_date:
+        return 0
+    try:
+        with engine.connect() as conn:
+            return int(conn.execute(text("""
+                SELECT COUNT(*)
+                FROM recommendation_events
+                WHERE event_date = :scan_date
+                  AND COALESCE(source, '') LIKE 'bark%'
+            """), {"scan_date": scan_date}).scalar() or 0)
+    except Exception:
+        return 0
 
 
 def _load_scan_performance_df(days: int) -> pd.DataFrame:
@@ -89,6 +146,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE(price_action_detail->>'sector_mainline', 'UNKNOWN') AS sector_mainline,
                 COALESCE(price_action_detail->>'trade_state', 'UNKNOWN') AS trade_state,
                 COALESCE((price_action_detail->>'trade_opportunity_score')::float, 0) AS trade_opportunity_score,
+                COALESCE((price_action_detail->>'sector_strength_score')::float, 0) AS sector_strength_score,
+                COALESCE((price_action_detail->>'stock_sector_fit_score')::float, 0) AS stock_sector_fit_score,
                 COALESCE((price_action_detail->>'sector_alignment_score')::float, 0) AS sector_alignment_score,
                 COALESCE((price_action_detail->>'sector_relative_pct')::float, 0) AS sector_relative_pct,
                 CASE
@@ -142,6 +201,8 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.sector_mainline,
                 s.trade_state,
                 s.trade_opportunity_score,
+                s.sector_strength_score,
+                s.stock_sector_fit_score,
                 s.sector_alignment_score,
                 s.sector_relative_pct,
                 s.pa_trap_risk_bucket,
@@ -264,6 +325,16 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
         bins=[-1, 50, 70, 100],
         labels=["弱联动<50", "中联动50~70", "强联动>70"],
     ).astype(str).replace("nan", "未知")
+    df["sector_strength_bucket"] = pd.cut(
+        pd.to_numeric(df["sector_strength_score"], errors="coerce"),
+        bins=[-1, 50, 70, 100],
+        labels=["弱板块<50", "中板块50~70", "强板块>70"],
+    ).astype(str).replace("nan", "未知")
+    df["stock_sector_fit_bucket"] = pd.cut(
+        pd.to_numeric(df["stock_sector_fit_score"], errors="coerce"),
+        bins=[-1, 45, 60, 100],
+        labels=["弱适配<45", "中适配45~60", "强适配>60"],
+    ).astype(str).replace("nan", "未知")
     df["next_open_gap_bucket"] = pd.cut(
         df["next_open_gap_pct"],
         bins=[-999, -2, 1, 3, 999],
@@ -376,12 +447,26 @@ def _build_bark_success_profile(event_df: pd.DataFrame) -> Dict[str, Any]:
     bark_df = bark_df.dropna(subset=["ret_5d"])
     if bark_df.empty:
         return {"sample": 0, "features": [], "notes": ["Bark样本暂无5日收益数据"]}
+    if "sector_strength_score" in bark_df.columns:
+        bark_df["sector_strength_bucket"] = pd.cut(
+            pd.to_numeric(bark_df["sector_strength_score"], errors="coerce"),
+            bins=[-1, 50, 70, 100],
+            labels=["弱板块<50", "中板块50~70", "强板块>70"],
+        ).astype(str).replace("nan", "未知")
+    if "stock_sector_fit_score" in bark_df.columns:
+        bark_df["stock_sector_fit_bucket"] = pd.cut(
+            pd.to_numeric(bark_df["stock_sector_fit_score"], errors="coerce"),
+            bins=[-1, 45, 60, 100],
+            labels=["弱适配<45", "中适配45~60", "强适配>60"],
+        ).astype(str).replace("nan", "未知")
     features: List[Dict[str, Any]] = []
     for col, label in [
         ("strategy_type", "策略"),
         ("trade_bucket", "交易桶"),
         ("pa_trade_setup", "价格行为"),
         ("sector_phase", "板块阶段"),
+        ("sector_strength_bucket", "板块强度"),
+        ("stock_sector_fit_bucket", "个股适配"),
         ("market_regime", "大盘环境"),
     ]:
         features.extend(_feature_success_rows(bark_df, col, label))
@@ -402,7 +487,22 @@ def _load_recommendation_event_performance_df(days: int) -> pd.DataFrame:
     engine = get_db_engine()
     if not engine:
         return pd.DataFrame()
-    df = pd.read_sql(text("""
+    with engine.connect() as conn:
+        if engine.dialect.name == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(recommendation_events)")).fetchall()
+            columns = {row[1] for row in rows}
+        else:
+            rows = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'recommendation_events'
+            """)).fetchall()
+            columns = {row[0] for row in rows}
+
+    def event_col(column: str) -> str:
+        return f"e.{column}" if column in columns else f"NULL AS {column}"
+
+    df = pd.read_sql(text(f"""
         SELECT
             e.source,
             e.code,
@@ -414,8 +514,11 @@ def _load_recommendation_event_performance_df(days: int) -> pd.DataFrame:
             e.trade_eligible,
             e.pa_trade_action,
             e.pa_trade_setup,
-            e.sector_phase,
-            e.market_regime,
+            {event_col("sector_strength_score")},
+            {event_col("stock_sector_fit_score")},
+            {event_col("sector_alignment_score")},
+            {event_col("sector_phase")},
+            {event_col("market_regime")},
             h1.close AS close_1d,
             h3.close AS close_3d,
             h5.close AS close_5d,
@@ -462,6 +565,7 @@ def _load_real_trade_performance_df(days: int) -> pd.DataFrame:
             p.entry_slippage_pct,
             p.plan_adherence,
             p.entry_source,
+            p.entry_signal_date,
             p.strategy_type,
             p.status,
             h1.close AS close_1d,
@@ -495,6 +599,408 @@ def _load_real_trade_performance_df(days: int) -> pd.DataFrame:
     return df
 
 
+def _metric_summary(returns: pd.Series) -> Dict[str, Any]:
+    clean = pd.to_numeric(returns, errors="coerce").dropna()
+    if clean.empty:
+        return {"signals": 0, "win_rate": 0, "avg_return": None, "best_return": None, "worst_return": None}
+    return {
+        "signals": int(len(clean)),
+        "win_rate": round(float((clean > 0).mean() * 100), 1),
+        "avg_return": round(float(clean.mean()), 2),
+        "best_return": round(float(clean.max()), 2),
+        "worst_return": round(float(clean.min()), 2),
+    }
+
+
+def _outcome_adjustment_rows(
+    rows: List[Dict[str, Any]],
+    value_key: str,
+    dimension: str,
+    min_samples: int = 10,
+) -> List[Dict[str, Any]]:
+    adjustments: List[Dict[str, Any]] = []
+    for row in rows:
+        metric = (row.get("metrics") or {}).get("5d") or {}
+        signals = int(metric.get("signals") or 0)
+        win_rate = float(metric.get("win_rate") or 0)
+        avg_return = metric.get("avg_return")
+        value = str(row.get(value_key) or "UNKNOWN")
+        if signals < min_samples:
+            action = "OBSERVE"
+            score_delta = 0
+            reason = f"5日成熟样本 {signals} < {min_samples}，只观察不调权"
+        elif avg_return is not None and avg_return <= -0.3:
+            action = "DOWNWEIGHT"
+            score_delta = -5
+            reason = f"5日均收 {avg_return}% 为负，建议降权"
+        elif win_rate < 45:
+            action = "DOWNWEIGHT"
+            score_delta = -3
+            reason = f"5日胜率 {win_rate}% 偏低，建议降低优先级"
+        elif avg_return is not None and avg_return >= 0.8 and win_rate >= 52:
+            action = "BOOST"
+            score_delta = 4
+            reason = f"5日均收 {avg_return}% 且胜率 {win_rate}%，可小幅加权"
+        else:
+            action = "KEEP"
+            score_delta = 0
+            reason = "表现接近中性，暂不调权"
+        adjustments.append({
+            "dimension": dimension,
+            "value": value,
+            "action": action,
+            "score_delta": score_delta,
+            "mature_5d": signals,
+            "win_rate_5d": win_rate,
+            "avg_return_5d": avg_return,
+            "reason": reason,
+        })
+    priority = {"DOWNWEIGHT": 0, "BOOST": 1, "OBSERVE": 2, "KEEP": 3}
+    adjustments.sort(key=lambda item: (priority.get(item["action"], 9), -abs(int(item["score_delta"])), -int(item["mature_5d"])))
+    return adjustments
+
+
+def _build_recommendation_outcome_loop(event_df: pd.DataFrame) -> Dict[str, Any]:
+    """Summarize post-recommendation returns so Bark/scan pushes form a feedback loop."""
+    if event_df.empty:
+        return {
+            "summary": {"events": 0, "mature_5d": 0, "best_source": "暂无", "worst_source": "暂无"},
+            "horizons": {},
+            "by_source": [],
+            "by_strategy": [],
+            "adjustments": {"by_source": [], "by_strategy": [], "rules": []},
+            "recent_events": [],
+            "suggestions": ["暂无推荐事件样本，先积累 Bark/扫描推荐记录"],
+        }
+
+    df = event_df.copy()
+    df["source"] = df.get("source", pd.Series(dtype=str)).fillna("UNKNOWN").astype(str)
+    df["strategy_type"] = df.get("strategy_type", pd.Series(dtype=str)).fillna("UNKNOWN").astype(str)
+    df["signal_date"] = df.get("signal_date", df.get("event_date", pd.Series(dtype=object)))
+    for horizon in [1, 3, 5, 10]:
+        df[f"ret_{horizon}d"] = pd.to_numeric(df.get(f"ret_{horizon}d"), errors="coerce")
+
+    horizons = {f"{horizon}d": _metric_summary(df[f"ret_{horizon}d"]) for horizon in [1, 3, 5, 10]}
+
+    def grouped_rows(group_col: str, label_col: str) -> List[Dict[str, Any]]:
+        if group_col not in df.columns:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for value, group in df.groupby(df[group_col].fillna("UNKNOWN").astype(str), dropna=False):
+            row = {
+                label_col: value,
+                "events": int(len(group)),
+                "mature_5d": int(group["ret_5d"].notna().sum()),
+                "metrics": {f"{horizon}d": _metric_summary(group[f"ret_{horizon}d"]) for horizon in [1, 3, 5, 10]},
+            }
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                row["metrics"]["5d"]["avg_return"] if row["metrics"]["5d"]["avg_return"] is not None else -999,
+                row["metrics"]["5d"]["win_rate"],
+                row["mature_5d"],
+            ),
+            reverse=True,
+        )
+        return rows
+
+    by_source = grouped_rows("source", "source")
+    by_strategy = grouped_rows("strategy_type", "strategy_type")
+    source_adjustments = _outcome_adjustment_rows(by_source, "source", "推荐来源")
+    strategy_adjustments = _outcome_adjustment_rows(by_strategy, "strategy_type", "策略")
+    mature_sources = [row for row in by_source if row["metrics"]["5d"]["signals"] > 0]
+    best_source = mature_sources[0]["source"] if mature_sources else "样本不足"
+    worst_source = mature_sources[-1]["source"] if mature_sources else "样本不足"
+
+    suggestions = []
+    five_day = horizons["5d"]
+    if five_day["signals"] < 10:
+        suggestions.append("5日成熟样本不足10个，暂时只做观察，不建议大幅调参")
+    elif (five_day["avg_return"] or 0) > 0 and five_day["win_rate"] >= 55:
+        suggestions.append("推荐事件5日表现为正，可继续强化当前高胜率画像")
+    else:
+        suggestions.append("推荐事件5日表现偏弱，应检查推送是否过晚、是否追高或板块联动不足")
+    for row in by_source:
+        metric = row["metrics"]["5d"]
+        if metric["signals"] >= 3 and metric["avg_return"] is not None and metric["avg_return"] < 0:
+            suggestions.append(f"{row['source']} 5日均收为负，建议降低展示优先级或延后确认")
+    for item in source_adjustments + strategy_adjustments:
+        if item["action"] in {"DOWNWEIGHT", "BOOST"}:
+            suggestions.append(f"{item['dimension']} {item['value']}：{item['reason']}")
+
+    recent_cols = [
+        "signal_date", "source", "code", "name", "strategy_type", "price",
+        "ret_1d", "ret_3d", "ret_5d", "ret_10d", "trade_bucket", "pa_trade_setup",
+    ]
+    recent_df = df[[c for c in recent_cols if c in df.columns]].copy()
+    if "signal_date" in recent_df.columns:
+        recent_df = recent_df.sort_values("signal_date", ascending=False)
+    recent_events = recent_df.head(12).where(pd.notna(recent_df), None).to_dict(orient="records")
+    for row in recent_events:
+        if row.get("signal_date") is not None:
+            row["signal_date"] = str(row["signal_date"])[:10]
+
+    return {
+        "summary": {
+            "events": int(len(df)),
+            "mature_5d": int(df["ret_5d"].notna().sum()),
+            "best_source": best_source,
+            "worst_source": worst_source,
+            "downweight_count": sum(1 for item in source_adjustments + strategy_adjustments if item["action"] == "DOWNWEIGHT"),
+            "boost_count": sum(1 for item in source_adjustments + strategy_adjustments if item["action"] == "BOOST"),
+        },
+        "horizons": horizons,
+        "by_source": by_source,
+        "by_strategy": by_strategy,
+        "adjustments": {
+            "by_source": source_adjustments,
+            "by_strategy": strategy_adjustments,
+            "rules": [
+                "5日成熟样本少于10个：只观察不调权",
+                "5日均收<=-0.3%或胜率<45%：建议降权",
+                "5日均收>=0.8%且胜率>=52%：建议小幅加权",
+            ],
+        },
+        "recent_events": recent_events,
+        "suggestions": suggestions[:5],
+    }
+
+
+def _safe_date(value: Any):
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
+
+
+def _payload_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _build_sector_watch_event_performance(event_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[str, Any]:
+    if event_df.empty:
+        return _build_sector_watch_performance(pd.DataFrame(), daily_df)
+
+    daily = daily_df.copy()
+    if not daily.empty:
+        daily["date"] = pd.to_datetime(daily["date"]).dt.date
+        daily = daily.sort_values(["code", "date"])
+
+    items: List[Dict[str, Any]] = []
+    for _, row in event_df.iterrows():
+        payload = _payload_dict(row.get("payload"))
+        code = str(row.get("code") or "").zfill(6)
+        signal_date = _safe_date(row.get("event_time"))
+        event_price = float(payload.get("current_price") or payload.get("watch_price") or 0)
+        if not code or not signal_date or event_price <= 0:
+            continue
+        path = daily[(daily["code"].astype(str).str.zfill(6) == code) & (daily["date"] > signal_date)] if not daily.empty else pd.DataFrame()
+        latest = path.iloc[-1].to_dict() if not path.empty else {}
+        item = {
+            "code": code,
+            "name": row.get("name") or "",
+            "theme": row.get("theme") or "",
+            "signal_date": str(signal_date),
+            "watch_price": round(event_price, 2),
+            "latest_close": round(float(latest.get("close") or event_price), 2),
+            "latest_date": str(latest.get("date") or "") if latest else "",
+            "state": payload.get("state") or "UNKNOWN",
+            "label": payload.get("label") or payload.get("state") or "未知",
+            "action": payload.get("action") or "",
+            "days_tracked": int(len(path)),
+        }
+        for horizon in [1, 3, 5, 10]:
+            if len(path) >= horizon:
+                close = float(path.iloc[horizon - 1]["close"])
+                item[f"ret_{horizon}d"] = round((close - event_price) / event_price * 100, 2)
+            else:
+                item[f"ret_{horizon}d"] = None
+        items.append(item)
+
+    item_df = pd.DataFrame(items)
+    if item_df.empty:
+        return {
+            "summary": {"items": 0, "mature_5d": 0, "best_state": "暂无"},
+            "by_state": [],
+            "items": [],
+            "notes": ["题材状态事件缺少有效价格或后续日线"],
+            "suggestions": [],
+            "source": "state_events",
+        }
+
+    by_state: List[Dict[str, Any]] = []
+    for state, group in item_df.groupby("state", dropna=False):
+        row = {
+            "state": state,
+            "label": str(group["label"].iloc[0] or state),
+            "items": int(len(group)),
+            "mature_5d": int(pd.to_numeric(group["ret_5d"], errors="coerce").notna().sum()),
+            "metrics": {
+                "1d": _metric_summary(group["ret_1d"]),
+                "3d": _metric_summary(group["ret_3d"]),
+                "5d": _metric_summary(group["ret_5d"]),
+                "10d": _metric_summary(group["ret_10d"]),
+            },
+        }
+        by_state.append(row)
+    by_state.sort(
+        key=lambda r: (
+            r["metrics"]["5d"]["avg_return"] if r["metrics"]["5d"]["avg_return"] is not None else -999,
+            r["metrics"]["5d"]["win_rate"],
+            r["mature_5d"],
+        ),
+        reverse=True,
+    )
+    best_state = by_state[0]["label"] if by_state and by_state[0]["mature_5d"] > 0 else "样本不足"
+    suggestions = []
+    for row in by_state:
+        metric = row["metrics"]["5d"]
+        if metric["signals"] >= 3 and metric["avg_return"] is not None and metric["avg_return"] > 1 and metric["win_rate"] >= 55:
+            suggestions.append(f"{row['label']} 5日表现较好，可提高Bark展示优先级")
+        if metric["signals"] >= 3 and metric["avg_return"] is not None and metric["avg_return"] < 0:
+            suggestions.append(f"{row['label']} 5日均值为负，应继续降权或延后确认")
+
+    return {
+        "summary": {
+            "items": int(len(item_df)),
+            "mature_5d": int(pd.to_numeric(item_df["ret_5d"], errors="coerce").notna().sum()),
+            "best_state": best_state,
+        },
+        "by_state": by_state,
+        "items": sorted(items, key=lambda x: (x.get("ret_5d") is not None, x.get("ret_5d") or -999), reverse=True)[:30],
+        "notes": ["按题材状态事件出现日和当时价格计算后续表现。"],
+        "suggestions": suggestions,
+        "source": "state_events",
+    }
+
+
+def _build_sector_watch_performance(watch_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[str, Any]:
+    if watch_df.empty:
+        return {
+            "summary": {"items": 0, "mature_5d": 0, "best_state": "暂无"},
+            "by_state": [],
+            "items": [],
+            "notes": ["暂无题材观察池样本"],
+        }
+
+    from routers.watchlist import _sector_watch_state
+
+    daily = daily_df.copy()
+    if not daily.empty:
+        daily["date"] = pd.to_datetime(daily["date"]).dt.date
+        daily = daily.sort_values(["code", "date"])
+
+    items: List[Dict[str, Any]] = []
+    for _, row in watch_df.iterrows():
+        code = str(row.get("code") or "").zfill(6)
+        watch_price = float(row.get("watch_price") or 0)
+        signal_date = _safe_date(row.get("created_at") or row.get("updated_at"))
+        if not code or watch_price <= 0 or not signal_date:
+            continue
+        path = daily[(daily["code"].astype(str).str.zfill(6) == code) & (daily["date"] > signal_date)] if not daily.empty else pd.DataFrame()
+        latest = path.iloc[-1].to_dict() if not path.empty else {}
+        current_price = float(latest.get("close") or watch_price)
+        target_price = row.get("target_price")
+        stop_price = row.get("stop_price")
+        state_input = {
+            "strategy_type": row.get("strategy_type") or "",
+            "source": row.get("source") or "",
+            "current_price": current_price,
+            "watch_price": watch_price,
+            "target_price": target_price if pd.notna(target_price) else None,
+            "stop_price": stop_price if pd.notna(stop_price) else None,
+            "target_hit": pd.notna(target_price) and current_price >= float(target_price),
+            "stop_hit": pd.notna(stop_price) and current_price <= float(stop_price),
+            "intraday_high": float(latest.get("high") or 0),
+            "pa_trade_action": row.get("pa_trade_action") or "",
+        }
+        state = _sector_watch_state(state_input)
+        item = {
+            "code": code,
+            "name": row.get("name") or "",
+            "theme": row.get("theme") or row.get("industry") or "",
+            "signal_date": str(signal_date),
+            "watch_price": round(watch_price, 2),
+            "latest_close": round(current_price, 2),
+            "latest_date": str(latest.get("date") or "") if latest else "",
+            "state": state.get("state") or "UNKNOWN",
+            "label": state.get("label") or "未知",
+            "action": state.get("action") or "",
+            "days_tracked": int(len(path)),
+        }
+        for horizon in [1, 3, 5, 10]:
+            if len(path) >= horizon:
+                close = float(path.iloc[horizon - 1]["close"])
+                item[f"ret_{horizon}d"] = round((close - watch_price) / watch_price * 100, 2)
+            else:
+                item[f"ret_{horizon}d"] = None
+        items.append(item)
+
+    item_df = pd.DataFrame(items)
+    if item_df.empty:
+        return {
+            "summary": {"items": 0, "mature_5d": 0, "best_state": "暂无"},
+            "by_state": [],
+            "items": [],
+            "notes": ["题材观察池样本缺少有效观察价或后续日线"],
+        }
+
+    by_state: List[Dict[str, Any]] = []
+    for state, group in item_df.groupby("state", dropna=False):
+        row = {
+            "state": state,
+            "label": str(group["label"].iloc[0] or state),
+            "items": int(len(group)),
+            "mature_5d": int(pd.to_numeric(group["ret_5d"], errors="coerce").notna().sum()),
+            "metrics": {
+                "1d": _metric_summary(group["ret_1d"]),
+                "3d": _metric_summary(group["ret_3d"]),
+                "5d": _metric_summary(group["ret_5d"]),
+                "10d": _metric_summary(group["ret_10d"]),
+            },
+        }
+        by_state.append(row)
+    by_state.sort(
+        key=lambda r: (
+            r["metrics"]["5d"]["avg_return"] if r["metrics"]["5d"]["avg_return"] is not None else -999,
+            r["metrics"]["5d"]["win_rate"],
+            r["mature_5d"],
+        ),
+        reverse=True,
+    )
+    best_state = by_state[0]["label"] if by_state and by_state[0]["mature_5d"] > 0 else "样本不足"
+    suggestions = []
+    for row in by_state:
+        metric = row["metrics"]["5d"]
+        if metric["signals"] >= 3 and metric["avg_return"] is not None and metric["avg_return"] > 1 and metric["win_rate"] >= 55:
+            suggestions.append(f"{row['label']} 5日表现较好，可提高Bark展示优先级")
+        if metric["signals"] >= 3 and metric["avg_return"] is not None and metric["avg_return"] < 0:
+            suggestions.append(f"{row['label']} 5日均值为负，应继续降权或延后确认")
+
+    return {
+        "summary": {
+            "items": int(len(item_df)),
+            "mature_5d": int(pd.to_numeric(item_df["ret_5d"], errors="coerce").notna().sum()),
+            "best_state": best_state,
+        },
+        "by_state": by_state,
+        "items": sorted(items, key=lambda x: (x.get("ret_5d") is not None, x.get("ret_5d") or -999), reverse=True)[:30],
+        "notes": [
+            "按当前可计算题材状态分组，收益从加入观察池的观察价开始计算。",
+            "历史未记录状态切换事件，因此这是当前状态画像，不是逐日状态事件回放。",
+        ],
+        "suggestions": suggestions,
+    }
+
+
 def _build_real_trade_execution_review(real_trade_df: pd.DataFrame, event_df: pd.DataFrame) -> Dict[str, Any]:
     if real_trade_df.empty:
         return {"sample": 0, "notes": ["暂无实盘买入样本"]}
@@ -505,6 +1011,19 @@ def _build_real_trade_execution_review(real_trade_df: pd.DataFrame, event_df: pd
     actual = pd.to_numeric(real.get("actual_entry_price"), errors="coerce")
     missing_slip = real["entry_slippage_pct"].isna() & planned.gt(0) & actual.gt(0)
     real.loc[missing_slip, "entry_slippage_pct"] = (actual[missing_slip] - planned[missing_slip]) / planned[missing_slip] * 100
+    signal_dates = pd.to_datetime(
+        real.get("entry_signal_date", pd.Series(index=real.index, dtype=object)), errors="coerce"
+    )
+    entry_dates = pd.to_datetime(
+        real.get("entry_date", pd.Series(index=real.index, dtype=object)), errors="coerce"
+    )
+    real["entry_delay_calendar_days"] = (entry_dates - signal_dates).dt.days
+    real.loc[real["entry_delay_calendar_days"] < 0, "entry_delay_calendar_days"] = pd.NA
+    real["entry_delay_bucket"] = pd.cut(
+        real["entry_delay_calendar_days"],
+        bins=[-1, 0, 1, 99999],
+        labels=["信号当日", "延迟1日", "延迟2日以上"],
+    ).astype(str).replace("nan", "未知")
 
     bark = pd.DataFrame()
     if not event_df.empty:
@@ -524,18 +1043,93 @@ def _build_real_trade_execution_review(real_trade_df: pd.DataFrame, event_df: pd
                 "win_rate_5d": round(float((returns > 0).mean() * 100), 1) if not returns.empty else None,
             })
 
+    by_entry_source: List[Dict[str, Any]] = []
+    if "entry_source" in real.columns:
+        for value, group in real.groupby(real["entry_source"].fillna("UNKNOWN").astype(str)):
+            returns = pd.to_numeric(group.get("ret_5d"), errors="coerce").dropna()
+            by_entry_source.append({
+                "entry_source": value,
+                "trades": int(len(group)),
+                "avg_return_5d": round(float(returns.mean()), 2) if not returns.empty else None,
+                "win_rate_5d": round(float((returns > 0).mean() * 100), 1) if not returns.empty else None,
+            })
+
+    slip_series = pd.to_numeric(real["entry_slippage_pct"], errors="coerce")
+    real["slippage_bucket"] = pd.cut(
+        slip_series,
+        bins=[-999, -0.01, 0.5, 2.0, 999],
+        labels=["优于/低于计划价", "轻微滑点0~0.5%", "高滑点0.5~2%", "严重滑点>2%"],
+    ).astype(str).replace("nan", "未知")
+    by_slippage_bucket: List[Dict[str, Any]] = []
+    for value, group in real.groupby("slippage_bucket", dropna=False):
+        returns = pd.to_numeric(group.get("ret_5d"), errors="coerce").dropna()
+        by_slippage_bucket.append({
+            "slippage_bucket": value,
+            "trades": int(len(group)),
+            "avg_return_5d": round(float(returns.mean()), 2) if not returns.empty else None,
+            "win_rate_5d": round(float((returns > 0).mean() * 100), 1) if not returns.empty else None,
+        })
+
+    by_entry_delay_bucket: List[Dict[str, Any]] = []
+    for value, group in real.groupby("entry_delay_bucket", dropna=False):
+        returns = pd.to_numeric(group.get("ret_5d"), errors="coerce").dropna()
+        by_entry_delay_bucket.append({
+            "entry_delay_bucket": value,
+            "trades": int(len(group)),
+            "avg_return_5d": round(float(returns.mean()), 2) if not returns.empty else None,
+            "win_rate_5d": round(float((returns > 0).mean() * 100), 1) if not returns.empty else None,
+        })
+
     real_avg = float(real_ret.mean()) if not real_ret.empty else None
     bark_avg = float(bark_ret.mean()) if not bark_ret.empty else None
+    avg_slip = float(real["entry_slippage_pct"].dropna().mean()) if not real["entry_slippage_pct"].dropna().empty else None
+    unknown_adherence = int(real.get("plan_adherence", pd.Series(dtype=str)).fillna("UNKNOWN").astype(str).eq("UNKNOWN").sum())
+    missing_planned_entry = int(planned.isna().sum() + planned.eq(0).sum())
+    missing_signal_date = int(real.get("entry_signal_date", pd.Series(dtype=object)).isna().sum()) if "entry_signal_date" in real.columns else int(len(real))
+    high_slippage_trades = int(slip_series.gt(0.5).sum())
+    delayed_trades = int(real["entry_delay_calendar_days"].ge(2).sum())
+    execution_quality_score = 100
+    execution_quality_score -= min(40, unknown_adherence * 10)
+    execution_quality_score -= min(25, high_slippage_trades * 8)
+    execution_quality_score -= min(20, missing_planned_entry * 8)
+    execution_quality_score -= min(15, missing_signal_date * 5)
+    execution_quality_score = max(0, execution_quality_score)
+
+    diagnostics: List[str] = []
+    if real_avg is not None and bark_avg is not None and real_avg < bark_avg:
+        diagnostics.append("实盘执行收益跑输系统Bark样本，优先复盘买入时点和卖出纪律")
+    if avg_slip is not None and avg_slip > 0.5:
+        diagnostics.append("平均买入滑点偏高，避免高开追价或盘中急单")
+    if unknown_adherence:
+        diagnostics.append(f"{unknown_adherence}笔实盘缺少计划遵守标记，影响执行胜率归因")
+    if missing_planned_entry:
+        diagnostics.append(f"{missing_planned_entry}笔实盘缺少计划价，无法判断是否按确认价执行")
+    if missing_signal_date:
+        diagnostics.append(f"{missing_signal_date}笔实盘缺少信号日期，无法精确匹配系统推荐")
+    if delayed_trades:
+        diagnostics.append(f"{delayed_trades}笔实盘在信号两日后才入场，需结合收益分桶复盘等待成本")
     return {
         "sample": int(len(real)),
         "system_bark_sample": int(len(bark_ret)),
         "real_trade_avg_return_5d": round(real_avg, 2) if real_avg is not None else None,
         "system_bark_avg_return_5d": round(bark_avg, 2) if bark_avg is not None else None,
         "execution_gap_5d": round(real_avg - bark_avg, 2) if real_avg is not None and bark_avg is not None else None,
-        "avg_entry_slippage_pct": round(float(real["entry_slippage_pct"].dropna().mean()), 2)
-        if not real["entry_slippage_pct"].dropna().empty else None,
+        "avg_entry_slippage_pct": round(avg_slip, 2) if avg_slip is not None else None,
+        "unknown_plan_adherence": unknown_adherence,
+        "missing_planned_entry": missing_planned_entry,
+        "missing_signal_date": missing_signal_date,
+        "high_slippage_trades": high_slippage_trades,
+        "delayed_trades_2d_plus": delayed_trades,
+        "execution_quality_score": execution_quality_score,
         "by_plan_adherence": by_adherence,
-        "notes": ["execution_gap_5d = 实盘买入5日均值 - Bark系统样本5日均值，用于区分系统胜率和执行胜率"],
+        "by_entry_source": by_entry_source,
+        "by_slippage_bucket": by_slippage_bucket,
+        "by_entry_delay_bucket": by_entry_delay_bucket,
+        "diagnostics": diagnostics,
+        "notes": [
+            "execution_gap_5d = 实盘买入5日均值 - Bark系统样本5日均值，用于区分系统胜率和执行胜率",
+            "entry_delay_bucket 按信号日至实际买入日的自然日差分组，节假日不计为交易日。",
+        ],
     }
 
 
@@ -550,20 +1144,97 @@ def _high_open_buyability(
 ) -> Optional[Dict[str, Any]]:
     if first_open_gap is None or first_open_gap <= 3:
         return None
+    if first_open_gap <= 5:
+        gap_bucket = "高开3~5%"
+    elif first_open_gap < 9.5:
+        gap_bucket = "高开5~9.5%"
+    else:
+        gap_bucket = "涨停/一字高开"
     if first_open_gap >= 9.5:
-        return {"state": "LIMIT_OPEN", "action": "不追：涨停/一字高开"}
+        return {
+            "state": "LIMIT_OPEN",
+            "gap_bucket": gap_bucket,
+            "buyable": False,
+            "action": "不追：涨停/一字高开",
+            "required_confirmation": "隔日回踩不破支撑后再观察",
+            "risk": "极易追在情绪高点",
+        }
     confirm_line = entry_line if entry_line > 0 else base_price
     support_line = stop_line if stop_line > 0 else base_price * 0.97
     pulled_back = min_low <= confirm_line * 1.01
     held_support = min_low >= support_line * 0.995
     stood_back = latest_close >= confirm_line and latest_gain >= 0
     if not held_support:
-        return {"state": "FAILED", "action": "高开回落跌破支撑：取消"}
+        return {
+            "state": "FAILED",
+            "gap_bucket": gap_bucket,
+            "buyable": False,
+            "action": "高开回落跌破支撑：取消",
+            "required_confirmation": "重新站回确认价且修复结构前不买",
+            "risk": "高开低走破坏结构",
+        }
     if pulled_back and stood_back:
-        return {"state": "CONFIRMED", "action": "高开回踩后站稳：尾盘小仓确认"}
+        return {
+            "state": "CONFIRMED",
+            "gap_bucket": gap_bucket,
+            "buyable": True,
+            "action": "高开回踩后站稳：尾盘小仓确认",
+            "required_confirmation": "贴近确认价小仓，跌破支撑取消",
+            "risk": "仍需控制仓位，避免二次冲高回落",
+        }
     if pulled_back:
-        return {"state": "PENDING_CONFIRM", "action": "高开已回踩：等重新站回确认价"}
-    return {"state": "WAIT_PULLBACK", "action": "高开不追：等回踩确认或尾盘站稳"}
+        return {
+            "state": "PENDING_CONFIRM",
+            "gap_bucket": gap_bucket,
+            "buyable": False,
+            "action": "高开已回踩：等重新站回确认价",
+            "required_confirmation": "放量站回确认价后再复核",
+            "risk": "回踩尚未重新转强",
+        }
+    return {
+        "state": "WAIT_PULLBACK",
+        "gap_bucket": gap_bucket,
+        "buyable": False,
+        "action": "高开不追：等回踩确认或尾盘站稳",
+        "required_confirmation": "回踩接近确认价/支撑位且尾盘站稳",
+        "risk": "未回踩时追价风险高",
+    }
+
+
+@router.get("/daily-strategy-report")
+def get_daily_strategy_report(date: str = "", limit: int = 8) -> Dict[str, Any]:
+    """After-close strategy report: scan buckets, Bark events, hot-sector misses, and next actions."""
+    try:
+        dates = get_scan_dates()
+        scan_date = date or (dates[0] if dates else "")
+        scan_results = get_scan_history_by_date(scan_date) if scan_date else []
+        try:
+            from routers.market import get_sector_push_gaps
+
+            sector_gap_payload = get_sector_push_gaps(limit=limit, date=scan_date)
+            sector_gaps = sector_gap_payload.get("items", [])
+        except Exception as exc:
+            logger.warning(f"Daily strategy sector gap unavailable: {exc}")
+            sector_gaps = []
+
+        report = build_daily_strategy_report(
+            scan_results,
+            scan_date=scan_date,
+            sector_gap_analysis=sector_gaps,
+            bark_push_count=_count_recommendation_events_for_date(scan_date),
+        )
+        return {
+            **report,
+            "body": build_daily_strategy_report_body(report),
+        }
+    except Exception as exc:
+        logger.error(f"Daily strategy report error: {exc}")
+        return {
+            "scan_date": date,
+            "summary": {"scan_count": 0, "stance": "日报生成失败"},
+            "body": "",
+            "error": str(exc),
+        }
 
 
 @router.get("/profitability-dashboard")
@@ -608,11 +1279,134 @@ def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
             "layers": layers,
             "bark_success_profile": bark_success_profile,
             "real_trade_execution": real_trade_execution,
+            "measurement_contract": _measurement_contract("profitability_layers"),
             "notes": notes,
         }
     except Exception as exc:
         logger.error(f"Profitability dashboard error: {exc}")
         return {"summary": {"days": int(days), "layers": 0}, "layers": [], "notes": [], "error": str(exc)}
+
+
+@router.get("/recommendation-outcome-loop")
+def get_recommendation_outcome_loop(days: int = 120) -> Dict[str, Any]:
+    """Closed-loop outcome view for Bark/scan recommendations after 1/3/5/10 trading days."""
+    engine = get_db_engine()
+    if not engine:
+        payload = _build_recommendation_outcome_loop(pd.DataFrame())
+        payload["summary"]["days"] = int(days)
+        return payload
+    try:
+        event_df = _load_recommendation_event_performance_df(days)
+        payload = _build_recommendation_outcome_loop(event_df)
+        payload["summary"]["days"] = int(days)
+        payload["measurement_contract"] = _measurement_contract("recommendation_event")
+        return payload
+    except Exception as exc:
+        logger.error(f"Recommendation outcome loop error: {exc}")
+        payload = _build_recommendation_outcome_loop(pd.DataFrame())
+        payload["summary"]["days"] = int(days)
+        payload["error"] = str(exc)
+        return payload
+
+
+@router.get("/strategy-calibration-report")
+def get_strategy_calibration_report(
+    days: int = 120,
+    min_grade_samples: int = 30,
+    min_blocker_samples: int = 10,
+) -> Dict[str, Any]:
+    """Point-in-time strategy, grade, bucket, regime, and blocker outcome calibration."""
+    days = max(1, min(int(days), 3650))
+    min_grade_samples = max(1, int(min_grade_samples))
+    min_blocker_samples = max(1, int(min_blocker_samples))
+    engine = get_db_engine()
+    if not engine:
+        payload = build_calibration_report(pd.DataFrame(), min_samples=min_grade_samples)
+        payload["summary"]["days"] = days
+        payload["blocker_analysis"] = build_blocker_report(pd.DataFrame(), min_samples=min_blocker_samples)
+        payload["notes"] = ["数据库未连接"]
+        return payload
+    try:
+        outcomes = load_scan_outcomes(engine, days=days)
+        payload = build_calibration_report(outcomes, min_samples=min_grade_samples)
+        payload["summary"]["days"] = days
+        payload["blocker_analysis"] = build_blocker_report(outcomes, min_samples=min_blocker_samples)
+        payload["measurement_contract"] = _measurement_contract("calibration")
+        payload["notes"] = [
+            "信号价统一使用 daily_k 信号日收盘，避免扫描快照价与历史复权口径混用。",
+            "未来第N个交易日收盘不存在时，该信号不计入N日成熟样本。",
+            "blocker 对照是相关性诊断，不应未经样本外验证直接改动策略。",
+        ]
+        return payload
+    except Exception as exc:
+        logger.error(f"Strategy calibration report error: {exc}")
+        payload = build_calibration_report(pd.DataFrame(), min_samples=min_grade_samples)
+        payload["summary"]["days"] = days
+        payload["blocker_analysis"] = build_blocker_report(pd.DataFrame(), min_samples=min_blocker_samples)
+        payload["notes"] = []
+        payload["error"] = str(exc)
+        return payload
+
+
+@router.get("/sector-watch-performance")
+def get_sector_watch_performance(days: int = 120) -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return _build_sector_watch_performance(pd.DataFrame(), pd.DataFrame())
+
+    days = max(1, min(int(days), 365))
+    try:
+        cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+        event_df = pd.read_sql(text("""
+            SELECT event_time, code, name, theme, payload
+            FROM lifecycle_events
+            WHERE event_type = 'WATCHLIST_THEME_STATE_CHANGED'
+              AND event_time >= :cutoff
+            ORDER BY event_time DESC
+        """), engine, params={"cutoff": cutoff.to_pydatetime()})
+        if not event_df.empty:
+            codes = sorted({str(code).zfill(6) for code in event_df["code"].dropna().astype(str)})
+            stmt = text("""
+                SELECT code, date, open, high, low, close, vol
+                FROM daily_k
+                WHERE code IN :codes
+                ORDER BY code, date
+            """).bindparams(bindparam("codes", expanding=True))
+            daily_df = pd.read_sql(stmt, engine, params={"codes": codes}) if codes else pd.DataFrame()
+            return _build_sector_watch_event_performance(event_df, daily_df)
+
+        watch_df = pd.read_sql(text("""
+            SELECT *
+            FROM watchlist
+            WHERE strategy_type = 'sector_watch'
+               OR source = 'sector_push_gap'
+        """), engine)
+        if watch_df.empty:
+            return _build_sector_watch_performance(watch_df, pd.DataFrame())
+
+        created = pd.to_datetime(watch_df["created_at"], errors="coerce")
+        watch_df = watch_df[created >= cutoff].copy()
+        if watch_df.empty:
+            return _build_sector_watch_performance(watch_df, pd.DataFrame())
+
+        codes = sorted({str(code).zfill(6) for code in watch_df["code"].dropna().astype(str)})
+        stmt = text("""
+            SELECT code, date, open, high, low, close, vol
+            FROM daily_k
+            WHERE code IN :codes
+            ORDER BY code, date
+        """).bindparams(bindparam("codes", expanding=True))
+        daily_df = pd.read_sql(stmt, engine, params={"codes": codes}) if codes else pd.DataFrame()
+        return _build_sector_watch_performance(watch_df, daily_df)
+    except Exception as exc:
+        logger.error(f"Sector watch performance error: {exc}")
+        return {
+            "summary": {"items": 0, "mature_5d": 0, "best_state": "错误"},
+            "by_state": [],
+            "items": [],
+            "notes": ["题材观察池复盘失败"],
+            "error": str(exc),
+        }
 
 
 @router.get("/scan-performance")
@@ -689,6 +1483,8 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
         )
         by_opportunity_bucket = metric_frame(research_df.groupby("opportunity_bucket", observed=False), "bucket")
         by_sector_alignment = metric_frame(research_df.groupby("sector_alignment_bucket", dropna=False), "bucket")
+        by_sector_strength = metric_frame(research_df.groupby("sector_strength_bucket", dropna=False), "bucket")
+        by_stock_sector_fit = metric_frame(research_df.groupby("stock_sector_fit_bucket", dropna=False), "bucket")
 
         ret_1d_all = research_df["ret_1d"].dropna()
         trade_ret_1d = research_df.loc[research_df["trade_bucket"].eq("TRADE"), "ret_1d"].dropna()
@@ -815,6 +1611,8 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_trade_state": by_trade_state,
             "by_opportunity_bucket": by_opportunity_bucket,
             "by_sector_alignment": by_sector_alignment,
+            "by_sector_strength": by_sector_strength,
+            "by_stock_sector_fit": by_stock_sector_fit,
             "data_quality": data_quality,
             "path_metrics": path_metrics,
             "score_buckets": score_buckets,
@@ -825,6 +1623,7 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "brooks_backtests": brooks_backtests,
             "by_industry": by_industry,
             "recent_dates": recent[:20],
+            "measurement_contract": _measurement_contract("scan"),
         }
     except Exception as exc:
         logger.error(f"Review performance error: {exc}")
@@ -1059,6 +1858,11 @@ def get_next_day_followup(date: Optional[str] = None, limit: int = 80) -> Dict[s
                 "latest_gain_pct": round(latest_gain, 2),
                 "first_open_gap_pct": round(first_open_gap, 2) if first_open_gap is not None else None,
                 "high_open_buyability": high_open_buyability,
+                "high_open_state": high_open_buyability.get("state") if high_open_buyability else None,
+                "high_open_gap_bucket": high_open_buyability.get("gap_bucket") if high_open_buyability else None,
+                "high_open_buyable": high_open_buyability.get("buyable") if high_open_buyability else None,
+                "high_open_required_confirmation": high_open_buyability.get("required_confirmation") if high_open_buyability else None,
+                "high_open_risk": high_open_buyability.get("risk") if high_open_buyability else None,
                 "latest_close": round(latest_close, 2),
                 "latest_date": str(latest.get("date")),
                 "days_tracked": int(len(group)),

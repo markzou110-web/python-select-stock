@@ -11,6 +11,9 @@ from core.sentinel import (
     _build_after_close_watchlist_body,
     _candidate_action_label,
     _candidate_brief_lines,
+    _intraday_state_fingerprint,
+    _mark_intraday_state_sent,
+    _should_send_intraday_state,
     _format_market_line,
     _format_regime_line,
     _real_position_action,
@@ -22,7 +25,7 @@ from core.sentinel import (
 
 def test_intraday_push_keeps_sector_watch_quota():
     stocks = [
-        {"代码": "000001", "名称": "一号", "sop_grade": "A", "Score": 90},
+        {"代码": "000001", "名称": "一号", "sop_grade": "A", "Score": 90, "trade_bucket": "TRADE", "trade_eligible": True},
         {"代码": "000002", "名称": "二号", "sop_grade": "B", "Score": 80},
         {"代码": "000003", "名称": "三号", "sop_grade": "C", "Score": 70, "sector_watch_only": True},
         {"代码": "000004", "名称": "四号", "sop_grade": "D", "Score": 95, "sector_watch_only": True},
@@ -31,6 +34,42 @@ def test_intraday_push_keeps_sector_watch_quota():
     selected = _select_intraday_push_stocks(stocks, executable_limit=1, sector_watch_limit=1)
 
     assert [s["代码"] for s in selected] == ["000001", "000003"]
+
+
+def test_intraday_push_uses_outcome_adjustments_within_same_grade():
+    stocks = [
+        {
+            "代码": "000001",
+            "名称": "弱策略",
+            "sop_grade": "A",
+            "Score": 91,
+            "strategy_type": "tv_dual",
+            "trade_bucket": "TRADE",
+            "trade_eligible": True,
+        },
+        {
+            "代码": "000002",
+            "名称": "强策略",
+            "sop_grade": "A",
+            "Score": 88,
+            "strategy_type": "tv_dual_strict",
+            "trade_bucket": "TRADE",
+            "trade_eligible": True,
+        },
+    ]
+    adjustments = {
+        "source": {},
+        "strategy": {
+            "tv_dual": {"dimension": "策略", "value": "tv_dual", "score_delta": -5, "action": "DOWNWEIGHT"},
+            "tv_dual_strict": {"dimension": "策略", "value": "tv_dual_strict", "score_delta": 4, "action": "BOOST"},
+        },
+    }
+
+    selected = _select_intraday_push_stocks(stocks, executable_limit=2, priority_adjustments=adjustments)
+
+    assert [s["代码"] for s in selected] == ["000002", "000001"]
+    assert selected[0]["bark_priority_delta"] == 4
+    assert "tv_dual_strict +4" in selected[0]["bark_priority_note"]
 
 
 def test_bark_market_line_prefers_decision_context_over_offensive_regime():
@@ -126,13 +165,83 @@ def test_after_close_watchlist_keeps_observe_candidate_and_excludes_block():
     body = _build_after_close_watchlist_body(selected, "2026-06-09")
 
     assert [stock["代码"] for stock in selected] == ["300145"]
-    assert "关键价：现价 5.62 | 确认 >5.72 | 支撑 5.36 | 失效 <4.31" in body
+    assert "关键价：现价 5.62 | 确认 >5.72 | 有效失效 <4.31" in body
     assert "站稳 >5.72" in body
     assert "跌破 <4.31" in body
     assert "回踩状态: 回踩待确认：支撑暂守住，等放量站上确认价" in body
-    assert "不追高；回踩不破支撑5.36，放量站上确认价5.72再考虑" in body
+    assert "不追高；等待回踩后重新站上5.72，跌破4.31取消" in body
     assert "涨停/近涨停，等待隔日确认" in body
     assert "不是买入指令" in body
+
+
+def test_after_close_watchlist_body_includes_outcome_adjustment_note():
+    stocks = [
+        {
+            "代码": "000001",
+            "名称": "弱策略",
+            "sop_grade": "M",
+            "trade_bucket": "OBSERVE",
+            "final_trade_score": 73,
+            "strategy_type": "tv_dual",
+            "现价": 10,
+        },
+        {
+            "代码": "000002",
+            "名称": "强策略",
+            "sop_grade": "M",
+            "trade_bucket": "OBSERVE",
+            "final_trade_score": 70,
+            "strategy_type": "tv_dual_strict",
+            "现价": 10,
+        },
+    ]
+    adjustments = {
+        "source": {},
+        "strategy": {
+            "tv_dual": {"dimension": "策略", "value": "tv_dual", "score_delta": -5, "action": "DOWNWEIGHT"},
+            "tv_dual_strict": {"dimension": "策略", "value": "tv_dual_strict", "score_delta": 4, "action": "BOOST"},
+        },
+    }
+
+    selected = _select_after_close_watchlist(stocks, limit=2, priority_adjustments=adjustments)
+    body = _build_after_close_watchlist_body(selected, "2026-06-09")
+
+    assert [s["代码"] for s in selected] == ["000002", "000001"]
+    assert "闭环调权：策略 tv_dual_strict +4，仅影响推送排序" in body
+
+
+def test_after_close_watchlist_body_includes_hot_sector_gap_summary():
+    stock = {
+        "代码": "300145",
+        "名称": "南方泵业",
+        "sop_grade": "M",
+        "trade_bucket": "OBSERVE",
+        "现价": 5.62,
+        "entry_price": 5.72,
+        "plan_stop_price": 4.31,
+    }
+    gaps = [
+        {
+            "industry": "机器人",
+            "sector_momentum_score": 86,
+            "scan_candidate_count": 2,
+            "has_push_candidate": False,
+            "primary_reason_label": "候选偏后排，暂不追",
+        },
+        {
+            "industry": "创新药",
+            "sector_momentum_score": 75,
+            "scan_candidate_count": 0,
+            "has_push_candidate": False,
+            "primary_reason_label": "板块强，但扫描策略没有选出候选",
+        },
+    ]
+
+    body = _build_after_close_watchlist_body([stock], "2026-06-09", gaps)
+
+    assert "热门板块未推原因：" in body
+    assert "机器人：候选偏后排，暂不追 | 板块分 86 | 候选 2只" in body
+    assert "创新药：板块强，但扫描策略没有选出候选 | 板块分 75 | 候选 0只" in body
 
 
 def test_intraday_candidate_line_shows_support_and_no_chase_rule():
@@ -152,8 +261,42 @@ def test_intraday_candidate_line_shows_support_and_no_chase_rule():
 
     body = "\n".join(_candidate_brief_lines(stock))
 
-    assert "现价5.62｜确认>5.72｜支撑5.36｜失效<4.31" in body
-    assert "不追高；回踩不破支撑5.36，放量站上确认价5.72再考虑" in body
+    assert "现价5.62｜确认>5.72｜有效失效<4.31" in body
+    assert "不追高；等待回踩后重新站上5.72，跌破4.31取消" in body
+
+
+def test_intraday_candidate_uses_structure_label_and_capped_display_score():
+    stock = {
+        "代码": "603127",
+        "名称": "昭衍新药",
+        "sop_grade": "A",
+        "trade_bucket": "OBSERVE",
+        "trade_eligible": False,
+        "final_trade_score": 132.02,
+        "display_trade_score": 100,
+        "现价": 43.22,
+        "pa_entry_price": 43.23,
+        "pa_stop_price": 39.34,
+    }
+
+    body = "\n".join(_candidate_brief_lines(stock))
+
+    assert "禁止买入｜A级结构" in body
+    assert "展示分100" in body
+    assert "132.02" not in body
+
+
+def test_intraday_state_dedupe_only_sends_changed_state(monkeypatch):
+    settings = {}
+    monkeypatch.setattr("core.sentinel.get_setting", lambda key, default=None: settings.get(key, default))
+    monkeypatch.setattr("core.sentinel.save_setting", lambda key, value: settings.update({key: value}) or True)
+    stocks = [{"代码": "000001", "sop_grade": "B", "trade_bucket": "OBSERVE", "trade_eligible": False}]
+    fingerprint = _intraday_state_fingerprint(stocks, {"status": "DEFENSIVE"})
+    now = datetime(2026, 7, 10, 10, 0)
+
+    assert _should_send_intraday_state(fingerprint, now) is True
+    _mark_intraday_state_sent(fingerprint, now)
+    assert _should_send_intraday_state(fingerprint, now) is False
 
 
 def test_after_close_watchlist_keeps_high_opportunity_d_grade_as_observation_only():
@@ -171,7 +314,7 @@ def test_after_close_watchlist_keeps_high_opportunity_d_grade_as_observation_onl
     body = _build_after_close_watchlist_body(selected, "2026-06-11")
 
     assert selected == [stock]
-    assert "D级观察" in body
+    assert "D级结构｜等待确认" in body
     assert "仅观察" in body
 
 
@@ -210,6 +353,50 @@ def test_after_close_watchlist_pushes_once_without_real_bark(monkeypatch):
     assert first is not None
     assert second is None
     assert len(sent) == 1
+
+
+def test_after_close_watchlist_push_includes_sector_gap_analysis(monkeypatch):
+    sent = []
+    settings = {}
+    stocks = [{
+        "代码": "300145",
+        "名称": "南方泵业",
+        "行业": "机器人",
+        "sop_grade": "M",
+        "trade_bucket": "OBSERVE",
+        "现价": 5.62,
+        "entry_price": 5.72,
+        "plan_stop_price": 4.31,
+        "strategy_type": "tv_dual_strict",
+        "sector_role": "FOLLOWER",
+        "trade_blockers": ["强板块后排角色，等待转强为核心股"],
+    }]
+    monkeypatch.setattr("core.sentinel.get_setting", lambda key, default=None: settings.get(key, default))
+    monkeypatch.setattr("core.sentinel.save_setting", lambda key, value: settings.update({key: value}) or True)
+    monkeypatch.setattr(
+        "core.sentinel._send_bark_message",
+        lambda title, body: sent.append((title, body)) or True,
+    )
+    monkeypatch.setattr("core.db.save_recommendation_events", lambda *args, **kwargs: True)
+    monkeypatch.setattr("routers.market.get_sector_strength", lambda limit=20, force=False: {
+        "items": [{
+            "industry": "机器人",
+            "sector_phase": "SECTOR_CONFIRM",
+            "sector_momentum_score": 86,
+            "sector_breadth": 78,
+        }],
+    })
+
+    body = send_after_close_watchlist(
+        stocks,
+        scan_date="2026-06-09",
+        now=datetime(2026, 6, 9, 21, 30),
+    )
+
+    assert body is not None
+    assert "热门板块未推原因：" in body
+    assert "机器人：候选偏后排，暂不追" in body
+    assert sent and sent[0][1] == body
 
 
 def _position_df(last_close: float, last_volume: float) -> pd.DataFrame:

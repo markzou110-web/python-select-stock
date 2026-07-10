@@ -122,68 +122,103 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 <div className="flex-1 min-h-0 overflow-y-auto">
                     <div className="px-5 sm:px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
                         <FilterItem label="🎯 选择选股策略">
-                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-2">
-                                <StrategyOption
-                                    title="TV双策略强共振"
-                                    description="均线B共振 + TV-ZP long"
-                                    active={params.strategy_type === "tv_dual_strict"}
-                                    onClick={() => setParams({
-                                        ...params,
-                                        strategy_type: "tv_dual_strict",
-                                        use_bb_sqz: false,
-                                        use_rs_filter: false,
-                                        use_weekly: false,
-                                    })}
-                                    icon="TV+"
-                                />
-                                <StrategyOption
-                                    title="TV双策略对齐"
-                                    description="均线B共振 或 TV-ZP long"
-                                    active={params.strategy_type === "tv_dual"}
-                                    onClick={() => setParams({
-                                        ...params,
-                                        strategy_type: "tv_dual",
-                                        use_bb_sqz: false,
-                                        use_rs_filter: false,
-                                        use_weekly: false,
-                                    })}
-                                    icon="TV"
-                                />
-                                <StrategyOption
-                                    title="均线粘合策略"
-                                    description="TV均线B共振"
-                                    active={params.strategy_type === "squeeze"}
-                                    onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
-                                    icon="📊"
-                                />
-                                <StrategyOption
-                                    title="Pine Script 多指标"
-                                    description="五指标趋势共振"
-                                    active={params.strategy_type === "pine"}
-                                    onClick={() => setParams({ ...params, strategy_type: "pine" })}
-                                    icon="🚀"
-                                />
-                                <StrategyOption
-                                    title="TradingView ZP"
-                                    description="RF主导+Volume/QQE确认"
-                                    active={params.strategy_type === "tv_zp"}
-                                    onClick={() => setParams({ ...params, strategy_type: "tv_zp" })}
-                                    icon="ZP"
-                                />
-                                <StrategyOption
-                                    title="双重强力共振"
-                                    description="均线粘合 + Pine 信号"
-                                    active={params.strategy_type === "both"}
-                                    onClick={() => setParams({ ...params, strategy_type: "both" })}
-                                    icon="🔥"
-                                />
-                                <StrategyOption
-                                    title="Azul 共识策略"
-                                    description="放量突破+高低点结构"
-                                    active={params.strategy_type === "consensus"}
-                                    onClick={() => setParams({ ...params, strategy_type: "consensus" })}
-                                    icon="💎"
-                                />
+                            <div className="space-y-3">
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+                                    <StrategyOption
+                                        title="宽松观察池"
+                                        description="均线B共振 或 TV-ZP long，数量更多"
+                                        active={params.strategy_type === "tv_dual"}
+                                        onClick={() => setParams({
+                                            ...params,
+                                            strategy_type: "tv_dual",
+                                            threshold: 0.15,
+                                            vol_multiplier: 1.3,
+                                            rsi_min: 52,
+                                            use_bb_sqz: false,
+                                            use_rs_filter: false,
+                                            use_weekly: false,
+                                        })}
+                                        icon="TV"
+                                    />
+                                    <StrategyOption
+                                        title="强确认精选"
+                                        description="均线B共振 + TV-ZP long，少而精"
+                                        active={params.strategy_type === "tv_dual_strict"}
+                                        onClick={() => setParams({
+                                            ...params,
+                                            strategy_type: "tv_dual_strict",
+                                            threshold: 0.12,
+                                            vol_multiplier: 1.5,
+                                            rsi_min: 55,
+                                            use_bb_sqz: false,
+                                            use_rs_filter: false,
+                                            use_weekly: false,
+                                        })}
+                                        icon="TV+"
+                                    />
+                                    <StrategyOption
+                                        title="放量突破"
+                                        description="高低点结构 + 放量大阳线"
+                                        active={params.strategy_type === "consensus"}
+                                        onClick={() => setParams({
+                                            ...params,
+                                            strategy_type: "consensus",
+                                            vol_multiplier: 1.8,
+                                        })}
+                                        icon="💎"
+                                    />
+                                    <StrategyOption
+                                        title="早期性价比"
+                                        description="20日低点+10%~20%，板块刚启动"
+                                        active={params.strategy_type === "early_value"}
+                                        onClick={() => setParams({
+                                            ...params,
+                                            strategy_type: "early_value",
+                                            threshold: 0.15,
+                                            vol_multiplier: 1.05,
+                                            rsi_min: 50,
+                                            use_bb_sqz: false,
+                                            use_rs_filter: false,
+                                            use_weekly: false,
+                                        })}
+                                        icon="A-"
+                                    />
+                                </div>
+                                <details className="rounded-2xl border border-indigo-100 bg-white/60 p-3">
+                                    <summary className="cursor-pointer select-none text-xs font-black uppercase tracking-wider text-indigo-600">
+                                        进阶策略
+                                    </summary>
+                                    <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                                        <StrategyOption
+                                            title="均线粘合"
+                                            description="TV均线B共振"
+                                            active={params.strategy_type === "squeeze"}
+                                            onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
+                                            icon="📊"
+                                        />
+                                        <StrategyOption
+                                            title="Pine Script 多指标"
+                                            description="五指标趋势共振"
+                                            active={params.strategy_type === "pine"}
+                                            onClick={() => setParams({ ...params, strategy_type: "pine" })}
+                                            icon="🚀"
+                                        />
+                                        <StrategyOption
+                                            title="TV-ZP"
+                                            description="RF主导+Volume/QQE确认"
+                                            active={params.strategy_type === "tv_zp"}
+                                            onClick={() => setParams({ ...params, strategy_type: "tv_zp" })}
+                                            icon="ZP"
+                                        />
+                                        <StrategyOption
+                                            title="双重共振"
+                                            description="均线粘合 + Pine 信号"
+                                            active={params.strategy_type === "both"}
+                                            onClick={() => setParams({ ...params, strategy_type: "both" })}
+                                            icon="🔥"
+                                        />
+                                    </div>
+                                </details>
                             </div>
                         </FilterItem>
                     </div>
@@ -513,6 +548,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                             params.strategy_type === "pine" ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : 
                             params.strategy_type === "both" ? "bg-gradient-to-r from-indigo-600 to-emerald-600 shadow-emerald-100" :
                             params.strategy_type === "consensus" ? "bg-gradient-to-r from-blue-600 to-cyan-600 shadow-blue-100" :
+                            params.strategy_type === "early_value" ? "bg-gradient-to-r from-amber-600 to-orange-600 shadow-amber-100" :
                             "premium-gradient"
                         )}
                     >

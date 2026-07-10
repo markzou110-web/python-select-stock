@@ -8,11 +8,12 @@ from core.logging_config import logger
 from core.db import get_db_engine
 from core.indicators import calculate_indicators
 from core.pro_workflow import build_alert_priority
+from core.risk_constants import FIXED_STOP_LOSS_PCT  # 实盘硬止损，与回测同源
 
 router = APIRouter(prefix="/api/alert", tags=["alert"])
 
 @router.get("/list")
-def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
+def list_alerts(stop_loss_pct: float = FIXED_STOP_LOSS_PCT) -> Dict[str, Any]:
     """
     检查持仓（OPEN 状态）标的的风险并生成告警
     风险定义：
@@ -75,7 +76,8 @@ def list_alerts(stop_loss_pct: float = -8.0) -> Dict[str, Any]:
                     stock_labeled, 
                     entry_price, 
                     high_since_entry, 
-                    stop_loss_pct=stop_loss_pct
+                    stop_loss_pct=stop_loss_pct,
+                    code=code,
                 )
                 
                 if exit_signals:

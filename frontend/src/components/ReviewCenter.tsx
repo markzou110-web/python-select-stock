@@ -9,7 +9,7 @@ import { cn } from '@/lib/utils';
 type LayerMetric = {
     signals?: number;
     win_rate?: number;
-    avg_return?: number;
+    avg_return?: number | null;
 };
 
 type ProfitabilityLayer = {
@@ -31,11 +31,186 @@ type ProfitabilityPayload = {
         weak_layers?: number;
     };
     layers?: ProfitabilityLayer[];
+    real_trade_execution?: ExecutionReview;
+    measurement_contract?: MeasurementContract;
+};
+
+type MeasurementContract = {
+    sample_unit?: string;
+    entry_price?: string;
+    risk_model?: string;
+    maturity_rule?: string;
+    return_type?: string;
+    benchmark_adjusted?: boolean;
+};
+
+type ExecutionReview = {
+    sample?: number;
+    system_bark_sample?: number;
+    execution_gap_5d?: number | null;
+    avg_entry_slippage_pct?: number | null;
+    unknown_plan_adherence?: number;
+    missing_planned_entry?: number;
+    missing_signal_date?: number;
+    execution_quality_score?: number;
+    diagnostics?: string[];
+};
+
+type CalibrationRow = {
+    value?: string;
+    signals?: number;
+    mature_5d?: number;
+    metrics?: Record<string, LayerMetric>;
+};
+
+type CalibrationPayload = {
+    summary?: { signals?: number; mature_5d?: number; mature_10d?: number };
+    grade_monotonicity?: {
+        status?: string;
+        reason?: string;
+        samples?: Record<string, number>;
+        values?: Record<string, number>;
+    };
+    by_confirmation_event?: CalibrationRow[];
+    by_early_value_transition?: CalibrationRow[];
+    blocker_analysis?: {
+        summary?: { review_rules?: number; valid_filters?: number };
+        items?: Array<{
+            blocker?: string;
+            occurrences?: number;
+            recommendation?: string;
+            hit_minus_miss_avg_return?: number | null;
+            controlled_comparison?: {
+                paired_samples?: number;
+                hit_minus_miss_avg_return?: number | null;
+            };
+        }>;
+    };
+    measurement_contract?: MeasurementContract;
+};
+
+type SectorWatchMetric = {
+    signals?: number;
+    win_rate?: number;
+    avg_return?: number | null;
+    best_return?: number | null;
+    worst_return?: number | null;
+};
+
+type SectorWatchStateRow = {
+    state?: string;
+    label?: string;
+    items?: number;
+    mature_5d?: number;
+    metrics?: Record<string, SectorWatchMetric>;
+};
+
+type SectorWatchPerformance = {
+    source?: string;
+    summary?: {
+        items?: number;
+        mature_5d?: number;
+        best_state?: string;
+    };
+    by_state?: SectorWatchStateRow[];
+    suggestions?: string[];
+    notes?: string[];
+};
+
+type RecommendationOutcomeLoop = {
+    summary?: {
+        events?: number;
+        mature_5d?: number;
+        best_source?: string;
+        worst_source?: string;
+        days?: number;
+        boost_count?: number;
+        downweight_count?: number;
+    };
+    horizons?: Record<string, LayerMetric>;
+    by_source?: Array<{
+        source?: string;
+        events?: number;
+        mature_5d?: number;
+        metrics?: Record<string, LayerMetric>;
+    }>;
+    by_strategy?: Array<{
+        strategy_type?: string;
+        events?: number;
+        mature_5d?: number;
+        metrics?: Record<string, LayerMetric>;
+    }>;
+    adjustments?: {
+        by_source?: OutcomeAdjustment[];
+        by_strategy?: OutcomeAdjustment[];
+        rules?: string[];
+    };
+    recent_events?: Array<{
+        signal_date?: string;
+        source?: string;
+        code?: string;
+        name?: string;
+        strategy_type?: string;
+        trade_bucket?: string;
+        pa_trade_setup?: string;
+        ret_1d?: number | null;
+        ret_3d?: number | null;
+        ret_5d?: number | null;
+        ret_10d?: number | null;
+    }>;
+    suggestions?: string[];
+    measurement_contract?: MeasurementContract;
+};
+
+type OutcomeAdjustment = {
+    dimension?: string;
+    value?: string;
+    action?: 'BOOST' | 'DOWNWEIGHT' | 'OBSERVE' | 'KEEP' | string;
+    score_delta?: number;
+    mature_5d?: number;
+    win_rate_5d?: number;
+    avg_return_5d?: number | null;
+    reason?: string;
+};
+
+type DailyStrategyReport = {
+    scan_date?: string;
+    summary?: {
+        scan_count?: number;
+        trade_count?: number;
+        early_count?: number;
+        observe_count?: number;
+        block_count?: number;
+        bark_push_count?: number;
+        watchlist_count?: number;
+        real_position_count?: number;
+        stance?: string;
+    };
+    top_candidates?: Array<{
+        code?: string;
+        name?: string;
+        industry?: string;
+        grade?: string;
+        bucket?: string;
+        score?: number;
+        blockers?: string[];
+    }>;
+    sector_push_gaps?: Array<{
+        industry?: string;
+        primary_reason_label?: string;
+        sector_momentum_score?: number;
+        scan_candidate_count?: number;
+    }>;
+    next_actions?: string[];
 };
 
 export default function ReviewCenter() {
     const [data, setData] = useState<any>(null);
     const [profitability, setProfitability] = useState<ProfitabilityPayload | null>(null);
+    const [sectorWatchPerformance, setSectorWatchPerformance] = useState<SectorWatchPerformance | null>(null);
+    const [recommendationLoop, setRecommendationLoop] = useState<RecommendationOutcomeLoop | null>(null);
+    const [dailyReport, setDailyReport] = useState<DailyStrategyReport | null>(null);
+    const [calibration, setCalibration] = useState<CalibrationPayload | null>(null);
     const [followup, setFollowup] = useState<any>(null);
     const [loading, setLoading] = useState(true);
     const [followupLoading, setFollowupLoading] = useState(false);
@@ -46,12 +221,20 @@ export default function ReviewCenter() {
     const fetchData = async () => {
         setLoading(true);
         try {
-            const [performanceRes, profitabilityRes] = await Promise.all([
+            const [performanceRes, profitabilityRes, sectorWatchRes, recommendationLoopRes, dailyReportRes, calibrationRes] = await Promise.all([
                 api.get(`/api/review/scan-performance?days=${days}`),
                 api.get(`/api/review/profitability-dashboard?days=${days}`),
+                api.get(`/api/review/sector-watch-performance?days=${days}`),
+                api.get(`/api/review/recommendation-outcome-loop?days=${days}`),
+                api.get('/api/review/daily-strategy-report'),
+                api.get(`/api/review/strategy-calibration-report?days=${days}`),
             ]);
             setData(performanceRes.data);
             setProfitability(profitabilityRes.data);
+            setSectorWatchPerformance(sectorWatchRes.data);
+            setRecommendationLoop(recommendationLoopRes.data);
+            setDailyReport(dailyReportRes.data);
+            setCalibration(calibrationRes.data);
         } finally {
             setLoading(false);
         }
@@ -128,7 +311,17 @@ export default function ReviewCenter() {
                 <Stat label="薄弱板块" value={summary.worst_bucket || "暂无"} sub="建议降低权重" icon={<Activity size={20} />} />
             </div>
 
+            <DailyStrategyReportCard data={dailyReport} />
+
             <ProfitabilityLayerCard data={profitability} />
+
+            <ExecutionReviewCard data={profitability?.real_trade_execution} contract={profitability?.measurement_contract} />
+
+            <CalibrationCard data={calibration} />
+
+            <RecommendationOutcomeLoopCard data={recommendationLoop} />
+
+            <SectorWatchPerformanceCard data={sectorWatchPerformance} />
 
             <div className="glass-card p-5">
                 <div className="flex items-center justify-between mb-4">
@@ -258,6 +451,210 @@ function RecommendationEventCard({ rows }: { rows: any[] }) {
     );
 }
 
+function RecommendationOutcomeLoopCard({ data }: { data: RecommendationOutcomeLoop | null }) {
+    const summary = data?.summary || {};
+    const horizons = data?.horizons || {};
+    const bySource = data?.by_source || [];
+    const recent = data?.recent_events || [];
+    const suggestions = data?.suggestions || [];
+    const adjustmentRows = [
+        ...(data?.adjustments?.by_source || []),
+        ...(data?.adjustments?.by_strategy || []),
+    ].filter(row => row.action && row.action !== 'KEEP').slice(0, 8);
+
+    return (
+        <div className="glass-card p-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between mb-5">
+                <div>
+                    <h3 className="font-black text-slate-800">推荐收益闭环</h3>
+                    <p className="text-xs font-bold text-slate-400 mt-1">验证 Bark/扫描推荐后 1/3/5/10 日真实表现</p>
+                </div>
+                <div className="grid grid-cols-4 gap-2 min-w-full lg:min-w-[560px]">
+                    <MiniStat label="推荐事件" value={`${summary.events || 0}`} />
+                    <MiniStat label="5日成熟" value={`${summary.mature_5d || 0}`} />
+                    <MiniStat label="最佳来源" value={summary.best_source || '暂无'} hot />
+                    <MiniStat label="薄弱来源" value={summary.worst_source || '暂无'} />
+                </div>
+            </div>
+
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+                {['1d', '3d', '5d', '10d'].map(key => (
+                    <div key={key} className="rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2">
+                        <div className="text-[10px] font-black text-slate-400">{key.toUpperCase()} 表现</div>
+                        <div className="mt-1">{formatLayerMetric(horizons[key])}</div>
+                    </div>
+                ))}
+            </div>
+
+            <div className="mb-5 rounded-md border border-slate-100 bg-white/70 px-3 py-2">
+                <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">调参提示</div>
+                <div className="mt-1 text-xs font-bold text-slate-600">
+                    {suggestions.length ? suggestions.slice(0, 2).join('；') : '等待更多推荐事件成熟后用于调权'}
+                </div>
+            </div>
+
+            <div className="mb-5 rounded-md border border-slate-100 bg-slate-50/70 px-3 py-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">自动调权建议</div>
+                    <div className="text-[10px] font-bold text-slate-400">加权 {summary.boost_count || 0} · 降权 {summary.downweight_count || 0}</div>
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
+                    {adjustmentRows.map((row, idx) => (
+                        <div key={`${row.dimension}-${row.value}-${idx}`} className="rounded-md border border-white bg-white px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                    <div className="text-xs font-black text-slate-800 truncate">{row.dimension} · {row.value}</div>
+                                    <div className="mt-0.5 text-[10px] font-bold text-slate-400">
+                                        样本 {row.mature_5d || 0} · 胜率 {row.win_rate_5d ?? 0}% · 均收 {formatSignedPct(row.avg_return_5d)}
+                                    </div>
+                                </div>
+                                <span className={cn("shrink-0 rounded-md border px-2 py-1 text-[10px] font-black", adjustmentTone(row.action))}>
+                                    {adjustmentLabel(row.action)} {formatScoreDelta(row.score_delta)}
+                                </span>
+                            </div>
+                            <div className="mt-1 text-[10px] font-bold text-slate-500">{row.reason || '--'}</div>
+                        </div>
+                    ))}
+                </div>
+                {adjustmentRows.length === 0 && <div className="py-6 text-center text-slate-400 text-xs font-bold">暂无需要调权的来源或策略</div>}
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left">
+                        <thead>
+                            <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                                <th className="py-2 pr-3">来源</th>
+                                <th className="py-2 pr-3">样本</th>
+                                <th className="py-2 pr-3">1日</th>
+                                <th className="py-2 pr-3">5日</th>
+                                <th className="py-2 pr-3">10日</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {bySource.slice(0, 6).map(row => (
+                                <tr key={row.source || 'UNKNOWN'} className="border-b border-slate-50 last:border-b-0 text-xs">
+                                    <td className="py-3 pr-3">
+                                        <div className="font-black text-slate-800">{row.source || 'UNKNOWN'}</div>
+                                        <div className="text-[10px] font-bold text-slate-400">{row.mature_5d || 0} 个5日成熟</div>
+                                    </td>
+                                    <td className="py-3 pr-3 font-black text-slate-700">{row.events || 0}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(row.metrics?.['1d'])}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(row.metrics?.['5d'])}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(row.metrics?.['10d'])}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    {bySource.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无来源闭环样本</div>}
+                </div>
+
+                <div className="space-y-2">
+                    {recent.slice(0, 6).map((row, idx) => (
+                        <div key={`${row.code}-${row.signal_date}-${idx}`} className="rounded-md border border-slate-100 bg-slate-50/60 px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                    <div className="text-sm font-black text-slate-800 truncate">{row.name || row.code || '--'}</div>
+                                    <div className="text-[10px] font-bold text-slate-400">
+                                        {row.signal_date || '--'} · {row.source || '--'} · {row.strategy_type || '--'}
+                                    </div>
+                                </div>
+                                <div className={cn("text-sm font-black", Number(row.ret_5d || 0) >= 0 ? "text-rose-600" : "text-emerald-600")}>
+                                    {formatSignedPct(row.ret_5d)}
+                                </div>
+                            </div>
+                            <div className="mt-1 text-[10px] font-bold text-slate-500">
+                                {row.trade_bucket || 'UNKNOWN'} · {row.pa_trade_setup || '未记录形态'} · 1日 {formatSignedPct(row.ret_1d)} / 10日 {formatSignedPct(row.ret_10d)}
+                            </div>
+                        </div>
+                    ))}
+                    {recent.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无最近推荐事件</div>}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function DailyStrategyReportCard({ data }: { data: DailyStrategyReport | null }) {
+    const summary = data?.summary || {};
+    const gaps = data?.sector_push_gaps || [];
+    const actions = data?.next_actions || [];
+    const candidates = data?.top_candidates || [];
+
+    return (
+        <div className="glass-card p-5">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <div className="flex items-center gap-2">
+                        <CalendarDays size={18} className="text-indigo-600" />
+                        <h3 className="font-black text-slate-800">收盘策略日报</h3>
+                        <span className="rounded-md border border-slate-100 bg-slate-50 px-2 py-0.5 text-[10px] font-black text-slate-400">
+                            {data?.scan_date || '--'}
+                        </span>
+                    </div>
+                    <p className="mt-2 text-sm font-bold text-slate-600">{summary.stance || '暂无收盘日报'}</p>
+                </div>
+                <div className="grid grid-cols-5 gap-2 min-w-full lg:min-w-[520px]">
+                    <MiniStat label="扫描" value={`${summary.scan_count || 0}`} />
+                    <MiniStat label="TRADE" value={`${summary.trade_count || 0}`} hot={(summary.trade_count || 0) > 0} />
+                    <MiniStat label="EARLY" value={`${summary.early_count || 0}`} hot={(summary.early_count || 0) > 0} />
+                    <MiniStat label="观察" value={`${summary.observe_count || 0}`} />
+                    <MiniStat label="Bark" value={`${summary.bark_push_count || 0}`} hot={(summary.bark_push_count || 0) > 0} />
+                </div>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 xl:grid-cols-3 gap-3">
+                <div className="rounded-md border border-slate-100 bg-white/70 p-3">
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">热门板块未推</div>
+                    <div className="space-y-2">
+                        {gaps.length === 0 ? (
+                            <p className="text-xs font-bold text-slate-400">暂无热门板块缺口</p>
+                        ) : gaps.slice(0, 4).map((item, idx) => (
+                            <div key={`${item.industry}-${idx}`} className="border-b border-slate-50 pb-2 last:border-b-0 last:pb-0">
+                                <div className="flex items-center justify-between gap-2">
+                                    <span className="text-sm font-black text-slate-700">{item.industry || '--'}</span>
+                                    <span className="text-[10px] font-black text-slate-400">板块分 {item.sector_momentum_score ?? '--'}</span>
+                                </div>
+                                <p className="mt-1 text-xs font-bold text-slate-500">{item.primary_reason_label || '继续观察'} · 候选 {item.scan_candidate_count ?? 0}只</p>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                <div className="rounded-md border border-slate-100 bg-white/70 p-3">
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">明日动作</div>
+                    <div className="space-y-2">
+                        {actions.length === 0 ? (
+                            <p className="text-xs font-bold text-slate-400">暂无动作建议</p>
+                        ) : actions.slice(0, 4).map((action, idx) => (
+                            <p key={`${action}-${idx}`} className="text-xs font-bold leading-relaxed text-slate-600">
+                                {idx + 1}. {action}
+                            </p>
+                        ))}
+                    </div>
+                </div>
+
+                <div className="rounded-md border border-slate-100 bg-white/70 p-3">
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">高分候选</div>
+                    <div className="space-y-2">
+                        {candidates.length === 0 ? (
+                            <p className="text-xs font-bold text-slate-400">暂无候选</p>
+                        ) : candidates.slice(0, 4).map((item, idx) => (
+                            <div key={`${item.code}-${idx}`} className="flex items-center justify-between gap-3 border-b border-slate-50 pb-2 last:border-b-0 last:pb-0">
+                                <div className="min-w-0">
+                                    <p className="truncate text-sm font-black text-slate-700">{item.name || item.code}</p>
+                                    <p className="text-[10px] font-bold text-slate-400">{item.industry || '--'} · {item.bucket || '--'} · {item.grade || '--'}</p>
+                                </div>
+                                <span className="text-sm font-black text-indigo-600">{item.score ?? '--'}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
 function ProfitabilityLayerCard({ data }: { data: ProfitabilityPayload | null }) {
     const layers = data?.layers || [];
     const summary = data?.summary || {};
@@ -324,6 +721,195 @@ function ProfitabilityLayerCard({ data }: { data: ProfitabilityPayload | null })
                     </tbody>
                 </table>
                 {rows.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无盈利能力分层数据</div>}
+            </div>
+        </div>
+    );
+}
+
+function ExecutionReviewCard({ data, contract }: { data?: ExecutionReview; contract?: MeasurementContract }) {
+    const diagnostics = data?.diagnostics || [];
+    return (
+        <div className="glass-card p-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <h3 className="font-black text-slate-800">真实执行差距</h3>
+                    <p className="mt-1 text-xs font-bold text-slate-400">区分系统信号表现与实际买入执行质量</p>
+                </div>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:min-w-[620px]">
+                    <MiniStat label="执行质量" value={`${data?.execution_quality_score ?? 0}`} hot={(data?.execution_quality_score ?? 0) >= 80} />
+                    <MiniStat label="实盘样本" value={`${data?.sample || 0}`} />
+                    <MiniStat label="5日执行差" value={formatSignedPct(data?.execution_gap_5d)} hot={(data?.execution_gap_5d ?? -1) >= 0} />
+                    <MiniStat label="平均滑点" value={formatSignedPct(data?.avg_entry_slippage_pct)} />
+                </div>
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
+                <div className="rounded-md border border-slate-100 bg-slate-50/70 px-3 py-3">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">字段完整度</div>
+                    <div className="mt-2 space-y-1 text-xs font-bold text-slate-600">
+                        <p>计划遵守未知：{data?.unknown_plan_adherence || 0}笔</p>
+                        <p>缺少计划价：{data?.missing_planned_entry || 0}笔</p>
+                        <p>缺少信号日期：{data?.missing_signal_date || 0}笔</p>
+                    </div>
+                </div>
+                <div className="rounded-md border border-slate-100 bg-white/70 px-3 py-3 lg:col-span-2">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">执行诊断</div>
+                    <div className="mt-2 space-y-1 text-xs font-bold text-slate-600">
+                        {diagnostics.length ? diagnostics.slice(0, 4).map((item, idx) => <p key={`${item}-${idx}`}>{idx + 1}. {item}</p>) : <p>暂无可归因的真实交易样本</p>}
+                    </div>
+                </div>
+            </div>
+            <MeasurementContractLine contract={contract} />
+        </div>
+    );
+}
+
+function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
+    const monotonicity = data?.grade_monotonicity || {};
+    const confirmationRows = (data?.by_confirmation_event || []).filter(row => row.value !== 'UNKNOWN');
+    const earlyRows = (data?.by_early_value_transition || []).filter(row => row.value !== 'UNKNOWN');
+    const reviewRules = (data?.blocker_analysis?.items || []).filter(row => row.recommendation === 'REVIEW_RULE');
+    const sampleText = Object.entries(monotonicity.samples || {}).map(([grade, count]) => `${grade}:${count}`).join(' / ');
+    return (
+        <div className="glass-card p-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <h3 className="font-black text-slate-800">评级与确认校准</h3>
+                    <p className="mt-1 text-xs font-bold text-slate-400">只展示成熟样本结论，样本不足时不触发调参</p>
+                </div>
+                <div className="grid grid-cols-3 gap-2 lg:min-w-[430px]">
+                    <MiniStat label="5日成熟" value={`${data?.summary?.mature_5d || 0}`} />
+                    <MiniStat label="Grade单调" value={monotonicity.status || 'UNKNOWN'} hot={monotonicity.status === 'PASS'} />
+                    <MiniStat label="待复核规则" value={`${data?.blocker_analysis?.summary?.review_rules || 0}`} />
+                </div>
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-3">
+                <CalibrationRows title="确认事件" rows={confirmationRows} empty="新事件尚未形成成熟样本" />
+                <CalibrationRows title="early_value 转化" rows={earlyRows} empty="早期策略尚未形成可验证转化" />
+                <div className="rounded-md border border-slate-100 bg-white/70 p-3">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">Blocker 复核</div>
+                    <div className="mt-2 space-y-2">
+                        {reviewRules.slice(0, 4).map((row, idx) => {
+                            const controlled = row.controlled_comparison?.hit_minus_miss_avg_return;
+                            return (
+                                <div key={`${row.blocker}-${idx}`} className="border-b border-slate-50 pb-2 last:border-b-0">
+                                    <p className="text-xs font-black text-slate-700">{row.blocker}</p>
+                                    <p className="mt-0.5 text-[10px] font-bold text-slate-400">
+                                        命中 {row.occurrences || 0} · 控制后差异 {formatSignedPct(controlled)} · 配对 {row.controlled_comparison?.paired_samples || 0}
+                                    </p>
+                                </div>
+                            );
+                        })}
+                        {!reviewRules.length && <p className="text-xs font-bold text-slate-400">暂无需要复核的成熟规则</p>}
+                    </div>
+                </div>
+            </div>
+            <div className="mt-3 text-[10px] font-bold text-slate-400">Grade成熟样本：{sampleText || '暂无'}；{monotonicity.reason || '等待样本成熟'}</div>
+            <MeasurementContractLine contract={data?.measurement_contract} />
+        </div>
+    );
+}
+
+function CalibrationRows({ title, rows, empty }: { title: string; rows: CalibrationRow[]; empty: string }) {
+    return (
+        <div className="rounded-md border border-slate-100 bg-white/70 p-3">
+            <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">{title}</div>
+            <div className="mt-2 space-y-2">
+                {rows.slice(0, 5).map(row => (
+                    <div key={row.value} className="flex items-center justify-between gap-3 border-b border-slate-50 pb-2 last:border-b-0">
+                        <div>
+                            <p className="text-xs font-black text-slate-700">{row.value}</p>
+                            <p className="text-[10px] font-bold text-slate-400">{row.mature_5d || 0}/{row.signals || 0} 个5日成熟</p>
+                        </div>
+                        <div className="text-right text-[10px] font-bold text-slate-500">{formatLayerMetric(row.metrics?.['5d'])}</div>
+                    </div>
+                ))}
+                {!rows.length && <p className="text-xs font-bold text-slate-400">{empty}</p>}
+            </div>
+        </div>
+    );
+}
+
+function MeasurementContractLine({ contract }: { contract?: MeasurementContract }) {
+    if (!contract) return null;
+    return (
+        <div className="mt-3 rounded-md border border-slate-100 bg-slate-50/60 px-3 py-2 text-[10px] font-bold text-slate-400">
+            口径：{contract.sample_unit || '--'}；入场价：{contract.entry_price || '--'}；成熟规则：{contract.maturity_rule || '--'}；{contract.benchmark_adjusted ? '含基准超额收益' : '当前为绝对收益'}
+        </div>
+    );
+}
+
+function SectorWatchPerformanceCard({ data }: { data: SectorWatchPerformance | null }) {
+    const rows = data?.by_state || [];
+    const summary = data?.summary || {};
+    const sourceLabel = data?.source === 'state_events' ? '状态事件日志' : '当前状态画像';
+    const suggestions = data?.suggestions || [];
+    const notes = data?.notes || [];
+
+    return (
+        <div className="glass-card p-6">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between mb-5">
+                <div>
+                    <h3 className="font-black text-slate-800">题材状态复盘</h3>
+                    <p className="text-xs font-bold text-slate-400 mt-1">验证接近确认价、等回踩、回踩放量确认等状态后的表现</p>
+                </div>
+                <div className="grid grid-cols-3 gap-2 min-w-[300px]">
+                    <MiniStat label="样本" value={`${summary.items || 0}`} />
+                    <MiniStat label="5日成熟" value={`${summary.mature_5d || 0}`} />
+                    <MiniStat label="最佳状态" value={summary.best_state || '样本不足'} hot />
+                </div>
+            </div>
+
+            <div className="mb-4 grid grid-cols-1 lg:grid-cols-3 gap-3">
+                <div className="rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">统计来源</div>
+                    <div className="mt-1 text-xs font-black text-slate-700">{sourceLabel}</div>
+                </div>
+                <div className="lg:col-span-2 rounded-md border border-slate-100 bg-white/70 px-3 py-2">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">调权建议</div>
+                    <div className="mt-1 text-xs font-bold text-slate-600">
+                        {suggestions.length > 0 ? suggestions.slice(0, 2).join('；') : notes[0] || '样本积累后用于调整 Bark 优先级'}
+                    </div>
+                </div>
+            </div>
+
+            <div className="overflow-x-auto">
+                <table className="w-full text-left">
+                    <thead>
+                        <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                            <th className="py-2 pr-3">状态</th>
+                            <th className="py-2 pr-3">样本</th>
+                            <th className="py-2 pr-3">5日</th>
+                            <th className="py-2 pr-3">1日</th>
+                            <th className="py-2 pr-3">3日</th>
+                            <th className="py-2 pr-3">10日</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows.map((row) => {
+                            const m1 = row.metrics?.['1d'] || {};
+                            const m3 = row.metrics?.['3d'] || {};
+                            const m5 = row.metrics?.['5d'] || {};
+                            const m10 = row.metrics?.['10d'] || {};
+                            return (
+                                <tr key={row.state || row.label} className="border-b border-slate-50 last:border-b-0 text-xs">
+                                    <td className="py-3 pr-3 min-w-[150px]">
+                                        <div className="font-black text-slate-800">{row.label || row.state || '--'}</div>
+                                        <div className="text-[10px] font-bold text-slate-400">{row.state || 'UNKNOWN'}</div>
+                                    </td>
+                                    <td className="py-3 pr-3">
+                                        <div className="font-black text-slate-700">{row.items || 0}</div>
+                                        <div className="text-[10px] font-bold text-slate-400">{row.mature_5d || 0} 个5日成熟</div>
+                                    </td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m5)}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m1)}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m3)}</td>
+                                    <td className="py-3 pr-3">{formatLayerMetric(m10)}</td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+                {rows.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">暂无题材状态复盘样本</div>}
             </div>
         </div>
     );
@@ -491,6 +1077,25 @@ function formatPrice(value?: number | null) {
 function formatSignedPct(value?: number | null) {
     if (value === undefined || value === null) return '--';
     return `${value >= 0 ? '+' : ''}${Number(value).toFixed(2)}%`;
+}
+
+function adjustmentLabel(action?: string) {
+    if (action === 'BOOST') return '加权';
+    if (action === 'DOWNWEIGHT') return '降权';
+    if (action === 'OBSERVE') return '观察';
+    return '保持';
+}
+
+function adjustmentTone(action?: string) {
+    if (action === 'BOOST') return 'border-rose-100 bg-rose-50 text-rose-600';
+    if (action === 'DOWNWEIGHT') return 'border-emerald-100 bg-emerald-50 text-emerald-700';
+    if (action === 'OBSERVE') return 'border-amber-100 bg-amber-50 text-amber-700';
+    return 'border-slate-100 bg-slate-50 text-slate-500';
+}
+
+function formatScoreDelta(value?: number) {
+    if (!value) return '';
+    return `${value > 0 ? '+' : ''}${value}`;
 }
 
 function Stat({ label, value, sub, icon, hot = false }: { label: string; value: string; sub: string; icon: React.ReactNode; hot?: boolean }) {

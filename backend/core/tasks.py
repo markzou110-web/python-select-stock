@@ -49,6 +49,23 @@ def collect_candidate_minute_bars():
         return {"error": str(exc)}
 
 
+@celery_app.task(name="tasks.theme_momentum_watch")
+def theme_momentum_watch(slot: str = "morning"):
+    now = datetime.now()
+    if not is_a_share_intraday_session(now):
+        logger.info(f"Theme momentum watch skipped: market closed ({slot}).")
+        return {"bark": False, "count": 0, "reason": "market_closed", "slot": slot}
+    try:
+        from routers.watchlist import send_theme_momentum_alert
+
+        result = send_theme_momentum_alert(slot=slot, notify=True)
+        logger.info(f"Theme momentum watch completed: {result}")
+        return result
+    except Exception as exc:
+        logger.error(f"Theme momentum watch failed: {exc}")
+        return {"bark": False, "count": 0, "reason": "error", "slot": slot, "detail": str(exc)}
+
+
 def _alert_action(signal: dict, trade_mode: str, pl_pct: float) -> str:
     level = signal.get("level")
     reason = signal.get("reason", "")
@@ -139,7 +156,7 @@ def check_realtime_alerts():
             df_labeled = calculate_indicators(df_hist, current_price=curr_price, bench_df=bench_df)
             
             # 4. 评估信号
-            signals = evaluate_exit_signals(df_labeled, entry_price, high_since_entry)
+            signals = evaluate_exit_signals(df_labeled, entry_price, high_since_entry, code=code)
             
             if signals:
                 # 过滤出需要推送的信号 (warning 和 critical)
@@ -209,8 +226,10 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
         "watch_status_push": 0,
         "pruned": 0,
         "next_day_push": 0,
+        "bark_self_check": 0,
     }
     try:
+        from core.bark_health import send_bark_self_check
         from routers.paper_trade import check_operation_triggers
         from routers.watchlist import (
             auto_prune_watchlist,
@@ -218,6 +237,10 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
             refresh_watchlist_decisions,
             send_watchlist_status_report,
         )
+
+        if slot == "open_risk":
+            self_check = send_bark_self_check()
+            summary["bark_self_check"] = 1 if (self_check.get("notification") or {}).get("bark") else 0
 
         if slot in {"open_risk", "morning_confirm", "late_decision", "price_watch"}:
             operation = check_operation_triggers(notify=True, trade_mode="REAL")
@@ -241,12 +264,29 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
 
         if slot == "after_close_review":
             from core.db import get_scan_history_by_date
-            from core.sentinel import send_after_close_watchlist
+            from core.sentinel import send_after_close_watchlist, _send_bark_message
 
             scan_date = now.strftime("%Y-%m-%d")
             scan_results = get_scan_history_by_date(scan_date)
             pushed_body = send_after_close_watchlist(scan_results, scan_date=scan_date, now=now)
             summary["next_day_push"] = 1 if pushed_body else 0
+            try:
+                from core.db import get_setting, save_setting
+                from routers.review import get_daily_strategy_report
+
+                if get_setting("daily_strategy_report_last_date") != scan_date:
+                    report_payload = get_daily_strategy_report(date=scan_date)
+                    report_body = report_payload.get("body") or ""
+                    if report_body and _send_bark_message(f"Alpha Vision 收盘策略日报 {scan_date}", report_body):
+                        save_setting("daily_strategy_report_last_date", scan_date)
+                        summary["daily_report_push"] = 1
+                    else:
+                        summary["daily_report_push"] = 0
+                else:
+                    summary["daily_report_push"] = 0
+            except Exception as exc:
+                logger.warning(f"Daily strategy report push skipped: {exc}")
+                summary["daily_report_push"] = 0
 
         logger.info(f"Intraday checkpoint completed: {summary}")
         return summary
@@ -309,6 +349,184 @@ def daily_sync(slot: str = "晚上"):
         return str(e)
     finally:
         release_sync_lock()
+
+
+def _scan_score(item: dict) -> float:
+    for key in ("final_trade_score", "Score", "score", "sop_quality_score"):
+        try:
+            value = float(item.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value:
+            return value
+    return 0.0
+
+
+def _scan_display_score(item: dict) -> float:
+    try:
+        return max(0.0, min(100.0, float(item.get("display_trade_score") or _scan_score(item))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _noon_action_text(item: dict) -> str:
+    grade = str(item.get("early_trade_grade") or item.get("sop_grade") or item.get("评级") or item.get("grade") or "").upper()
+    action = str(item.get("sop_action") or item.get("pa_trade_action") or item.get("trade_bucket") or "WATCH").upper()
+    bucket = str(item.get("trade_bucket") or "").upper()
+    if grade == "D" or bucket == "BLOCK" or action in {"AVOID", "D"}:
+        return "排除/不买：评级或交易桶未通过，最多复盘观察"
+    if action == "READY":
+        return "待确认：可复核，不等于立即买入；需下午放量站稳确认价"
+    if action == "WATCH":
+        return "观察：等待回踩、放量或尾盘站稳，未确认前不买"
+    if action == "WAIT":
+        return "等待：方向未确认，先不操作"
+    if action in {"TRADE", "PROBE"}:
+        return "可交易候选：仍需确认价、量能和仓位约束，小仓复核"
+    return f"{action}：按确认价和量能复核，禁止追高"
+
+
+def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
+    if not results:
+        return False
+
+    selected = sorted(results, key=_scan_score, reverse=True)[:limit]
+    scan_date = selected[0].get("data_date") or datetime.now().strftime("%Y-%m-%d")
+    lines = [
+        f"午间全量同步后选股 {scan_date}",
+        "性质：午间候选清单，下午需结合放量站稳和市场情绪复核。",
+        "",
+    ]
+    for item in selected:
+        code = item.get("代码") or item.get("code") or ""
+        name = item.get("名称") or item.get("name") or ""
+        price = item.get("现价") or item.get("current_price") or item.get("price") or "--"
+        score = _scan_display_score(item)
+        grade = item.get("early_trade_grade") or item.get("sop_grade") or item.get("评级") or item.get("grade") or "--"
+        lines.append(f"{name}({code}) 现价 {price} | 评分 {score:.1f} | {grade}")
+        lines.append(f"  建议：{_noon_action_text(item)}")
+        if item.get("early_trade_candidate") and item.get("early_trade_reason"):
+            lines.append(f"  提前复核：{item['early_trade_reason']}；仅小仓，不追高")
+        if item.get("observe_promotion_candidate") and item.get("observe_promotion_action"):
+            lines.append(f"  转可买：{item['observe_promotion_action']}")
+        if item.get("pa_decision_summary") or item.get("price_action_summary"):
+            lines.append(f"  结构：{item.get('pa_decision_summary') or item.get('price_action_summary')}")
+        lines.append("")
+
+    try:
+        from core.data import get_stale_cache, format_freshness
+        lines.append(format_freshness(get_stale_cache("market_snapshot")))
+    except Exception:
+        pass
+
+    body = "\n".join(lines).rstrip()
+    try:
+        return bool(asyncio.run(notifier.send(
+            f"Alpha Vision 午间选股 {scan_date}",
+            body,
+            channels=["bark"],
+            group="AlphaVision_Noon",
+            url="http://localhost:3000",
+        )))
+    except Exception as exc:
+        logger.error(f"Noon scan Bark push failed: {exc}")
+        return False
+
+
+@celery_app.task(name="tasks.noon_sync_scan_review")
+def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
+    """Lunch workflow: sync at 11:35, then run live review after the afternoon session resumes."""
+    now = datetime.now()
+    if not is_a_share_trading_day(now):
+        logger.info("Noon workflow skipped: non-trading day.")
+        return {"status": "skipped", "reason": "non_trading_day"}
+
+    summary = {
+        "slot": "noon",
+        "sync": None,
+        "scan_count": 0,
+        "scan_push": False,
+        "operation_alerts": 0,
+        "watch_alerts": 0,
+        "watch_status_push": 0,
+        "errors": [],
+    }
+    try:
+        if sync_first:
+            sync_result = daily_sync(slot="午间")
+            summary["sync"] = sync_result
+            if "completed successfully" not in str(sync_result):
+                logger.warning(f"Noon workflow stopped before review: {sync_result}")
+                return summary
+        if not run_review:
+            logger.info(f"Noon sync workflow completed: {summary}")
+            return summary
+
+        from routers.scan import run_market_scan_task
+        try:
+            results = run_market_scan_task(
+                strategy_type="tv_dual_strict",
+                local_only=True,
+                require_live_snapshot=True,
+            ) or []
+            summary["scan_count"] = len(results)
+            summary["scan_push"] = _send_noon_scan_push(results)
+        except Exception as scan_exc:
+            logger.error(f"Noon scan step error: {scan_exc}")
+            summary["errors"].append(f"scan: {scan_exc}")
+
+        from routers.paper_trade import check_operation_triggers
+        from routers.watchlist import check_watchlist_triggers, send_watchlist_status_report
+
+        try:
+            operation = check_operation_triggers(notify=True, trade_mode="REAL")
+            summary["operation_alerts"] = len(operation.get("alerts") or [])
+        except Exception as operation_exc:
+            logger.error(f"Noon operation trigger step error: {operation_exc}")
+            summary["errors"].append(f"operation: {operation_exc}")
+        try:
+            watch = check_watchlist_triggers(notify=True)
+            summary["watch_alerts"] = int(watch.get("count") or 0)
+        except Exception as watch_exc:
+            logger.error(f"Noon watch trigger step error: {watch_exc}")
+            summary["errors"].append(f"watch: {watch_exc}")
+        try:
+            report = send_watchlist_status_report("noon")
+            summary["watch_status_push"] = int(report.get("count") or 0) if report.get("bark") else 0
+        except Exception as report_exc:
+            logger.error(f"Noon watch status step error: {report_exc}")
+            summary["errors"].append(f"watch_report: {report_exc}")
+        logger.info(f"Noon workflow completed: {summary}")
+        return summary
+    except Exception as exc:
+        logger.error(f"Noon workflow error: {exc}")
+        summary["error"] = str(exc)
+        return summary
+
+
+@celery_app.task(name="tasks.early_value_scan")
+def early_value_scan():
+    """Run the independent early-value watch strategy without changing the main scan."""
+    now = datetime.now()
+    if not is_a_share_trading_day(now):
+        return {"status": "skipped", "reason": "non_trading_day", "strategy_type": "early_value"}
+    try:
+        from routers.scan import run_market_scan_task
+
+        results = run_market_scan_task(
+            strategy_type="early_value",
+            local_only=True,
+            require_live_snapshot=True,
+        ) or []
+        return {"status": "ok", "strategy_type": "early_value", "scan_count": len(results)}
+    except Exception as exc:
+        logger.error(f"Early-value independent scan failed: {exc}")
+        return {
+            "status": "error",
+            "strategy_type": "early_value",
+            "scan_count": 0,
+            "error": str(exc),
+        }
 
 
 @celery_app.task(name="tasks.weekly_entry_timing_report")

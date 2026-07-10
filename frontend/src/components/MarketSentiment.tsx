@@ -12,6 +12,14 @@ interface SentimentData {
     max_streak: number;
     sentiment_score: number;
     market_sentiment_label?: string;
+    market_sentiment_reason?: string;
+    market_breadth?: {
+        advance_ratio?: number;
+        strong_ratio?: number;
+        weak_ratio?: number;
+        limit_up_ratio?: number;
+        limit_down_ratio?: number;
+    };
     portfolio_position_cap_pct?: number;
     market_allowed_actions?: string[];
     market_forbidden_actions?: string[];
@@ -121,6 +129,11 @@ const MarketSentiment: React.FC = () => {
                             </div>
                         </div>
                         <div className={`mt-2 text-xs font-black ${scoreColor}`}>{data.market_sentiment_label || statusText}</div>
+                        {typeof data.market_breadth?.advance_ratio === 'number' && (
+                            <div className="mt-0.5 text-[10px] font-bold text-slate-400">
+                                仅 {data.market_breadth.advance_ratio.toFixed(0)}% 个股上涨
+                            </div>
+                        )}
                         <div className="mt-1 text-[10px] font-bold text-slate-500">
                             总仓上限 {data.portfolio_position_cap_pct ?? '--'}%
                         </div>
@@ -183,6 +196,12 @@ const MarketSentiment: React.FC = () => {
                     )}
                 </div>
             </div>
+
+            {data.market_sentiment_reason && (
+                <div className="mt-2 text-[11px] font-semibold text-slate-500">
+                    💡 {data.market_sentiment_reason}
+                </div>
+            )}
 
             <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] font-semibold">
                 <div className="border-l-2 border-emerald-500 pl-2 text-emerald-700">

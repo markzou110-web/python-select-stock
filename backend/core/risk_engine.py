@@ -12,9 +12,13 @@ from core.risk_constants import (
     ATR_STOP_MAX_PCT,
     ATR_STOP_MIN_PCT,
     ATR_STOP_MULTIPLIER,
+    BREAKEVEN_FLOOR_PCT,
+    BREAKEVEN_TRIGGER_PCT,
     CAPITAL_PROTECT_FLOOR_PCT,
     CAPITAL_PROTECT_THRESHOLD_PCT,
     FIXED_STOP_LOSS_RATIO,
+    POSITION_SPIKE_PCT,
+    POSITION_SPIKE_TRAIL_RATIO,
     TAKE_PROFIT_RATIO,
     TIER_HIGH_PROFIT_PCT,
     TIER_HIGH_TRAIL_RATIO,
@@ -211,7 +215,27 @@ def compute_paper_risk_levels(
 
     capital_protect_price = 0.0
     moving_stop_price = 0.0
+    breakeven_price = 0.0
+    spike_protect_price = 0.0
     risk_stage = "初始/结构防守"
+
+    # 改动 #14：保本移动止损——补全 [0%, 5%) 利润区间的止损空白。
+    # 浮盈达 +3% 即把止损上移到成本线附近（-0.5%），守住绝大部分本金，
+    # 避免股票从 +4% 回撤到 -9% 浮盈全部回吐。
+    if max_pl_pct >= BREAKEVEN_TRIGGER_PCT:
+        breakeven_price = round(entry_price * (1 + BREAKEVEN_FLOOR_PCT / 100), 2)
+        candidates.append(breakeven_price)
+        risk_stage = "保本移动"
+
+    # 改动 #13 持仓侧：持仓追高保护——当日冲高(浮盈>7%)但已从高点回落时，
+    # 收紧止损锁定脉冲利润，避免"冲高 → 全回吐"。只在 pl_pct 满足且确认回落时触发。
+    # 注：用 max_pl 比较加 0.5% 容差，避免浮点精度导致 6.9999% 误判为未达标。
+    if pl_pct >= POSITION_SPIKE_PCT - 0.5 and high_since_entry > current_price * 1.01:
+        spike_protect_price = round(current_price * POSITION_SPIKE_TRAIL_RATIO, 2)
+        candidates.append(spike_protect_price)
+        # 不覆盖更高的 risk_stage（保本/移动档优先），仅当仍处于初始档时标注脉冲保护
+        if risk_stage == "初始/结构防守":
+            risk_stage = "脉冲保护"
 
     if max_pl_pct >= CAPITAL_PROTECT_THRESHOLD_PCT:
         capital_protect_price = round(entry_price * (1 + CAPITAL_PROTECT_FLOOR_PCT / 100), 2)
@@ -255,8 +279,10 @@ def compute_paper_risk_levels(
         "buy_price": buy_price,
         "initial_stop_price": initial_stop_price,
         "structure_stop_price": structure_stop_price,
+        "breakeven_price": breakeven_price,
         "capital_protect_price": capital_protect_price,
         "moving_stop_price": moving_stop_price,
+        "spike_protect_price": spike_protect_price,
         "stop_price": active_stop_price,
         "active_stop_price": active_stop_price,
         "take_profit_price": take_profit_price,

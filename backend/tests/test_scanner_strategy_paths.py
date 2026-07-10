@@ -9,6 +9,101 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core import scanner
 
 
+def _make_early_value_df(current: float = 11.5, prev: float = 11.2) -> pd.DataFrame:
+    n = 90
+    close = np.linspace(10.4, 10.9, n)
+    close[-6:] = [10.8, 10.95, 11.0, 11.05, prev, current]
+    low = close - 0.2
+    low[-20] = 10.0
+    low[-3:] = [10.75, 10.85, 11.2]
+    high = close + 0.2
+    open_ = close - 0.1
+    volume = np.full(n, 100000.0)
+    volume[-1] = 125000.0
+    return pd.DataFrame({
+        "日期": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "开盘": open_,
+        "收盘": close,
+        "最高": high,
+        "最低": low,
+        "成交量": volume,
+        "EMA20": np.full(n, 10.85),
+        "EMA60": np.full(n, 10.55),
+        "RSI": np.full(n, 55.0),
+        "MACD_DIF": np.full(n, 0.1),
+        "MACD_DEA": np.full(n, 0.05),
+    })
+
+
+def test_early_value_strategy_tracks_10_to_20pct_from_20d_low():
+    result = scanner.single_stock_task(
+        "000001",
+        "早期票",
+        price=11.5,
+        vol=125000,
+        open_price=11.4,
+        threshold=0.12,
+        vol_multiplier=1.5,
+        rsi_min=55,
+        use_macd_filter=True,
+        use_bb_sqz=False,
+        sqz_lookback=10,
+        use_weekly=False,
+        preloaded_df=_make_early_value_df(),
+        strategy_type="early_value",
+    )
+
+    assert result["strategy_type"] == "early_value"
+    assert result["early_value_watch_only"] is True
+    assert result["early_value_metrics"]["rise_from_20d_low"] == 15.0
+    assert "早期性价比追踪" in result["signal"]
+
+
+def test_early_value_strategy_rejects_overextended_names():
+    result = scanner.single_stock_task(
+        "000001",
+        "过热票",
+        price=12.5,
+        vol=125000,
+        open_price=12.4,
+        threshold=0.12,
+        vol_multiplier=1.5,
+        rsi_min=55,
+        use_macd_filter=True,
+        use_bb_sqz=False,
+        sqz_lookback=10,
+        use_weekly=False,
+        preloaded_df=_make_early_value_df(current=12.5, prev=12.1),
+        strategy_type="early_value",
+    )
+
+    assert "距20日低点涨幅不在10%-20%区间" in result["reason"]
+
+
+def test_strategy_registry_includes_early_value():
+    from core.strategy_registry import get_strategy
+
+    item = get_strategy("early_value")
+
+    assert item["supports_scan"] is True
+    assert item["supports_backtest"] is False
+    assert item["name"] == "早期性价比追踪"
+
+
+def test_early_value_keeps_pending_candidates_when_sector_not_started():
+    results, dropped, kept_pending = scanner._apply_early_value_sector_filter(
+        [{"代码": "000001", "名称": "早期票", "Score": 75}],
+        {"000001": "测试板块"},
+        {"测试板块": {"sector_phase": "SECTOR_FADE", "sector_momentum_score": 20, "sector_breadth": 30}},
+    )
+
+    assert dropped == 0
+    assert kept_pending is True
+    assert results[0]["early_value_sector_confirmed"] is False
+    assert results[0]["early_value_sector_pending"] is True
+    assert "待确认观察池" in results[0]["early_value_action"]
+
+
 def test_single_stock_task_backfills_missing_pine_indicators(monkeypatch):
     n = 130
     close = np.linspace(10, 13, n)

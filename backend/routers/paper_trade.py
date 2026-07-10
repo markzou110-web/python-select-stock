@@ -132,6 +132,21 @@ def _resolve_trade_theme_and_logic(engine, trade: PaperTradeCreate, industry: st
     )
 
 
+def _real_trade_execution_warnings(trade: PaperTradeCreate) -> List[str]:
+    if trade.trade_mode != "REAL":
+        return []
+    warnings: List[str] = []
+    if trade.planned_entry_price is None:
+        warnings.append("实盘买入缺少计划价，无法复盘是否按确认价执行")
+    if not trade.entry_signal_date:
+        warnings.append("实盘买入缺少系统信号日期，无法匹配Bark/扫描样本")
+    if trade.plan_adherence == "UNKNOWN":
+        warnings.append("实盘买入未标记计划遵守情况，执行胜率无法归因")
+    if not trade.entry_source:
+        warnings.append("实盘买入缺少入口来源，无法区分Bark、观察池或手工追单")
+    return warnings
+
+
 def _time_stop_policy(strategy_type: str | None) -> Dict[str, Any]:
     strategy = (strategy_type or "").lower()
     if strategy == "squeeze":
@@ -484,6 +499,15 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
     if not engine:
         return {"status": "error"}
     try:
+        execution_warnings = _real_trade_execution_warnings(trade)
+        if execution_warnings and not trade.force:
+            return {
+                "status": "warning",
+                "detail": "实盘执行记录不完整，请补齐后再加入；若确认为人工强制记录，可 force=true。",
+                "warnings": execution_warnings,
+                "execution_quality": "INCOMPLETE",
+            }
+
         budget_check = evaluate_portfolio_risk_budget(engine, trade.model_dump(), force=bool(trade.force))
         if budget_check["status"] == "warning":
             return {
@@ -596,7 +620,12 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
             trade_id=trade_id,
             strategy_type=trade.strategy_type,
             theme=resolved_theme,
-            payload={"planned_price": planned_price, "actual_price": actual_price, "slippage_pct": round(slippage_pct, 3)},
+            payload={
+                "planned_price": planned_price,
+                "actual_price": actual_price,
+                "slippage_pct": round(slippage_pct, 3),
+                "execution_warnings": execution_warnings,
+            },
         )
 
         # 发送 Bark 实时推送 — 根据交易模式区分标题（使用统一风控常量）
@@ -607,6 +636,8 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
         body = (
             f"交易模式：{'🔴 实盘' if trade.trade_mode == 'REAL' else '🔵 模拟盘'}\n"
             f"入场价格：¥{trade.price:.2f}\n"
+            f"计划价格：¥{planned_price:.2f}｜实际价格：¥{actual_price:.2f}｜滑点：{slippage_pct:+.2f}%\n"
+            f"计划遵守：{trade.plan_adherence}\n"
             f"价格来源：{trade.entry_source or 'manual_current_price'}\n"
             f"信号日期：{trade.entry_signal_date or datetime.now().strftime('%Y-%m-%d')}\n"
             f"固定止损：¥{stop_price:.2f} ({FIXED_STOP_LOSS_PCT}%)\n"

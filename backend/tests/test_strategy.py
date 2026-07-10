@@ -20,6 +20,8 @@ from core.strategy import (
     get_signal_details,
     calculate_pine_win_rate,
     calculate_historical_win_rate,
+    calculate_tv_dual_win_rate,
+    evaluate_exit_signals,
 )
 from core.scanner import _apply_sop_filter
 
@@ -100,6 +102,44 @@ class TestSimulateBacktestBasic:
             use_trailing_stop=False
         )
         assert result["avg_hold_days"] == 5
+
+    def test_next_day_open_entry_removes_look_ahead_bias(self):
+        """传入 open_vals 时入场价用次日开盘（真实 T+1 执行），而非信号日收盘（前视偏差）。
+
+        构造：信号日(idx=0)收盘 10，次日(idx=1)开盘 +8%（非涨停，可成交）。
+        - 不传 open_vals（旧行为）：入场价=10
+        - 传 open_vals（真实）：入场价=10.8（次日开盘）
+        后续价格平稳，退出价相同 → 两者的 exit_return 应不同（入场价不同）。
+        """
+        n = 8
+        close = np.array([10.0, 10.8, 10.8, 10.8, 10.8, 10.8, 10.8, 10.8])
+        openp = np.array([10.0, 10.8, 10.8, 10.8, 10.8, 10.8, 10.8, 10.8])  # 次日 +8% 高开（未涨停）
+        high = close + 0.05
+        low = close - 0.05
+
+        # 旧行为：信号日收盘入场 = 10
+        legacy = _simulate_backtest(close, high, low, signal_indices=[0], max_hold_days=5, use_trailing_stop=False)
+        # T+1 真实入场 = 次日开盘 = 10.8
+        t1 = _simulate_backtest(close, high, low, signal_indices=[0], max_hold_days=5, use_trailing_stop=False, open_vals=openp)
+
+        # 旧入场 10，退出 ~10.8 → 正收益；T+1 入场 10.8，退出 10.8 → ~0 收益
+        assert legacy["avg_return"] > t1["avg_return"]
+        # T+1 入场后退出价仍是后续收盘，持仓窗口从 idx+1 起算
+        assert t1["signal_count"] == 1
+
+    def test_limit_up_signals_are_skipped(self):
+        """涨停信号买不到，不应计入回测（否则高估胜率）。
+
+        信号日(idx=0)收盘 10，次日开盘 +10%（≥9.5% 涨停阈值）→ 实盘封板买不到 → 跳过。
+        """
+        close = np.array([10.0, 11.0, 11.0, 11.0, 11.0, 11.0])
+        openp = np.array([10.0, 11.0, 11.0, 11.0, 11.0, 11.0])  # 次日 +10% 涨停开盘
+        high = close + 0.05
+        low = close - 0.05
+
+        result = _simulate_backtest(close, high, low, signal_indices=[0], max_hold_days=3, use_trailing_stop=False, open_vals=openp)
+        assert result["signal_count"] == 0  # 涨停跳过，无成交
+        assert result["limit_up_skipped"] == 1
 
 
 class TestBacktestWinRateReliability:
@@ -371,6 +411,7 @@ class TestStrategySignalAlignment:
         df.loc[:, "最高"] = close + 0.2
         df.loc[:, "最低"] = close - 0.2
         df.loc[:, "EMA5"] = close - 0.2
+        df.loc[:, "EMA10"] = close - 0.25
         df.loc[:, "EMA20"] = close - 0.3
         df.loc[:, "EMA60"] = close - 0.4
         df.loc[:, "成交量"] = 160000.0
@@ -390,6 +431,7 @@ class TestStrategySignalAlignment:
         df.loc[:, "最高"] = close + 0.2
         df.loc[:, "最低"] = close - 0.2
         df.loc[:, "EMA5"] = close - 0.1
+        df.loc[:, "EMA10"] = close - 0.15
         df.loc[:, "EMA20"] = close - 0.2
         df.loc[:, "EMA60"] = close - 0.3
         df.loc[:, "RSI_WILDER"] = 60.0
@@ -407,12 +449,78 @@ class TestStrategySignalAlignment:
         assert strict_stats["tv_zp_signal"] == "无"
 
 
+class TestTvDualStrictBacktestFallback:
+    """tv_dual_strict 历史胜率回测：严格配对样本不足时退回"任意单信号"并集，避免胜率恒为0。
+
+    回归 bug：require_both=True 时直接套用实时筛选的 3 天配对窗口到 4 年历史，
+    导致绝大多数股票 0 信号、历史胜率恒为 0%。
+    """
+
+    def _df_with_signals(self, n=200):
+        close = np.linspace(10, 14, n)
+        df = pd.DataFrame({
+            "开盘": close - 0.3,
+            "收盘": close,
+            "最高": close + 0.2,
+            "最低": close - 0.2,
+            "成交量": np.full(n, 200000.0),
+            "ATR": np.full(n, 0.3),
+        })
+        return df
+
+    def test_strict_falls_back_to_union_when_paired_samples_too_few(self, monkeypatch):
+        """均线信号与 ZP 信号相隔很远（无 3 天内配对）→ 退回并集，得到非零胜率。"""
+        import core.strategy as strategy
+
+        # MA 在 50/120，ZP 在 80/150 —— 全部相隔 >=30 天，3 天窗口内 0 配对
+        monkeypatch.setattr(strategy, "_find_squeeze_signal_indices", lambda *a, **k: [50, 120])
+        monkeypatch.setattr(strategy, "_find_tv_zp_signal_indices", lambda *a, **k: ([80, 150], [], {}))
+
+        df = self._df_with_signals()
+        result = calculate_tv_dual_win_rate(df, require_both=True)
+
+        # 退回并集后应有 4 个信号，胜率非"无历史信号"
+        assert result["signal_count"] == 4
+        assert "任意单信号" in result["sample_warning"]
+
+    def test_strict_uses_paired_when_enough_samples(self, monkeypatch):
+        """均线与 ZP 在 3 天内多次配对（>=5）→ 直接用配对样本，不触发退回。"""
+        import core.strategy as strategy
+
+        # 构造 6 组 3 天内配对（MA 与 ZP 相隔 1 天）
+        pairs = [(20 + i * 20, 21 + i * 20) for i in range(6)]
+        ma = [p[0] for p in pairs]
+        zp = [p[1] for p in pairs]
+        monkeypatch.setattr(strategy, "_find_squeeze_signal_indices", lambda *a, **k: ma)
+        monkeypatch.setattr(strategy, "_find_tv_zp_signal_indices", lambda *a, **k: (zp, [], {}))
+
+        df = self._df_with_signals(300)
+        result = calculate_tv_dual_win_rate(df, require_both=True)
+
+        assert result["signal_count"] == 6
+        # 用的是严格配对样本，不应出现"任意单信号"标注
+        assert "任意单信号" not in result.get("sample_warning", "")
+
+    def test_loose_mode_never_uses_paired_logic(self, monkeypatch):
+        """require_both=False 始终用并集，不受配对影响。"""
+        import core.strategy as strategy
+
+        monkeypatch.setattr(strategy, "_find_squeeze_signal_indices", lambda *a, **k: [50, 120])
+        monkeypatch.setattr(strategy, "_find_tv_zp_signal_indices", lambda *a, **k: ([80, 150], [], {}))
+
+        df = self._df_with_signals()
+        result = calculate_tv_dual_win_rate(df, require_both=False)
+
+        assert result["signal_count"] == 4
+        assert "任意单信号" not in result.get("sample_warning", "")
+
+
 class TestTradingViewZPStrategy:
     def test_expiry_and_alternate_rule_keeps_first_three_leading_bars(self):
-        leading_long = pd.Series([False, True, True, True, True, False, False, False])
-        leading_short = pd.Series([False, False, False, False, False, True, True, True])
-        long_cond = pd.Series([False, True, True, True, True, False, False, False])
-        short_cond = pd.Series([False, False, False, False, False, True, True, True])
+        leading_long = pd.Series([False, False, False, True, True, True, True, False, False, False])
+        leading_short = pd.Series([False, True, True, False, False, False, False, True, True, True])
+        long_cond = pd.Series([False, False, False, True, True, True, True, False, False, False])
+        short_cond = pd.Series([False, True, True, False, False, False, False, True, True, True])
 
         long_indices, short_indices = _apply_tv_zp_expiry_and_alternate(
             leading_long=leading_long,
@@ -422,8 +530,25 @@ class TestTradingViewZPStrategy:
             expiry=3,
         )
 
-        assert long_indices == [1]
-        assert short_indices == [5]
+        assert long_indices == [3]
+        assert short_indices == [7]
+
+    def test_alternate_rule_requires_previous_opposite_state(self):
+        leading_long = pd.Series([False, True, True, True])
+        leading_short = pd.Series([False, False, False, False])
+        long_cond = pd.Series([False, True, True, True])
+        short_cond = pd.Series([False, False, False, False])
+
+        long_indices, short_indices = _apply_tv_zp_expiry_and_alternate(
+            leading_long=leading_long,
+            leading_short=leading_short,
+            long_cond=long_cond,
+            short_cond=short_cond,
+            expiry=3,
+        )
+
+        assert long_indices == []
+        assert short_indices == []
 
     def test_tv_zp_signal_details_returns_tradingview_style_keys(self):
         n = 180
@@ -446,3 +571,18 @@ class TestTradingViewZPStrategy:
         assert isinstance(details["buy_signals"], list)
         assert isinstance(details["sell_signals"], list)
         assert details["trailing_stops"] == []
+
+
+def test_evaluate_exit_signals_accepts_optional_code():
+    df = pd.DataFrame({
+        "日期": pd.date_range("2026-06-01", periods=20),
+        "开盘": [10.0] * 20,
+        "最高": [10.5] * 20,
+        "最低": [9.8] * 20,
+        "收盘": [10.2] * 19 + [9.0],
+        "成交量": [100000] * 20,
+        "ATR": [0.4] * 20,
+    })
+
+    assert isinstance(evaluate_exit_signals(df, entry_price=10.0, high_since_entry=10.8), list)
+    assert isinstance(evaluate_exit_signals(df, entry_price=10.0, high_since_entry=10.8, code="603259"), list)

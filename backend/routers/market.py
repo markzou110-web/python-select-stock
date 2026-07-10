@@ -17,8 +17,9 @@ from core.data import (
     get_stale_cache,
     set_cached_data,
 )
-from core.db import get_db_engine
-from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
+from core.db import get_db_engine, get_scan_dates, get_scan_history_by_date
+from core.sector_strength import build_sector_strength, build_sector_leaders, build_sector_history_context, classify_sector_role
+from core.sector_push_analysis import build_hot_sector_push_gap_analysis
 
 router = APIRouter(prefix="/api", tags=["market"])
 
@@ -112,13 +113,12 @@ def fetch_mine_sweeper_data() -> Dict[str, List[str]]:
         if df_unlocks is not None and not df_unlocks.empty:
             data["unlocks"] = df_unlocks['股票代码'].tolist()[:500]
 
-        # 3. Reductions (Block trades - 大宗交易)
-        df_reduce = fetch_with_timeout(
-            lambda: ak.stock_dzjy_mrtj(),
-            timeout=10
-        )
-        if df_reduce is not None and not df_reduce.empty:
-            data["reductions"] = df_reduce['证券代码'].tolist()[:500]
+        # 3. Reductions — 已移除（口径错误）
+        # 原用 ak.stock_dzjy_mrtj()（大宗交易每日统计）当"减持"数据源，但：
+        #   a) 大宗交易 ≠ 减持（机构调仓/引入战投/约定购回都走大宗，买方常有6个月限售）；
+        #   b) 实测该接口返回 2022-01-05 的陈旧数据（4年前），601138 因此被误判 D 级。
+        # 真正的减持信号应来自高管减持公告或限售股减持计划，而非大宗交易统计。
+        # 保留 data["reductions"] 为空列表以维持接口契约（调用方仍可读，但恒为空）。
 
     except Exception as e:
         logger.warning(f"Mine Sweeper Error: {e}")
@@ -180,7 +180,11 @@ def get_sector_strength(limit: int = 20, force: bool = False):
         if not strength:
             return {"items": [], "updated_at": datetime.now().isoformat()}
 
-        lead_map: Dict[str, List[Dict[str, Any]]] = {}
+        lead_map: Dict[str, List[Dict[str, Any]]] = build_sector_leaders(
+            engine, snapshot, sector_map, strength
+        )
+
+        # 兜底：多日历史缺失时退回当日涨幅排序（保留原契约 code/name/price/pct/role）
         if snapshot is not None and not snapshot.empty:
             df = snapshot.copy()
             df['code'] = df['code'].astype(str).str.zfill(6)
@@ -189,6 +193,8 @@ def get_sector_strength(limit: int = 20, force: bool = False):
             if 'price' in df.columns:
                 df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0)
             for industry, group in df[df['industry'] != '未知'].groupby('industry'):
+                if lead_map.get(industry):
+                    continue
                 sector_avg = float(strength.get(industry, {}).get('sector_avg_pct', group['pct_chg'].mean()) or 0)
                 leaders = group.sort_values('pct_chg', ascending=False).head(5)
                 lead_map[industry] = [
@@ -231,6 +237,33 @@ def get_sector_strength(limit: int = 20, force: bool = False):
         return payload
     except Exception as e:
         logger.error(f"Error fetching sector strength: {e}")
+        return {"items": [], "updated_at": datetime.now().isoformat(), "error": str(e)}
+
+
+@router.get("/market/sector-push-gaps")
+def get_sector_push_gaps(limit: int = 8, date: str = "", force: bool = False):
+    """解释热门板块为什么有/没有进入推荐推送。"""
+    try:
+        safe_limit = max(1, min(limit, 30))
+        dates = get_scan_dates()
+        scan_date = date or (dates[0] if dates else "")
+        scan_results = get_scan_history_by_date(scan_date) if scan_date else []
+        sector_payload = get_sector_strength(limit=max(safe_limit, 20), force=force)
+        items = build_hot_sector_push_gap_analysis(
+            sector_payload.get("items", []),
+            scan_results,
+            limit=safe_limit,
+        )
+        return {
+            "items": items,
+            "scan_date": scan_date,
+            "scan_result_count": len(scan_results),
+            "updated_at": datetime.now().isoformat(),
+            "cache_hit": bool(sector_payload.get("cache_hit")),
+            "cache_stale": bool(sector_payload.get("cache_stale")),
+        }
+    except Exception as e:
+        logger.error(f"Error building sector push gap analysis: {e}")
         return {"items": [], "updated_at": datetime.now().isoformat(), "error": str(e)}
 
 

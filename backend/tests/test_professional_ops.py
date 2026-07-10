@@ -128,6 +128,33 @@ def test_scan_audit_log_persists_on_sqlite():
     assert count == 1
 
 
+def test_sector_push_gaps_endpoint_explains_hot_sector_without_db(monkeypatch):
+    monkeypatch.setattr(market, "get_scan_dates", lambda: ["2026-07-07"])
+    monkeypatch.setattr(market, "get_scan_history_by_date", lambda date: [{
+        "代码": "000002",
+        "名称": "后排B",
+        "行业": "机器人",
+        "trade_bucket": "OBSERVE",
+        "sector_role": "FOLLOWER",
+        "trade_blockers": ["强板块后排角色，等待转强为核心股"],
+    }])
+    monkeypatch.setattr(market, "get_sector_strength", lambda limit=20, force=False: {
+        "items": [{
+            "industry": "机器人",
+            "sector_phase": "SECTOR_CONFIRM",
+            "sector_momentum_score": 82,
+            "sector_breadth": 75,
+        }],
+        "cache_hit": False,
+    })
+
+    result = market.get_sector_push_gaps(limit=5)
+
+    assert result["scan_date"] == "2026-07-07"
+    assert result["scan_result_count"] == 1
+    assert result["items"][0]["primary_reason"] == "REAR_ROLE"
+
+
 def test_failure_sample_persists_on_sqlite():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
@@ -187,16 +214,25 @@ def test_recommendation_event_persists_on_sqlite():
         "trade_bucket": "TRADE",
         "trade_eligible": True,
         "final_trade_score": 88,
+        "sector_strength_score": 82,
+        "stock_sector_fit_score": 76,
+        "sector_alignment_score": 80,
         "pa_trade_plan": {"action": "READY", "setup": "回踩确认"},
     }], engine=engine, source="test", event_date="2025-05-31", market_regime="OFFENSIVE")
 
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT code, trade_bucket, market_regime FROM recommendation_events")).fetchone()
+        row = conn.execute(text("""
+            SELECT code, trade_bucket, market_regime, sector_strength_score, stock_sector_fit_score, sector_alignment_score
+            FROM recommendation_events
+        """)).fetchone()
 
     assert ok is True
     assert row[0] == "000001"
     assert row[1] == "TRADE"
     assert row[2] == "OFFENSIVE"
+    assert row[3] == 82
+    assert row[4] == 76
+    assert row[5] == 80
 
 
 def test_recommendation_event_upserts_same_daily_identity_on_sqlite():
@@ -384,6 +420,24 @@ def test_add_paper_trade_does_not_report_success_when_insert_conflicts(monkeypat
     assert "今天已有拟合实盘记录" in conflict["detail"]
     assert len(lifecycle_events) == 1
     assert len(notifications) == 1
+
+
+def test_real_trade_requires_execution_context_before_open(monkeypatch):
+    monkeypatch.setattr(paper_trade, "get_db_engine", lambda: object())
+
+    trade = paper_trade.PaperTradeCreate(
+        code="000001",
+        name="平安银行",
+        price=10.0,
+        trade_mode="REAL",
+    )
+
+    result = paper_trade.add_paper_trade(trade)
+
+    assert result["status"] == "warning"
+    assert result["execution_quality"] == "INCOMPLETE"
+    assert "缺少计划价" in "；".join(result["warnings"])
+    assert "计划遵守" in "；".join(result["warnings"])
 
 
 def test_sector_strength_returns_stale_cache_without_recomputing(monkeypatch):

@@ -13,6 +13,7 @@ from core.system_health import build_system_health_snapshot
 from core.strategy_health import build_strategy_health
 from core.source_comparison import compare_history_sources
 from core.db import validate_stock_code
+from core.bark_health import build_bark_self_check, send_bark_self_check
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -21,6 +22,12 @@ router = APIRouter(prefix="/api/system", tags=["system"])
 def get_system_health():
     """Return an operational readiness snapshot for daily trading workflow."""
     return build_system_health_snapshot(get_db_engine())
+
+
+@router.post("/bark-self-check")
+def post_bark_self_check(notify: bool = False):
+    """Build or send a Bark readiness report without exposing private keys."""
+    return send_bark_self_check() if notify else build_bark_self_check(get_db_engine())
 
 
 @router.get("/data-sources")

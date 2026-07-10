@@ -115,6 +115,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     rfFilter={chartData.rf_filter || []}
                     trailingStops={chartData.trailing_stops || []}
                     markers={chartData.markers || []}
+                    strategySignalSets={chartData.strategy_sets || {}}
                     priceAction={chartData.price_action || null}
                     priceActionLines={chartData.price_action_lines || []}
                     riskLevels={chartData.chart_context || {}}

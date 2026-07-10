@@ -199,28 +199,22 @@ def map_status_to_regime(status: str) -> str:
 
 
 def _fetch_index_data() -> Optional[pd.DataFrame]:
-    """从数据库获取上证指数(000001)的K线数据"""
+    """从数据库获取上证指数的K线数据。
+
+    修复 BUG：原用 load_from_db("000001") 从 daily_k 取数据，但 000001 在库里是
+    **平安银行**（个股，收盘 ~10），不是上证指数（收盘 ~3000+）。这导致市场状态
+    判定（牛/熊/震荡）以及弱市止损收紧完全基于一只银行股，系统性失真。
+    改为复用 data.get_index_hist("000001")：优先新浪在线接口（返回真正指数），
+    在线失败时返回 None（detect_market_regime 会诚实降级为"震荡/数据不足"），
+    绝不用个股冒充指数。
+    """
     try:
-        from core.db import get_db_engine, load_from_db
-        from datetime import datetime, timedelta
-        
-        engine = get_db_engine()
-        if not engine:
-            return None
-        
-        start_date = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
-        df = load_from_db("000001", start_date, engine)
-        
-        if df.empty:
-            # 尝试在线获取
-            try:
-                import akshare as ak
-                start_fetch = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
-                df = ak.stock_zh_a_hist(symbol="000001", period="daily", start_date=start_fetch, adjust="qfq")
-            except Exception:
-                pass
-        
-        return df if not df.empty else None
+        from core.data import get_index_hist
+        df = get_index_hist("000001")
+        if df is not None and not df.empty:
+            return df
+        # 在线失败时不再用个股 000001 冒充指数，直接返回 None
+        return None
     except Exception as e:
         logger.error(f"Failed to fetch index data: {e}")
         return None

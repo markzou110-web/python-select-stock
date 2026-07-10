@@ -43,16 +43,29 @@ def _percentile_scores(values: List[float]) -> List[float]:
 
 
 def _parse_win_rate(row: Dict[str, Any]) -> float:
-    """从结果行解析历史胜率。scanner 以中文字符串 '58.0%' 存于 '历史胜率' 键。
+    """从结果行解析历史胜率，优先用可靠性折扣后的 Wilson 下界胜率。
 
-    无胜率数据时返回中性值 50（不拉高也不拉低该标的的 win_rate 分量）。
+    优先级：
+      1. 回测统计.adjusted_win_rate（Wilson 99% 下界，已含小样本惩罚）—— 与 scanner 层一致。
+      2. 原始 历史胜率 字符串（回测统计缺失时兜底）。
+      3. 无任何胜率数据 → 中性 50（不拉高也不拉低）。
+
+    改动（提高胜率区分度）：原实现无视样本量，2 笔交易 100% 胜率 与 30 笔 100% 同分，
+    且 0%（真无胜率数据的历史遗留）会被当作"真实 0%"严重压分。改为优先用 Wilson 下界，
+    既惩罚小样本虚高、也避免把"无数据"误判为"必输"。
     """
+    bt = row.get("回测统计") or {}
+    adj = bt.get("adjusted_win_rate")
+    if adj is not None:
+        try:
+            return _clamp(float(adj))
+        except (TypeError, ValueError):
+            pass
     raw = row.get("历史胜率")
     if raw is None:
-        # 兼容可能的英文键
         raw = row.get("win_rate", row.get("historical_win_rate"))
     try:
-        return _clamp(float(str(raw).replace("%", "").strip()), 50.0)
+        return _clamp(float(str(raw).replace("%", "").strip()))
     except (TypeError, ValueError):
         return 50.0
 

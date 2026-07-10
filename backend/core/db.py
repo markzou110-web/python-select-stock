@@ -96,6 +96,7 @@ PRICE_ACTION_DETAIL_KEYS = [
     "sop_grade", "sop_action", "sop_risks", "sop_vetoes", "sop_checks", "sop_bonuses",
     "sop_quality_score", "sop_subgrade",
     "sector_momentum_score", "sector_breadth",
+    "sector_strength_score", "stock_sector_fit_score",
     "sector_phase", "sector_rank", "sector_alignment_score", "sector_relative_pct",
     "sector_3d_pct", "sector_5d_pct", "sector_consecutive_up_days", "sector_role",
     "stock_rank_in_sector", "limit_up_unsealed",
@@ -111,6 +112,15 @@ PRICE_ACTION_DETAIL_KEYS = [
     "raw_score", "calibrated_score", "score_components",
     "research_eligible", "research_missing_fields",
     "strategy_health",
+    "strategy_health_segment", "strategy_health_scope",
+    "grade_stage", "grade_label", "grade_action", "grade_reason",
+    "decision_lifecycle_state", "decision_lifecycle_action",
+    "confirmation_event_state", "confirmation_event_reason",
+    "early_value_transition_state",
+    "execution_plan_frozen", "frozen_plan_date", "frozen_confirmation_price",
+    "frozen_stop_price", "frozen_target_price", "generated_confirmation_price",
+    "generated_stop_price", "display_trade_score",
+    "frozen_entry_extension_pct", "frozen_confirmation_triggered",
 ]
 
 
@@ -206,6 +216,8 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_samples_code_date ON failure_samples(code, sample_date DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_time ON lifecycle_events(event_time DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_type ON lifecycle_events(event_type);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_watchlist_type ON lifecycle_events(watchlist_id, event_type, event_time DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_code_type ON lifecycle_events(code, event_type, event_time DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_task_run_audits_started ON task_run_audits(started_at DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notification_audits_sent ON notification_audits(sent_at DESC);"))
                 logger.info("Database and performance indexes verified via ORM.")
@@ -337,6 +349,43 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"price action migration skipped (may already exist): {e}")
 
+            # --- Migration: SOP grade snapshots for historical review ---
+            try:
+                conn.execute(text("""
+                    ALTER TABLE scan_history
+                    ADD COLUMN IF NOT EXISTS sop_grade VARCHAR(10),
+                    ADD COLUMN IF NOT EXISTS sop_quality_score FLOAT,
+                    ADD COLUMN IF NOT EXISTS sop_subgrade VARCHAR(10),
+                    ADD COLUMN IF NOT EXISTS sop_vetoes JSONB,
+                    ADD COLUMN IF NOT EXISTS sop_checks JSONB,
+                    ADD COLUMN IF NOT EXISTS sop_bonuses JSONB,
+                    ADD COLUMN IF NOT EXISTS sop_risks JSONB
+                """))
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("""
+                        UPDATE scan_history
+                        SET
+                            sop_grade = COALESCE(sop_grade, price_action_detail->>'sop_grade'),
+                            sop_quality_score = COALESCE(
+                                sop_quality_score,
+                                CASE
+                                    WHEN (price_action_detail->>'sop_quality_score') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                    THEN (price_action_detail->>'sop_quality_score')::float
+                                    ELSE NULL
+                                END
+                            ),
+                            sop_subgrade = COALESCE(sop_subgrade, price_action_detail->>'sop_subgrade'),
+                            sop_vetoes = COALESCE(sop_vetoes, price_action_detail->'sop_vetoes'),
+                            sop_checks = COALESCE(sop_checks, price_action_detail->'sop_checks'),
+                            sop_bonuses = COALESCE(sop_bonuses, price_action_detail->'sop_bonuses'),
+                            sop_risks = COALESCE(sop_risks, price_action_detail->'sop_risks')
+                        WHERE price_action_detail IS NOT NULL
+                    """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_sop_grade ON scan_history(sop_grade);"))
+                logger.info("Migration: SOP grade snapshot columns ensured.")
+            except Exception as e:
+                logger.debug(f"SOP grade snapshot migration skipped: {e}")
+
             # --- Migration: lossless scan signal identity and data-date semantics ---
             try:
                 if engine.dialect.name == "postgresql":
@@ -430,6 +479,9 @@ def init_db(engine=None):
                             pa_trade_setup VARCHAR(80),
                             pa_entry_price FLOAT,
                             pa_stop_price FLOAT,
+                            sector_strength_score FLOAT,
+                            stock_sector_fit_score FLOAT,
+                            sector_alignment_score FLOAT,
                             sector_phase VARCHAR(40),
                             market_regime VARCHAR(30),
                             blockers JSON,
@@ -457,6 +509,9 @@ def init_db(engine=None):
                             pa_trade_setup VARCHAR(80),
                             pa_entry_price FLOAT,
                             pa_stop_price FLOAT,
+                            sector_strength_score FLOAT,
+                            stock_sector_fit_score FLOAT,
+                            sector_alignment_score FLOAT,
                             sector_phase VARCHAR(40),
                             market_regime VARCHAR(30),
                             blockers JSONB,
@@ -471,6 +526,19 @@ def init_db(engine=None):
                     CREATE UNIQUE INDEX IF NOT EXISTS uq_recommendation_events_identity
                     ON recommendation_events(event_date, source, code, strategy_type)
                 """))
+                event_columns = {
+                    "sector_strength_score": "FLOAT",
+                    "stock_sector_fit_score": "FLOAT",
+                    "sector_alignment_score": "FLOAT",
+                }
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(recommendation_events)"))}
+                    for column_name, definition in event_columns.items():
+                        if column_name not in existing:
+                            conn.execute(text(f"ALTER TABLE recommendation_events ADD COLUMN {column_name} {definition}"))
+                else:
+                    clauses = ", ".join(f"ADD COLUMN IF NOT EXISTS {name} {definition}" for name, definition in event_columns.items())
+                    conn.execute(text(f"ALTER TABLE recommendation_events {clauses}"))
                 logger.info("Migration: recommendation event log ensured.")
             except Exception as e:
                 logger.debug(f"recommendation event migration skipped: {e}")
@@ -816,6 +884,9 @@ def save_recommendation_events(
             "pa_trade_setup": pa_plan.get("setup") or r.get("pa_trade_setup"),
             "pa_entry_price": float(r.get("pa_entry_price") or detail.get("pa_entry_price") or 0) or None,
             "pa_stop_price": float(r.get("pa_stop_price") or detail.get("pa_stop_price") or 0) or None,
+            "sector_strength_score": float(r.get("sector_strength_score") or detail.get("sector_strength_score") or 0) or None,
+            "stock_sector_fit_score": float(r.get("stock_sector_fit_score") or detail.get("stock_sector_fit_score") or 0) or None,
+            "sector_alignment_score": float(r.get("sector_alignment_score") or detail.get("sector_alignment_score") or 0) or None,
             "sector_phase": r.get("sector_phase") or detail.get("sector_phase"),
             "market_regime": market_regime,
             "blockers": json.dumps(_json_safe(blockers), ensure_ascii=False),
@@ -831,11 +902,13 @@ def save_recommendation_events(
                         event_date, event_time, source, code, name, industry, strategy_type,
                         recommendation_price, score, trade_bucket, trade_eligible, final_trade_score,
                         pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
+                        sector_strength_score, stock_sector_fit_score, sector_alignment_score,
                         sector_phase, market_regime, blockers, status, created_at
                     ) VALUES (
                         :event_date, :event_time, :source, :code, :name, :industry, :strategy_type,
                         :recommendation_price, :score, :trade_bucket, :trade_eligible, :final_trade_score,
                         :pa_trade_action, :pa_trade_setup, :pa_entry_price, :pa_stop_price,
+                        :sector_strength_score, :stock_sector_fit_score, :sector_alignment_score,
                         :sector_phase, :market_regime, :blockers, :status, :created_at
                     )
                     ON CONFLICT (event_date, source, code, strategy_type) DO UPDATE SET
@@ -844,6 +917,9 @@ def save_recommendation_events(
                         score = excluded.score,
                         trade_bucket = excluded.trade_bucket,
                         final_trade_score = excluded.final_trade_score,
+                        sector_strength_score = excluded.sector_strength_score,
+                        stock_sector_fit_score = excluded.stock_sector_fit_score,
+                        sector_alignment_score = excluded.sector_alignment_score,
                         blockers = excluded.blockers,
                         status = excluded.status
                 """), rows)
@@ -853,11 +929,13 @@ def save_recommendation_events(
                         event_date, event_time, source, code, name, industry, strategy_type,
                         recommendation_price, score, trade_bucket, trade_eligible, final_trade_score,
                         pa_trade_action, pa_trade_setup, pa_entry_price, pa_stop_price,
+                        sector_strength_score, stock_sector_fit_score, sector_alignment_score,
                         sector_phase, market_regime, blockers, status, created_at
                     ) VALUES (
                         CAST(:event_date AS DATE), :event_time, :source, :code, :name, :industry, :strategy_type,
                         :recommendation_price, :score, :trade_bucket, :trade_eligible, :final_trade_score,
                         :pa_trade_action, :pa_trade_setup, :pa_entry_price, :pa_stop_price,
+                        :sector_strength_score, :stock_sector_fit_score, :sector_alignment_score,
                         :sector_phase, :market_regime, CAST(:blockers AS JSONB), :status, :created_at
                     )
                     ON CONFLICT (event_date, source, code, strategy_type) DO UPDATE SET
@@ -866,6 +944,9 @@ def save_recommendation_events(
                         score = EXCLUDED.score,
                         trade_bucket = EXCLUDED.trade_bucket,
                         final_trade_score = EXCLUDED.final_trade_score,
+                        sector_strength_score = EXCLUDED.sector_strength_score,
+                        stock_sector_fit_score = EXCLUDED.stock_sector_fit_score,
+                        sector_alignment_score = EXCLUDED.sector_alignment_score,
                         blockers = EXCLUDED.blockers,
                         status = EXCLUDED.status
                 """), rows)
@@ -1052,6 +1133,13 @@ def save_scan_results(
                     "pa_trade_action": pa_plan.get("action"),
                     "pa_trade_setup": pa_plan.get("setup"),
                     "pa_risk_pct": float(pa_plan.get("risk_pct", 0)) if pa_plan.get("risk_pct") is not None else None,
+                    "sop_grade": r.get("sop_grade"),
+                    "sop_quality_score": float(r.get("sop_quality_score", 0)) if r.get("sop_quality_score") is not None else None,
+                    "sop_subgrade": r.get("sop_subgrade"),
+                    "sop_vetoes": json.dumps(r.get("sop_vetoes") or [], ensure_ascii=False),
+                    "sop_checks": json.dumps(r.get("sop_checks") or [], ensure_ascii=False),
+                    "sop_bonuses": json.dumps(r.get("sop_bonuses") or [], ensure_ascii=False),
+                    "sop_risks": json.dumps(r.get("sop_risks") or [], ensure_ascii=False),
                     "price_action_detail": _price_action_detail_snapshot(r)
                 })
 
@@ -1060,10 +1148,12 @@ def save_scan_results(
                 conn.execute(text('''
                     INSERT INTO scan_history (
                         code, name, date, data_date, scanned_at, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
-                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct, price_action_detail
+                        price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct,
+                        sop_grade, sop_quality_score, sop_subgrade, sop_vetoes, sop_checks, sop_bonuses, sop_risks, price_action_detail
                     ) VALUES (
                         :code, :name, :date, :data_date, :scanned_at, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
-                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct, CAST(:price_action_detail AS JSONB)
+                        :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct,
+                        :sop_grade, :sop_quality_score, :sop_subgrade, CAST(:sop_vetoes AS JSONB), CAST(:sop_checks AS JSONB), CAST(:sop_bonuses AS JSONB), CAST(:sop_risks AS JSONB), CAST(:price_action_detail AS JSONB)
                     ) ON CONFLICT (code, data_date, strategy_type) DO UPDATE SET
                         date = EXCLUDED.date,
                         scanned_at = EXCLUDED.scanned_at,
@@ -1096,6 +1186,13 @@ def save_scan_results(
                         pa_trade_action = EXCLUDED.pa_trade_action,
                         pa_trade_setup = EXCLUDED.pa_trade_setup,
                         pa_risk_pct = EXCLUDED.pa_risk_pct,
+                        sop_grade = EXCLUDED.sop_grade,
+                        sop_quality_score = EXCLUDED.sop_quality_score,
+                        sop_subgrade = EXCLUDED.sop_subgrade,
+                        sop_vetoes = EXCLUDED.sop_vetoes,
+                        sop_checks = EXCLUDED.sop_checks,
+                        sop_bonuses = EXCLUDED.sop_bonuses,
+                        sop_risks = EXCLUDED.sop_risks,
                         price_action_detail = EXCLUDED.price_action_detail
                 '''), rows)
             conn.commit()
@@ -1167,6 +1264,13 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
             "pa_trade_action": "pa_trade_action",
             "pa_trade_setup": "pa_trade_setup",
             "pa_risk_pct": "pa_risk_pct",
+            "sop_grade": "sop_grade",
+            "sop_quality_score": "sop_quality_score",
+            "sop_subgrade": "sop_subgrade",
+            "sop_vetoes": "sop_vetoes",
+            "sop_checks": "sop_checks",
+            "sop_bonuses": "sop_bonuses",
+            "sop_risks": "sop_risks",
             "price_action_detail": "price_action_detail"
         }
         
