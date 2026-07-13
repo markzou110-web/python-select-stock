@@ -937,6 +937,9 @@ function ExecutionReplayCard({ data }: { data: any }) {
     if (!data) return null;
     const statusTone = data.verdict === 'SUPPORTED' ? 'text-emerald-600' : data.verdict === 'NOT_SUPPORTED' ? 'text-rose-600' : 'text-amber-600';
     const policies = Array.isArray(data.policies) ? data.policies : [];
+    const evidence = data.evidence_quality || {};
+    const grades = evidence.grade_distribution || {};
+    const attribution = evidence.attribution || {};
     return (
         <div className="glass-card p-5">
             <div className="flex items-center justify-between mb-4">
@@ -947,7 +950,7 @@ function ExecutionReplayCard({ data }: { data: any }) {
                 <span className={cn("text-sm font-black", statusTone)}>{data.verdict || 'UNKNOWN'}</span>
             </div>
             <p className="text-xs font-bold text-slate-600 mb-4">{data.verdict_reason || '暂无验证结论'}</p>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
                 {policies.map((item: any) => (
                     <div key={item.policy} className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
                         <div className="text-[10px] font-black text-slate-400 uppercase">{item.policy}</div>
@@ -955,6 +958,27 @@ function ExecutionReplayCard({ data }: { data: any }) {
                         <div className="mt-1 text-xs text-slate-500">胜率 {item.metrics_5d?.win_rate || 0}%｜均收 {item.metrics_5d?.avg_return || 0}%</div>
                     </div>
                 ))}
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                <div className="rounded-xl border border-slate-100 bg-white p-3">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">证据质量分布 · {evidence.mode || 'SHADOW'}</div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                        {['A', 'B', 'C', 'D', 'F', 'UNRATED'].map(grade => (
+                            <span key={grade} className="rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-xs font-black text-slate-600">
+                                {grade}: {grades[grade] || 0}
+                            </span>
+                        ))}
+                    </div>
+                </div>
+                <div className="rounded-xl border border-slate-100 bg-white p-3">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">影子门禁归因</div>
+                    <div className="mt-2 grid grid-cols-2 gap-2 text-xs font-bold text-slate-600">
+                        <span>避免亏损 {attribution.RISK_GATE_SAVED_LOSS || 0}</span>
+                        <span>漏掉赢家 {attribution.RISK_GATE_MISSED_WINNER || 0}</span>
+                        <span>数据缺失 {attribution.DATA_MISSING || 0}</span>
+                        <span>未成交 {attribution.NO_FILL || 0}</span>
+                    </div>
+                </div>
             </div>
         </div>
     );

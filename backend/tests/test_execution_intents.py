@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from datetime import datetime
@@ -29,6 +30,8 @@ def _stock(tradable=True):
         "sop_grade": "A", "Score": 90, "trade_opportunity_score": 80,
         "pa_entry_price": 10.0, "pa_stop_price": 9.1, "pa_target_price": 12.0,
         "suggested_position_pct": 5,
+        "evidence_id": "ev_test", "evidence_grade": "A", "evidence_status": "PASS",
+        "evidence_reason_codes": [],
     }
 
 
@@ -42,6 +45,9 @@ def test_only_delivered_tradable_candidate_creates_idempotent_intent():
     with engine.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM execution_intents")).scalar() == 1
         assert conn.execute(text("SELECT instruction FROM execution_intents")).scalar() == "可交易"
+    snapshot = json.loads(get_execution_intent(engine, first[0])["intent"]["signal_snapshot"])
+    assert snapshot["evidence_id"] == "ev_test"
+    assert snapshot["evidence_grade"] == "A"
 
 
 def test_intent_lifecycle_records_timeline_and_slippage():

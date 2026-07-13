@@ -49,6 +49,10 @@ def create_bark_execution_intents(stocks: Iterable[Dict[str, Any]], engine, issu
                 "trade_opportunity_score": stock.get("trade_opportunity_score"),
                 "entry_condition": stock.get("pa_entry_condition") or detail.get("pa_entry_condition"),
                 "blockers": stock.get("trade_blockers") or detail.get("trade_blockers") or [],
+                "evidence_id": stock.get("evidence_id") or detail.get("evidence_id"),
+                "evidence_grade": stock.get("evidence_grade") or detail.get("evidence_grade"),
+                "evidence_status": stock.get("evidence_status") or detail.get("evidence_status"),
+                "evidence_reason_codes": stock.get("evidence_reason_codes") or detail.get("evidence_reason_codes") or [],
             }
             params = {
                 "id": intent_id, "signal_date": now.date(), "issued_at": now,

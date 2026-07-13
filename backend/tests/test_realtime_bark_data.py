@@ -76,6 +76,31 @@ def test_bark_requires_bucket_and_eligibility_for_clear_trade_instruction():
     assert _candidate_brief_lines(confirmed)[0].startswith("指令：可交易")
 
 
+def test_bark_adds_evidence_only_after_gate_is_enforced():
+    from core.sentinel import _candidate_brief_lines
+
+    stock = {
+        "代码": "000005", "名称": "证据候选", "sop_grade": "A",
+        "trade_bucket": "TRADE", "trade_eligible": True,
+        "evidence_grade": "A", "evidence_status": "PASS",
+        "evidence_summary": "核心与研究证据完整",
+        "decision_memo": {
+            "bull_case": [{"text": "板块主线增强"}, {"text": "量能确认"}],
+            "bear_case": [{"text": "短线位置偏高"}],
+            "invalidation_conditions": ["跌破计划止损价"],
+        },
+    }
+
+    stock["evidence_gate_mode"] = "SHADOW"
+    assert not any("证据：" in line for line in _candidate_brief_lines(stock))
+
+    stock["evidence_gate_mode"] = "ENFORCED"
+    lines = _candidate_brief_lines(stock)
+    assert any("证据：A级" in line for line in lines)
+    assert any("看多：板块主线增强；量能确认" in line for line in lines)
+    assert any("反证：短线位置偏高" in line for line in lines)
+
+
 def test_bark_scan_fetches_live_snapshot_even_when_local_only(monkeypatch):
     from core import scanner
 

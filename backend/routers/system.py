@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 from fastapi import APIRouter, HTTPException, Response
 from sqlalchemy import text
 
@@ -223,6 +224,7 @@ def get_scan_audits(limit: int = 20):
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT scan_date, started_at, finished_at, duration_sec, status, strategy_type,
+                   params_snapshot, version_snapshot,
                    total_snapshot, candidate_count, result_count, fail_reasons, error_message,
                    as_of, data_mode, field_coverage, effective_filters, research_only,
                    degradation_reasons
@@ -231,6 +233,59 @@ def get_scan_audits(limit: int = 20):
             LIMIT :limit
         """), {"limit": min(max(limit, 1), 100)}).mappings().all()
     return [dict(row) for row in rows]
+
+
+@router.get("/evidence-quality")
+def get_evidence_quality(limit: int = 500):
+    """Summarize persisted shadow evidence without recalculating trade decisions."""
+    engine = get_db_engine()
+    if not engine:
+        return {"sample_size": 0, "grade_distribution": {}, "reason_codes": {}, "domains": {}}
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT price_action_detail
+            FROM scan_history
+            WHERE price_action_detail IS NOT NULL
+            ORDER BY COALESCE(data_date, date) DESC, scanned_at DESC
+            LIMIT :limit
+        """), {"limit": min(max(limit, 1), 5000)}).scalars().all()
+
+    grades: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    modes: dict[str, int] = {}
+    stages: dict[str, int] = {}
+    domains: dict[str, dict[str, int]] = {}
+    assessed = 0
+    for raw in rows:
+        try:
+            detail = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (TypeError, json.JSONDecodeError):
+            continue
+        grade = str(detail.get("evidence_grade") or "").upper()
+        if not grade:
+            continue
+        assessed += 1
+        grades[grade] = grades.get(grade, 0) + 1
+        mode = str(detail.get("evidence_gate_mode") or "UNKNOWN").upper()
+        modes[mode] = modes.get(mode, 0) + 1
+        stage = str(detail.get("evidence_pipeline_stage") or "UNKNOWN").upper()
+        stages[stage] = stages.get(stage, 0) + 1
+        for reason in detail.get("evidence_reason_codes") or []:
+            key = str(reason)
+            reasons[key] = reasons.get(key, 0) + 1
+        bundle = detail.get("evidence_bundle") or {}
+        for name, domain in (bundle.get("domains") or {}).items():
+            status = str((domain or {}).get("status") or "UNKNOWN").upper()
+            counter = domains.setdefault(str(name), {})
+            counter[status] = counter.get(status, 0) + 1
+    return {
+        "sample_size": assessed,
+        "grade_distribution": grades,
+        "reason_codes": reasons,
+        "mode_distribution": modes,
+        "pipeline_stages": stages,
+        "domains": domains,
+    }
 
 
 @router.get("/failure-samples")

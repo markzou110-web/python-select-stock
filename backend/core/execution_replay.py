@@ -71,6 +71,7 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
     }
     policy_returns = {
         "current_policy": [], "hard_wait_a_b_shadow": [], "hard_only_a_b_shadow": [],
+        "evidence_enforced_simulation": [],
     }
     policy_trades = {key: [] for key in policy_returns}
     executable_returns = {key: [] for key in policy_returns}
@@ -78,6 +79,8 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
     unfilled_reasons: Dict[str, int] = {}
     funnel = {"research": 0, "strict_strategy": 0, "strict_grade_a": 0, "current_profile_trade": 0}
     blocker_counts: Dict[str, int] = {}
+    evidence_grades: Dict[str, int] = {}
+    evidence_attribution: Dict[str, int] = {}
     replay_rows = []
     for _, row in candidates.iterrows():
         candidate = _row_candidate(row)
@@ -98,10 +101,13 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
             current = False
         funnel["current_profile_trade"] += int(current)
         common = strict and grade in {"A", "B"} and opportunity >= 60
+        evidence_grade = str(candidate.get("evidence_grade") or "UNRATED").upper()
+        evidence_grades[evidence_grade] = evidence_grades.get(evidence_grade, 0) + 1
         decisions = {
             "current_policy": current,
             "hard_wait_a_b_shadow": common and not groups["hard"] and not groups["wait"],
             "hard_only_a_b_shadow": common and not groups["hard"],
+            "evidence_enforced_simulation": current and evidence_grade in {"A", "B"},
         }
         key = (str(row.get("code")), str(row.get("signal_date"))[:10], str(row.get("strategy_type")))
         outcome = outcome_map.get(key)
@@ -109,6 +115,20 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
         exec_filled = bool(outcome.get("exec_filled")) if outcome is not None and pd.notna(outcome.get("exec_filled")) else False
         exec_return = outcome.get("exec_return_pct") if outcome is not None else None
         exec_reason = str(outcome.get("exec_reason") or "未生成真实成交标签") if outcome is not None else "缺少结果样本"
+        if current and outcome is not None:
+            if not exec_filled:
+                evidence_attribution["NO_FILL"] = evidence_attribution.get("NO_FILL", 0) + 1
+            if future_return is not None and not pd.isna(future_return):
+                direction = "DIRECTION_CORRECT" if float(future_return) > 0 else "DIRECTION_WRONG"
+                evidence_attribution[direction] = evidence_attribution.get(direction, 0) + 1
+                if evidence_grade in {"C", "D", "F"}:
+                    gate_result = "RISK_GATE_MISSED_WINNER" if float(future_return) > 0 else "RISK_GATE_SAVED_LOSS"
+                    evidence_attribution[gate_result] = evidence_attribution.get(gate_result, 0) + 1
+        reason_codes = candidate.get("evidence_reason_codes") or []
+        if any("STALE" in str(code) for code in reason_codes):
+            evidence_attribution["DATA_STALE"] = evidence_attribution.get("DATA_STALE", 0) + 1
+        if any(any(marker in str(code) for marker in ("MISSING", "UNAVAILABLE", "NOT_COLLECTED")) for code in reason_codes):
+            evidence_attribution["DATA_MISSING"] = evidence_attribution.get("DATA_MISSING", 0) + 1
         for policy, selected in decisions.items():
             if selected:
                 policy_returns[policy].append(future_return)
@@ -125,7 +145,9 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
             blocker_counts[str(blocker)] = blocker_counts.get(str(blocker), 0) + 1
         replay_rows.append({
             "code": key[0], "signal_date": key[1], "strategy_type": key[2],
-            "grade": grade, "current_selected": current, "ret_5d": future_return,
+            "grade": grade, "evidence_grade": evidence_grade,
+            "current_selected": current, "evidence_selected": decisions["evidence_enforced_simulation"],
+            "ret_5d": future_return,
         })
     policies = []
     for policy, values in policy_returns.items():
@@ -178,6 +200,14 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
             "profit_factor_gt": 1,
         },
         "summary": {"point_in_time_candidates": int(len(candidates)), "funnel": funnel},
+        "evidence_quality": {
+            "mode": "SHADOW",
+            "grade_distribution": evidence_grades,
+            "graded": int(len(candidates) - evidence_grades.get("UNRATED", 0)),
+            "unrated": int(evidence_grades.get("UNRATED", 0)),
+            "attribution": evidence_attribution,
+            "note": "证据策略只做点时影子对照，不改变生产交易资格",
+        },
         "policies": policies,
         "portfolio_simulations": portfolio_simulations,
         "top_blockers": [

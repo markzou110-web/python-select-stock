@@ -26,6 +26,15 @@ from core.money_flow import get_stock_money_flow
 STOCK_RESEARCH_TTL_SECONDS = int(os.getenv("STOCK_RESEARCH_TTL_SECONDS", "21600"))
 RISK_KEYWORDS = ("减持", "问询", "处罚", "诉讼", "仲裁", "立案", "退市", "亏损", "解禁", "担保")
 OPPORTUNITY_KEYWORDS = ("回购", "增持", "中标", "签订", "订单", "业绩预增", "分红", "股权激励")
+POINT_IN_TIME_UNAVAILABLE = {"concepts", "money_flow", "intraday_fund_flow", "industry_comparison"}
+SOURCE_NAMES = {
+    "concepts": "eastmoney", "money_flow": "eastmoney", "hot_theme": "10jqka",
+    "intraday_fund_flow": "eastmoney", "industry_comparison": "eastmoney",
+    "daily_dragon_tiger": "eastmoney", "dragon_tiger": "eastmoney", "lockup": "eastmoney",
+    "margin": "eastmoney", "block_trade": "eastmoney", "holder_count": "eastmoney",
+    "dividends": "eastmoney", "reports": "eastmoney", "news": "eastmoney",
+    "announcements": "cninfo",
+}
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -60,6 +69,36 @@ def _keyword_hits(rows: List[Dict[str, Any]], key: str, keywords: tuple[str, ...
                 "keywords": ",".join(matched),
             })
     return hits
+
+
+def _row_date(row: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("published_at", "publish_date", "notice_date", "report_date", "trade_date", "date", "time"):
+        value = str(row.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(value[:19].replace("/", "-"))
+        except ValueError:
+            try:
+                return datetime.strptime(value[:10], "%Y-%m-%d")
+            except ValueError:
+                continue
+    return None
+
+
+def _filter_rows_as_of(rows: Any, trade_date: str) -> Any:
+    """Exclude future/undated rows from historical research snapshots."""
+    if not isinstance(rows, list):
+        return rows
+    cutoff = datetime.strptime(trade_date[:10], "%Y-%m-%d").date()
+    filtered = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        observed = _row_date(row)
+        if observed is not None and observed.date() <= cutoff:
+            filtered.append(row)
+    return filtered
 
 
 def _summarise_research_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -241,6 +280,10 @@ def build_stock_research_signals(
             return {**cached, "cache_hit": True}
 
     trade_date = trade_date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        historical = datetime.strptime(trade_date[:10], "%Y-%m-%d").date() < datetime.now().date()
+    except ValueError:
+        historical = False
     payload: Dict[str, Any] = {
         "status": "ok",
         "code": code,
@@ -248,6 +291,9 @@ def build_stock_research_signals(
         "cache_hit": False,
         "updated_at": datetime.now().isoformat(),
         "errors": {},
+        "source_status": {},
+        "point_in_time": historical,
+        "as_of": trade_date,
     }
 
     fetchers = {
@@ -268,12 +314,29 @@ def build_stock_research_signals(
         "announcements": lambda: cninfo_announcements(code, page_size=20),
     }
     for name, fetcher in fetchers.items():
+        if historical and name in POINT_IN_TIME_UNAVAILABLE:
+            payload[name] = {} if name in {"concepts", "money_flow", "industry_comparison"} else []
+            payload["errors"][name] = "POINT_IN_TIME_UNAVAILABLE"
+            payload["source_status"][name] = {
+                "status": "UNAVAILABLE", "source": SOURCE_NAMES.get(name, name),
+                "reason": "POINT_IN_TIME_UNAVAILABLE",
+            }
+            continue
         try:
-            payload[name] = fetcher()
+            value = fetcher()
+            payload[name] = _filter_rows_as_of(value, trade_date) if historical else value
+            payload["source_status"][name] = {
+                "status": "AVAILABLE", "source": SOURCE_NAMES.get(name, name),
+                "observed_at": trade_date,
+            }
         except Exception as exc:
             logger.warning(f"Research fetcher {name} failed for {code}: {exc}")
             payload[name] = {} if name in {"concepts", "money_flow", "dragon_tiger", "lockup", "hot_theme", "industry_comparison", "daily_dragon_tiger"} else []
             payload["errors"][name] = str(exc)[:120]
+            payload["source_status"][name] = {
+                "status": "UNAVAILABLE", "source": SOURCE_NAMES.get(name, name),
+                "reason": type(exc).__name__,
+            }
 
     payload["summary"] = _summarise_research_payload(payload)
     if payload["errors"]:

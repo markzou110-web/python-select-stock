@@ -35,7 +35,7 @@ from core.strategy import (
 )
 from core.price_action import analyze_price_action
 from core.risk_engine import compute_paper_risk_levels
-from core.risk_constants import BACKTEST_STOP_LOSS_PCT  # 与实盘硬止损同源，保证回测胜率反映真实规则
+from core.risk_constants import BACKTEST_STOP_LOSS_PCT, EVIDENCE_GATE_MODE  # 与实盘硬止损同源，保证回测胜率反映真实规则
 from core.scan_preflight import build_scan_preflight
 
 # 数据预检熔断开关：True 时，若 preflight 报告 blocking（数据异常/陈旧），
@@ -2212,6 +2212,7 @@ def perform_market_scan(
             "weekly_ma_period": weekly_ma_period,
             "stop_loss_pct": stop_loss_pct,
             "require_live_snapshot": require_live_snapshot,
+            "evidence_pipeline": {"stage": "PENDING", "mode": EVIDENCE_GATE_MODE},
         },
         "version_snapshot": {
             "strategy_logic_version": STRATEGY_LOGIC_VERSION,
@@ -2390,6 +2391,9 @@ def perform_market_scan(
             snapshot_df, dataset_version, snapshot_as_of, data_mode, engine,
         )
         audit_payload["params_snapshot"]["point_in_time_snapshot_count"] = audit_payload["point_in_time_snapshot_count"]
+        audit_payload["params_snapshot"]["evidence_pipeline"] = {
+            "stage": "MARKET_DATA_READY", "mode": EVIDENCE_GATE_MODE,
+        }
         if audit_payload["point_in_time_snapshot_count"] <= 0:
             audit_payload["research_only"] = True
             audit_payload.setdefault("degradation_reasons", []).append("点时快照持久化失败")
@@ -3048,6 +3052,35 @@ def perform_market_scan(
             row["execution_plan_state"] = build_frozen_plan_state(row)
             row["distance_to_trade"] = build_distance_to_trade(row)
         _apply_research_only_gate(results, audit_payload)
+        from core.candidate_evidence import apply_candidate_evidence
+        from core.stock_research import get_cached_stock_research_signals
+
+        def _cached_research(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            code = str(row.get("代码") or row.get("code") or "").zfill(6)
+            return (
+                get_cached_stock_research_signals(code, scan_event_date)
+                or get_cached_stock_research_signals(code)
+            )
+
+        evidence_summary = apply_candidate_evidence(
+            results,
+            as_of=snapshot_as_of,
+            mode=EVIDENCE_GATE_MODE,
+            research_lookup=_cached_research,
+        )
+        # Research-only and evidence gates run after the first presentation pass;
+        # refresh derived labels so Bark and persisted snapshots reflect final state.
+        apply_decision_semantics(results)
+        for row in results:
+            row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
+            row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
+            row["distance_to_trade"] = build_distance_to_trade(row)
+        audit_payload["evidence_pipeline"] = evidence_summary
+        audit_payload["params_snapshot"]["evidence_pipeline"] = {
+            **evidence_summary, "stage": "DECISION_READY",
+        }
+        audit_payload["version_snapshot"]["candidate_evidence"] = "candidate-evidence-v1"
+        mark_phase("candidate_evidence")
         audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
         audit_payload["version_snapshot"]["strategy_health_control"] = "expected-return-circuit-breaker-v1"
         audit_payload["version_snapshot"]["decision_layer"] = "market-cycle-mainline-leadership-v2"

@@ -27,6 +27,9 @@ def _candidate(code: str, blockers_ready: bool = True):
         "pa_pullback_status": "CONFIRMED",
         "pct_5d": 5,
         "mkt_cap_yi": 100,
+        "evidence_grade": "A",
+        "evidence_status": "PASS",
+        "evidence_reason_codes": [],
     }
     return {
         "code": code, "name": "测试", "signal_date": "2026-01-05", "price": 10,
@@ -52,6 +55,9 @@ def test_replay_selects_only_current_double_gate_and_keeps_future_outcome_separa
     assert current["metrics_5d"]["avg_return"] == 3.0
     assert current["realistic_execution"]["filled"] == 1
     assert current["realistic_execution"]["metrics"]["avg_return"] == 2.4
+    evidence = next(item for item in report["policies"] if item["policy"] == "evidence_enforced_simulation")
+    assert evidence["selected"] == 1
+    assert report["evidence_quality"]["grade_distribution"] == {"A": 1}
     assert report["verdict"] == "NOT_VALIDATED"
 
 
@@ -98,3 +104,22 @@ def test_historical_replay_supports_sqlite_end_to_end():
     report = run_historical_execution_replay(engine, days=30)
     assert report["summary"]["point_in_time_candidates"] == 1
     assert report["days"] == 30
+
+
+def test_evidence_shadow_reports_missed_winner_without_changing_current():
+    candidate = _candidate("000003")
+    candidate["price_action_detail"]["evidence_grade"] = "D"
+    candidate["price_action_detail"]["evidence_status"] = "BLOCKED"
+    candidates = pd.DataFrame([candidate])
+    outcomes = pd.DataFrame([{
+        "code": "000003", "signal_date": "2026-01-05", "strategy_type": "tv_dual_strict",
+        "ret_5d": 6.0, "exec_filled": True, "exec_return_pct": 5.0,
+    }])
+
+    report = build_execution_replay_report(candidates, outcomes)
+    current = next(item for item in report["policies"] if item["policy"] == "current_policy")
+    evidence = next(item for item in report["policies"] if item["policy"] == "evidence_enforced_simulation")
+
+    assert current["selected"] == 1
+    assert evidence["selected"] == 0
+    assert report["evidence_quality"]["attribution"]["RISK_GATE_MISSED_WINNER"] == 1

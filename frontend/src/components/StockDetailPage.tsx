@@ -113,6 +113,18 @@ interface StockResearchData {
     reports?: Array<{ title?: string; publish_date?: string; org?: string; rating?: string }>;
     lockup?: { upcoming?: Array<{ date?: string; ratio?: number }> };
     holder_count?: Array<{ date?: string; change_ratio?: number }>;
+    evidence_quality?: {
+        grade?: string;
+        status?: string;
+        summary?: string;
+        reason_codes?: string[];
+    };
+    decision_memo?: {
+        bull_case?: Array<{ text?: string } | string>;
+        bear_case?: Array<{ text?: string } | string>;
+        unknowns?: string[];
+        invalidation_conditions?: string[];
+    };
 }
 
 export default function StockDetailPage({ code, name, onBack }: StockDetailPageProps) {
@@ -942,6 +954,12 @@ function StockResearchCard({
     onRefresh: () => void;
 }) {
     const summary = data?.summary || {};
+    const quality = data?.evidence_quality;
+    const memoText = (items?: Array<{ text?: string } | string>) => (items || [])
+        .map(item => typeof item === 'string' ? item : item.text)
+        .filter(Boolean) as string[];
+    const bullCase = memoText(data?.decision_memo?.bull_case);
+    const bearCase = memoText(data?.decision_memo?.bear_case);
     const opportunities = summary.opportunity_flags || [];
     const risks = summary.risk_flags || [];
     const evidence: Array<{ title?: string; meta: string; url?: string; kind: string }> = [
@@ -1003,6 +1021,28 @@ function StockResearchCard({
                 </button>
             </div>
 
+            {quality && (
+                <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-4">
+                    <div className="rounded-md border border-slate-100 bg-slate-50 px-3 py-3">
+                        <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">证据质量</div>
+                        <div className={cn(
+                            "mt-1 text-lg font-black",
+                            ['A', 'B'].includes(quality.grade || '') ? 'text-emerald-600' :
+                                quality.grade === 'C' ? 'text-amber-600' :
+                                    ['D', 'F'].includes(quality.grade || '') ? 'text-rose-600' : 'text-slate-500'
+                        )}>{quality.grade || 'UNRATED'} · {quality.status || 'NOT_ASSESSED'}</div>
+                        <p className="mt-1 text-xs font-bold text-slate-500">{quality.summary || '暂无评级说明'}</p>
+                    </div>
+                    <EvidenceMemoList title="看多依据" items={bullCase} tone="bull" />
+                    <EvidenceMemoList title="主要反证" items={bearCase} tone="bear" />
+                    <EvidenceMemoList
+                        title="失效 / 未知"
+                        items={[...(data?.decision_memo?.invalidation_conditions || []), ...(data?.decision_memo?.unknowns || [])]}
+                        tone="unknown"
+                    />
+                </div>
+            )}
+
             <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
                 <ResearchFlagList title="催化证据" items={opportunities} tone="opportunity" />
                 <ResearchFlagList title="风险证据" items={risks} tone="risk" />
@@ -1029,6 +1069,21 @@ function StockResearchCard({
                         {!evidence.length && <p className="text-xs font-bold text-slate-400">暂无最新公开证据</p>}
                     </div>
                 </div>
+            </div>
+        </div>
+    );
+}
+
+function EvidenceMemoList({ title, items, tone }: { title: string; items: string[]; tone: 'bull' | 'bear' | 'unknown' }) {
+    const toneClass = tone === 'bull' ? 'border-rose-100 bg-rose-50 text-rose-700'
+        : tone === 'bear' ? 'border-amber-100 bg-amber-50 text-amber-800'
+            : 'border-slate-100 bg-slate-50 text-slate-600';
+    return (
+        <div className={cn("rounded-md border px-3 py-3", toneClass)}>
+            <div className="text-[10px] font-black uppercase tracking-widest opacity-70">{title}</div>
+            <div className="mt-2 space-y-1">
+                {items.slice(0, 3).map((item, index) => <p key={`${title}-${index}`} className="text-xs font-bold leading-relaxed">{item}</p>)}
+                {!items.length && <p className="text-xs font-bold opacity-60">暂无</p>}
             </div>
         </div>
     );

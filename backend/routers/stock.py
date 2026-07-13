@@ -7,7 +7,8 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+import json
 import math
 import akshare as ak
 import pandas as pd
@@ -24,6 +25,7 @@ from core.money_flow import get_stock_money_flow
 from core.audit_log import get_position_decision_timeline, record_position_decision_change
 from core.stock_research import build_stock_research_signals
 from core.stock_research import get_cached_stock_research_signals
+from core.candidate_evidence import build_candidate_evidence
 from core.models import ResearchThesis
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
@@ -83,14 +85,85 @@ def _get_live_snapshot_price(code: str) -> dict | None:
         return None
 
 
+def _load_scan_candidate(code: str, signal_date: date | None) -> dict | None:
+    engine = get_db_engine()
+    if engine is None:
+        return None
+    date_filter = "AND COALESCE(data_date, date) = :signal_date" if signal_date else ""
+    params = {"code": code}
+    if signal_date:
+        params["signal_date"] = signal_date
+    with engine.connect() as conn:
+        row = conn.execute(text(f"""
+            SELECT code, name, COALESCE(data_date, date) AS signal_date, price, pct,
+                   industry, resonance, strategy_type, sop_grade, pa_entry_price,
+                   pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action,
+                   pa_trade_setup, pa_risk_pct, price_action_score, price_action_regime,
+                   price_action_signal, price_action_pattern, price_action_detail
+            FROM scan_history
+            WHERE code = :code {date_filter}
+            ORDER BY COALESCE(data_date, date) DESC, scanned_at DESC
+            LIMIT 1
+        """), params).mappings().first()
+    if not row:
+        return None
+    record = dict(row)
+    detail = record.pop("price_action_detail", None) or {}
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except json.JSONDecodeError:
+            detail = {}
+    candidate = dict(detail) if isinstance(detail, dict) else {}
+    candidate.update({
+        "代码": str(record.get("code") or "").zfill(6), "名称": record.get("name"),
+        "data_date": str(record.get("signal_date"))[:10], "现价": record.get("price"),
+        "涨幅%": record.get("pct"), "行业": record.get("industry"),
+        "共振": record.get("resonance"), "strategy_type": record.get("strategy_type"),
+        "sop_grade": record.get("sop_grade"), "pa_entry_price": record.get("pa_entry_price"),
+        "pa_stop_price": record.get("pa_stop_price"), "pa_target_price": record.get("pa_target_price"),
+        "pa_risk_reward": record.get("pa_risk_reward"), "pa_trade_action": record.get("pa_trade_action"),
+        "pa_trade_setup": record.get("pa_trade_setup"), "pa_risk_pct": record.get("pa_risk_pct"),
+        "price_action_score": record.get("price_action_score"),
+        "price_action_regime": record.get("price_action_regime"),
+        "price_action_signal": record.get("price_action_signal"),
+        "price_action_pattern": record.get("price_action_pattern"),
+    })
+    return candidate
+
+
 @router.get("/{code}/research")
-def get_stock_research(code: str, force_refresh: bool = False):
+def get_stock_research(code: str, force_refresh: bool = False, signal_date: date | None = None):
     """Return read-only event and fundamental research evidence for one stock."""
     if not validate_stock_code(code):
         raise HTTPException(status_code=400, detail="Invalid stock code format")
-    return _json_safe_response(
-        build_stock_research_signals(code, force_refresh=force_refresh)
+    selected_date = signal_date.isoformat() if signal_date else None
+    research = build_stock_research_signals(
+        code, trade_date=selected_date, force_refresh=force_refresh,
     )
+    candidate = _load_scan_candidate(code, signal_date)
+    if candidate:
+        bundle = build_candidate_evidence(
+            candidate, research=research, as_of=selected_date or datetime.now(),
+        )
+        research["evidence_bundle"] = bundle
+        research["evidence_quality"] = bundle["quality"]
+        research["decision_memo"] = bundle["decision_memo"]
+    else:
+        summary = research.get("summary") or {}
+        research["evidence_quality"] = {
+            "grade": "UNRATED", "status": "NOT_ASSESSED",
+            "reason_codes": ["SCAN_SNAPSHOT_NOT_FOUND"],
+            "summary": "未找到对应扫描快照，研究证据不参与交易评级",
+            "evaluated_by": "RULES",
+        }
+        research["decision_memo"] = {
+            "bull_case": [{"text": item, "evidence_ids": ["research.opportunity"]} for item in (summary.get("opportunity_flags") or [])[:3]],
+            "bear_case": [{"text": item, "evidence_ids": ["research.risk"]} for item in (summary.get("risk_flags") or [])[:3]],
+            "unknowns": ["未找到对应扫描快照"], "invalidation_conditions": [],
+            "summary": "仅展示研究数据，不生成交易结论", "generated_by": "RULES",
+        }
+    return _json_safe_response(research)
 
 
 @router.post("/{code}/research-theses")

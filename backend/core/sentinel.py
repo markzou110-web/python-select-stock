@@ -263,6 +263,27 @@ def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
         lines.append(f"  闭环调权：{stock['bark_priority_note']}，仅影响推送排序")
     if stock.get("early_trade_candidate") and stock.get("early_trade_reason"):
         lines.append(f"  提前复核：{stock['early_trade_reason']}；仅小仓，不追高")
+    if str(stock.get("evidence_gate_mode") or "").upper() == "ENFORCED" and stock.get("evidence_grade"):
+        lines.append(f"  证据：{stock['evidence_grade']}级｜{stock.get('evidence_summary') or stock.get('evidence_status') or '--'}")
+        memo = stock.get("decision_memo") or {}
+
+        def _memo_text(items: Any, limit: int) -> str:
+            values = []
+            for item in items or []:
+                value = item.get("text") if isinstance(item, dict) else item
+                if value:
+                    values.append(str(value))
+            return "；".join(values[:limit])
+
+        bull = _memo_text(memo.get("bull_case"), 2)
+        bear = _memo_text(memo.get("bear_case"), 1)
+        invalidation = _memo_text(memo.get("invalidation_conditions"), 1)
+        if bull:
+            lines.append(f"  看多：{bull}")
+        if bear:
+            lines.append(f"  反证：{bear}")
+        if invalidation:
+            lines.append(f"  失效：{invalidation}")
     chase_line = _no_chase_line(stock)
     if chase_line:
         lines.append(chase_line)

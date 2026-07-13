@@ -5,6 +5,13 @@ All stop-loss, take-profit, and risk control thresholds are defined here
 as the single source of truth. Any layer (backtest, real-time alerts,
 wind control) should import from this module instead of hardcoding values.
 """
+import os
+
+
+# ── 候选证据质量闸门 ──
+# OFF: 不计算；SHADOW: 只记录不改变生产权限；ENFORCED: A/B 才允许维持现有交易权限。
+# 默认 SHADOW，必须通过点时验证并经人工批准后才允许切换 ENFORCED。
+EVIDENCE_GATE_MODE = os.getenv("EVIDENCE_GATE_MODE", "SHADOW").upper()
 
 # ── 固定止损 (Absolute Stop Loss) ──
 # 跌破买入成本的百分比即触发硬性止损

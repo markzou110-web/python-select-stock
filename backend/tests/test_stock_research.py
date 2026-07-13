@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import date
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -64,7 +65,9 @@ def test_build_stock_research_signals_summarises_risk_and_opportunity(monkeypatc
     monkeypatch.setattr(stock_research, "eastmoney_stock_news", lambda code, page_size: [{"title": "公司收到问询函", "time": "2026-06-01"}])
     monkeypatch.setattr(stock_research, "cninfo_announcements", lambda code, page_size: [])
 
-    result = stock_research.build_stock_research_signals("000001", trade_date="2026-06-05", force_refresh=True)
+    result = stock_research.build_stock_research_signals(
+        "000001", trade_date=date.today().isoformat(), force_refresh=True,
+    )
 
     assert result["status"] == "ok"
     assert "未来90天存在限售解禁" in result["summary"]["risk_flags"][0]
@@ -101,13 +104,42 @@ def test_apply_research_adjustment_updates_scan_candidate():
 def test_stock_research_endpoint_is_read_only(monkeypatch):
     captured = {}
 
-    def fake_build(code, force_refresh=False):
-        captured.update({"code": code, "force_refresh": force_refresh})
+    def fake_build(code, trade_date=None, force_refresh=False):
+        captured.update({"code": code, "trade_date": trade_date, "force_refresh": force_refresh})
         return {"status": "ok", "code": code, "summary": {"label": "中性"}}
 
     monkeypatch.setattr(stock_router, "build_stock_research_signals", fake_build)
+    monkeypatch.setattr(stock_router, "_load_scan_candidate", lambda code, signal_date: None)
 
     payload = stock_router.get_stock_research("000001", force_refresh=True)
 
     assert payload["summary"]["label"] == "中性"
-    assert captured == {"code": "000001", "force_refresh": True}
+    assert payload["evidence_quality"]["status"] == "NOT_ASSESSED"
+    assert captured == {"code": "000001", "trade_date": None, "force_refresh": True}
+
+
+def test_historical_rows_exclude_future_and_undated_records():
+    rows = [
+        {"date": "2026-07-10", "title": "当时可见"},
+        {"publish_date": "2026-07-14", "title": "未来信息"},
+        {"title": "无时间信息"},
+    ]
+
+    filtered = stock_research._filter_rows_as_of(rows, "2026-07-13")
+
+    assert [item["title"] for item in filtered] == ["当时可见"]
+
+
+def test_research_endpoint_passes_signal_date(monkeypatch):
+    captured = {}
+
+    def fake_build(code, trade_date=None, force_refresh=False):
+        captured.update({"code": code, "trade_date": trade_date})
+        return {"status": "partial", "summary": {}}
+
+    monkeypatch.setattr(stock_router, "build_stock_research_signals", fake_build)
+    monkeypatch.setattr(stock_router, "_load_scan_candidate", lambda code, signal_date: None)
+
+    stock_router.get_stock_research("000001", signal_date=date(2026, 7, 10))
+
+    assert captured == {"code": "000001", "trade_date": "2026-07-10"}
