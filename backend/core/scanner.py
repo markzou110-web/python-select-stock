@@ -17,7 +17,8 @@ from core.logging_config import logger
 from core.config import config
 from core.ws_manager import manager as ws_manager
 from core.db import (
-    get_db_engine, save_scan_results, load_from_db, save_scan_audit_log
+    get_db_engine, save_scan_results, load_from_db, save_scan_audit_log,
+    save_point_in_time_snapshot, load_active_event_catalysts,
 )
 from core.data import (
     get_market_snapshot, get_index_hist, get_sector_map, get_sector_trends, get_market_regime,
@@ -87,6 +88,8 @@ from core.money_flow import get_money_flow_rank
 from core.decision_layer import apply_decision_layer
 from routers.market import fetch_mine_sweeper_data
 from core.data_source_quality import get_suspected_adjustment_gap_codes
+from core.execution_audit import classify_trade_blockers
+from core.execution_insights import build_distance_to_trade, build_execution_rr, build_frozen_plan_state
 
 
 EXECUTABLE_PA_ACTIONS = {"READY"}
@@ -141,27 +144,45 @@ def _money_flow_label(item: Dict[str, Any]) -> str:
 
 def _blocker_category(blocker: str) -> str:
     value = str(blocker or "")
+    if "距冻结确认价" in value:
+        return "frozen_plan_extension"
     if "确认价" in value or "等待突破确认" in value:
         return "price_confirmation"
     if "量能未确认" in value or "换手不足" in value:
         return "liquidity_confirmation"
+    if "历史信号复活" in value:
+        return "signal_revival"
+    if "动量加速" in value:
+        return "momentum_acceleration"
     if any(text_value in value for text_value in ("涨停/近涨停", "涨幅偏高", "5日涨幅偏高")):
         return "price_acceleration"
     if any(text_value in value for text_value in ("板块强度弱", "弱板块联动", "板块联动<")):
         return "weak_sector"
+    if any(text_value in value for text_value in ("H1首次入场", "H2二次入场", "交易计划未确认")):
+        return "setup_confirmation"
     return value
 
 
 def _dedupe_trade_blockers(blockers: List[str]) -> List[str]:
-    result: List[str] = []
-    categories = set()
+    preferred = {
+        "price_acceleration": ("重大业绩催化但涨停不可成交", "涨停/近涨停", "5日涨幅偏高", "涨幅偏高"),
+        "price_confirmation": ("未站上确认价", "未站稳", "等待突破确认"),
+        "weak_sector": ("板块强度弱", "弱板块联动", "板块联动<"),
+        "setup_confirmation": ("交易计划未确认", "H2二次入场", "H1首次入场"),
+    }
+    selected: Dict[str, str] = {}
     for blocker in blockers:
         category = _blocker_category(blocker)
-        if category in categories:
+        current = selected.get(category)
+        if current is None:
+            selected[category] = blocker
             continue
-        categories.add(category)
-        result.append(blocker)
-    return result
+        ranking = preferred.get(category, ())
+        def rank(value: str) -> int:
+            return next((idx for idx, marker in enumerate(ranking) if marker in value), len(ranking))
+        if rank(blocker) < rank(current):
+            selected[category] = blocker
+    return list(selected.values())
 
 
 def _market_cap_bucket(mkt_cap_yi: float) -> str:
@@ -311,6 +332,61 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _build_snapshot_audit(snapshot_df: pd.DataFrame, data_mode: str, as_of: Any) -> Dict[str, Any]:
+    """Describe which point-in-time filters can actually be enforced for this snapshot."""
+    required = ("price", "pct_chg", "turnover", "mkt_cap")
+    total = len(snapshot_df)
+    coverage = {
+        field: round(float(snapshot_df[field].notna().mean()), 4)
+        if total and field in snapshot_df.columns else 0.0
+        for field in required
+    }
+    effective_filters = ["target_market", "exclude_st_delist", "positive_pct_change"]
+    degradation_reasons = []
+    if coverage["turnover"] == 1.0:
+        effective_filters.append("turnover_min")
+    else:
+        degradation_reasons.append("换手率字段不完整，未能对全部股票执行换手率过滤")
+    if coverage["mkt_cap"] == 1.0:
+        effective_filters.append("market_cap_min")
+    else:
+        degradation_reasons.append("市值字段不完整，未能对全部股票执行市值过滤")
+    if coverage["price"] < 1.0 or coverage["pct_chg"] < 1.0:
+        degradation_reasons.append("价格或涨跌幅字段不完整")
+    return {
+        "as_of": as_of,
+        "data_mode": data_mode,
+        "field_coverage": coverage,
+        "effective_filters": effective_filters,
+        "research_only": bool(degradation_reasons),
+        "degradation_reasons": degradation_reasons,
+    }
+
+
+def _discovery_pool_mask(snapshot_df: pd.DataFrame, strategy_type: str) -> tuple[pd.Series, str]:
+    """Keep discovery recall separate from later trade confirmation."""
+    pct = pd.to_numeric(snapshot_df["pct_chg"], errors="coerce")
+    if strategy_type == "early_value":
+        return pct.between(-3.0, 5.0, inclusive="both"), "EARLY_DISCOVERY"
+    if strategy_type == "sector_watch":
+        return pct.between(-2.0, 8.0, inclusive="both"), "PULLBACK_DISCOVERY"
+    return pct > 0, "MOMENTUM_DISCOVERY"
+
+
+def _apply_research_only_gate(results: List[Dict[str, Any]], audit: Dict[str, Any]) -> None:
+    """Prevent incomplete point-in-time inputs from becoming executable recommendations."""
+    if not audit.get("research_only"):
+        return
+    reason = "关键点时字段不完整，本次扫描仅供研究，禁止交易执行"
+    for row in results:
+        row["trade_eligible"] = False
+        row["trade_bucket"] = "OBSERVE"
+        row["research_only"] = True
+        blockers = list(row.get("trade_blockers") or [])
+        row["trade_blockers"] = list(dict.fromkeys([*blockers, reason]))
+    audit["status"] = "RESEARCH_ONLY"
 
 
 def _candidate_price(res: Dict[str, Any]) -> float:
@@ -2269,7 +2345,7 @@ def perform_market_scan(
                             WHERE date <= CAST(:max_date AS date)
                               AND date >= CAST(CAST(:max_date AS date) - interval '7 days' AS date)
                         )
-                        SELECT r.code, b.name, r.close as price, r.open, r.high, r.low, r.vol,
+                        SELECT r.code, b.name, b.industry, r.close as price, r.open, r.high, r.low, r.vol,
                                CASE WHEN r.prev_close > 0
                                    THEN ROUND(CAST((r.close - r.prev_close) / r.prev_close * 100 AS numeric), 2)
                                    ELSE 0
@@ -2301,6 +2377,22 @@ def perform_market_scan(
             else:
                 detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
             raise HTTPException(status_code=503, detail=detail_msg)
+        data_mode = "LOCAL_DB" if max_date else "LIVE_SNAPSHOT"
+        snapshot_as_of = (
+            max_date or getattr(snapshot_df, "attrs", {}).get("data_date")
+            if data_mode == "LOCAL_DB"
+            else datetime.now()
+        )
+        audit_payload.update(_build_snapshot_audit(snapshot_df, data_mode, snapshot_as_of))
+        dataset_version = f"{data_mode}:{str(snapshot_as_of)[:19]}"
+        audit_payload["version_snapshot"]["dataset_version"] = dataset_version
+        audit_payload["point_in_time_snapshot_count"] = save_point_in_time_snapshot(
+            snapshot_df, dataset_version, snapshot_as_of, data_mode, engine,
+        )
+        audit_payload["params_snapshot"]["point_in_time_snapshot_count"] = audit_payload["point_in_time_snapshot_count"]
+        if audit_payload["point_in_time_snapshot_count"] <= 0:
+            audit_payload["research_only"] = True
+            audit_payload.setdefault("degradation_reasons", []).append("点时快照持久化失败")
         mark_phase("market_snapshot_load")
 
         # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
@@ -2318,12 +2410,19 @@ def perform_market_scan(
         has_turnover = snapshot_df['turnover'].notna()
         has_mkt_cap = snapshot_df['mkt_cap'].notna()
 
+        discovery_mask, discovery_pool = _discovery_pool_mask(snapshot_df, strategy_type)
+        audit_payload["effective_filters"] = [
+            item for item in audit_payload.get("effective_filters", [])
+            if item != "positive_pct_change"
+        ] + [f"discovery_pool:{discovery_pool}"]
         candidates = snapshot_df[
-            (snapshot_df['pct_chg'] > 0) &
+            discovery_mask &
             is_target_market & is_not_st &
             (~has_mkt_cap | (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)) &
             (~has_turnover | (snapshot_df['turnover'] >= turnover_min))
         ].copy()
+        candidates["discovery_pool"] = discovery_pool
+        audit_payload["params_snapshot"]["discovery_pool"] = discovery_pool
         adjustment_gap_codes = get_suspected_adjustment_gap_codes(engine, target_date=data_date)
         if adjustment_gap_codes:
             candidates = candidates[~candidates["code"].astype(str).isin(adjustment_gap_codes)]
@@ -2920,6 +3019,11 @@ def perform_market_scan(
         from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
         scan_event_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
         apply_limit_up_features(results, load_limit_up_event_map(scan_event_date, engine))
+        from core.event_driven import apply_event_catalysts
+        apply_event_catalysts(
+            results,
+            load_active_event_catalysts(engine, as_of=scan_event_date),
+        )
         from core.decision_layer import load_market_cycle_history
         decision_context = apply_decision_layer(
             results,
@@ -2932,8 +3036,18 @@ def perform_market_scan(
         calibrate_scan_scores(results)
         from core.strategy_health import apply_strategy_health_controls, build_strategy_health
         apply_strategy_health_controls(results, build_strategy_health(engine))
+        from core.event_driven import finalize_event_trade_state
+        finalize_event_trade_state(results)
         from core.decision_semantics import apply_decision_semantics
         apply_decision_semantics(results)
+        for row in results:
+            row.setdefault("discovery_pool", discovery_pool)
+            row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
+            row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
+            row["execution_rr"] = build_execution_rr(row)
+            row["execution_plan_state"] = build_frozen_plan_state(row)
+            row["distance_to_trade"] = build_distance_to_trade(row)
+        _apply_research_only_gate(results, audit_payload)
         audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
         audit_payload["version_snapshot"]["strategy_health_control"] = "expected-return-circuit-breaker-v1"
         audit_payload["version_snapshot"]["decision_layer"] = "market-cycle-mainline-leadership-v2"

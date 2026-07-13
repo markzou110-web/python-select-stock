@@ -17,7 +17,8 @@ import {
     SlidersHorizontal,
     ServerCog,
     BarChart3,
-    Newspaper
+    Newspaper,
+    Inbox
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAlertStore } from '@/stores/alertStore';
@@ -97,6 +98,12 @@ export default function Sidebar({ syncProgress, onStartSync, onStartSyncFundamen
                         label="交易复盘"
                         active={activeView === 'review'}
                         onClick={() => onNavigate('review')}
+                    />
+                    <NavItem
+                        icon={<Inbox size={20} />}
+                        label="执行收件箱"
+                        active={activeView === 'execution-inbox'}
+                        onClick={() => onNavigate('execution-inbox')}
                     />
                     <NavItem
                         icon={<BarChart3 size={20} />}

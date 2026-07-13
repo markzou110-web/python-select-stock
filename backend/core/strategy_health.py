@@ -149,6 +149,11 @@ def apply_strategy_health_controls(results: list[dict], health: Dict[str, Any]) 
         strategy_health = segment_health if int((segment_health or {}).get("signals") or 0) >= 20 else strategies.get(strategy)
         if not strategy_health:
             continue
+        if row.get("event_driven_candidate"):
+            row["strategy_health"] = strategy_health
+            row["strategy_health_scope"] = "event_shadow"
+            row["strategy_health_reference_status"] = strategy_health.get("status")
+            continue
         row["strategy_health"] = strategy_health
         row["strategy_health_segment"] = segment_key if strategy_health is segment_health else None
         row["strategy_health_scope"] = "segment" if strategy_health is segment_health else "strategy"

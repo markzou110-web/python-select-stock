@@ -6,11 +6,21 @@ from fastapi import APIRouter, HTTPException
 from core.backtest_lab import run_single_stock_backtest
 from core.db import get_db_engine, load_from_db, validate_stock_code
 from core.indicators import calculate_indicators, calculate_pine_indicators
-from core.batch_experiment import run_batch_experiment, run_walk_forward_experiment
+from core.batch_experiment import (
+    run_batch_experiment,
+    run_rolling_walk_forward_experiment,
+    run_walk_forward_experiment,
+)
 from core.data import get_index_hist
 from core.strategy_registry import list_strategies, supported_backtest_strategies
+from core.experiment_artifacts import get_experiment, list_experiments, record_backtest_experiment
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
+
+
+def _attach_artifact(engine, kind: str, request: Dict[str, Any], result: Dict[str, Any], data_frame=None):
+    artifact = record_backtest_experiment(engine, kind, request, result, data_frame=data_frame)
+    return {**result, "experiment": artifact}
 
 
 @router.get("/strategies")
@@ -94,7 +104,8 @@ def run_single_backtest(payload: Dict[str, Any]):
         "end_date": end_date,
         "data_points": int(len(df)),
     }
-    return result
+    artifact_request = {**payload, "code": code, "strategy_type": strategy_type, "start_date": start_date, "end_date": end_date}
+    return _attach_artifact(engine, "single", artifact_request, result, data_frame=df)
 
 
 @router.post("/batch")
@@ -111,7 +122,9 @@ def run_batch_backtest(payload: Dict[str, Any]):
     engine = get_db_engine()
     if not engine:
         raise HTTPException(status_code=503, detail="Database unavailable")
-    return run_batch_experiment(engine, codes, strategy_type, payload)
+    result = run_batch_experiment(engine, codes, strategy_type, payload)
+    request = {**payload, "codes": codes, "strategy_type": strategy_type, **result.get("meta", {})}
+    return _attach_artifact(engine, "batch", request, result)
 
 
 @router.post("/walk-forward")
@@ -133,4 +146,40 @@ def run_walk_forward_backtest(payload: Dict[str, Any]):
     engine = get_db_engine()
     if not engine:
         raise HTTPException(status_code=503, detail="Database unavailable")
-    return run_walk_forward_experiment(engine, codes, strategy_type, payload)
+    result = run_walk_forward_experiment(engine, codes, strategy_type, payload)
+    request = {**payload, "codes": codes, "strategy_type": strategy_type, **result.get("meta", {})}
+    return _attach_artifact(engine, "walk_forward", request, result)
+
+
+@router.post("/rolling-walk-forward")
+def run_rolling_walk_forward_backtest(payload: Dict[str, Any]):
+    raw_codes = payload.get("codes") or []
+    if isinstance(raw_codes, str):
+        raw_codes = raw_codes.replace("，", ",").split(",")
+    codes = list(dict.fromkeys(str(code).strip() for code in raw_codes if str(code).strip()))
+    if not codes or len(codes) > 10 or any(not validate_stock_code(code) for code in codes):
+        raise HTTPException(status_code=400, detail="codes must contain 1-10 valid stock codes")
+    strategy_type = payload.get("strategy_type") or "squeeze"
+    if strategy_type not in supported_backtest_strategies():
+        raise HTTPException(status_code=400, detail="Unsupported strategy_type")
+    engine = get_db_engine()
+    if not engine:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    result = run_rolling_walk_forward_experiment(engine, codes, strategy_type, payload)
+    request = {**payload, "codes": codes, "strategy_type": strategy_type, **result.get("meta", {})}
+    return _attach_artifact(engine, "rolling_walk_forward", request, result)
+
+
+@router.get("/experiments")
+def get_backtest_experiments(limit: int = 50):
+    return {"items": list_experiments(get_db_engine(), limit=limit)}
+
+
+@router.get("/experiments/{experiment_id}")
+def get_backtest_experiment(experiment_id: str):
+    if not experiment_id.startswith("exp_") or len(experiment_id) != 24:
+        raise HTTPException(status_code=400, detail="Invalid experiment_id")
+    artifact = get_experiment(get_db_engine(), experiment_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    return artifact

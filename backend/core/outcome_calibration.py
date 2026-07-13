@@ -45,7 +45,37 @@ def _detail_dict(value: Any) -> Dict[str, Any]:
 def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
     """Load one point-in-time scan signal and future trading-day closes."""
     days = max(1, min(int(days), 3650))
-    df = pd.read_sql(text("""
+    if engine.dialect.name == "sqlite":
+        query = """
+        WITH ranked_signals AS (
+            SELECT s.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.code, COALESCE(s.data_date, s.date), COALESCE(s.strategy_type, 'squeeze')
+                       ORDER BY s.scanned_at DESC, s.signal_id DESC
+                   ) AS row_num
+            FROM scan_history s
+            WHERE date(COALESCE(s.data_date, s.date)) >= date('now', '-' || :days || ' days')
+        ), signals AS (
+            SELECT signal_id, code, name, COALESCE(data_date, date) AS signal_date,
+                   COALESCE(strategy_type, 'squeeze') AS strategy_type,
+                   COALESCE(sop_grade, json_extract(price_action_detail, '$.sop_grade'), 'UNKNOWN') AS sop_grade,
+                   COALESCE(sop_quality_score, CAST(json_extract(price_action_detail, '$.sop_quality_score') AS REAL)) AS sop_quality_score,
+                   COALESCE(json_extract(price_action_detail, '$.trade_bucket'), 'UNKNOWN') AS trade_bucket,
+                   COALESCE(json_extract(price_action_detail, '$.trade_eligible'), 0) AS trade_eligible,
+                   COALESCE(json_extract(price_action_detail, '$.market_regime'), 'UNKNOWN') AS market_regime,
+                   COALESCE(json_extract(price_action_detail, '$.score_model_version'), 'legacy') AS score_model_version,
+                   sop_vetoes, price_action_detail, scanned_at
+            FROM ranked_signals WHERE row_num = 1
+        )
+        SELECT s.*, d0.close AS signal_close,
+               (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 0) AS close_1d,
+               (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 2) AS close_3d,
+               (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 4) AS close_5d,
+               (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 9) AS close_10d
+        FROM signals s JOIN daily_k d0 ON d0.code=s.code AND d0.date=s.signal_date
+        """
+    else:
+        query = """
         WITH signals AS (
             SELECT DISTINCT ON (
                 s.code,
@@ -104,7 +134,8 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
             WHERE d.code = s.code AND d.date > s.signal_date
             ORDER BY d.date ASC OFFSET 9 LIMIT 1
         ) h10 ON true
-    """), engine, params={"days": days})
+        """
+    df = pd.read_sql(text(query), engine, params={"days": days})
     if df.empty:
         return df
 
@@ -118,9 +149,11 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
         detail = _detail_dict(row.get("price_action_detail"))
         for key in (
             "grade_stage", "decision_lifecycle_state", "confirmation_event_state",
-            "early_value_transition_state", "sector_phase",
+            "early_value_transition_state", "sector_phase", "research_eligible",
+            "trade_opportunity_score",
         ):
-            df.loc[row.name, key] = detail.get(key) or "UNKNOWN"
+            value = detail.get(key)
+            df.loc[row.name, key] = "UNKNOWN" if value is None else value
         values: Iterable[str] = (
             _as_list(detail.get("trade_blockers"))
             + _as_list(row.get("sop_vetoes"))
@@ -129,6 +162,65 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
         blockers.append(list(dict.fromkeys(item for item in values if item)))
     df["blockers"] = blockers
     return df
+
+
+def build_execution_cohort_report(df: pd.DataFrame) -> Dict[str, Any]:
+    """Compare research, blocked, and executable cohorts on the same future-return basis."""
+    if df.empty:
+        return {"cohorts": [], "primary_horizon": "5d", "notes": ["暂无成熟扫描样本"]}
+    research = df.get("research_eligible", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    executable = (
+        df.get("trade_eligible", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+        & df.get("trade_bucket", pd.Series("", index=df.index)).astype(str).str.upper().eq("TRADE")
+    )
+    masks = {
+        "research_candidate": research,
+        "blocked_candidate": research & ~executable,
+        "executable_candidate": executable,
+    }
+    labels = {
+        "research_candidate": "全部研究候选",
+        "blocked_candidate": "被执行门禁拦截",
+        "executable_candidate": "Bark可交易候选",
+    }
+    cohorts = []
+    for name, mask in masks.items():
+        group = df[mask]
+        cohorts.append({
+            "cohort": name,
+            "label": labels[name],
+            "signals": int(len(group)),
+            "metrics": {f"{horizon}d": _metric_summary(group[f"ret_{horizon}d"]) for horizon in HORIZONS},
+        })
+    return {
+        "cohorts": cohorts,
+        "primary_horizon": "5d",
+        "notes": ["各组使用同一信号日收盘和未来交易日口径；相关性诊断不等于因果。"],
+    }
+
+
+def build_opportunity_threshold_report(
+    df: pd.DataFrame, thresholds: Iterable[float] = (55, 60, 65, 70),
+) -> Dict[str, Any]:
+    """Report threshold sensitivity without changing the production threshold."""
+    if df.empty or "trade_opportunity_score" not in df.columns:
+        return {"thresholds": [], "production_threshold": 60, "status": "INSUFFICIENT"}
+    research = df.get("research_eligible", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    scores = pd.to_numeric(df["trade_opportunity_score"], errors="coerce")
+    rows = []
+    for threshold in thresholds:
+        group = df[research & scores.ge(float(threshold))]
+        rows.append({
+            "threshold": float(threshold),
+            "signals": int(len(group)),
+            "metrics_5d": _metric_summary(group["ret_5d"]),
+        })
+    return {
+        "thresholds": rows,
+        "production_threshold": 60,
+        "status": "DIAGNOSTIC_ONLY",
+        "selection_rule": "research_eligible=true and trade_opportunity_score>=threshold",
+    }
 
 
 def _metric_summary(values: pd.Series) -> Dict[str, Any]:
@@ -224,7 +316,7 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
     horizons = {f"{horizon}d": _metric_summary(df[f"ret_{horizon}d"]) for horizon in HORIZONS}
     by_grade = _group_rows(df, "sop_grade")
     signal_dates = pd.to_datetime(df.get("signal_date"), errors="coerce")
-    return {
+    report = {
         "summary": {
             "signals": int(len(df)),
             "mature_5d": horizons["5d"]["signals"],
@@ -245,6 +337,14 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
         "by_early_value_transition": _group_rows(df, "early_value_transition_state"),
         "grade_monotonicity": _grade_monotonicity(by_grade, min_samples),
     }
+    if "exec_return_pct" in df.columns:
+        filled = df["exec_filled"].fillna(False).astype(bool) if "exec_filled" in df.columns else pd.Series(False, index=df.index)
+        mature = df["exec_mature"].fillna(False).astype(bool) if "exec_mature" in df.columns else pd.Series(False, index=df.index)
+        executable = df[filled]
+        report["executable"] = _metric_summary(executable["exec_return_pct"])
+        report["summary"]["executable_mature"] = int(mature.sum())
+        report["summary"]["executable_filled"] = int(len(executable))
+    return report
 
 
 def build_blocker_report(df: pd.DataFrame, min_samples: int = 10) -> Dict[str, Any]:
@@ -337,3 +437,29 @@ def build_blocker_report(df: pd.DataFrame, min_samples: int = 10) -> Dict[str, A
         },
         "control_note": "优先按策略、市场状态和评分版本分层比较；无可配对分层时回退到全样本相关性。",
     }
+
+
+def build_feature_ablation_report(
+    df: pd.DataFrame,
+    features: Iterable[str],
+    outcome: str = "exec_return_pct",
+    min_samples: int = 30,
+) -> Dict[str, Any]:
+    """Report marginal rank association; causal promotion still requires rolling OOS."""
+    if outcome not in df.columns:
+        return {"outcome": outcome, "samples": 0, "items": []}
+    items = []
+    for feature in features:
+        if feature not in df.columns:
+            continue
+        pair = df[[feature, outcome]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(pair) < min_samples or pair[feature].nunique() < 2:
+            items.append({"feature": feature, "samples": len(pair), "status": "RESEARCH_ONLY", "rank_correlation": None})
+            continue
+        correlation = float(pair[feature].rank().corr(pair[outcome].rank()))
+        items.append({
+            "feature": feature, "samples": len(pair), "status": "OOS_REQUIRED",
+            "rank_correlation": round(correlation, 4),
+            "direction": "POSITIVE" if correlation > 0 else "NEGATIVE" if correlation < 0 else "NONE",
+        })
+    return {"outcome": outcome, "samples": int(pd.to_numeric(df[outcome], errors="coerce").notna().sum()), "items": items}

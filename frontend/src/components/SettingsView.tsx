@@ -15,7 +15,7 @@ import {
     AlertTriangle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import api from '@/lib/api';
+import api, { hasSessionApiToken, setSessionApiToken } from '@/lib/api';
 
 interface SystemHealthCheck {
     name: string;
@@ -41,6 +41,30 @@ interface SystemHealth {
     recommendations: string[];
 }
 
+interface OperationalMetrics {
+    status: 'ok' | 'warning' | 'critical';
+    metrics: Record<string, string | number | null>;
+    alerts: Array<{ severity: string; code: string; message: string }>;
+}
+
+interface PointInTimeCoverage {
+    status: 'ok' | 'collecting' | 'error';
+    summary: {
+        snapshots?: { dates?: number; rows?: number };
+        scan_audits?: { dates?: number };
+        events?: { verified?: number };
+    };
+    gaps: string[];
+    target?: { trading_dates?: number; verified_events?: number };
+}
+
+interface StrategyReleaseState {
+    strategy_key: string;
+    state: string;
+    version?: string;
+    updated_at?: string;
+}
+
 export default function SettingsView() {
     const [settings, setSettings] = useState({
         sentinel_schedule_times: "14:20",
@@ -51,25 +75,34 @@ export default function SettingsView() {
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
     const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
+    const [operationalMetrics, setOperationalMetrics] = useState<OperationalMetrics | null>(null);
+    const [pointInTimeCoverage, setPointInTimeCoverage] = useState<PointInTimeCoverage | null>(null);
+    const [strategyStates, setStrategyStates] = useState<StrategyReleaseState[]>([]);
+    const [apiToken, setApiToken] = useState('');
+    const [apiTokenActive, setApiTokenActive] = useState(false);
 
     useEffect(() => {
+        setApiTokenActive(hasSessionApiToken());
         fetchSettings();
     }, []);
 
     const fetchSettings = async () => {
-        try {
-            const [settingsRes, healthRes] = await Promise.all([
+        const results = await Promise.allSettled([
                 api.get('/api/settings'),
-                api.get('/api/system/health')
-            ]);
-            const res = settingsRes;
-            setSettings(res.data);
-            setSystemHealth(healthRes.data);
-        } catch (err) {
-            console.error("Fetch Settings Error:", err);
-        } finally {
-            setLoading(false);
-        }
+                api.get('/api/system/health'),
+                api.get('/api/system/operational-metrics'),
+                api.get('/api/system/point-in-time-coverage'),
+                api.get('/api/system/strategy-release/states')
+        ]);
+        if (results[0].status === 'fulfilled') setSettings(results[0].value.data);
+        if (results[1].status === 'fulfilled') setSystemHealth(results[1].value.data);
+        if (results[2].status === 'fulfilled') setOperationalMetrics(results[2].value.data);
+        if (results[3].status === 'fulfilled') setPointInTimeCoverage(results[3].value.data);
+        if (results[4].status === 'fulfilled') setStrategyStates(results[4].value.data);
+        results.forEach(result => {
+            if (result.status === 'rejected') console.error("Fetch Settings Diagnostic Error:", result.reason);
+        });
+        setLoading(false);
     };
 
     const handleSave = async () => {
@@ -131,6 +164,27 @@ export default function SettingsView() {
                     </div>
 
                     <div className="glass-card p-6 space-y-6">
+                        <div className="space-y-3">
+                            <label className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                                <ShieldCheck size={16} className="text-emerald-500" />
+                                写操作 API Token（仅当前标签页会话）
+                            </label>
+                            <div className="flex gap-2">
+                                <input
+                                    type="password"
+                                    value={apiToken}
+                                    onChange={(e) => setApiToken(e.target.value)}
+                                    placeholder={apiTokenActive ? "会话令牌已设置" : "输入 API_TOKEN"}
+                                    className="flex-1 bg-slate-50 border border-slate-100 text-slate-600 font-mono font-bold rounded-xl px-4 py-3 outline-none"
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => { setSessionApiToken(apiToken); setApiTokenActive(Boolean(apiToken.trim())); setApiToken(''); }}
+                                    className="px-4 rounded-xl bg-emerald-600 text-white text-xs font-black"
+                                >保存会话</button>
+                            </div>
+                            <p className="text-[10px] text-slate-400">令牌只保存在 sessionStorage，关闭标签页后失效，不写入数据库或构建产物。状态：{apiTokenActive ? '已启用' : '未设置'}</p>
+                        </div>
                         <div className="space-y-3">
                             <label className="flex items-center gap-2 text-sm font-bold text-slate-700">
                                 <Clock size={16} className="text-indigo-500" />
@@ -273,6 +327,37 @@ export default function SettingsView() {
                 </div>
             )}
 
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+                <DiagnosticCard
+                    title="运行与备份"
+                    status={operationalMetrics?.status || 'unavailable'}
+                    metrics={[
+                        ['最新行情', operationalMetrics?.metrics.latest_daily_date || '--'],
+                        ['最新扫描', operationalMetrics?.metrics.latest_scan_at || '--'],
+                        ['24h任务失败', operationalMetrics?.metrics.failed_tasks_24h ?? '--'],
+                        ['最新备份', operationalMetrics?.metrics.latest_backup_at || '--'],
+                    ]}
+                    messages={operationalMetrics?.alerts.map(item => item.message) || ['运行指标暂不可用']}
+                />
+                <DiagnosticCard
+                    title="点时证据覆盖"
+                    status={pointInTimeCoverage?.status || 'unavailable'}
+                    metrics={[
+                        ['快照交易日', pointInTimeCoverage?.summary.snapshots?.dates ?? '--'],
+                        ['扫描审计日', pointInTimeCoverage?.summary.scan_audits?.dates ?? '--'],
+                        ['验证事件', pointInTimeCoverage?.summary.events?.verified ?? '--'],
+                        ['目标交易日', pointInTimeCoverage?.target?.trading_dates ?? '--'],
+                    ]}
+                    messages={pointInTimeCoverage?.gaps || ['覆盖数据暂不可用']}
+                />
+                <DiagnosticCard
+                    title="策略发布状态"
+                    status={strategyStates.length ? 'ok' : 'collecting'}
+                    metrics={(strategyStates.length ? strategyStates.slice(0, 4) : [{ strategy_key: '尚无已登记策略', state: 'DRAFT' }]).map(item => [item.strategy_key, item.state])}
+                    messages={[strategyStates.length ? '策略晋级受成熟样本与正期望证据门禁控制' : '尚未有策略通过人工状态迁移']}
+                />
+            </div>
+
             {/* Performance Hints */}
             <div className="glass-card p-8 bg-slate-900 text-slate-300 relative overflow-hidden">
                 <div className="relative z-10 flex gap-6">
@@ -299,6 +384,38 @@ function HealthMetric({ label, value }: { label: string; value: string | number 
         <div className="rounded-2xl border border-slate-100 bg-white px-4 py-3">
             <p className="text-[10px] text-slate-400 font-bold">{label}</p>
             <p className="text-sm font-black text-slate-800 truncate">{value}</p>
+        </div>
+    );
+}
+
+function DiagnosticCard({ title, status, metrics, messages }: {
+    title: string;
+    status: string;
+    metrics: Array<[string, string | number]>;
+    messages: string[];
+}) {
+    const healthy = status === 'ok';
+    const critical = status === 'critical' || status === 'error';
+    return (
+        <div className="glass-card p-5 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-black text-slate-800">{title}</h3>
+                <span className={cn(
+                    "rounded-full px-2.5 py-1 text-[9px] font-black uppercase tracking-wider",
+                    healthy ? "bg-emerald-100 text-emerald-700" : critical ? "bg-rose-100 text-rose-700" : "bg-amber-100 text-amber-700"
+                )}>{status}</span>
+            </div>
+            <div className="space-y-2">
+                {metrics.map(([label, value]) => (
+                    <div key={label} className="flex items-center justify-between gap-3 text-[11px]">
+                        <span className="text-slate-400 font-bold truncate">{label}</span>
+                        <span className="text-slate-700 font-black text-right truncate max-w-[60%]">{value}</span>
+                    </div>
+                ))}
+            </div>
+            <div className={cn("rounded-xl px-3 py-2 text-[10px] font-medium leading-relaxed", critical ? "bg-rose-50 text-rose-600" : "bg-slate-50 text-slate-500")}>
+                {messages.slice(0, 3).map(message => <p key={message}>{message}</p>)}
+            </div>
         </div>
     );
 }

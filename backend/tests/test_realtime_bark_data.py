@@ -58,6 +58,24 @@ def test_intraday_bark_groups_only_confirmed_trades_as_executable():
     assert [item["代码"] for item in selected] == ["000003", "000002", "000001"]
 
 
+def test_bark_requires_bucket_and_eligibility_for_clear_trade_instruction():
+    from core.sentinel import _candidate_brief_lines, _candidate_push_bucket
+
+    inconsistent = {
+        "代码": "000004", "名称": "门禁不一致", "sop_grade": "A",
+        "trade_bucket": "TRADE", "trade_eligible": False,
+    }
+    confirmed = {
+        "代码": "000005", "名称": "门禁通过", "sop_grade": "A",
+        "trade_bucket": "TRADE", "trade_eligible": True,
+    }
+
+    assert _candidate_push_bucket(inconsistent) == "禁止追买"
+    assert _candidate_brief_lines(inconsistent)[0].startswith("指令：不可交易")
+    assert _candidate_push_bucket(confirmed) == "可交易"
+    assert _candidate_brief_lines(confirmed)[0].startswith("指令：可交易")
+
+
 def test_bark_scan_fetches_live_snapshot_even_when_local_only(monkeypatch):
     from core import scanner
 

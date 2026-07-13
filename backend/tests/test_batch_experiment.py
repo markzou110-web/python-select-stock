@@ -10,10 +10,58 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.batch_experiment import (
     _split_df_by_ratio,
+    build_rolling_windows,
+    run_rolling_walk_forward_experiment,
     run_walk_forward_experiment,
     DEFAULT_TRAIN_RATIO,
     OVERFIT_WARNING_GAP,
 )
+
+
+def test_rolling_windows_keep_train_validation_test_separate():
+    windows = build_rolling_windows(220, 100, 20, 20, 20)
+    assert len(windows) == 5
+    first = windows[0]
+    assert first["train"].stop == first["validation"].start
+    assert first["validation"].stop == first["test"].start
+    assert set(range(*first["train"].indices(220))).isdisjoint(range(*first["test"].indices(220)))
+
+
+def test_rolling_walk_forward_returns_weighted_oos_summary(monkeypatch):
+    df = _pine_fixture(220)
+    monkeypatch.setattr("core.batch_experiment.load_from_db", lambda *args: df.copy())
+    monkeypatch.setattr("core.batch_experiment.calculate_indicators", lambda frame, **kw: frame)
+    monkeypatch.setattr("core.batch_experiment.calculate_pine_indicators", lambda frame: frame)
+
+    result = run_rolling_walk_forward_experiment(None, ["000001"], "pine", {
+        "train_size": 100, "validation_size": 20, "test_size": 20, "step_size": 20,
+    })
+    assert result["meta"]["params_frozen"] is True
+    assert result["summary"]["test_windows"] == 5
+    periods = result["items"][0]["windows"][0]["periods"]
+    assert periods["train"]["end"] < periods["validation"]["start"]
+    assert periods["validation"]["end"] < periods["test"]["start"]
+
+
+def test_rolling_walk_forward_excludes_unmature_window_tail(monkeypatch):
+    df = _pine_fixture(220)
+    captured = []
+    monkeypatch.setattr("core.batch_experiment.load_from_db", lambda *args: df.copy())
+    monkeypatch.setattr("core.batch_experiment.calculate_indicators", lambda frame, **kw: frame)
+    monkeypatch.setattr("core.batch_experiment.calculate_pine_indicators", lambda frame: frame)
+
+    def fake_backtest(frame, strategy_type, params):
+        captured.append(params.copy())
+        return {"summary": {"signal_count": 0, "win_rate": 0, "total_return": 0, "profit_factor": 0, "max_drawdown": 0}}
+
+    monkeypatch.setattr("core.batch_experiment.run_single_stock_backtest", fake_backtest)
+    run_rolling_walk_forward_experiment(None, ["000001"], "pine", {
+        "train_size": 100, "validation_size": 20, "test_size": 20, "step_size": 20,
+        "max_hold_days": 10, "entry_mode": "next_open_confirm",
+    })
+    first_test = captured[2]
+    expected_end = str(df.loc[128, "日期"])[:10]  # test ends at 139; reserve 11 rows
+    assert first_test["signal_end_date"] == expected_end
 
 
 def _pine_fixture(rows: int = 200) -> pd.DataFrame:

@@ -122,6 +122,16 @@ BACKTEST_RISK_PER_TRADE = 0.02      # 单笔交易最大风险占总资金比例
 # 历史代码硬编码 -8.0，而实盘止损是 -9.0，导致回测胜率系统性失真（更早止损=更多假亏损）。
 BACKTEST_STOP_LOSS_PCT = FIXED_STOP_LOSS_PCT  # -9.0，与实盘硬止损同源
 
+# ── 事件驱动首次回踩试仓 ──
+# 仅在官方重大催化后的首次健康回踩完成量价确认时开放；这是仓位上限，不是绕过价格风控。
+EVENT_TRIAL_MIN_RISK_REWARD = 2.0
+EVENT_TRIAL_MAX_DAILY_PCT = 6.0
+EVENT_TRIAL_POSITION_PCT = 3
+EVENT_TRIAL_WEAK_POSITION_PCT = 2
+
+# 单笔组合风险预算：仓位比例 × 结构止损距离不得高于总资金的 1%。
+MAX_PORTFOLIO_RISK_PER_TRADE_PCT = 1.0
+
 # ── 量能见顶检测 (Volume Climax) ──
 VOLUME_CLIMAX_MULTIPLIER = 3.0      # 成交量超过 MA20 的倍数阈值
 

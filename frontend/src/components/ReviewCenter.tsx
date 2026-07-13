@@ -228,6 +228,7 @@ export default function ReviewCenter() {
     const [recommendationLoop, setRecommendationLoop] = useState<RecommendationOutcomeLoop | null>(null);
     const [dailyReport, setDailyReport] = useState<DailyStrategyReport | null>(null);
     const [calibration, setCalibration] = useState<CalibrationPayload | null>(null);
+    const [executionReplay, setExecutionReplay] = useState<any>(null);
     const [researchContext, setResearchContext] = useState<ResearchContext | null>(null);
     const [followup, setFollowup] = useState<any>(null);
     const [loading, setLoading] = useState(true);
@@ -239,7 +240,7 @@ export default function ReviewCenter() {
     const fetchData = async () => {
         setLoading(true);
         try {
-            const [performanceRes, profitabilityRes, sectorWatchRes, recommendationLoopRes, dailyReportRes, calibrationRes, researchContextRes] = await Promise.all([
+            const results = await Promise.allSettled([
                 api.get(`/api/review/scan-performance?days=${days}`),
                 api.get(`/api/review/profitability-dashboard?days=${days}`),
                 api.get(`/api/review/sector-watch-performance?days=${days}`),
@@ -247,14 +248,17 @@ export default function ReviewCenter() {
                 api.get('/api/review/daily-strategy-report'),
                 api.get(`/api/review/strategy-calibration-report?days=${days}`),
                 api.get('/api/review/research-context'),
+                api.get(`/api/review/execution-policy-replay?days=${days}`),
             ]);
-            setData(performanceRes.data);
-            setProfitability(profitabilityRes.data);
-            setSectorWatchPerformance(sectorWatchRes.data);
-            setRecommendationLoop(recommendationLoopRes.data);
-            setDailyReport(dailyReportRes.data);
-            setCalibration(calibrationRes.data);
-            setResearchContext(researchContextRes.data);
+            const value = (index: number) => results[index].status === 'fulfilled' ? (results[index] as PromiseFulfilledResult<any>).value.data : null;
+            if (value(0)) setData(value(0));
+            if (value(1)) setProfitability(value(1));
+            if (value(2)) setSectorWatchPerformance(value(2));
+            if (value(3)) setRecommendationLoop(value(3));
+            if (value(4)) setDailyReport(value(4));
+            if (value(5)) setCalibration(value(5));
+            if (value(6)) setResearchContext(value(6));
+            if (value(7)) setExecutionReplay(value(7));
         } finally {
             setLoading(false);
         }
@@ -340,6 +344,8 @@ export default function ReviewCenter() {
             <ExecutionReviewCard data={profitability?.real_trade_execution} contract={profitability?.measurement_contract} />
 
             <CalibrationCard data={calibration} />
+
+            <ExecutionReplayCard data={executionReplay} />
 
             <RecommendationOutcomeLoopCard data={recommendationLoop} />
 
@@ -923,6 +929,33 @@ function MeasurementContractLine({ contract }: { contract?: MeasurementContract 
     return (
         <div className="mt-3 rounded-md border border-slate-100 bg-slate-50/60 px-3 py-2 text-[10px] font-bold text-slate-400">
             口径：{contract.sample_unit || '--'}；入场价：{contract.entry_price || '--'}；成熟规则：{contract.maturity_rule || '--'}；{contract.benchmark_adjusted ? '含基准超额收益' : '当前为绝对收益'}
+        </div>
+    );
+}
+
+function ExecutionReplayCard({ data }: { data: any }) {
+    if (!data) return null;
+    const statusTone = data.verdict === 'SUPPORTED' ? 'text-emerald-600' : data.verdict === 'NOT_SUPPORTED' ? 'text-rose-600' : 'text-amber-600';
+    const policies = Array.isArray(data.policies) ? data.policies : [];
+    return (
+        <div className="glass-card p-5">
+            <div className="flex items-center justify-between mb-4">
+                <div>
+                    <h3 className="font-black text-slate-800">执行策略历史验证</h3>
+                    <p className="text-xs text-slate-400 mt-1">点时候选重放，未来收益只用于评价</p>
+                </div>
+                <span className={cn("text-sm font-black", statusTone)}>{data.verdict || 'UNKNOWN'}</span>
+            </div>
+            <p className="text-xs font-bold text-slate-600 mb-4">{data.verdict_reason || '暂无验证结论'}</p>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {policies.map((item: any) => (
+                    <div key={item.policy} className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                        <div className="text-[10px] font-black text-slate-400 uppercase">{item.policy}</div>
+                        <div className="mt-2 text-sm font-black text-slate-700">成熟 {item.metrics_5d?.signals || 0} 笔</div>
+                        <div className="mt-1 text-xs text-slate-500">胜率 {item.metrics_5d?.win_rate || 0}%｜均收 {item.metrics_5d?.avg_return || 0}%</div>
+                    </div>
+                ))}
+            </div>
         </div>
     );
 }

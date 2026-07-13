@@ -16,6 +16,7 @@ import threading
 import asyncio
 import requests
 import warnings
+import hmac
 
 # Suppress pandas FutureWarnings caused by akshare
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -83,6 +84,23 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+
+@app.middleware("http")
+async def security_headers_and_write_auth(request: Request, call_next):
+    """Protect state-changing APIs when ENABLE_AUTH is enabled and add browser hardening."""
+    if config.ENABLE_AUTH and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        authorization = request.headers.get("Authorization", "")
+        supplied = authorization[7:] if authorization.startswith("Bearer ") else request.headers.get("X-API-Key", "")
+        expected = config.API_TOKEN or ""
+        if not expected or not hmac.compare_digest(supplied, expected):
+            return JSONResponse(status_code=401, content=error_response("UNAUTHORIZED", "写操作需要有效API令牌"))
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: https:; connect-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+    return response
+
 # --- Rate Limiting Middleware ---
 if config.RATE_LIMIT_ENABLED:
     from core.rate_limiter import RateLimiter
@@ -142,6 +160,7 @@ from routers.strategy_templates import router as strategy_templates_router
 from routers.system import router as system_router
 from routers.backtest import router as backtest_router
 from routers.money_flow import router as money_flow_router
+from routers.execution_intents import router as execution_intents_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -157,6 +176,7 @@ app.include_router(strategy_templates_router)
 app.include_router(system_router)
 app.include_router(backtest_router)
 app.include_router(money_flow_router)
+app.include_router(execution_intents_router)
 
 @app.get("/api/market/pulse")
 async def get_market_pulse():

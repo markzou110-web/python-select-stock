@@ -18,8 +18,8 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
         blockers = [str(item) for item in raw_blockers if str(item)]
         pullback = str(row.get("pa_pullback_status") or "").upper()
 
-        if grade == "A" and bool(row.get("trade_eligible")):
-            stage, label, action = "A-TRADE", "A级可交易", "可执行"
+        if bool(row.get("trade_eligible")) and bucket == "TRADE":
+            stage, label, action = f"{grade}-TRADE", f"{grade}级可交易", "可执行"
         elif grade == "A" and bucket == "EARLY":
             stage, label, action = "A-EARLY", "A级提前复核", "小仓复核"
         elif grade == "A":

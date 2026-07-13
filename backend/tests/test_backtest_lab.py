@@ -153,6 +153,22 @@ def test_backtest_no_benchmark_returns_none():
     assert s["cagr"] is None
 
 
+def test_backtest_signal_date_bounds_keep_warmup_but_filter_trades():
+    df = _pine_fixture()
+    signal_date = str(df.loc[125, "日期"])[:10]
+    later_date = str(df.loc[len(df) - 1, "日期"])[:10]
+    included = run_single_stock_backtest(
+        df, strategy_type="pine",
+        params={"pine_min_signals": 3, "signal_start_date": signal_date, "signal_end_date": signal_date},
+    )
+    excluded = run_single_stock_backtest(
+        df, strategy_type="pine",
+        params={"pine_min_signals": 3, "signal_start_date": later_date},
+    )
+    assert included["summary"]["signal_count"] >= 1
+    assert excluded["summary"]["signal_count"] == 0
+
+
 # ── 改动 #16：缺口穿越止损按开盘成交 ──
 
 def test_gap_through_stop_fills_at_open():

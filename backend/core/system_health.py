@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from core.config import config
 
 
 CORE_TABLES = [
@@ -75,6 +76,9 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
                       ELSE entry_price
                   END * 1.001
             """, 0) or 0)
+            notification_total = int(_safe_scalar(conn, "SELECT COUNT(*) FROM notification_audits WHERE sent_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'", 0) or 0)
+            notification_success = int(_safe_scalar(conn, "SELECT COUNT(*) FROM notification_audits WHERE sent_at >= CURRENT_TIMESTAMP - INTERVAL '7 days' AND CAST(results AS text) LIKE '%true%'", 0) or 0)
+            task_failures = int(_safe_scalar(conn, "SELECT COUNT(*) FROM task_run_audits WHERE COALESCE(started_at, finished_at) >= CURRENT_TIMESTAMP - INTERVAL '7 days' AND status='FAILURE'", 0) or 0)
 
             table_counts = {}
             missing_tables = []
@@ -111,6 +115,9 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
         "latest_scan_date": latest_scan,
         "table_counts": table_counts,
         "same_day_high_anomalies": same_day_high_anomalies,
+        "notification_delivery_rate_7d": round(notification_success / notification_total * 100, 1) if notification_total else None,
+        "notification_total_7d": notification_total,
+        "task_failures_7d": task_failures,
     })
 
     checks.append({
@@ -118,6 +125,11 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
         "status": "ok",
         "message": "数据库连接正常",
     })
+    if config.ENABLE_AUTH and config.API_TOKEN:
+        checks.append({"name": "api_write_auth", "status": "ok", "message": "写操作API令牌认证已启用"})
+    else:
+        checks.append({"name": "api_write_auth", "status": "warn", "message": "写操作API认证未启用，仅适合可信本机环境"})
+        recommendations.append("设置 ENABLE_AUTH=true 和 API_TOKEN 后再暴露到局域网或公网")
 
     if missing_tables:
         checks.append({
@@ -177,6 +189,15 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
     else:
         checks.append({"name": "notification", "status": "warn", "message": "Bark 推送未配置"})
         recommendations.append("配置 Bark Key，确保风险告警能触达手机")
+
+    if notification_total and notification_success < notification_total:
+        checks.append({"name": "notification_delivery", "status": "warn", "message": f"近7日通知成功 {notification_success}/{notification_total}"})
+        recommendations.append("检查通知失败审计并补发重要可交易/风控指令")
+    elif notification_total:
+        checks.append({"name": "notification_delivery", "status": "ok", "message": "近7日通知审计均成功"})
+    if task_failures:
+        checks.append({"name": "background_tasks", "status": "warn", "message": f"近7日后台任务失败 {task_failures} 次"})
+        recommendations.append("检查 task-runs 中最近失败的同步或扫描任务")
 
     if same_day_high_anomalies:
         checks.append({

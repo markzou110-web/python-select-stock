@@ -103,6 +103,10 @@ PRICE_ACTION_DETAIL_KEYS = [
     "sector_mainline", "leadership_score", "leadership_components", "leadership_reason",
     "limit_up_status", "first_limit_time", "last_limit_time", "break_count",
     "limit_up_streak", "seal_amount", "limit_up_sector_rank",
+    "event_catalyst", "event_driven_candidate", "event_model_version",
+    "event_post_limit_state", "event_alert_tier", "event_health_scope",
+    "trade_blocker_groups",
+    "execution_rr", "execution_plan_state", "distance_to_trade",
     "sector_watch_only", "sector_watch_reason",
     "market_sentiment_stage", "market_sentiment_label", "market_sentiment_score",
     "market_sentiment_reason", "market_cycle_metrics", "market_sentiment_model_version",
@@ -199,6 +203,26 @@ def init_db(engine=None):
         Base.metadata.create_all(bind=engine)
         
         with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version VARCHAR(80) PRIMARY KEY,
+                    applied_at TIMESTAMP NOT NULL,
+                    description TEXT
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS task_slot_claims (
+                    slot_key VARCHAR(160) PRIMARY KEY,
+                    claimed_at TIMESTAMP NOT NULL,
+                    status VARCHAR(30) NOT NULL DEFAULT 'CLAIMED'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO schema_migrations(version, applied_at, description)
+                VALUES ('2026-07-12-execution-ops-v1', CURRENT_TIMESTAMP, 'execution evidence, event, notification and ops fields')
+                ON CONFLICT(version) DO NOTHING
+            """))
+            conn.commit()
             # 性能索引
             try:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date ON daily_k(date);"))
@@ -223,6 +247,31 @@ def init_db(engine=None):
                 logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
+
+            # Scan audit point-in-time metadata. Additive migration only: existing audit rows remain valid.
+            try:
+                audit_columns = {
+                    "as_of": "TIMESTAMP",
+                    "data_mode": "VARCHAR(30)",
+                    "field_coverage": "JSON",
+                    "effective_filters": "JSON",
+                    "research_only": "INTEGER DEFAULT 0",
+                    "degradation_reasons": "JSON",
+                }
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(scan_audit_log)"))}
+                    for column_name, definition in audit_columns.items():
+                        if column_name not in existing:
+                            conn.execute(text(f"ALTER TABLE scan_audit_log ADD COLUMN {column_name} {definition}"))
+                else:
+                    clauses = ", ".join(
+                        f"ADD COLUMN IF NOT EXISTS {name} {definition}"
+                        for name, definition in audit_columns.items()
+                    )
+                    conn.execute(text(f"ALTER TABLE scan_audit_log {clauses}"))
+                logger.info("Migration: scan audit point-in-time metadata ensured.")
+            except Exception as e:
+                logger.debug(f"scan audit metadata migration skipped: {e}")
 
             # --- Migration: add trade_mode column if missing ---
             try:
@@ -634,6 +683,151 @@ def init_db(engine=None):
         logger.error(f"Database init failed: {e}")
 
 
+def claim_task_slot(slot_key: str, engine=None) -> bool:
+    """Atomically claim one deterministic task slot; false means it already ran/started."""
+    engine = engine or get_db_engine()
+    if engine is None or not slot_key:
+        return False
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO task_slot_claims(slot_key, claimed_at, status)
+                VALUES (:slot_key, CURRENT_TIMESTAMP, 'CLAIMED')
+                ON CONFLICT(slot_key) DO NOTHING
+            """), {"slot_key": str(slot_key)[:160]})
+        return bool(result.rowcount)
+    except Exception as exc:
+        logger.warning(f"Task slot claim unavailable: {exc}")
+        return False
+
+
+def save_point_in_time_snapshot(
+    snapshot: pd.DataFrame,
+    dataset_version: str,
+    as_of: Any,
+    data_mode: str,
+    engine=None,
+) -> int:
+    """Persist the stock-state inputs used by one scan without changing market/trade tables."""
+    if snapshot is None or snapshot.empty or not dataset_version:
+        return 0
+    engine = engine or get_db_engine()
+    if engine is None:
+        return 0
+    try:
+        with engine.connect() as conn:
+            existing_count = int(conn.execute(text("""
+                SELECT COUNT(*) FROM point_in_time_stock_snapshots
+                WHERE dataset_version = :dataset_version
+            """), {"dataset_version": dataset_version}).scalar() or 0)
+        if existing_count >= len(snapshot):
+            return existing_count
+    except Exception:
+        # The following insert remains the source of truth and will report failure.
+        pass
+    rows = []
+    for _, item in snapshot.iterrows():
+        code = str(item.get("code") or "").zfill(6)
+        if not validate_stock_code(code):
+            continue
+        name = str(item.get("name") or code)
+        rows.append({
+            "dataset_version": dataset_version,
+            "as_of": as_of,
+            "data_mode": data_mode,
+            "code": code,
+            "name": name,
+            "industry": item.get("industry"),
+            "is_st_or_delist": int(bool(re.search(r"ST|退", name, re.IGNORECASE))),
+            "turnover": None if pd.isna(item.get("turnover")) else float(item.get("turnover")),
+            "mkt_cap": None if pd.isna(item.get("mkt_cap")) else float(item.get("mkt_cap")),
+            "source": item.get("source") or data_mode,
+            "created_at": datetime.now(),
+        })
+    if not rows:
+        return 0
+    statement = text("""
+        INSERT INTO point_in_time_stock_snapshots
+            (dataset_version, as_of, data_mode, code, name, industry, is_st_or_delist,
+             turnover, mkt_cap, source, created_at)
+        VALUES
+            (:dataset_version, :as_of, :data_mode, :code, :name, :industry, :is_st_or_delist,
+             :turnover, :mkt_cap, :source, :created_at)
+        ON CONFLICT(dataset_version, code) DO UPDATE SET
+            name=EXCLUDED.name, industry=EXCLUDED.industry,
+            is_st_or_delist=EXCLUDED.is_st_or_delist, turnover=EXCLUDED.turnover,
+            mkt_cap=EXCLUDED.mkt_cap, source=EXCLUDED.source
+    """)
+    try:
+        with engine.begin() as conn:
+            conn.execute(statement, rows)
+        return len(rows)
+    except Exception as exc:
+        logger.error(f"Failed to save point-in-time snapshot: {exc}")
+        return 0
+
+
+def save_event_catalyst(event: Dict[str, Any], engine=None) -> bool:
+    engine = engine or get_db_engine()
+    if engine is None or not validate_stock_code(str(event.get("code") or "")):
+        return False
+    payload = {
+        "code": str(event["code"]),
+        "event_type": str(event.get("event_type") or "EARNINGS_SURPRISE"),
+        "published_at": event.get("published_at"),
+        "title": event.get("title"),
+        "profit_growth_low": event.get("profit_growth_low"),
+        "profit_growth_high": event.get("profit_growth_high"),
+        "source_url": event.get("source_url"),
+        "verified": int(bool(event.get("verified"))),
+        "metadata_json": json.dumps(_json_safe(event.get("metadata") or {}), ensure_ascii=False),
+        "created_at": datetime.now(),
+    }
+    try:
+        with engine.begin() as conn:
+            json_value = ":metadata_json" if engine.dialect.name == "sqlite" else "CAST(:metadata_json AS JSONB)"
+            conn.execute(text(f"""
+                INSERT INTO event_catalysts
+                    (code, event_type, published_at, title, profit_growth_low, profit_growth_high,
+                     source_url, verified, metadata_json, created_at)
+                VALUES
+                    (:code, :event_type, :published_at, :title, :profit_growth_low, :profit_growth_high,
+                     :source_url, :verified, {json_value}, :created_at)
+                ON CONFLICT(code, published_at, event_type) DO UPDATE SET
+                    title=EXCLUDED.title, profit_growth_low=EXCLUDED.profit_growth_low,
+                    profit_growth_high=EXCLUDED.profit_growth_high, source_url=EXCLUDED.source_url,
+                    verified=EXCLUDED.verified, metadata_json=EXCLUDED.metadata_json
+            """), payload)
+        return True
+    except Exception as exc:
+        logger.error(f"Failed to save event catalyst: {exc}")
+        return False
+
+
+def load_active_event_catalysts(engine=None, as_of: Any = None, days: int = 10) -> Dict[str, Dict[str, Any]]:
+    engine = engine or get_db_engine()
+    if engine is None:
+        return {}
+    as_of_date = pd.Timestamp(as_of or datetime.now()).date()
+    start_date = as_of_date - pd.Timedelta(days=max(1, min(int(days), 90)))
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT code, event_type, published_at, title, profit_growth_low,
+                       profit_growth_high, source_url, verified, metadata_json
+                FROM event_catalysts
+                WHERE verified = 1 AND published_at >= :start_date AND published_at < :end_date
+                ORDER BY published_at DESC
+            """), {"start_date": start_date, "end_date": as_of_date + pd.Timedelta(days=1)}).mappings().all()
+        active: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            active.setdefault(str(row["code"]), dict(row))
+        return active
+    except Exception as exc:
+        logger.warning(f"Failed to load event catalysts: {exc}")
+        return {}
+
+
 def save_scan_audit_log(audit: Dict[str, Any], engine=None) -> bool:
     if engine is None:
         engine = get_db_engine()
@@ -654,6 +848,12 @@ def save_scan_audit_log(audit: Dict[str, Any], engine=None) -> bool:
         "result_count": int(audit.get("result_count") or 0),
         "fail_reasons": json.dumps(_json_safe(audit.get("fail_reasons") or {}), ensure_ascii=False),
         "error_message": audit.get("error_message"),
+        "as_of": audit.get("as_of"),
+        "data_mode": audit.get("data_mode"),
+        "field_coverage": json.dumps(_json_safe(audit.get("field_coverage") or {}), ensure_ascii=False),
+        "effective_filters": json.dumps(_json_safe(audit.get("effective_filters") or []), ensure_ascii=False),
+        "research_only": int(bool(audit.get("research_only"))),
+        "degradation_reasons": json.dumps(_json_safe(audit.get("degradation_reasons") or []), ensure_ascii=False),
     }
 
     try:
@@ -663,11 +863,13 @@ def save_scan_audit_log(audit: Dict[str, Any], engine=None) -> bool:
                     INSERT INTO scan_audit_log (
                         scan_date, started_at, finished_at, duration_sec, status, strategy_type,
                         params_snapshot, version_snapshot, total_snapshot, candidate_count,
-                        result_count, fail_reasons, error_message
+                        result_count, fail_reasons, error_message, as_of, data_mode,
+                        field_coverage, effective_filters, research_only, degradation_reasons
                     ) VALUES (
                         :scan_date, :started_at, :finished_at, :duration_sec, :status, :strategy_type,
                         :params_snapshot, :version_snapshot, :total_snapshot, :candidate_count,
-                        :result_count, :fail_reasons, :error_message
+                        :result_count, :fail_reasons, :error_message, :as_of, :data_mode,
+                        :field_coverage, :effective_filters, :research_only, :degradation_reasons
                     )
                 """), payload)
             else:
@@ -675,11 +877,14 @@ def save_scan_audit_log(audit: Dict[str, Any], engine=None) -> bool:
                     INSERT INTO scan_audit_log (
                         scan_date, started_at, finished_at, duration_sec, status, strategy_type,
                         params_snapshot, version_snapshot, total_snapshot, candidate_count,
-                        result_count, fail_reasons, error_message
+                        result_count, fail_reasons, error_message, as_of, data_mode,
+                        field_coverage, effective_filters, research_only, degradation_reasons
                     ) VALUES (
                         CAST(:scan_date AS DATE), :started_at, :finished_at, :duration_sec, :status, :strategy_type,
                         CAST(:params_snapshot AS JSONB), CAST(:version_snapshot AS JSONB), :total_snapshot, :candidate_count,
-                        :result_count, CAST(:fail_reasons AS JSONB), :error_message
+                        :result_count, CAST(:fail_reasons AS JSONB), :error_message, :as_of, :data_mode,
+                        CAST(:field_coverage AS JSONB), CAST(:effective_filters AS JSONB), :research_only,
+                        CAST(:degradation_reasons AS JSONB)
                     )
                 """), payload)
             conn.commit()

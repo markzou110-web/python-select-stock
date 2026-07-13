@@ -9,6 +9,59 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core import scanner
 
 
+def test_snapshot_audit_marks_complete_live_snapshot_trade_capable():
+    snapshot = pd.DataFrame({
+        "price": [10.0, 20.0],
+        "pct_chg": [1.0, 2.0],
+        "turnover": [3.0, 4.0],
+        "mkt_cap": [1e10, 2e10],
+    })
+
+    audit = scanner._build_snapshot_audit(snapshot, "LIVE_SNAPSHOT", "2026-07-11 15:00:00")
+
+    assert audit["research_only"] is False
+    assert audit["field_coverage"] == {
+        "price": 1.0, "pct_chg": 1.0, "turnover": 1.0, "mkt_cap": 1.0,
+    }
+    assert {"turnover_min", "market_cap_min"} <= set(audit["effective_filters"])
+
+
+def test_snapshot_audit_marks_missing_local_fields_research_only():
+    snapshot = pd.DataFrame({
+        "price": [10.0, 20.0],
+        "pct_chg": [1.0, 2.0],
+        "turnover": [None, None],
+        "mkt_cap": [None, None],
+    })
+
+    audit = scanner._build_snapshot_audit(snapshot, "LOCAL_DB", "2026-07-10")
+
+    assert audit["research_only"] is True
+    assert audit["field_coverage"]["turnover"] == 0.0
+    assert "turnover_min" not in audit["effective_filters"]
+    assert len(audit["degradation_reasons"]) == 2
+
+
+def test_discovery_pools_keep_pullbacks_out_of_momentum_pool():
+    snapshot = pd.DataFrame({"pct_chg": [-2.5, -1.0, 1.0, 6.0]})
+    momentum, momentum_name = scanner._discovery_pool_mask(snapshot, "tv_dual_strict")
+    early, early_name = scanner._discovery_pool_mask(snapshot, "early_value")
+    assert momentum_name == "MOMENTUM_DISCOVERY"
+    assert momentum.tolist() == [False, False, True, True]
+    assert early_name == "EARLY_DISCOVERY"
+    assert early.tolist() == [True, True, True, False]
+
+
+def test_research_only_gate_removes_all_trade_permission():
+    rows = [{"trade_eligible": True, "trade_bucket": "TRADE", "trade_blockers": []}]
+    audit = {"research_only": True}
+    scanner._apply_research_only_gate(rows, audit)
+    assert rows[0]["trade_eligible"] is False
+    assert rows[0]["trade_bucket"] == "OBSERVE"
+    assert rows[0]["research_only"] is True
+    assert audit["status"] == "RESEARCH_ONLY"
+
+
 def _make_early_value_df(current: float = 11.5, prev: float = 11.2) -> pd.DataFrame:
     n = 90
     close = np.linspace(10.4, 10.9, n)

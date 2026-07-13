@@ -143,6 +143,15 @@ def run_single_stock_backtest(
     adjustment_gap_pct = max(10.0, float(params.get("adjustment_gap_pct", 20.0)))
 
     raw_signals = [idx for idx in _signal_indices(df, strategy_type, params) if idx < len(df) - 1]
+    signal_start_date = params.get("signal_start_date")
+    signal_end_date = params.get("signal_end_date")
+    if signal_start_date or signal_end_date:
+        signal_dates = df["日期"].astype(str).str[:10]
+        raw_signals = [
+            idx for idx in raw_signals
+            if (not signal_start_date or signal_dates.iloc[idx] >= str(signal_start_date)[:10])
+            and (not signal_end_date or signal_dates.iloc[idx] <= str(signal_end_date)[:10])
+        ]
     if not raw_signals:
         # 改动 #15：即使无信号也返回 benchmark（市场收益与策略信号无关）
         _br, _al, _cg = _compute_benchmark_fields(bench_df, 0.0, len(df))

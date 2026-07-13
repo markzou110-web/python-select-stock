@@ -49,6 +49,17 @@ interface BacktestResult {
     versions?: Record<string, string>;
 }
 
+interface RollingResult {
+    meta: { train_size: number; validation_size: number; test_size: number; params_frozen: boolean };
+    summary: {
+        test_windows: number;
+        test_signals: number;
+        oos_weighted_win_rate: number;
+        positive_test_windows: number;
+        positive_window_ratio: number;
+    };
+}
+
 export default function BacktestLab() {
     const [code, setCode] = useState('000001');
     const [strategyType, setStrategyType] = useState('pine');
@@ -61,6 +72,7 @@ export default function BacktestLab() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [result, setResult] = useState<BacktestResult | null>(null);
+    const [rollingResult, setRollingResult] = useState<RollingResult | null>(null);
 
     const runBacktest = async () => {
         setLoading(true);
@@ -86,6 +98,25 @@ export default function BacktestLab() {
         }
     };
 
+    const runRollingBacktest = async () => {
+        setLoading(true);
+        setError(null);
+        setRollingResult(null);
+        try {
+            const res = await api.post<RollingResult>('/api/backtest/rolling-walk-forward', {
+                codes: [code], strategy_type: strategyType, days,
+                stop_loss_pct: stopLossPct, max_hold_days: maxHoldDays,
+                pine_min_signals: pineMinSignals, entry_mode: entryMode,
+                max_open_gap_pct: maxOpenGapPct,
+            }, { timeout: 60000 });
+            setRollingResult(res.data);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : '滚动样本外验证失败');
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const maxEquity = Math.max(...(result?.equity_curve || []).map(item => item.equity), result?.summary.final_equity || 100000, 100000);
     const minEquity = Math.min(...(result?.equity_curve || []).map(item => item.equity), 100000);
 
@@ -101,10 +132,16 @@ export default function BacktestLab() {
                         <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Single Stock Backtest Lab</p>
                     </div>
                 </div>
-                <button onClick={runBacktest} disabled={loading} className="toolbar-button">
-                    {loading ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
-                    执行回测
-                </button>
+                <div className="flex items-center gap-2">
+                    <button onClick={runRollingBacktest} disabled={loading} className="toolbar-button">
+                        {loading ? <Loader2 size={16} className="animate-spin" /> : <BarChart3 size={16} />}
+                        滚动 OOS
+                    </button>
+                    <button onClick={runBacktest} disabled={loading} className="toolbar-button">
+                        {loading ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
+                        执行回测
+                    </button>
+                </div>
             </div>
 
             <section className="glass-card p-5">
@@ -143,6 +180,23 @@ export default function BacktestLab() {
                 </div>
                 {error && <div className="mt-4 rounded-xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</div>}
             </section>
+
+            {rollingResult && (
+                <section className="glass-card p-5 space-y-4">
+                    <SectionTitle title="滚动样本外验证" />
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+                        <Tiny label="测试窗口" value={rollingResult.summary.test_windows} />
+                        <Tiny label="OOS 成交" value={rollingResult.summary.test_signals} />
+                        <Tiny label="加权胜率" value={`${rollingResult.summary.oos_weighted_win_rate}%`} />
+                        <Tiny label="正收益窗口" value={`${rollingResult.summary.positive_test_windows}/${rollingResult.summary.test_windows}`} />
+                        <Tiny label="正窗口比例" value={`${Math.round(rollingResult.summary.positive_window_ratio * 100)}%`} />
+                    </div>
+                    <p className="text-xs font-bold text-slate-500">
+                        参数已冻结；窗口为 {rollingResult.meta.train_size}/{rollingResult.meta.validation_size}/{rollingResult.meta.test_size} 个交易日。
+                        该报告用于研究晋级，不会自动修改正式策略。
+                    </p>
+                </section>
+            )}
 
             {result && (
                 <>

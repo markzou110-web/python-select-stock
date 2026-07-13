@@ -20,6 +20,10 @@ from core.trading_calendar import (
 from core.operation_plan import position_health_score, position_size_advice, price_instruction
 
 
+def _is_executable_candidate(stock: Dict[str, Any]) -> bool:
+    return stock.get("trade_bucket") == "TRADE" and stock.get("trade_eligible") is True
+
+
 def _candidate_action_label(stock: Dict[str, Any]) -> str:
     trade_bucket = stock.get('trade_bucket')
     trade_eligible = stock.get('trade_eligible')
@@ -60,9 +64,11 @@ def _candidate_action_label(stock: Dict[str, Any]) -> str:
 
 
 def _candidate_push_bucket(stock: Dict[str, Any]) -> str:
+    if stock.get("event_alert_tier") == "STRONG_WATCH":
+        return "强势异动"
     if stock.get('sector_watch_only'):
         return "观察"
-    if stock.get('trade_bucket') == 'TRADE' or stock.get('trade_eligible') is True:
+    if _is_executable_candidate(stock):
         return "可交易"
     if stock.get('trade_bucket') == 'BLOCK' or stock.get('trade_eligible') is False:
         return "禁止追买"
@@ -128,11 +134,15 @@ def _annotate_push_priority(
 
 
 def _candidate_brief_action(stock: Dict[str, Any]) -> str:
-    if stock.get('trade_bucket') == 'TRADE' or stock.get('trade_eligible') is True:
+    if _is_executable_candidate(stock):
+        if stock.get("event_trial_trade"):
+            return "事件回踩试仓"
         return "可小仓复核"
     if stock.get('trade_bucket') == 'EARLY' or stock.get('early_trade_candidate'):
         return "提前复核"
     if stock.get('trade_bucket') == 'BLOCK' or stock.get('trade_eligible') is False:
+        if stock.get("event_alert_tier") == "STRONG_WATCH":
+            return "强势观察不追高"
         return "禁止买入"
     action = stock.get('pa_trade_action')
     if action == "READY":
@@ -149,7 +159,7 @@ def _candidate_grade_label(stock: Dict[str, Any]) -> str:
     if explicit:
         return explicit
     grade = str(stock.get("early_trade_grade") or stock.get("sop_grade") or "?").upper()
-    if stock.get("trade_bucket") == "TRADE" or stock.get("trade_eligible") is True:
+    if _is_executable_candidate(stock):
         return f"{grade}级可交易"
     if stock.get("trade_bucket") == "EARLY" or stock.get("early_trade_candidate"):
         return f"{grade}级提前复核"
@@ -167,6 +177,11 @@ def _candidate_display_score(stock: Dict[str, Any]) -> Optional[float]:
 
 
 def _candidate_brief_reason(stock: Dict[str, Any]) -> str:
+    catalyst = stock.get("event_catalyst") or {}
+    if stock.get("event_alert_tier") == "STRONG_WATCH" and catalyst:
+        low = catalyst.get("profit_growth_low")
+        high = catalyst.get("profit_growth_high")
+        return f"业绩催化同比+{low:.0f}%~+{high:.0f}%，等待首次可交易回踩"
     blockers = stock.get('trade_blockers') or []
     if isinstance(blockers, str):
         text = blockers.strip("[]'\" ")
@@ -226,16 +241,24 @@ def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
     code = stock.get('代码', stock.get('code', ''))
     action = _candidate_brief_action(stock)
     price = stock.get('现价') or stock.get('price')
-    entry = stock.get('entry_price') or stock.get('pa_entry_price')
+    plan_state = stock.get("execution_plan_state") or {}
+    rr_state = stock.get("execution_rr") or {}
+    entry = plan_state.get("active_confirmation_price") or stock.get('entry_price') or stock.get('pa_entry_price')
     stop = stock.get('plan_stop_price') or stock.get('stop_price') or stock.get('pa_stop_price')
     display_score = _candidate_display_score(stock)
     score_text = f" | 展示分{display_score:g}" if display_score is not None else ""
-    lines = [f"{action}｜{grade_label} {name}({code}){score_text}"]
+    instruction = "可交易" if _is_executable_candidate(stock) else "不可交易"
+    lines = [f"指令：{instruction}｜{action}｜{grade_label} {name}({code}){score_text}"]
     lines.append(
         f"  现价{price if price else '--'}｜确认>{entry if entry else '--'}"
         f"｜有效失效<{stop if stop else '--'}"
     )
     lines.append(f"  原因：{_candidate_brief_reason(stock)}")
+    if rr_state.get("execution_rr") is not None:
+        lines.append(f"  执行盈亏比：{rr_state.get('execution_rr')}｜依据价{rr_state.get('price_basis') or '--'}")
+    distance = stock.get("distance_to_trade") or {}
+    if not _is_executable_candidate(stock) and distance.get("steps"):
+        lines.append(f"  距可交易：{'；'.join(str(item) for item in distance['steps'][:3])}")
     if stock.get("bark_priority_note"):
         lines.append(f"  闭环调权：{stock['bark_priority_note']}，仅影响推送排序")
     if stock.get("early_trade_candidate") and stock.get("early_trade_reason"):
@@ -477,7 +500,7 @@ def _select_intraday_push_stocks(
         if (
             not s.get('sector_watch_only')
             and s.get('sop_grade') in ('A', 'B', 'M', 'C')
-            and (s.get('trade_bucket') == 'TRADE' or s.get('trade_eligible') is True)
+            and _is_executable_candidate(s)
         )
     ]
     early = [
@@ -1071,7 +1094,7 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         (
             "模式：策略暂停研究模式；以下仅用于跟踪，不产生买入指令。"
             if all_paused
-            else "先看动作：仅“可小仓复核”属于执行候选；其余不下单。"
+            else "执行规则：仅看到“指令：可交易”才可按计划复核；其余一律不下单。"
         ),
         (
             "恢复条件：分层健康度恢复且当日交易条件全部通过。"
@@ -1082,14 +1105,15 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     ]
     section_titles = {
         "可交易": "【可交易候选】",
+        "强势异动": "【强势异动｜只观察不追高】",
         "观察": "【只观察】",
         "禁止追买": "【禁止买入】",
     }
-    grouped = {"可交易": [], "观察": [], "禁止追买": []}
+    grouped = {"可交易": [], "强势异动": [], "观察": [], "禁止追买": []}
     for s in push_stocks[:10]:
         grouped.setdefault(_candidate_push_bucket(s), []).append(s)
 
-    for section in ("可交易", "观察", "禁止追买"):
+    for section in ("可交易", "强势异动", "观察", "禁止追买"):
         stocks = grouped.get(section) or []
         if not stocks:
             continue
@@ -1115,6 +1139,12 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
 
     body = "\n".join(lines)
     if _send_bark_message(title, body):
+        try:
+            from core.db import get_db_engine
+            from core.execution_intents import create_bark_execution_intents
+            create_bark_execution_intents(push_stocks, get_db_engine())
+        except Exception as exc:
+            logger.warning(f"Execution intent persistence skipped: {exc}")
         _mark_intraday_state_sent(fingerprint)
     return body
 

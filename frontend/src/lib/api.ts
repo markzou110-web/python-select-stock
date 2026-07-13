@@ -12,9 +12,25 @@ const api = axios.create({
     timeout: 600000,  // 增加到10分钟
 });
 
+const SESSION_TOKEN_KEY = 'alphavision_api_token';
+
+export function setSessionApiToken(token: string) {
+    if (typeof window === 'undefined') return;
+    if (token.trim()) sessionStorage.setItem(SESSION_TOKEN_KEY, token.trim());
+    else sessionStorage.removeItem(SESSION_TOKEN_KEY);
+}
+
+export function hasSessionApiToken(): boolean {
+    return typeof window !== 'undefined' && Boolean(sessionStorage.getItem(SESSION_TOKEN_KEY));
+}
+
 // 请求拦截器 - 添加开始时间
 api.interceptors.request.use((config) => {
     config.metadata = { startTime: Date.now() };
+    if (typeof window !== 'undefined') {
+        const token = sessionStorage.getItem(SESSION_TOKEN_KEY);
+        if (token) config.headers.Authorization = `Bearer ${token}`;
+    }
     return config;
 });
 
@@ -35,6 +51,9 @@ api.interceptors.response.use(
             );
             const log = isPollingNetworkError ? console.warn : console.error;
             log(`API ${url} failed after ${duration}ms:`, error.message);
+        }
+        if (typeof window !== 'undefined' && error.response?.status === 401) {
+            window.dispatchEvent(new CustomEvent('alphavision:auth-required'));
         }
         return Promise.reject(error);
     }

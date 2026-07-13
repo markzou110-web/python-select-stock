@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 import math
 
 import pandas as pd
+
+from core.risk_constants import MAX_PORTFOLIO_RISK_PER_TRADE_PCT
 from sqlalchemy import text
 
 from core.sector_strength import classify_mainline_sector
@@ -309,6 +311,27 @@ def _position_plan(score: float, market_cap: int, mainline: str, blocked: bool) 
     }
 
 
+def _risk_normalize_position(position: Dict[str, Any], stock: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(position)
+    risk_pct = _num(stock.get("pa_risk_pct"))
+    normalized["risk_budget_pct"] = MAX_PORTFOLIO_RISK_PER_TRADE_PCT
+    normalized["stop_risk_pct"] = round(risk_pct, 2) if risk_pct > 0 else None
+    normalized["risk_capped"] = False
+    if risk_pct <= 0 or normalized.get("initial_position_pct", 0) <= 0:
+        return normalized
+    max_by_risk = round(MAX_PORTFOLIO_RISK_PER_TRADE_PCT / risk_pct * 100, 1)
+    old_initial = float(normalized["initial_position_pct"])
+    old_max = float(normalized["max_position_pct"])
+    normalized["initial_position_pct"] = min(old_initial, max_by_risk)
+    normalized["max_position_pct"] = min(old_max, max_by_risk)
+    normalized["risk_capped"] = normalized["max_position_pct"] < old_max
+    normalized["max_position_by_risk_pct"] = max_by_risk
+    normalized["estimated_initial_risk_pct"] = round(
+        normalized["initial_position_pct"] * risk_pct / 100, 2
+    )
+    return normalized
+
+
 def _trade_state(stock: Dict[str, Any], position: Dict[str, Any]) -> str:
     if stock.get("trade_bucket") == "BLOCK" or position["initial_position_pct"] == 0:
         return "BLOCKED"
@@ -386,7 +409,9 @@ def apply_decision_layer(
         sector_blocked = mainline == "FADING"
         score_blocked = opportunity < 60
         blocked = market_blocked or sector_blocked or score_blocked or stock.get("trade_bucket") == "BLOCK"
-        position = _position_plan(opportunity, market_cap, mainline, blocked)
+        position = _risk_normalize_position(
+            _position_plan(opportunity, market_cap, mainline, blocked), stock,
+        )
         state = _trade_state(stock, position)
 
         stock.update(context)

@@ -2,6 +2,7 @@ from .celery_app import celery_app
 from .logging_config import logger
 from .notifier import notifier
 from .db import get_db_engine
+from .task_idempotency import daily_task_slot
 from .data import get_market_snapshot, is_snapshot_stale
 from .indicators import calculate_indicators
 from core.strategy import evaluate_exit_signals
@@ -14,6 +15,36 @@ from sqlalchemy import text
 
 _ALERT_DEDUPE_CACHE = {}
 _ALERT_DEDUPE_SECONDS = 30 * 60
+
+
+@celery_app.task(name="tasks.discover_event_catalysts")
+@daily_task_slot("event-catalyst-discovery", timeout_minutes=60)
+def discover_event_catalysts():
+    try:
+        from core.event_ingestion import discover_official_event_catalysts
+        return discover_official_event_catalysts(get_db_engine())
+    except Exception as exc:
+        logger.error(f"Event catalyst discovery failed: {exc}")
+        return {"error": str(exc)}
+
+
+@celery_app.task(name="tasks.database_backup")
+@daily_task_slot("database-backup", timeout_minutes=60)
+def database_backup():
+    try:
+        from core.database_backup import create_database_backup
+        return {"status": "ok", **create_database_backup(retention=14)}
+    except Exception as exc:
+        logger.error(f"Database backup failed: {exc}")
+        return {"status": "error", "error": str(exc)}
+
+
+@celery_app.task(name="tasks.expire_execution_intents")
+@daily_task_slot("expire-execution-intents", timeout_minutes=15)
+def expire_execution_intents():
+    from core.execution_intents import expire_due_execution_intents
+    expired = expire_due_execution_intents(get_db_engine())
+    return {"status": "ok", "expired": expired}
 
 
 def _is_limit_up_collection_window(now: datetime) -> bool:
@@ -212,6 +243,7 @@ def check_realtime_alerts():
 
 
 @celery_app.task(name="tasks.intraday_monitor_checkpoint")
+@daily_task_slot("intraday-monitor", slot_argument="slot", timeout_minutes=45)
 def intraday_monitor_checkpoint(slot: str = "price_watch"):
     """Professional intraday workflow checkpoints for real trading operations."""
     now = datetime.now()
@@ -296,6 +328,7 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
 
 
 @celery_app.task(name="tasks.daily_sync")
+@daily_task_slot("daily-sync", slot_argument="slot", timeout_minutes=180)
 def daily_sync(slot: str = "晚上"):
     """
     按计划自动执行全市场数据同步：盘前 / 中午 / 晚上。
@@ -434,6 +467,7 @@ def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
 
 
 @celery_app.task(name="tasks.noon_sync_scan_review")
+@daily_task_slot("noon-sync-scan-review", slot_argument="sync_first", timeout_minutes=180)
 def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
     """Lunch workflow: sync at 11:35, then run live review after the afternoon session resumes."""
     now = datetime.now()

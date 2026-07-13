@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text, bindparam
 from typing import Dict, Any, List, Optional
@@ -6,11 +6,17 @@ import io
 import json
 import pandas as pd
 
-from core.db import get_db_engine
+from core.db import get_db_engine, validate_stock_code
 from core.db import get_scan_dates, get_scan_history_by_date
 from core.daily_strategy_report import build_daily_strategy_report, build_daily_strategy_report_body
 from core.logging_config import logger
-from core.outcome_calibration import build_blocker_report, build_calibration_report, load_scan_outcomes
+from core.outcome_calibration import (
+    build_blocker_report, build_calibration_report, build_execution_cohort_report,
+    build_feature_ablation_report, build_opportunity_threshold_report, load_scan_outcomes,
+)
+from core.execution_labels import build_executable_labels
+from core.execution_replay import run_historical_execution_replay
+from core.entry_events import classify_entry_event, save_entry_event
 from core.performance_metrics import return_metrics
 from core.pro_workflow import classify_strategy_health
 from core.research_context import build_ai_research_context, get_global_market_context
@@ -1332,6 +1338,7 @@ def get_strategy_calibration_report(
     days: int = 120,
     min_grade_samples: int = 30,
     min_blocker_samples: int = 10,
+    executable: bool = False,
 ) -> Dict[str, Any]:
     """Point-in-time strategy, grade, bucket, regime, and blocker outcome calibration."""
     days = max(1, min(int(days), 3650))
@@ -1346,9 +1353,28 @@ def get_strategy_calibration_report(
         return payload
     try:
         outcomes = load_scan_outcomes(engine, days=days)
+        if executable and not outcomes.empty:
+            codes = outcomes["code"].astype(str).unique().tolist()
+            start_date = str(pd.to_datetime(outcomes["signal_date"]).min().date())
+            max_hold_days = 10
+            end_date = str((pd.to_datetime(outcomes["signal_date"]).max() + pd.Timedelta(days=max_hold_days * 3)).date())
+            query = text("""
+                SELECT code, date AS "日期", open AS "开盘", high AS "最高",
+                       low AS "最低", close AS "收盘"
+                FROM daily_k WHERE code IN :codes AND date >= :start_date AND date <= :end_date
+                ORDER BY code, date
+            """).bindparams(bindparam("codes", expanding=True))
+            daily = pd.read_sql(query, engine, params={"codes": codes, "start_date": start_date, "end_date": end_date})
+            outcomes = build_executable_labels(outcomes, daily, max_hold_days=max_hold_days)
         payload = build_calibration_report(outcomes, min_samples=min_grade_samples)
         payload["summary"]["days"] = days
         payload["blocker_analysis"] = build_blocker_report(outcomes, min_samples=min_blocker_samples)
+        payload["feature_ablation"] = build_feature_ablation_report(
+            outcomes,
+            ["sop_quality_score", "sector_strength_score", "stock_sector_fit_score", "sector_alignment_score"],
+            outcome="exec_return_pct" if executable else "ret_5d",
+            min_samples=min_grade_samples,
+        )
         payload["measurement_contract"] = _measurement_contract("calibration")
         payload["notes"] = [
             "信号价统一使用 daily_k 信号日收盘，避免扫描快照价与历史复权口径混用。",
@@ -1364,6 +1390,112 @@ def get_strategy_calibration_report(
         payload["notes"] = []
         payload["error"] = str(exc)
         return payload
+
+
+@router.get("/execution-science-report")
+def get_execution_science_report(days: int = 120) -> Dict[str, Any]:
+    """Read-only cohort and opportunity-threshold diagnostics for execution policy."""
+    days = max(1, min(int(days), 3650))
+    engine = get_db_engine()
+    if not engine:
+        outcomes = pd.DataFrame()
+    else:
+        try:
+            outcomes = load_scan_outcomes(engine, days=days)
+        except Exception as exc:
+            logger.error(f"Execution science report error: {exc}")
+            return {
+                "days": days,
+                "cohort_analysis": build_execution_cohort_report(pd.DataFrame()),
+                "opportunity_threshold_analysis": build_opportunity_threshold_report(pd.DataFrame()),
+                "error": str(exc),
+            }
+    return {
+        "days": days,
+        "cohort_analysis": build_execution_cohort_report(outcomes),
+        "opportunity_threshold_analysis": build_opportunity_threshold_report(outcomes),
+        "production_logic_changed": False,
+        "notes": [
+            "本接口只做样本外诊断，不自动修改选股、机会分或生产阈值。",
+            "至少比较全部研究候选、被拦截候选、Bark可交易候选的5日成熟收益。",
+        ],
+    }
+
+
+@router.get("/execution-policy-replay")
+def get_execution_policy_replay(days: int = 120) -> Dict[str, Any]:
+    """Replay the current execution policy against persisted point-in-time candidates."""
+    engine = get_db_engine()
+    if not engine:
+        return {"verdict": "INSUFFICIENT_DATA", "days": int(days), "error": "数据库未连接"}
+    try:
+        return run_historical_execution_replay(engine, days=days)
+    except Exception as exc:
+        logger.error(f"Execution policy replay error: {exc}")
+        return {"verdict": "ERROR", "days": int(days), "error": str(exc)}
+
+
+@router.get("/execution-policy-replay/rolling")
+def get_rolling_execution_policy_replay(windows: str = "60,120,250") -> Dict[str, Any]:
+    engine = get_db_engine()
+    if not engine:
+        return {"items": [], "error": "数据库未连接"}
+    selected = sorted({min(max(int(value), 20), 3650) for value in windows.split(",") if value.strip()})[:6]
+    return {"items": [run_historical_execution_replay(engine, days=days) for days in selected]}
+
+
+@router.get("/execution-plan-timeline/{code}")
+def get_execution_plan_timeline(code: str, limit: int = 30) -> Dict[str, Any]:
+    """Show how confirmation, stop, target, and lifecycle changed across point-in-time scans."""
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code")
+    engine = get_db_engine()
+    if not engine:
+        return {"code": code, "items": []}
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT COALESCE(data_date, date) AS data_date, scanned_at, strategy_type, sop_grade,
+                   price, pa_entry_price, pa_stop_price, pa_target_price, price_action_detail
+            FROM scan_history WHERE code = :code
+            ORDER BY COALESCE(scanned_at, date::timestamp) DESC LIMIT :limit
+        """), {"code": code, "limit": min(max(int(limit), 1), 100)}).mappings().all()
+    items = []
+    for row in rows:
+        detail = row.get("price_action_detail") or {}
+        items.append({
+            "data_date": row.get("data_date"), "scanned_at": row.get("scanned_at"),
+            "strategy_type": row.get("strategy_type"), "grade": row.get("sop_grade"),
+            "price": row.get("price"), "confirmation_price": row.get("pa_entry_price"),
+            "stop_price": row.get("pa_stop_price"), "target_price": row.get("pa_target_price"),
+            "trade_bucket": detail.get("trade_bucket"), "trade_eligible": detail.get("trade_eligible"),
+            "lifecycle": detail.get("decision_lifecycle_state"),
+            "plan_state": detail.get("execution_plan_state"),
+            "distance_to_trade": detail.get("distance_to_trade"),
+            "blockers": detail.get("trade_blockers") or [],
+        })
+    return {"code": code, "items": items}
+
+
+@router.post("/entry-event")
+def record_entry_event(payload: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(payload.get("code") or "")
+    try:
+        current_price = float(payload.get("current_price") or 0)
+        confirmation_price = float(payload.get("confirmation_price") or 0)
+        invalidation_price = float(payload["invalidation_price"]) if payload.get("invalidation_price") is not None else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="prices must be numeric")
+    if not validate_stock_code(code) or current_price <= 0 or confirmation_price <= 0:
+        raise HTTPException(status_code=400, detail="valid code, current_price and confirmation_price are required")
+    event_type = classify_entry_event(
+        current_price,
+        confirmation_price,
+        invalidation_price,
+        close_confirmed=bool(payload.get("close_confirmed")),
+    )
+    event = {**payload, "event_type": event_type}
+    saved = save_entry_event(get_db_engine(), event)
+    return {"event_type": event_type, "saved": saved}
 
 
 @router.get("/sector-watch-performance")

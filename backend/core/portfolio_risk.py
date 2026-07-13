@@ -26,6 +26,11 @@ DEFAULT_RISK_BUDGET = {
 }
 
 
+def calculate_capital_risk(capital_used: float, risk_pct: float) -> float:
+    """Money at risk if the planned stop fills, excluding overnight gap risk."""
+    return round(max(0.0, float(capital_used or 0)) * max(0.0, float(risk_pct or 0)) / 100, 2)
+
+
 def evaluate_floating_loss_circuit_breaker(
     engine: Optional[Engine],
     snapshot: Optional[pd.DataFrame] = None,
@@ -212,11 +217,16 @@ def evaluate_portfolio_risk_budget(
     new_strategy = new_trade.get("strategy_type") or "unknown"
     new_mode = new_trade.get("trade_mode") or "SIMULATED"
     new_risk = float(new_trade.get("pa_risk_pct") or 0)
+    new_capital_used = float(new_trade.get("capital_used") or 0)
+    new_capital_risk = calculate_capital_risk(new_capital_used, new_risk)
     new_sector = sector_map.get(new_code, "未知")
 
     open_count = len(open_df)
     real_count = int((open_df.get("trade_mode", pd.Series(dtype=str)) == "REAL").sum()) if not open_df.empty else 0
     total_plan_risk = float(open_df.get("pa_risk_pct", pd.Series(dtype=float)).fillna(0).sum()) if not open_df.empty else 0.0
+    existing_capital = pd.to_numeric(open_df.get("capital_used", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    existing_risk = pd.to_numeric(open_df.get("pa_risk_pct", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    current_capital_risk = float((existing_capital * existing_risk / 100).sum())
 
     strategy_count = 0
     sector_count = 0
@@ -241,7 +251,9 @@ def evaluate_portfolio_risk_budget(
 
     # 修复#4: 总仓位上限检查。所有OPEN持仓的capital_used之和 + 新仓 占虚拟总资金的比例。
     try:
-        existing_capital = float(open_df.get("capital_used", pd.Series(dtype=float)).fillna(0).sum())
+        existing_capital = float(pd.to_numeric(
+            open_df.get("capital_used", pd.Series(dtype=float)), errors="coerce",
+        ).fillna(0).sum())
     except Exception:
         existing_capital = 0.0
     new_capital = float(new_trade.get("capital_used") or new_trade.get("position_pct", 0) * float(new_trade.get("entry_price", 0) or 0) / 100 or 0)
@@ -251,6 +263,12 @@ def evaluate_portfolio_risk_budget(
     max_cap_pct = float(limits.get("max_total_capital_pct", 80.0))
     if capital_pct > max_cap_pct:
         warnings.append(f"总仓位占比将达到 {capital_pct:.1f}%，超过上限 {max_cap_pct:.0f}%（虚拟资金¥{virtual_cap/10000:.0f}万）")
+    projected_capital_risk_pct = (current_capital_risk + new_capital_risk) / virtual_cap * 100 if virtual_cap > 0 else 0
+    if projected_capital_risk_pct > float(limits["max_total_plan_risk_pct"]):
+        warnings.append(
+            f"组合资本风险将达到 {projected_capital_risk_pct:.2f}%，超过上限 "
+            f"{float(limits['max_total_plan_risk_pct']):.1f}%"
+        )
 
     summary.update({
         "open_positions": open_count,
@@ -260,6 +278,9 @@ def evaluate_portfolio_risk_budget(
         "strategy_positions": strategy_count,
         "current_plan_risk_pct": round(total_plan_risk, 2),
         "projected_plan_risk_pct": round(total_plan_risk + new_risk, 2),
+        "current_capital_risk_amount": round(current_capital_risk, 2),
+        "new_capital_risk_amount": new_capital_risk,
+        "projected_capital_risk_pct": round(projected_capital_risk_pct, 3),
     })
 
     status = "ok"
@@ -339,4 +360,49 @@ def build_portfolio_exposure(engine: Optional[Engine], budget: Optional[Dict[str
             "total_plan_risk_pct": total_plan_risk,
         },
         "budget": limits,
+    }
+
+
+def build_portfolio_stress(engine: Optional[Engine], lookback: int = 60) -> Dict[str, Any]:
+    """Estimate hidden correlation, liquidity capacity, and two-limit-down stress."""
+    if engine is None:
+        return {"status": "error", "positions": [], "correlation_clusters": []}
+    positions = pd.read_sql(text("SELECT code, name, capital_used FROM paper_trading WHERE status='OPEN'"), engine)
+    if positions.empty:
+        return {"status": "ok", "positions": [], "correlation_clusters": [], "two_limit_down_loss": 0}
+    codes = positions["code"].astype(str).tolist()
+    bars = pd.read_sql(text("""
+        SELECT code, date, close, vol FROM daily_k
+        WHERE code = ANY(:codes) AND date >= CURRENT_DATE - (:days || ' days')::interval
+        ORDER BY code, date
+    """), engine, params={"codes": codes, "days": max(20, min(int(lookback), 250)) * 2})
+    if bars.empty:
+        return {"status": "warn", "positions": [], "correlation_clusters": [], "warnings": ["持仓历史行情不足"]}
+    bars["amount_proxy"] = pd.to_numeric(bars["close"], errors="coerce") * pd.to_numeric(bars["vol"], errors="coerce")
+    close = bars.pivot(index="date", columns="code", values="close").tail(lookback)
+    corr = close.pct_change().corr(min_periods=20)
+    clusters = []
+    for i, code_a in enumerate(codes):
+        for code_b in codes[i + 1:]:
+            value = corr.loc[code_a, code_b] if code_a in corr.index and code_b in corr.columns else None
+            if pd.notna(value) and float(value) >= 0.75:
+                clusters.append({"codes": [code_a, code_b], "correlation": round(float(value), 2), "status": "warning"})
+    liquidity = bars.groupby("code")["amount_proxy"].mean().to_dict()
+    position_rows = []
+    for _, row in positions.iterrows():
+        capital = float(row.get("capital_used") or 0)
+        avg_amount = float(liquidity.get(str(row["code"])) or 0)
+        capacity = capital / avg_amount * 100 if avg_amount > 0 else None
+        position_rows.append({
+            "code": str(row["code"]), "name": row.get("name"),
+            "avg_amount_proxy": round(avg_amount, 2),
+            "position_to_avg_amount_pct": round(capacity, 3) if capacity is not None else None,
+            "liquidity_status": "warning" if capacity is not None and capacity > 1 else "ok",
+        })
+    two_limit_loss = float(pd.to_numeric(positions["capital_used"], errors="coerce").fillna(0).sum()) * 0.19
+    return {
+        "status": "warning" if clusters or any(item["liquidity_status"] == "warning" for item in position_rows) else "ok",
+        "positions": position_rows, "correlation_clusters": clusters,
+        "two_limit_down_loss": round(two_limit_loss, 2),
+        "assumption": "连续两日各下跌10%的近似压力场景",
     }

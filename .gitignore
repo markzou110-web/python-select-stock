@@ -16,6 +16,7 @@ dist/
 build/
 .venv/
 venv/
+backend/venv_new/
 
 # Database config (contains local credentials)
 backend/db_config.json
@@ -33,6 +34,11 @@ Thumbs.db
 # Celery
 celerybeat-schedule
 celerybeat.pid
+*.pid
+.frontend_url
+*_restart.pid
+backend/*_restart.pid
+frontend/*_restart.pid
 
 # Profiler
 *.prof
@@ -51,3 +57,4 @@ verify_*.py
 check_*.py
 scan_today_signals.py
 backend/scratch/
+backend/backups/

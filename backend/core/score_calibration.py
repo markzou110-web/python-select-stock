@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import Any, Dict, List
+import math
 
 
 # 综合评分权重（求和=1.0）。历史胜率（historical_win_rate）专项 0.10，
@@ -70,6 +71,23 @@ def _parse_win_rate(row: Dict[str, Any]) -> float:
         return 50.0
 
 
+def beta_binomial_probability(wins: float, trials: int, alpha: float = 2.0, beta: float = 2.0) -> Dict[str, float]:
+    """Small-sample shrinkage with an approximate 95% credible interval."""
+    trials = max(0, int(trials))
+    wins = max(0.0, min(float(wins), trials))
+    a, b = alpha + wins, beta + trials - wins
+    mean = a / (a + b)
+    variance = a * b / (((a + b) ** 2) * (a + b + 1))
+    margin = 1.96 * math.sqrt(variance)
+    return {
+        "p_win": round(mean, 4),
+        "ci95_low": round(max(0.0, mean - margin), 4),
+        "ci95_high": round(min(1.0, mean + margin), 4),
+        "trials": trials,
+        "model_version": "beta-binomial-2-2-v1",
+    }
+
+
 def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert strategy-specific raw scores into a comparable 0-100 score."""
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -88,6 +106,9 @@ def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             safety = _clamp(row.get("pa_risk_score"), 50)
             price_action_composite = round(structure * 0.4 + execution * 0.35 + safety * 0.25, 1)
             historical_win_rate = _parse_win_rate(row)
+            backtest_stats = row.get("回测统计") or {}
+            trials = int(backtest_stats.get("signal_count") or backtest_stats.get("total_signals") or 0)
+            probability = beta_binomial_probability(historical_win_rate / 100 * trials, trials)
             components = {
                 "strategy_percentile": percentile,
                 "price_action": price_action_composite,
@@ -109,6 +130,8 @@ def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             row["raw_score"] = round(raw_score, 2)
             row["calibrated_score"] = calibrated
             row["score_components"] = components
+            row["win_probability"] = probability
+            row["p_win"] = round(probability["p_win"] * 100, 1)
             row["Score"] = calibrated
 
             missing = []

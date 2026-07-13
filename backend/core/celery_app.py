@@ -113,6 +113,18 @@ celery_app.conf.update(
             'schedule': crontab(hour=15, minute=10),
             'kwargs': {'slot': 'after_close_review'},
         },
+        'expire-execution-intents-1510': {
+            'task': 'tasks.expire_execution_intents',
+            'schedule': crontab(hour=15, minute=10, day_of_week='1-5'),
+        },
+        'event-catalyst-discovery-1630': {
+            'task': 'tasks.discover_event_catalysts',
+            'schedule': crontab(hour=16, minute=30, day_of_week='1-5'),
+        },
+        'database-backup-2030': {
+            'task': 'tasks.database_backup',
+            'schedule': crontab(hour=20, minute=30),
+        },
         # 买入时点周报：每周一 09:00，对比尾盘买 vs 次日开盘买的胜率
         'weekly-entry-timing-report-monday-0900': {
             'task': 'tasks.weekly_entry_timing_report',

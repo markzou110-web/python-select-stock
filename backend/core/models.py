@@ -183,6 +183,49 @@ class ScanAuditLog(Base):
     result_count = Column(Integer, default=0)
     fail_reasons = Column(JSON, nullable=True)
     error_message = Column(Text, nullable=True)
+    as_of = Column(DateTime, nullable=True)
+    data_mode = Column(String(30), nullable=True)
+    field_coverage = Column(JSON, nullable=True)
+    effective_filters = Column(JSON, nullable=True)
+    research_only = Column(Integer, default=0)
+    degradation_reasons = Column(JSON, nullable=True)
+
+
+class PointInTimeStockSnapshot(Base):
+    __tablename__ = "point_in_time_stock_snapshots"
+    __table_args__ = (
+        UniqueConstraint("dataset_version", "code", name="uq_point_in_time_snapshot"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dataset_version = Column(String(100), nullable=False)
+    as_of = Column(DateTime, nullable=False)
+    data_mode = Column(String(30), nullable=False)
+    code = Column(String(20), nullable=False)
+    name = Column(String(100), nullable=True)
+    industry = Column(String(100), nullable=True)
+    is_st_or_delist = Column(Integer, default=0)
+    turnover = Column(Float, nullable=True)
+    mkt_cap = Column(Float, nullable=True)
+    source = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class EventCatalyst(Base):
+    __tablename__ = "event_catalysts"
+    __table_args__ = (
+        UniqueConstraint("code", "published_at", "event_type", name="uq_event_catalyst_identity"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(20), nullable=False)
+    event_type = Column(String(40), nullable=False)
+    published_at = Column(DateTime, nullable=False)
+    title = Column(String(300), nullable=True)
+    profit_growth_low = Column(Float, nullable=True)
+    profit_growth_high = Column(Float, nullable=True)
+    source_url = Column(Text, nullable=True)
+    verified = Column(Integer, default=0)
+    metadata_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class ResearchThesis(Base):
@@ -285,3 +328,66 @@ class NotificationAudit(Base):
     results = Column(JSON, nullable=True)
     group_name = Column(String(100), nullable=True)
     body_preview = Column(Text, nullable=True)
+
+
+class StrategyReleaseState(Base):
+    __tablename__ = "strategy_release_states"
+    strategy_key = Column(String(100), primary_key=True)
+    state = Column(String(30), nullable=False, default="DRAFT")
+    version = Column(String(80), nullable=True)
+    evidence = Column(JSON, nullable=True)
+    reason = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BacktestExperiment(Base):
+    __tablename__ = "backtest_experiments"
+    experiment_id = Column(String(40), primary_key=True)
+    content_hash = Column(String(64), nullable=False, unique=True)
+    experiment_type = Column(String(40), nullable=False)
+    strategy_type = Column(String(40), nullable=False)
+    code_version = Column(String(80), nullable=False)
+    data_hash = Column(String(64), nullable=False)
+    request_payload = Column(JSON, nullable=False)
+    data_manifest = Column(JSON, nullable=False)
+    result_payload = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ExecutionIntent(Base):
+    __tablename__ = "execution_intents"
+    __table_args__ = (
+        UniqueConstraint("signal_date", "source", "code", "strategy_type", name="uq_execution_intent_signal"),
+    )
+    intent_id = Column(String(40), primary_key=True)
+    signal_date = Column(Date, nullable=False)
+    issued_at = Column(DateTime, nullable=False)
+    valid_until = Column(DateTime, nullable=True)
+    source = Column(String(40), nullable=False)
+    code = Column(String(20), nullable=False)
+    name = Column(String(50), nullable=True)
+    strategy_type = Column(String(40), nullable=False)
+    instruction = Column(String(20), nullable=False)
+    state = Column(String(20), nullable=False, default="ISSUED")
+    planned_entry_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    target_price = Column(Float, nullable=True)
+    planned_position_pct = Column(Float, nullable=True)
+    ordered_shares = Column(Integer, nullable=True)
+    filled_shares = Column(Integer, nullable=True)
+    actual_price = Column(Float, nullable=True)
+    slippage_pct = Column(Float, nullable=True)
+    signal_snapshot = Column(JSON, nullable=True)
+    updated_at = Column(DateTime, nullable=False)
+
+
+class ExecutionIntentEvent(Base):
+    __tablename__ = "execution_intent_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    intent_id = Column(String(40), nullable=False)
+    event_at = Column(DateTime, nullable=False)
+    from_state = Column(String(20), nullable=True)
+    to_state = Column(String(20), nullable=False)
+    actual_price = Column(Float, nullable=True)
+    shares = Column(Integer, nullable=True)
+    note = Column(Text, nullable=True)

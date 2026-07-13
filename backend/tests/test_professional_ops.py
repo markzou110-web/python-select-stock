@@ -14,11 +14,14 @@ from core.db import (
     init_db,
     save_failure_sample,
     save_recommendation_events,
+    save_point_in_time_snapshot,
+    save_event_catalyst,
+    load_active_event_catalysts,
     save_scan_audit_log,
     save_scan_results,
 )
 from core.models import Base
-from core.portfolio_risk import evaluate_portfolio_risk_budget
+from core.portfolio_risk import calculate_capital_risk, evaluate_portfolio_risk_budget
 from routers import market, paper_trade
 
 
@@ -119,13 +122,67 @@ def test_scan_audit_log_persists_on_sqlite():
         "candidate_count": 20,
         "result_count": 3,
         "fail_reasons": {"量能不足": 17},
+        "as_of": "2025-05-31 15:00:00",
+        "data_mode": "LOCAL_DB",
+        "field_coverage": {"price": 1.0, "turnover": 0.0},
+        "effective_filters": ["target_market", "positive_pct_change"],
+        "research_only": True,
+        "degradation_reasons": ["换手率字段不完整"],
     }, engine)
 
     with engine.connect() as conn:
-        count = conn.execute(text("SELECT COUNT(*) FROM scan_audit_log")).scalar()
+        row = conn.execute(text("""
+            SELECT data_mode, research_only, field_coverage, effective_filters
+            FROM scan_audit_log
+        """)).mappings().one()
 
     assert ok is True
-    assert count == 1
+    assert row["data_mode"] == "LOCAL_DB"
+    assert row["research_only"] == 1
+    assert "turnover" in row["field_coverage"]
+    assert "positive_pct_change" in row["effective_filters"]
+
+
+def test_init_db_adds_point_in_time_fields_to_legacy_scan_audit_table():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE scan_audit_log (id INTEGER PRIMARY KEY)"))
+
+    init_db(engine)
+
+    columns = {column["name"] for column in inspect(engine).get_columns("scan_audit_log")}
+    assert {
+        "as_of", "data_mode", "field_coverage", "effective_filters",
+        "research_only", "degradation_reasons",
+    } <= columns
+
+
+def test_point_in_time_snapshot_is_versioned_and_idempotent():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    snapshot = pd.DataFrame([{
+        "code": "000001", "name": "平安银行", "industry": "银行",
+        "turnover": 2.5, "mkt_cap": 100000000000,
+    }])
+    assert save_point_in_time_snapshot(snapshot, "LOCAL_DB:2026-07-11", "2026-07-11", "LOCAL_DB", engine) == 1
+    snapshot.loc[0, "turnover"] = 3.0
+    assert save_point_in_time_snapshot(snapshot, "LOCAL_DB:2026-07-11", "2026-07-11", "LOCAL_DB", engine) == 1
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT COUNT(*), MAX(turnover) FROM point_in_time_stock_snapshots")).one()
+    assert row == (1, 2.5)  # frozen dataset versions are immutable on repeat scans
+
+
+def test_verified_event_catalyst_round_trip():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    assert save_event_catalyst({
+        "code": "000977", "event_type": "EARNINGS_SURPRISE",
+        "published_at": "2026-07-08 08:00:00", "title": "半年度业绩预告",
+        "profit_growth_low": 226, "profit_growth_high": 288,
+        "source_url": "https://static.cninfo.com.cn/example.pdf", "verified": True,
+    }, engine)
+    items = load_active_event_catalysts(engine, as_of="2026-07-10", days=10)
+    assert items["000977"]["profit_growth_low"] == 226
 
 
 def test_sector_push_gaps_endpoint_explains_hot_sector_without_db(monkeypatch):
@@ -284,6 +341,10 @@ def test_portfolio_risk_budget_warns_on_exposure():
     assert result["status"] == "warning"
     assert any("行业" in item for item in result["warnings"])
     assert any("组合计划风险" in item for item in result["warnings"])
+
+
+def test_capital_risk_uses_position_amount_and_stop_distance():
+    assert calculate_capital_risk(100000, 2.5) == 2500
 
 
 def test_portfolio_stats_derives_pl_pct_from_trade_prices(monkeypatch):

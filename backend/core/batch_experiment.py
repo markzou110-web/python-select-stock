@@ -13,6 +13,30 @@ DEFAULT_TRAIN_RATIO = 0.7
 OVERFIT_WARNING_GAP = 10.0
 
 
+def build_rolling_windows(
+    length: int,
+    train_size: int,
+    validation_size: int,
+    test_size: int,
+    step_size: int,
+) -> List[Dict[str, slice]]:
+    """Return non-overlapping train/validation/test slices rolled through time."""
+    sizes = [max(1, int(value)) for value in (train_size, validation_size, test_size, step_size)]
+    train_size, validation_size, test_size, step_size = sizes
+    windows = []
+    end_required = train_size + validation_size + test_size
+    for start in range(0, max(0, length - end_required + 1), step_size):
+        train_end = start + train_size
+        validation_end = train_end + validation_size
+        test_end = validation_end + test_size
+        windows.append({
+            "train": slice(start, train_end),
+            "validation": slice(train_end, validation_end),
+            "test": slice(validation_end, test_end),
+        })
+    return windows
+
+
 def run_batch_experiment(engine, codes: List[str], strategy_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     days = min(max(int(payload.get("days") or 720), 120), 1500)
     start_date = payload.get("start_date") or (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -88,6 +112,7 @@ def _summary_subset(summary: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "signal_count": summary.get("signal_count", 0),
         "win_rate": summary.get("win_rate", 0),
+        "avg_return": summary.get("avg_return", 0),
         "total_return": summary.get("total_return", 0),
         "profit_factor": summary.get("profit_factor", 0),
         "max_drawdown": summary.get("max_drawdown", 0),
@@ -186,6 +211,109 @@ def run_walk_forward_experiment(engine, codes: List[str], strategy_type: str, pa
             "oos_avg_win_rate": round(sum(oos_rates) / len(oos_rates), 2) if oos_rates else 0,
             "avg_overfit_gap": round(sum(gaps) / len(gaps), 2) if gaps else 0,
             "overfit_warning_count": sum(1 for it in effective if it.get("overfit_warning")),
+        },
+        "items": items,
+    }
+
+
+def run_rolling_walk_forward_experiment(engine, codes: List[str], strategy_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Multi-window OOS evaluation with strictly separated train/validation/test periods."""
+    days = min(max(int(payload.get("days") or 1500), 240), 3650)
+    start_date = payload.get("start_date") or (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    end_date = payload.get("end_date")
+    train_size = int(payload.get("train_size") or 360)
+    validation_size = int(payload.get("validation_size") or 60)
+    test_size = int(payload.get("test_size") or 60)
+    step_size = int(payload.get("step_size") or test_size)
+    params = {
+        "threshold": payload.get("threshold", 0.12),
+        "vol_multiplier": payload.get("vol_multiplier", 1.5),
+        "rsi_min": payload.get("rsi_min", 55),
+        "pine_min_signals": payload.get("pine_min_signals", 3),
+        "stop_loss_pct": payload.get("stop_loss_pct", -8.0),
+        "max_hold_days": payload.get("max_hold_days", 10),
+        "entry_mode": payload.get("entry_mode", "next_open_confirm"),
+        "max_open_gap_pct": payload.get("max_open_gap_pct", 3.0),
+        "slippage_bps": payload.get("slippage_bps", 5.0),
+        "position_pct": payload.get("position_pct", 1.0),
+    }
+    items = []
+    all_tests = []
+    for code in codes:
+        df = load_from_db(code, start_date, engine)
+        if end_date and not df.empty:
+            df = df[df["日期"].astype(str).str[:10] <= end_date]
+        if df.empty:
+            items.append({"code": code, "status": "NO_DATA", "windows": []})
+            continue
+        enable_pine = strategy_type in {"pine", "tv_zp"}
+        full = calculate_indicators(df, enable_pine_indicators=enable_pine)
+        if enable_pine and "RF_Upward" not in full.columns:
+            full = calculate_pine_indicators(full)
+        windows = []
+        for index, slices in enumerate(build_rolling_windows(len(full), train_size, validation_size, test_size, step_size), 1):
+            segments = {}
+            for name, segment_slice in slices.items():
+                # Keep causal warm-up history, but only allow signals inside this segment.
+                segment = full.iloc[:segment_slice.stop].reset_index(drop=True)
+                maturity_buffer = max(0, int(params["max_hold_days"]))
+                if str(params.get("entry_mode")) == "next_open_confirm":
+                    maturity_buffer += 1
+                last_mature_signal_idx = segment_slice.stop - maturity_buffer - 1
+                segment_params = {
+                    **params,
+                    "signal_start_date": str(full.iloc[segment_slice.start]["日期"])[:10],
+                    "signal_end_date": (
+                        str(full.iloc[last_mature_signal_idx]["日期"])[:10]
+                        if last_mature_signal_idx >= segment_slice.start else "0000-00-00"
+                    ),
+                }
+                result = run_single_stock_backtest(segment, strategy_type=strategy_type, params=segment_params)
+                segments[name] = _summary_subset(result["summary"])
+            test_summary = segments["test"]
+            all_tests.append(test_summary)
+            windows.append({
+                "window": index,
+                "periods": {
+                    name: {
+                        "start": str(full.iloc[value.start]["日期"])[:10],
+                        "end": str(full.iloc[value.stop - 1]["日期"])[:10],
+                    }
+                    for name, value in slices.items()
+                },
+                **segments,
+                "test_positive_expectancy": test_summary["total_return"] > 0,
+            })
+        items.append({"code": code, "status": "OK" if windows else "INSUFFICIENT_DATA", "windows": windows})
+
+    total_signals = sum(row["signal_count"] for row in all_tests)
+    weighted_win_rate = (
+        sum(row["win_rate"] * row["signal_count"] for row in all_tests) / total_signals
+        if total_signals else 0
+    )
+    positive_windows = sum(1 for row in all_tests if row["total_return"] > 0)
+    weighted_avg_return = (
+        sum(row["avg_return"] * row["signal_count"] for row in all_tests) / total_signals
+        if total_signals else 0
+    )
+    weighted_profit_factor = (
+        sum(row["profit_factor"] * row["signal_count"] for row in all_tests) / total_signals
+        if total_signals else 0
+    )
+    return {
+        "meta": {
+            "strategy_type": strategy_type, "start_date": start_date, "end_date": end_date,
+            "train_size": train_size, "validation_size": validation_size,
+            "test_size": test_size, "step_size": step_size,
+            "window_unit": "trading_rows", "params_frozen": True,
+        },
+        "summary": {
+            "test_windows": len(all_tests), "test_signals": total_signals,
+            "oos_weighted_win_rate": round(weighted_win_rate, 2),
+            "oos_weighted_avg_return": round(weighted_avg_return, 4),
+            "oos_weighted_profit_factor": round(weighted_profit_factor, 4),
+            "positive_test_windows": positive_windows,
+            "positive_window_ratio": round(positive_windows / len(all_tests), 3) if all_tests else 0,
         },
         "items": items,
     }

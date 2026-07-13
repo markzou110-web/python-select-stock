@@ -24,6 +24,7 @@ import BacktestLab from '@/components/BacktestLab';
 import StockDetailPage from '@/components/StockDetailPage';
 import SectorRadarView from '@/components/SectorRadarView';
 import ResearchRadarView from '@/components/ResearchRadarView';
+import ExecutionInbox from '@/components/ExecutionInbox';
 import { Download, LayoutGrid, List, Search, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
@@ -148,6 +149,10 @@ export default function Dashboard() {
                             ) : activeView === 'review' ? (
                                 <ErrorBoundary fallbackTitle="交易复盘加载异常">
                                     <ReviewCenter />
+                                </ErrorBoundary>
+                            ) : activeView === 'execution-inbox' ? (
+                                <ErrorBoundary fallbackTitle="执行收件箱加载异常">
+                                    <ExecutionInbox />
                                 </ErrorBoundary>
                             ) : activeView === 'backtest' ? (
                                 <ErrorBoundary fallbackTitle="策略回测加载异常">

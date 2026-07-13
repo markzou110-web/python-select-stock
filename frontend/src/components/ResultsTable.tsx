@@ -22,11 +22,11 @@ import {
     Eye
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import api from '@/lib/api';
 import dynamic from 'next/dynamic';
 const StockChart = dynamic(() => import('./StockChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
 import PositionSizer from './PositionSizer';
 import HeatmapOptimizer from './HeatmapOptimizer';
-import api from '@/lib/api';
 import { ScanResult } from '@/stores/scanStore';
 export default function ResultsTable({
     results,
@@ -49,6 +49,18 @@ export default function ResultsTable({
     const [collapsedSectors, setCollapsedSectors] = useState<Set<string>>(new Set());
     const [sopFilterOnly, setSopFilterOnly] = useState(false);
     const [brooksFilter, setBrooksFilter] = useState<'ALL' | 'READY' | 'NO_AVOID' | 'LOW_RISK' | 'PULLBACK' | 'LOW_FAILURE' | 'H2_STRONG' | 'STRONG_TREND'>('ALL');
+    const [timeline, setTimeline] = useState<any>(null);
+    const [timelineLoading, setTimelineLoading] = useState(false);
+
+    const openTimeline = async (code: string) => {
+        setTimelineLoading(true);
+        try {
+            const response = await api.get(`/api/review/execution-plan-timeline/${code}`);
+            setTimeline(response.data);
+        } finally {
+            setTimelineLoading(false);
+        }
+    };
 
     const applyBrooksFilter = (rows: ScanResult[]) => {
         if (brooksFilter === 'READY') {
@@ -735,7 +747,14 @@ export default function ResultsTable({
                                                 <p><span className="text-slate-400">触发：</span>{res.pa_trade_plan.entry_condition}</p>
                                                 <p><span className="text-slate-400">失效：</span>{res.pa_trade_plan.invalidation}</p>
                                                 <p><span className="text-slate-400">仓位：</span>{res.pa_trade_plan.position_hint} / 风险 {res.pa_trade_plan.risk_pct || 0}%</p>
+                                                <p><span className="text-slate-400">有效确认：</span>{res.execution_plan_state?.active_confirmation_price || res.pa_entry_price || '--'} / {res.execution_plan_state?.state || 'GENERATED_PLAN'}</p>
+                                                <p><span className="text-slate-400">执行盈亏比：</span>{res.execution_rr?.execution_rr ?? res.pa_risk_reward ?? '--'}</p>
                                             </div>
+                                            {!!res.distance_to_trade?.steps?.length && (
+                                                <div className="mt-3 rounded-xl bg-amber-50 border border-amber-100 p-2 text-[11px] font-bold text-amber-700">
+                                                    距可交易：{res.distance_to_trade.steps.join('；')}
+                                                </div>
+                                            )}
                                             {res.pa_trade_plan.avoid_reasons?.length > 0 && (
                                                 <div className="mt-3 flex flex-wrap gap-1.5">
                                                     {res.pa_trade_plan.avoid_reasons.map((reason, i) => (
@@ -755,6 +774,15 @@ export default function ResultsTable({
                                     <span className="text-xs text-slate-400 font-bold font-mono tracking-widest">{res.名称} {res.代码}</span>
                                 </div>
                                 <div className="flex gap-4">
+                                    <button
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            openTimeline(res.代码);
+                                        }}
+                                        className="flex items-center gap-1.5 text-xs font-bold text-amber-600 hover:text-amber-700 transition-colors"
+                                    >
+                                        <History size={12} />计划时间线
+                                    </button>
                                     <button
                                         onClick={(e) => { e.stopPropagation(); openChart(res.代码); }}
                                         className="flex items-center gap-1.5 text-xs font-bold text-indigo-600 hover:text-indigo-700 transition-colors"
@@ -858,6 +886,30 @@ export default function ResultsTable({
 
     return (
         <div className="glass-card overflow-hidden border-none shadow-2xl shadow-slate-200/50 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            {(timeline || timelineLoading) && (
+                <div className="fixed inset-0 z-50 bg-slate-950/40 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !timelineLoading && setTimeline(null)}>
+                    <div className="w-full max-w-3xl max-h-[80vh] overflow-auto rounded-2xl bg-white p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center justify-between mb-4">
+                            <div><h3 className="font-black text-slate-800">执行计划时间线</h3><p className="text-xs text-slate-400">{timeline?.code || '加载中'}</p></div>
+                            <button onClick={() => setTimeline(null)} className="text-xs font-black text-slate-500">关闭</button>
+                        </div>
+                        {timelineLoading ? <div className="p-10 text-center text-slate-400">加载中...</div> : (
+                            <div className="space-y-3">
+                                {(timeline?.items || []).map((item: any, index: number) => (
+                                    <div key={`${item.scanned_at}-${index}`} className="rounded-xl border border-slate-100 bg-slate-50 p-3">
+                                        <div className="flex justify-between text-xs font-black text-slate-700"><span>{item.data_date} · {item.strategy_type}</span><span>{item.grade || '--'} / {item.trade_bucket || '--'}</span></div>
+                                        <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] text-slate-500">
+                                            <span>现价 {item.price ?? '--'}</span><span>确认 {item.confirmation_price ?? '--'}</span><span>止损 {item.stop_price ?? '--'}</span><span>目标 {item.target_price ?? '--'}</span>
+                                        </div>
+                                        <div className="mt-2 text-[11px] font-bold text-amber-700">状态：{item.plan_state?.state || item.lifecycle || '--'}</div>
+                                        {!!item.blockers?.length && <div className="mt-1 text-[10px] text-slate-400">{item.blockers.slice(0, 3).join('；')}</div>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
             <div className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white">
                 <div className="flex items-center gap-3">
                     <div className="w-10 h-10 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center">

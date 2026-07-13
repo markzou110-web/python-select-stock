@@ -81,6 +81,9 @@ export interface ScanResult {
     trade_opportunity_label?: string;
     trade_state?: 'BLOCKED' | 'WATCHLIST' | 'PROBE' | 'CONFIRM_ADD' | 'TREND_HOLD' | string;
     execution_instruction?: string;
+    execution_rr?: { planned_rr?: number; current_rr?: number; space_rr?: number; execution_rr?: number; price_basis?: number };
+    execution_plan_state?: { state?: string; active_confirmation_price?: number; prior_confirmation_price?: number; generated_confirmation_price?: number };
+    distance_to_trade?: { remaining_count?: number; steps?: string[]; invalidation_price?: number };
     position_plan?: {
         label: string;
         initial_position_pct: number;

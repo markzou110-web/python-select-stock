@@ -6,7 +6,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.outcome_calibration import build_blocker_report, build_calibration_report
+from core.outcome_calibration import (
+    build_blocker_report, build_calibration_report, build_execution_cohort_report,
+    build_feature_ablation_report, build_opportunity_threshold_report,
+)
 
 
 def _sample_frame() -> pd.DataFrame:
@@ -18,6 +21,9 @@ def _sample_frame() -> pd.DataFrame:
             "strategy_type": "strict",
             "sop_grade": "A",
             "trade_bucket": "TRADE",
+            "trade_eligible": True,
+            "research_eligible": True,
+            "trade_opportunity_score": 70,
             "market_regime": "OFFENSIVE",
             "score_model_version": "v1",
             "grade_stage": "A-TRADE",
@@ -36,6 +42,9 @@ def _sample_frame() -> pd.DataFrame:
             "strategy_type": "strict",
             "sop_grade": "B",
             "trade_bucket": "OBSERVE",
+            "trade_eligible": False,
+            "research_eligible": True,
+            "trade_opportunity_score": 58,
             "market_regime": "OFFENSIVE",
             "score_model_version": "v1",
             "grade_stage": "B-STRUCTURE",
@@ -99,3 +108,27 @@ def test_blocker_report_marks_small_samples_as_research_only():
 
     row = next(item for item in report["items"] if item["blocker"] == "小样本规则")
     assert row["recommendation"] == "RESEARCH_ONLY"
+
+
+def test_feature_ablation_reports_rank_direction_without_claiming_causality():
+    df = pd.DataFrame({"score": range(40), "exec_return_pct": range(40)})
+    report = build_feature_ablation_report(df, ["score"], min_samples=30)
+    assert report["items"][0]["rank_correlation"] == 1.0
+    assert report["items"][0]["status"] == "OOS_REQUIRED"
+
+
+def test_execution_cohorts_keep_research_blocked_and_executable_separate():
+    report = build_execution_cohort_report(_sample_frame())
+    cohorts = {item["cohort"]: item for item in report["cohorts"]}
+    assert cohorts["research_candidate"]["signals"] == 24
+    assert cohorts["blocked_candidate"]["metrics"]["5d"]["avg_return"] == -1.0
+    assert cohorts["executable_candidate"]["metrics"]["5d"]["avg_return"] == 2.0
+
+
+def test_opportunity_threshold_report_is_diagnostic_only():
+    report = build_opportunity_threshold_report(_sample_frame())
+    rows = {item["threshold"]: item for item in report["thresholds"]}
+    assert rows[55.0]["signals"] == 24
+    assert rows[60.0]["signals"] == 12
+    assert report["production_threshold"] == 60
+    assert report["status"] == "DIAGNOSTIC_ONLY"

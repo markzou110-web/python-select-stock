@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.performance_metrics import return_metrics
 from core.pro_workflow import classify_strategy_health
-from core.score_calibration import calibrate_scan_scores
+from core.score_calibration import beta_binomial_probability, calibrate_scan_scores
 from core.strategy_health import apply_strategy_health_controls
 
 
@@ -45,6 +45,14 @@ def test_incomplete_scan_sample_is_not_research_eligible():
 
     assert rows[0]["research_eligible"] is False
     assert "pa_trade_action" in rows[0]["research_missing_fields"]
+
+
+def test_beta_binomial_probability_shrinks_small_samples():
+    small = beta_binomial_probability(1, 1)
+    large = beta_binomial_probability(80, 100)
+    assert small["p_win"] < 0.8
+    assert large["p_win"] > small["p_win"]
+    assert small["ci95_high"] - small["ci95_low"] > large["ci95_high"] - large["ci95_low"]
 
 
 def test_return_metrics_and_strategy_health_use_net_expectation():
