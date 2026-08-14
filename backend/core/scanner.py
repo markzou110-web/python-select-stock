@@ -29,14 +29,39 @@ from core.indicators import (
     get_weekly_indicators, batch_calculate_indicators
 )
 from core.strategy import (
-    check_strategy, check_pine_strategy, check_tv_zp_strategy, check_tv_dual_strategy, check_consensus_strategy,
+    check_strategy, check_pine_strategy, check_tv_zp_strategy, check_tv_dual_strategy, check_tv_reversal_watch, check_consensus_strategy,
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_tv_zp_win_rate, calculate_tv_dual_win_rate, calculate_consensus_win_rate,
     STRATEGY_LOGIC_VERSION, BACKTEST_ENGINE_VERSION, EXIT_RULE_VERSION
 )
 from core.price_action import analyze_price_action
+from core.pa_execution_policy import classify_price_action_execution
 from core.risk_engine import compute_paper_risk_levels
-from core.risk_constants import BACKTEST_STOP_LOSS_PCT, EVIDENCE_GATE_MODE  # 与实盘硬止损同源，保证回测胜率反映真实规则
+from core.risk_constants import (
+    A_EOD_CONTROLLED_POLICY_VERSION,
+    A_EOD_MAX_5D_GAIN_PCT,
+    A_EOD_MAX_ENTRY_EXTENSION_PCT,
+    A_EOD_MIN_QUALITY_SCORE,
+    A_EOD_MIN_RISK_REWARD,
+    A_MINUS_TRIAL_MAX_DAILY_RISE_PCT,
+    A_MINUS_TRIAL_MIN_PRICE_ACTION_SCORE,
+    A_MINUS_TRIAL_MIN_QUALITY_SCORE,
+    A_MINUS_TRIAL_MIN_RISK_REWARD,
+    A_MINUS_TRIAL_POLICY_VERSION,
+    BACKTEST_STOP_LOSS_PCT,
+    EVIDENCE_GATE_MODE,
+    SOP_A_GRADE_5D_PENALTY_PER_PCT,
+    SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT,
+    SOP_A_GRADE_MAX_5D_GAIN_PCT,
+    SOP_A_GRADE_MIN_PRICE_ACTION_SCORE,
+    SOP_A_GRADE_MIN_SCORE,
+    SOP_A_GRADE_POLICY_VERSION,
+    SOP_A_GRADE_STRATEGIES,
+    PRIMARY_TV_STRATEGY,
+    TV_MA_ONLY_MIN_PA_SCORE,
+    TV_SIGNAL_WARMUP_DAYS,
+)  # 与实盘硬止损同源，保证回测胜率反映真实规则
 from core.scan_preflight import build_scan_preflight
+from core.trading_calendar import shift_a_share_trading_date
 
 # 数据预检熔断开关：True 时，若 preflight 报告 blocking（数据异常/陈旧），
 # perform_market_scan 会中止并返回空结果，避免坏数据静默产生假信号。
@@ -75,7 +100,7 @@ STRICT_REAL_SIGNAL_GATE = True
 REVIVAL_LOOKBACK_DAYS = 10
 REVIVAL_SOURCE_STRATEGIES = ("tv_dual", "tv_dual_strict", "squeeze", "tv_zp")
 MOMENTUM_ACCEL_LOOKBACK_DAYS = 5
-EXECUTION_PLAN_FREEZE_DAYS = 10
+EXECUTION_PLAN_FREEZE_SESSIONS = 3
 CONFIRMATION_PRICE_TOLERANCE_PCT = 0.05
 MAX_FROZEN_ENTRY_EXTENSION_PCT = 3.0
 EARLY_VALUE_MIN_RISE_FROM_20D_LOW = 10.0
@@ -83,13 +108,23 @@ EARLY_VALUE_MAX_RISE_FROM_20D_LOW = 20.0
 EARLY_VALUE_MAX_5D_RISE = 12.0
 EARLY_VALUE_MIN_VOLUME_RATIO = 1.05
 EARLY_VALUE_MAX_VOLUME_RATIO = 2.20
+BOTTOM_DISCOVERY_LOOKBACK_DAYS = 60
+BOTTOM_DISCOVERY_MAX_RISE_FROM_LOW = 12.0
+BOTTOM_DISCOVERY_NO_NEW_LOW_TOLERANCE = 0.005
+BOTTOM_DISCOVERY_MAX_BASE_VOLUME_RATIO = 0.95
+BOTTOM_DISCOVERY_MAX_CURRENT_VOLUME_RATIO = 1.80
+BOTTOM_DISCOVERY_MAX_RANGE_CONTRACTION_RATIO = 1.05
+BOTTOM_DISCOVERY_MIN_EMA20_SLOPE_5D_PCT = -1.5
 from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
 from core.money_flow import get_money_flow_rank
-from core.decision_layer import apply_decision_layer
+from core.decision_layer import apply_decision_layer, apply_growth_segment_context
 from routers.market import fetch_mine_sweeper_data
 from core.data_source_quality import get_suspected_adjustment_gap_codes
-from core.execution_audit import classify_trade_blockers
-from core.execution_insights import build_distance_to_trade, build_execution_rr, build_frozen_plan_state
+from core.execution_audit import assess_persistent_b_shadow, classify_trade_blockers, load_recent_push_counts
+from core.execution_insights import (
+    build_distance_to_trade, build_execution_rr, build_frozen_plan_state,
+    get_active_execution_plan,
+)
 
 
 EXECUTABLE_PA_ACTIONS = {"READY"}
@@ -113,8 +148,8 @@ SMALL_CAP_MIN_EXECUTION_YI = 50.0
 MID_CAP_MIN_EXECUTION_YI = 50.0
 LARGE_CAP_TURNOVER_CONFIRM_YI = 500.0
 EARLY_ENTRY_MAX_CONFIRM_GAP_PCT = 0.8
-CORE_TRADE_STRATEGIES = {"tv_dual_strict"}
-DISCOVERY_ONLY_STRATEGIES = {"tv_dual"}
+CORE_TRADE_STRATEGIES = {"tv_dual_strict", "tv_dual"}
+DISCOVERY_ONLY_STRATEGIES = set()  # tv_dual 已升格为核心交易策略，发现层白名单为空
 H1_STRONG_SECTOR_ALIGNMENT = 85.0
 H1_EARLY_SECTOR_ALIGNMENT = 90.0
 SWEET_SPOT_OPPORTUNITY_LOW = 70.0
@@ -240,7 +275,8 @@ def _h1_execution_confirmed(res: Dict[str, Any], sector_alignment: float) -> boo
 
 def _trade_quality_confirmed(res: Dict[str, Any], sector_strength: float, stock_sector_fit: float) -> bool:
     return (
-        sector_strength >= MIN_EXECUTION_SECTOR_STRENGTH
+        res.get("pa_execution_tier") == "NORMAL"
+        and sector_strength >= MIN_EXECUTION_SECTOR_STRENGTH
         and stock_sector_fit >= MIN_EXECUTION_STOCK_SECTOR_FIT
         and _strong_sector_core_candidate(res, sector_strength, stock_sector_fit)
         and not _strong_sector_rear_candidate(res, sector_strength)
@@ -248,6 +284,92 @@ def _trade_quality_confirmed(res: Dict[str, Any], sector_strength: float, stock_
         and _pa_plan_action(res) == "READY"
         and _has_stable_close_confirmation(res)
     )
+
+
+def _a_minus_trial_qualified(
+    res: Dict[str, Any],
+    blockers: List[str],
+    sector_strength: float,
+    stock_sector_fit: float,
+) -> bool:
+    """Allow only fully confirmed B-grade names into the controlled A- trial."""
+    health = res.get("a_minus_trial_health") or {}
+    checks = {
+        "health_enabled": health.get("enabled") is True,
+        "tv_trade_strategy": str(res.get("strategy_type") or "") in CORE_TRADE_STRATEGIES,
+        "b_grade": str(res.get("sop_grade") or "") == "B",
+        "quality": _as_float(res.get("sop_quality_score")) >= A_MINUS_TRIAL_MIN_QUALITY_SCORE,
+        "price_action": _as_float(res.get("price_action_score")) >= A_MINUS_TRIAL_MIN_PRICE_ACTION_SCORE,
+        "no_sop_veto": not list(res.get("sop_vetoes") or []),
+        "ready": _pa_plan_action(res) == "READY",
+        "volume": _has_volume_confirmation(res),
+        "stable_close": _has_stable_close_confirmation(res),
+        "strong_sector_core": _strong_sector_core_candidate(res, sector_strength, stock_sector_fit),
+        "sector_alignment": _as_float(res.get("sector_alignment_score")) >= MIN_EXECUTION_SECTOR_ALIGNMENT,
+        "risk_reward": (
+            _as_float(res.get("pa_risk_reward") or res.get("risk_reward"))
+            >= A_MINUS_TRIAL_MIN_RISK_REWARD
+        ),
+        "not_extended": _as_float(res.get("涨幅%")) < A_MINUS_TRIAL_MAX_DAILY_RISE_PCT,
+        "no_execution_blocker": not blockers,
+    }
+    res["a_minus_trial_checks"] = checks
+    return all(checks.values())
+
+
+_A_EOD_SOFT_BLOCKER_MARKERS = (
+    "板块强度不足，降级观察",
+    "强板块但个股适配不足，降级观察",
+    "强板块后排角色，等待转强为核心股",
+    "板块联动<",
+    "周线中性，降级观察",
+    "周线交易区间，降级观察",
+)
+
+
+def _a_eod_controlled_qualified(
+    res: Dict[str, Any],
+    blockers: List[str],
+    *,
+    price_triggered: bool,
+    volume_confirmed: bool,
+    close_confirmed: bool,
+    near_limit: bool,
+) -> tuple[bool, List[str], List[str]]:
+    """Qualify the calibrated small-position route without weakening hard gates."""
+    cautions = [
+        blocker for blocker in blockers
+        if any(marker in blocker for marker in _A_EOD_SOFT_BLOCKER_MARKERS)
+    ]
+    hard_blockers = [blocker for blocker in blockers if blocker not in cautions]
+    current_price = _candidate_price(res)
+    entry_price = _effective_entry_price(res)
+    extension_pct = (
+        max(0.0, (current_price - entry_price) / entry_price * 100)
+        if current_price > 0 and entry_price > 0 else 999.0
+    )
+    grade = str(res.get("sop_grade") or "")
+    checks = {
+        "tv_trade_strategy": str(res.get("strategy_type") or "") in CORE_TRADE_STRATEGIES,
+        "core_resonance": res.get("共振") == "🔥 核心热点",
+        "grade": grade in {"A", "B"},
+        "needs_controlled_route": grade == "B" or bool(cautions),
+        "quality": _as_float(res.get("sop_quality_score")) >= A_EOD_MIN_QUALITY_SCORE,
+        "price_action": res.get("pa_execution_tier") == "NORMAL",
+        "not_extended_5d": _as_float(res.get("pct_5d")) <= A_EOD_MAX_5D_GAIN_PCT,
+        "risk_reward": _as_float(res.get("pa_risk_reward") or res.get("risk_reward")) >= A_EOD_MIN_RISK_REWARD,
+        "no_sop_veto": not list(res.get("sop_vetoes") or []),
+        "ready": _pa_plan_action(res) == "READY",
+        "price_triggered": price_triggered,
+        "volume": volume_confirmed,
+        "stable_close": close_confirmed,
+        "entry_extension": extension_pct <= A_EOD_MAX_ENTRY_EXTENSION_PCT,
+        "not_near_limit": not near_limit,
+        "no_hard_blocker": not hard_blockers,
+    }
+    res["a_eod_trial_checks"] = checks
+    res["a_eod_entry_extension_pct"] = round(extension_pct, 2) if extension_pct < 999 else None
+    return all(checks.values()), cautions, hard_blockers
 
 
 def _bark_profile_setup_confirmed(res: Dict[str, Any], setup: str, sector_alignment: float) -> bool:
@@ -334,8 +456,26 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _inject_missing_fundamentals(res: Dict[str, Any], fund_map: Dict[str, Dict[str, Any]]) -> None:
+    """Fill fundamentals for candidates added after the primary strategy scan."""
+    code = str(res.get("代码") or res.get("code") or "").zfill(6)
+    fund = fund_map.get(code)
+    if not fund:
+        return
+    if res.get("ROE") is None:
+        res["ROE"] = round(float(fund.get("roe") or 0), 2)
+    if res.get("净利YOY") is None:
+        res["净利YOY"] = round(float(fund.get("net_profit_yoy") or 0), 2)
+    res.setdefault("fundamental_data_source", "stock_fundamentals")
+
+
 def _build_snapshot_audit(snapshot_df: pd.DataFrame, data_mode: str, as_of: Any) -> Dict[str, Any]:
     """Describe which point-in-time filters can actually be enforced for this snapshot."""
+    from core.risk_constants import (
+        POINT_IN_TIME_CORE_FIELD_MIN_COVERAGE,
+        POINT_IN_TIME_FILTER_FIELD_MIN_COVERAGE,
+    )
+
     required = ("price", "pct_chg", "turnover", "mkt_cap")
     total = len(snapshot_df)
     coverage = {
@@ -345,23 +485,35 @@ def _build_snapshot_audit(snapshot_df: pd.DataFrame, data_mode: str, as_of: Any)
     }
     effective_filters = ["target_market", "exclude_st_delist", "positive_pct_change"]
     degradation_reasons = []
-    if coverage["turnover"] == 1.0:
+    blocking_reasons = []
+    if coverage["turnover"] >= POINT_IN_TIME_FILTER_FIELD_MIN_COVERAGE:
         effective_filters.append("turnover_min")
+        if coverage["turnover"] < 1.0:
+            degradation_reasons.append("少量股票缺少换手率，已按股票隔离")
     else:
         degradation_reasons.append("换手率字段不完整，未能对全部股票执行换手率过滤")
-    if coverage["mkt_cap"] == 1.0:
+        blocking_reasons.append("换手率覆盖不足")
+    if coverage["mkt_cap"] >= POINT_IN_TIME_FILTER_FIELD_MIN_COVERAGE:
         effective_filters.append("market_cap_min")
+        if coverage["mkt_cap"] < 1.0:
+            degradation_reasons.append("少量股票缺少市值，已按股票隔离")
     else:
         degradation_reasons.append("市值字段不完整，未能对全部股票执行市值过滤")
-    if coverage["price"] < 1.0 or coverage["pct_chg"] < 1.0:
+        blocking_reasons.append("市值覆盖不足")
+    if (
+        coverage["price"] < POINT_IN_TIME_CORE_FIELD_MIN_COVERAGE
+        or coverage["pct_chg"] < POINT_IN_TIME_CORE_FIELD_MIN_COVERAGE
+    ):
         degradation_reasons.append("价格或涨跌幅字段不完整")
+        blocking_reasons.append("核心价格字段覆盖不足")
     return {
         "as_of": as_of,
         "data_mode": data_mode,
         "field_coverage": coverage,
         "effective_filters": effective_filters,
-        "research_only": bool(degradation_reasons),
+        "research_only": bool(blocking_reasons),
         "degradation_reasons": degradation_reasons,
+        "blocking_degradation_reasons": blocking_reasons,
     }
 
 
@@ -370,6 +522,8 @@ def _discovery_pool_mask(snapshot_df: pd.DataFrame, strategy_type: str) -> tuple
     pct = pd.to_numeric(snapshot_df["pct_chg"], errors="coerce")
     if strategy_type == "early_value":
         return pct.between(-3.0, 5.0, inclusive="both"), "EARLY_DISCOVERY"
+    if strategy_type == "bottom_discovery":
+        return pct.between(-4.0, 4.0, inclusive="both"), "BOTTOM_DISCOVERY"
     if strategy_type == "sector_watch":
         return pct.between(-2.0, 8.0, inclusive="both"), "PULLBACK_DISCOVERY"
     return pct > 0, "MOMENTUM_DISCOVERY"
@@ -394,11 +548,7 @@ def _candidate_price(res: Dict[str, Any]) -> float:
 
 
 def _effective_entry_price(res: Dict[str, Any]) -> float:
-    return _as_float(
-        res.get('pa_entry_price')
-        or res.get('entry_price')
-        or res.get('frozen_confirmation_price')
-    )
+    return _as_float(get_active_execution_plan(res)["entry"])
 
 
 def _confirmation_price_reached(current_price: float, entry_price: float) -> bool:
@@ -415,10 +565,117 @@ def _load_market_snapshot(force_refresh: bool = False) -> pd.DataFrame:
 
 
 def _has_volume_confirmation(res: Dict[str, Any]) -> bool:
+    if res.get('pa_close_time_eligible') is False:
+        return False
     return bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') in {'放量突破', '缩量回调后放量反包'}
 
 
+def _apply_close_confirmation_timing(
+    res: Dict[str, Any],
+    as_of: Any,
+    data_mode: str,
+    now: Any = None,
+) -> None:
+    """Classify whether the observed bar is late enough for execution confirmation."""
+    as_of_text = str(as_of or "")
+    try:
+        observed = pd.Timestamp(as_of)
+        if pd.isna(observed):
+            raise ValueError("invalid as_of")
+        current = pd.Timestamp(now or datetime.now())
+        date_only = len(as_of_text) == 10 and as_of_text.count("-") == 2
+        if date_only and observed.date() < current.date():
+            phase = "AFTER_CLOSE"
+            eligible = True
+        else:
+            clock = current if data_mode == "LOCAL_DB" and date_only else observed
+            minute_of_day = clock.hour * 60 + clock.minute
+            if minute_of_day >= 15 * 60:
+                phase = "AFTER_CLOSE"
+                eligible = True
+            elif minute_of_day >= 14 * 60 + 30:
+                phase = "LATE_SESSION"
+                eligible = True
+            else:
+                phase = "INTRADAY_PROVISIONAL"
+                eligible = False
+    except (TypeError, ValueError):
+        phase = "LEGACY_UNKNOWN"
+        eligible = True
+    res["pa_close_confirmation_as_of"] = as_of_text[:19] or None
+    res["pa_close_confirmation_phase"] = phase
+    res["pa_close_time_eligible"] = eligible
+    raw_volume_confirmed = bool(res.get('pa_volume_confirmed')) or res.get('pa_volume_pattern') in {
+        '放量突破', '缩量回调后放量反包'
+    }
+    res["pa_volume_confirmation_state"] = (
+        "CONFIRMED" if raw_volume_confirmed and eligible
+        else "PROVISIONAL" if raw_volume_confirmed
+        else "NOT_CONFIRMED"
+    )
+    res["pa_volume_confirmation_final"] = raw_volume_confirmed and eligible
+
+
+_OBSERVATION_ONLY_PLAN_FLAGS = (
+    "revival_watch_only",
+    "momentum_acceleration_watch_only",
+    "bottom_discovery_watch_only",
+    "tv_reversal_watch_only",
+    "sector_watch_only",
+    "early_value_watch_only",
+)
+
+
+def _is_observation_only_plan(res: Dict[str, Any]) -> bool:
+    return any(bool(res.get(flag)) for flag in _OBSERVATION_ONLY_PLAN_FLAGS)
+
+
+def _apply_price_action_execution_stage(
+    res: Dict[str, Any],
+    *,
+    executable: Optional[bool] = None,
+) -> str:
+    """Expose one unambiguous PA lifecycle state for UI and Bark."""
+    action = _pa_plan_action(res)
+    confirmation = str(res.get("pa_confirmation_state") or "")
+    frozen = bool(res.get("execution_plan_frozen"))
+
+    if _is_observation_only_plan(res):
+        stage = "OBSERVATION_ONLY"
+    elif action == "AVOID" or str(res.get("pa_pullback_status") or "") == "INVALIDATED":
+        stage = "BLOCKED"
+    elif res.get("pa_close_time_eligible") is False:
+        stage = "INTRADAY_PREVIEW"
+    elif executable and frozen and confirmation == "ENTRY_CONFIRMED":
+        stage = "NEXT_SESSION_EXECUTABLE"
+    elif frozen:
+        stage = "NEXT_SESSION_REVIEW"
+    elif confirmation == "ENTRY_CONFIRMED":
+        stage = "EOD_CONFIRMED"
+    elif action == "READY":
+        stage = "SETUP_READY"
+    else:
+        stage = "WAITING_SETUP"
+
+    labels = {
+        "OBSERVATION_ONLY": "观察策略｜需生成新计划",
+        "BLOCKED": "结构失效｜禁止买入",
+        "INTRADAY_PREVIEW": "盘中预观察｜14:30后确认",
+        "SETUP_READY": "结构就绪｜等待价量确认",
+        "EOD_CONFIRMED": "尾盘已确认｜次一交易日复核",
+        "NEXT_SESSION_REVIEW": "次日复核｜尚不可执行",
+        "NEXT_SESSION_EXECUTABLE": "次日确认｜可执行候选",
+        "WAITING_SETUP": "等待新结构",
+    }
+    res["pa_execution_stage"] = stage
+    res["pa_execution_stage_label"] = labels[stage]
+    res["pa_signal_date"] = res.get("frozen_plan_date") or res.get("data_date") or res.get("date")
+    return stage
+
+
 def _has_stable_close_confirmation(res: Dict[str, Any]) -> bool:
+    if res.get('pa_close_time_eligible') is False:
+        return False
     close_position = _as_float(res.get('pa_close_position'), -1.0)
     upper_shadow_pct = _as_float(res.get('pa_upper_shadow_pct'), -1.0)
     close_ok = close_position < 0 or close_position >= 0.6
@@ -607,7 +864,7 @@ def _fetch_active_execution_plan_map(
     engine,
     codes: List[str],
     data_date: str,
-    freeze_days: int = EXECUTION_PLAN_FREEZE_DAYS,
+    freeze_sessions: int = EXECUTION_PLAN_FREEZE_SESSIONS,
 ) -> Dict[str, Dict[str, Any]]:
     """Load the earliest still-valid READY plan so the trigger does not move daily."""
     if not codes:
@@ -617,12 +874,15 @@ def _fetch_active_execution_plan_map(
     params = {
         **code_params,
         "data_date": str(data_date)[:10],
-        "freeze_days": max(1, int(freeze_days)),
+        "min_plan_date": shift_a_share_trading_date(
+            str(data_date)[:10], -max(1, int(freeze_sessions))
+        ),
     }
     query = text(f"""
         WITH active AS (
             SELECT s.code, COALESCE(s.data_date, s.date) AS plan_date,
                    s.pa_entry_price, s.pa_stop_price, s.pa_target_price,
+                   s.price_action_detail,
                    ROW_NUMBER() OVER (
                        PARTITION BY s.code
                        ORDER BY COALESCE(s.data_date, s.date) ASC, s.scanned_at ASC NULLS LAST
@@ -630,8 +890,7 @@ def _fetch_active_execution_plan_map(
             FROM scan_history s
             WHERE s.code IN ({placeholders})
               AND COALESCE(s.data_date, s.date) < CAST(:data_date AS date)
-              AND COALESCE(s.data_date, s.date) >= CAST(:data_date AS date)
-                  - (CAST(:freeze_days AS integer) * interval '1 day')
+              AND COALESCE(s.data_date, s.date) >= CAST(:min_plan_date AS date)
               AND s.pa_trade_action = 'READY'
               AND s.pa_entry_price > 0
               AND s.pa_stop_price > 0
@@ -644,20 +903,28 @@ def _fetch_active_execution_plan_map(
                     AND d.low <= s.pa_stop_price
               )
         )
-        SELECT code, plan_date, pa_entry_price, pa_stop_price, pa_target_price
+        SELECT code, plan_date, pa_entry_price, pa_stop_price, pa_target_price,
+               price_action_detail
         FROM active WHERE rn = 1
     """)
     try:
         with engine.connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return {str(row._mapping["code"]).zfill(6): dict(row._mapping) for row in rows}
+        plans = {}
+        for row in rows:
+            plan = dict(row._mapping)
+            plan["plan_expiry_date"] = shift_a_share_trading_date(
+                str(plan.get("plan_date"))[:10], max(1, int(freeze_sessions))
+            )
+            plans[str(plan["code"]).zfill(6)] = plan
+        return plans
     except Exception as exc:
         logger.warning(f"Frozen execution plan lookup skipped: {exc}")
         return {}
 
 
 def _apply_frozen_execution_plan(res: Dict[str, Any], plan: Dict[str, Any]) -> None:
-    if not plan:
+    if not plan or _is_observation_only_plan(res):
         return
     current = _candidate_price(res)
     entry = _as_float(plan.get("pa_entry_price"))
@@ -667,14 +934,26 @@ def _apply_frozen_execution_plan(res: Dict[str, Any], plan: Dict[str, Any]) -> N
     res["generated_confirmation_price"] = res.get("pa_entry_price")
     res["generated_stop_price"] = res.get("pa_stop_price")
     res["frozen_plan_date"] = str(plan.get("plan_date") or "")[:10]
+    res["frozen_plan_expiry_date"] = str(plan.get("plan_expiry_date") or "")[:10] or None
+    res["frozen_plan_valid_sessions"] = EXECUTION_PLAN_FREEZE_SESSIONS
     res["frozen_confirmation_price"] = round(entry, 2)
     res["frozen_stop_price"] = round(stop, 2)
+    detail = plan.get("price_action_detail") or {}
+    if not isinstance(detail, dict):
+        detail = {}
+    close_guard = _as_float(detail.get("pa_close_guard_price") or stop)
+    res["frozen_close_guard_price"] = round(close_guard, 2)
     target = _as_float(plan.get("pa_target_price"))
     res["frozen_target_price"] = round(target, 2) if target > 0 else None
     extension_pct = (current - entry) / entry * 100 if current > 0 else 0.0
     res["frozen_entry_extension_pct"] = round(extension_pct, 2)
     res["frozen_confirmation_triggered"] = _confirmation_price_reached(current, entry)
     res["execution_plan_frozen"] = True
+    res["active_execution_plan_source"] = "FROZEN"
+    res["active_confirmation_price"] = round(entry, 2)
+    res["active_stop_price"] = round(stop, 2)
+    res["active_close_guard_price"] = round(close_guard, 2)
+    res["active_target_price"] = round(target, 2) if target > 0 else None
 
 
 def _classify_historical_revival(res: Dict[str, Any], history: Dict[str, Any]) -> Dict[str, Any]:
@@ -969,6 +1248,127 @@ def _check_early_value_strategy(df: pd.DataFrame, code: str, name: str, price: f
     }
 
 
+def _check_bottom_discovery_strategy(
+    df: pd.DataFrame,
+    code: str,
+    name: str,
+    price: float,
+    current_vol: float = 0,
+    current_open: float = 0,
+) -> tuple[bool, Dict[str, Any]]:
+    """Point-in-time B0/B1 bottom discovery; this strategy never grants trade permission."""
+    if df is None or df.empty or len(df) < 80:
+        return False, {"reason": "底部发现样本不足"}
+
+    work = df.copy().reset_index(drop=True)
+    close = pd.to_numeric(work.get("收盘"), errors="coerce")
+    high = pd.to_numeric(work.get("最高"), errors="coerce")
+    low = pd.to_numeric(work.get("最低"), errors="coerce")
+    open_ = pd.to_numeric(work.get("开盘"), errors="coerce")
+    volume = pd.to_numeric(work.get("成交量"), errors="coerce")
+    if any(series.tail(BOTTOM_DISCOVERY_LOOKBACK_DAYS).isna().any() for series in (close, high, low, volume)):
+        return False, {"reason": "底部发现数据不完整"}
+
+    current = _as_float(price) or float(close.iloc[-1])
+    if current <= 0:
+        return False, {"reason": "底部发现价格无效"}
+    close.iloc[-1] = current
+    high.iloc[-1] = max(float(high.iloc[-1]), current)
+    if current_vol > 0:
+        volume.iloc[-1] = current_vol
+    if current_open > 0:
+        open_.iloc[-1] = current_open
+
+    low_60 = float(low.tail(BOTTOM_DISCOVERY_LOOKBACK_DAYS).min())
+    rise_from_low = (current / low_60 - 1) * 100 if low_60 > 0 else 999
+    if not 0 <= rise_from_low <= BOTTOM_DISCOVERY_MAX_RISE_FROM_LOW:
+        return False, {"reason": f"距60日低点涨幅不在0%-12%区间({rise_from_low:.1f}%)"}
+
+    prior_floor = float(low.iloc[-BOTTOM_DISCOVERY_LOOKBACK_DAYS:-3].min())
+    recent_low3 = float(low.tail(3).min())
+    no_new_low = recent_low3 >= prior_floor * (1 - BOTTOM_DISCOVERY_NO_NEW_LOW_TOLERANCE)
+    if not no_new_low:
+        return False, {"reason": "最近3日仍在创新低，暂按下跌中继处理"}
+
+    prior_volume = float(volume.iloc[-25:-5].mean())
+    base_volume_ratio = float(volume.iloc[-5:-1].mean()) / prior_volume if prior_volume > 0 else 0
+    current_volume_ratio = float(volume.iloc[-1]) / prior_volume if prior_volume > 0 else 0
+    if base_volume_ratio > BOTTOM_DISCOVERY_MAX_BASE_VOLUME_RATIO:
+        return False, {"reason": f"底部量能尚未收缩({base_volume_ratio:.2f}x)"}
+    if current_volume_ratio > BOTTOM_DISCOVERY_MAX_CURRENT_VOLUME_RATIO:
+        return False, {"reason": f"当日量能已过度放大({current_volume_ratio:.2f}x)，不属于底部发现"}
+
+    range_pct = (high - low).clip(lower=0) / close.replace(0, pd.NA)
+    prior_range = float(range_pct.iloc[-25:-5].mean())
+    recent_range = float(range_pct.tail(5).mean())
+    range_contraction_ratio = recent_range / prior_range if prior_range > 0 else 999
+    if range_contraction_ratio > BOTTOM_DISCOVERY_MAX_RANGE_CONTRACTION_RATIO:
+        return False, {"reason": f"底部波动尚未收敛({range_contraction_ratio:.2f}x)"}
+
+    ema5 = close.ewm(span=5, adjust=False).mean()
+    ema10 = close.ewm(span=10, adjust=False).mean()
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema20_5d_ago = float(ema20.iloc[-6])
+    ema20_slope = (float(ema20.iloc[-1]) / ema20_5d_ago - 1) * 100 if ema20_5d_ago > 0 else -999
+    if ema20_slope < BOTTOM_DISCOVERY_MIN_EMA20_SLOPE_5D_PCT:
+        return False, {"reason": f"EMA20仍快速下行({ema20_slope:.1f}%)"}
+
+    prior_low3 = float(low.iloc[-6:-3].min())
+    higher_low = recent_low3 > prior_low3
+    reclaimed_short_ma = current >= float(ema5.iloc[-1]) and current >= float(ema10.iloc[-1])
+    day_range = max(float(high.iloc[-1]) - float(low.iloc[-1]), 0.01)
+    close_position = (current - float(low.iloc[-1])) / day_range
+    bullish_reversal = current > float(open_.iloc[-1]) and close_position >= 0.6
+    ignition_confirmed = higher_low and reclaimed_short_ma and bullish_reversal
+    stage = "B1_REVERSAL" if ignition_confirmed else "B0_BASE"
+    stage_label = "B1止跌转强" if ignition_confirmed else "B0底部候选"
+    score = round(
+        52
+        + max(0, BOTTOM_DISCOVERY_MAX_RISE_FROM_LOW - rise_from_low) * 0.8
+        + max(0, 1 - base_volume_ratio) * 12
+        + max(0, 1 - range_contraction_ratio) * 10
+        + (12 if ignition_confirmed else 0),
+        1,
+    )
+    action = (
+        "起涨预警：只观察，等待板块启动、确认价与量能共同确认"
+        if ignition_confirmed
+        else "底部观察：等待更高低点、短均线收复和反转K确认"
+    )
+    prev_close = float(close.iloc[-2])
+    daily_pct = (current / prev_close - 1) * 100 if prev_close > 0 else 0.0
+    rsi = pd.to_numeric(work.get("RSI"), errors="coerce")
+    macd_dif = pd.to_numeric(work.get("MACD_DIF"), errors="coerce")
+    return True, {
+        "代码": code,
+        "名称": name,
+        "现价": round(current, 2),
+        "涨幅%": round(daily_pct, 2),
+        "RSI": round(float(rsi.iloc[-1]), 2) if rsi is not None and not pd.isna(rsi.iloc[-1]) else None,
+        "DIF": round(float(macd_dif.iloc[-1]), 4) if macd_dif is not None and not pd.isna(macd_dif.iloc[-1]) else None,
+        "Score": score,
+        "raw_score": score,
+        "strategy_type": "bottom_discovery",
+        "signal": stage_label,
+        "reason": action,
+        "bottom_discovery_watch_only": True,
+        "bottom_discovery_stage": stage,
+        "bottom_discovery_action": action,
+        "trade_eligible": False,
+        "trade_bucket": "OBSERVE",
+        "bottom_discovery_metrics": {
+            "rise_from_60d_low": round(rise_from_low, 2),
+            "base_volume_ratio": round(base_volume_ratio, 2),
+            "current_volume_ratio": round(current_volume_ratio, 2),
+            "range_contraction_ratio": round(range_contraction_ratio, 2),
+            "ema20_slope_5d_pct": round(ema20_slope, 2),
+            "higher_low": higher_low,
+            "reclaimed_short_ma": reclaimed_short_ma,
+            "bullish_reversal": bullish_reversal,
+        },
+    }
+
+
 def _early_value_sector_started(res: Dict[str, Any], sector_info: Dict[str, Any]) -> bool:
     phase = str(sector_info.get("sector_phase") or "")
     score = _as_float(sector_info.get("sector_momentum_score"))
@@ -1136,6 +1536,12 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     action = _pa_plan_action(res)
     setup = str(res.get('pa_trade_setup') or "")
     strategy_type = str(res.get('strategy_type') or "")
+    pa_execution = classify_price_action_execution(res)
+    res['pa_execution_policy_version'] = pa_execution['version']
+    res['pa_execution_tier'] = pa_execution['tier']
+    res['pa_execution_tier_label'] = pa_execution['label']
+    res['pa_execution_hard_blocked'] = pa_execution['hard_blocked']
+    res['pa_execution_hard_reason'] = pa_execution['hard_reason']
     blockers: List[str] = []
     raw_score = _as_float(res.get('raw_score') or res.get('Score') or res.get('score'))
     risk_pct = _as_float(res.get('pa_risk_pct'))
@@ -1175,18 +1581,31 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
 
     if _is_abnormal_price_move(res.get('代码'), res.get('涨幅%')):
         blockers.append("异常价格跳变，排除交易")
-    if action == "AVOID":
-        blockers.append("价格行为建议回避")
+    if pa_execution['hard_reason']:
+        blockers.append(pa_execution['hard_reason'])
     elif action and action not in EXECUTABLE_PA_ACTIONS:
         blockers.append("交易计划未确认")
     elif not action and strategy_type in {"tv_dual", "tv_dual_strict"}:
         blockers.append("缺少价格行为交易计划")
     if strategy_type in DISCOVERY_ONLY_STRATEGIES:
         blockers.append("普通tv_dual仅用于发现，需严格双策略确认")
-    if setup in BLOCKED_PA_SETUPS:
-        blockers.append(f"{setup}结构不进入交易池")
-    if res.get('pa_pullback_status') == 'INVALIDATED':
-        blockers.append("回踩结构失效")
+    if res.get("tv_reversal_watch_only"):
+        blockers.append("强修复观察仅供观察，等待周线转强和次日确认")
+    tv_execution_tier = str(res.get("tv_execution_tier") or "")
+    if strategy_type == "tv_dual" and tv_execution_tier == "C":
+        blockers.append("ZP单信号仅研究观察，禁止自动执行")
+    elif strategy_type == "tv_dual" and tv_execution_tier == "B":
+        if _as_float(res.get("price_action_score")) < TV_MA_ONLY_MIN_PA_SCORE:
+            blockers.append(f"MA单信号价格行为分<{TV_MA_ONLY_MIN_PA_SCORE:g}，只观察")
+        if action == "AVOID":
+            blockers.append("MA单信号价格行为回避，禁止实盘")
+        effective_regime = str(
+            res.get("effective_market_regime") or res.get("market_regime") or "UNKNOWN"
+        ).upper()
+        if effective_regime != "OFFENSIVE":
+            blockers.append("MA单信号仅进攻市场允许执行")
+    if res.get("bottom_discovery_watch_only"):
+        blockers.append("底部起涨发现仅供观察，等待板块、确认价和量能共同确认")
     if res.get('sector_trend') == 'DOWN':
         blockers.append("板块下跌")
     if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
@@ -1229,7 +1648,9 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         else:
             if not _has_volume_confirmation(res):
                 blockers.append("站上确认价但量能未确认")
-            if not _has_stable_close_confirmation(res):
+            if res.get('pa_close_time_eligible') is False:
+                blockers.append("盘中仅临时触价，等待14:30后站稳确认")
+            elif not _has_stable_close_confirmation(res):
                 blockers.append("冲高回落，站稳未确认")
     if mkt_cap_yi >= LOW_TURNOVER_MKT_CAP_YI and 0 < turnover < LOW_TURNOVER_MIN_PCT:
         blockers.append("大市值低换手，右侧弹性不足")
@@ -1276,6 +1697,26 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
 
     blockers = _dedupe_trade_blockers(blockers)
 
+    price_triggered = _confirmation_price_reached(current_price, entry_price)
+    volume_confirmed = _has_volume_confirmation(res)
+    close_confirmed = _has_stable_close_confirmation(res)
+    if price_triggered and volume_confirmed and close_confirmed:
+        confirmation_state = "ENTRY_CONFIRMED"
+    elif price_triggered:
+        confirmation_state = "PRICE_TRIGGERED"
+    elif action == "READY":
+        confirmation_state = "SETUP_READY"
+    else:
+        confirmation_state = "WAITING_SETUP"
+    res["pa_setup_confirmed"] = action == "READY"
+    res["pa_plan_triggered"] = price_triggered
+    res["pa_close_confirmed"] = close_confirmed
+    res["pa_confirmation_state"] = confirmation_state
+    pa_execution_stage = _apply_price_action_execution_stage(res)
+    if pa_execution_stage == "EOD_CONFIRMED":
+        blockers.append("信号日尾盘确认，次一交易日复核执行")
+        blockers = _dedupe_trade_blockers(blockers)
+
     score = float(res.get('final_rank_score', res.get('Score', 0)) or 0)
     if action == "READY":
         score += 8
@@ -1303,7 +1744,7 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     if _is_sweet_spot_trade_model(res, sector_alignment):
         score += 8
         res['sweet_spot_trade_candidate'] = True
-        res['sweet_spot_reason'] = "机会分70-79 + 强联动 + 严格双策略，按专门买点模型复核"
+        res['sweet_spot_reason'] = "机会分70-79 + 强联动 + TV均线或ZP，按专门买点模型复核"
     if observe_promotion:
         score += 3
     if str(res.get('sector_phase') or "") in BARK_PROFILE_SECTOR_PHASE_BONUS:
@@ -1350,23 +1791,54 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         score += 3
 
     grade = res.get('sop_grade')
-    fatal_markers = ("回避", "结构不进入交易池", "异常价格跳变", "板块下跌", "禁止实盘")
+    a_minus_trial = _a_minus_trial_qualified(res, blockers, sector_strength, stock_sector_fit)
+    if a_minus_trial:
+        res['a_minus_trial'] = True
+        res['a_minus_trial_grade'] = "A-"
+        res['a_minus_trial_policy_version'] = A_MINUS_TRIAL_POLICY_VERSION
+    a_eod_trial = False
+    if not a_minus_trial:
+        a_eod_trial, a_eod_cautions, a_eod_hard_blockers = _a_eod_controlled_qualified(
+            res,
+            blockers,
+            price_triggered=price_triggered,
+            volume_confirmed=volume_confirmed,
+            close_confirmed=close_confirmed,
+            near_limit=near_limit,
+        )
+        if a_eod_trial:
+            blockers = a_eod_hard_blockers
+            res['a_eod_controlled_trial'] = True
+            res['a_eod_policy_version'] = A_EOD_CONTROLLED_POLICY_VERSION
+            res['a_eod_trade_cautions'] = a_eod_cautions
+    fatal_markers = ("回避", "结构不进入交易池", "结构失效", "异常价格跳变", "板块下跌", "禁止实盘")
     has_fatal_blocker = any(any(marker in b for marker in fatal_markers) for b in blockers)
     # 改动(上班族Bark)：实盘门槛收紧。STRICT_REAL_SIGNAL_GATE=True 时仅 A 级 + 多重共振
     # (🔥核心热点) 判为可交易；B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。
     if STRICT_REAL_SIGNAL_GATE:
-        trade_eligible = (grade == "A" and not blockers
+        formal_a_trade = (grade == "A" and not blockers
                           and strategy_type in CORE_TRADE_STRATEGIES
                           and res.get('共振') == "🔥 核心热点"
                           and _trade_quality_confirmed(res, sector_strength, stock_sector_fit))
+        trade_eligible = formal_a_trade or a_minus_trial or a_eod_trial
     else:
         trade_eligible = grade in {"A", "B"} and not blockers and strategy_type in CORE_TRADE_STRATEGIES
     if trade_eligible:
         bucket = "TRADE"
-        execution_policy = "BARK_CONFIRMED_TRADE"
+        execution_policy = (
+            "A_MINUS_CONTROLLED_TRIAL" if a_minus_trial
+            else "A_EOD_CONTROLLED_TRIAL" if a_eod_trial
+            else "BARK_CONFIRMED_TRADE"
+        )
     elif early_entry and not has_fatal_blocker:
         bucket = "EARLY"
         execution_policy = "EARLY_REVIEW_ONLY"
+    elif pa_execution['tier'] == "T1_CONFIRM" and not has_fatal_blocker:
+        bucket = "OBSERVE"
+        execution_policy = "PA_T1_CONFIRMATION"
+    elif pa_execution['tier'] == "PULLBACK_WATCH" and not has_fatal_blocker:
+        bucket = "OBSERVE"
+        execution_policy = "PA_PULLBACK_WATCH"
     elif observe_promotion and not has_fatal_blocker:
         bucket = "OBSERVE"
         execution_policy = "WAIT_CONFIRMATION"
@@ -1382,6 +1854,7 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     res['trade_execution_policy'] = execution_policy
     res['requires_bark_confirmation'] = not trade_eligible
     res['trade_blockers'] = blockers
+    _apply_price_action_execution_stage(res, executable=trade_eligible)
     res['final_trade_score'] = round(score, 2)
     res['display_trade_score'] = round(max(0, min(100, score)), 1)
     if strategy_type == "pine":
@@ -1643,7 +2116,8 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         _d_pf = max(0, min(100, min(_pf, 3) / 3 * 100))
         _d_sig = max(0, min(100, _raw / 120 * 100))
         _d_fund = (max(0, min(100, _roe / 15 * 100)) + max(0, min(100, _yoy / 30 * 100))) / 2
-        _d_regime = {"OFFENSIVE": 100, "DEFENSIVE": 50, "UNKNOWN": 50}.get(regime_status, 0)
+        effective_regime = str(res.get('effective_market_regime') or regime_status).upper()
+        _d_regime = {"OFFENSIVE": 100, "DEFENSIVE": 50, "UNKNOWN": 50}.get(effective_regime, 0)
         _d_brooks = max(0, min(100, _pa_struct))
         _d_sector = max(0, min(100, _sector_align))
         _d_cap = {"UNKNOWN": 80, "MICRO": 10, "SMALL": 45, "MID": 85, "LARGE": 80, "MEGA": 65}.get(_cap_bucket, 80)
@@ -1664,6 +2138,9 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             checks.append(f"盈亏比{_pf:.1f}")
         if regime_status == "OFFENSIVE":
             checks.append("大盘进攻")
+        elif res.get('market_segment_stage') == "STRUCTURAL_REPAIR":
+            checks.append(f"{res.get('market_segment')}结构性强修复")
+            bonuses.append("成长板块独立强势")
         if res.get('共振') == "🔥 核心热点":
             bonuses.append("板块核心共振")
         if (res.get('sector_momentum_score') or 0) >= 75:
@@ -1719,7 +2196,7 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             quality_score += 5
             bonuses.append("70-79机会分强联动买点")
             res['sweet_spot_trade_candidate'] = True
-            res['sweet_spot_reason'] = "机会分70-79 + 强联动 + 严格双策略，按专门买点模型复核"
+            res['sweet_spot_reason'] = "机会分70-79 + 强联动 + TV均线或ZP，按专门买点模型复核"
         if str(res.get('sector_phase') or "") in BARK_PROFILE_SECTOR_PHASE_BONUS:
             quality_score += 4
             bonuses.append("Bark高胜率板块阶段")
@@ -1752,14 +2229,60 @@ def _apply_sop_filter(results, market_regime, sector_trends):
                         "异常价格跳变", "低质量价格结构", "近期失败模式命中"}
         _has_hard_veto = any(any(hv in v for hv in _hard_vetoes) for v in vetoes)
 
+        grade_strategy = str(res.get('strategy_type') or "")
+        grade_pa_score = float(res.get('price_action_score') or 0)
+        grade_pct_5d = float(res.get('pct_5d') or 0)
+        a_grade_structure_ok = grade_pa_score >= SOP_A_GRADE_MIN_PRICE_ACTION_SCORE
+        # 5日涨幅渐进惩罚：软起扣点(10%)以上每超1%扣 quality_score，硬否决线(25%)以上不得评A。
+        _5d_penalty = 0.0
+        if grade_pct_5d > SOP_A_GRADE_MAX_5D_GAIN_PCT:
+            _over_ext = grade_pct_5d - SOP_A_GRADE_MAX_5D_GAIN_PCT
+            _5d_penalty = round(
+                min(_over_ext, SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT - SOP_A_GRADE_MAX_5D_GAIN_PCT)
+                * SOP_A_GRADE_5D_PENALTY_PER_PCT, 1
+            )
+            quality_score = round(quality_score - _5d_penalty, 1)
+            risks.append(
+                f"5日涨幅{grade_pct_5d:.1f}%超{SOP_A_GRADE_MAX_5D_GAIN_PCT:g}%起扣线，质量分扣{_5d_penalty:.1f}"
+            )
+        a_grade_not_extended = grade_pct_5d <= SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT
         if _has_hard_veto:
             grade = "D"
         elif vetoes:
             quality_score -= 15
             risks.append(f"软否决: {', '.join(vetoes[:2])}")
-            grade = "D" if quality_score < 30 else "C" if quality_score < 50 else "B" if quality_score < 70 else "A"
+            # 有否决项的候选不得仅靠其他维度补分回到A级。
+            grade = "D" if quality_score < 30 else "C" if quality_score < 50 else "B"
         else:
-            grade = "A" if quality_score >= 70 else "B" if quality_score >= 50 else "C"
+            grade = (
+                "A"
+                if (
+                    quality_score >= SOP_A_GRADE_MIN_SCORE
+                    and grade_strategy in SOP_A_GRADE_STRATEGIES
+                    and a_grade_structure_ok
+                    and a_grade_not_extended
+                )
+                else "B" if quality_score >= 50 else "C"
+            )
+        a_grade_gate_reasons = []
+        if quality_score >= SOP_A_GRADE_MIN_SCORE:
+            if grade_strategy not in SOP_A_GRADE_STRATEGIES:
+                a_grade_gate_reasons.append("仅核心交易策略可评A级")
+            if not a_grade_structure_ok:
+                a_grade_gate_reasons.append(
+                    f"价格行为评分低于{SOP_A_GRADE_MIN_PRICE_ACTION_SCORE:g}"
+                )
+            if not a_grade_not_extended:
+                a_grade_gate_reasons.append(
+                    f"5日涨幅超过{SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT:g}%"
+                )
+            if _5d_penalty > 0 and grade == "B" and quality_score < SOP_A_GRADE_MIN_SCORE:
+                a_grade_gate_reasons.append(
+                    f"5日涨幅超{SOP_A_GRADE_MAX_5D_GAIN_PCT:g}%起扣线，质量分扣{_5d_penalty:.1f}后未达A级线"
+                )
+            if vetoes:
+                a_grade_gate_reasons.append("存在SOP否决项")
+        base_grade = grade
         if quality_score < 30 and grade == "C":
             res['sop_subgrade'] = 'C2'
         elif grade == "C":
@@ -1767,6 +2290,9 @@ def _apply_sop_filter(results, market_regime, sector_trends):
 
         res['sop_quality_score'] = quality_score
         res['sop_grade'] = grade
+        res['sop_a_grade_eligible'] = grade == "A"
+        res['sop_a_grade_gate_reasons'] = a_grade_gate_reasons
+        res['sop_grade_policy_version'] = SOP_A_GRADE_POLICY_VERSION
         res['sop_vetoes'] = vetoes
         res['sop_checks'] = checks
         res['sop_bonuses'] = bonuses
@@ -1806,7 +2332,12 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         if brooks_adjustment <= -6:
             vetoes.append("Brooks风险偏高")
             res['sop_grade'] = "D" if grade in {"C", "D"} else "C"
-        if res.get('early_watch_only'):
+        if res.get('bottom_discovery_watch_only'):
+            res['sop_grade'] = "D" if vetoes else "C"
+            stage = str(res.get('bottom_discovery_stage') or "B0_BASE")
+            res['sop_checks'].append("B1止跌转强" if stage == "B1_REVERSAL" else "B0底部候选")
+            res['sop_bonuses'].append("低位起涨研究样本")
+        elif res.get('early_watch_only'):
             res['sop_grade'] = "D" if vetoes else "C"
             res['sop_checks'].append("等待TV-ZP确认")
             res['sop_bonuses'].append("早期异动观察")
@@ -1827,6 +2358,10 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             else:
                 res['sop_checks'].append("复活信号禁止追涨")
                 res['sop_grade'] = "D" if vetoes else "C"
+        elif res.get('tv_reversal_watch_only'):
+            res['sop_grade'] = "M"
+            res['sop_checks'].append("TV-ZP原始long + 日线B确认")
+            res['sop_bonuses'].append("暴跌后强修复观察")
         elif res.get('momentum_acceleration_watch_only'):
             res['sop_grade'] = "M"
             res['sop_checks'].append("强趋势加速")
@@ -1847,6 +2382,38 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             res['sop_bonuses'].append("强势动量观察")
             res['momentum_watch_only'] = True
             res['momentum_watch_reason'] = "涨幅/短线涨幅偏高，不追买；保留观察回踩或次日确认"
+        transition_reasons = []
+        if res.get('sop_grade') != base_grade:
+            if res.get('revival_watch_only'):
+                transition_reasons.append("历史信号复活按确认状态调整等级")
+            if res.get('momentum_acceleration_watch_only') or res.get('momentum_watch_only'):
+                transition_reasons.append("强趋势加速改为M级观察，禁止追高")
+            if res.get('tv_reversal_watch_only'):
+                transition_reasons.append("强修复入口固定为M级观察，等待周线与次日确认")
+            if res.get('sector_watch_only'):
+                transition_reasons.append("板块观察入口不直接生成交易等级")
+            if res.get('bottom_discovery_watch_only'):
+                transition_reasons.append("底部发现入口固定为C级观察，不产生交易权限")
+            if brooks_adjustment <= -6:
+                transition_reasons.append("Brooks风险导致等级下调")
+            if not transition_reasons:
+                transition_reasons.append("执行语义规则调整最终等级")
+        gap_to_a = round(max(0.0, SOP_A_GRADE_MIN_SCORE - float(quality_score)), 1)
+        if gap_to_a > 0:
+            quality_reason = f"质量分{quality_score:.1f}，距A级还差{gap_to_a:.1f}分"
+        elif a_grade_gate_reasons:
+            quality_reason = (
+                f"质量分{quality_score:.1f}，已达到A级分数线；"
+                f"A级校准门禁未通过：{'、'.join(a_grade_gate_reasons)}"
+            )
+        else:
+            quality_reason = f"质量分{quality_score:.1f}，已达到A级分数线"
+        if transition_reasons:
+            quality_reason += f"；基础{base_grade}→最终{res.get('sop_grade')}：{'、'.join(transition_reasons)}"
+        res['sop_base_grade'] = base_grade
+        res['sop_quality_gap_to_a'] = gap_to_a
+        res['sop_grade_transition_reasons'] = transition_reasons
+        res['sop_grade_reason'] = quality_reason
         _apply_trade_execution_profile(res)
 
 
@@ -1900,7 +2467,9 @@ def _build_sector_watch_candidates(
         if strength.get('sector_phase') != 'SECTOR_CONFIRM':
             continue
         sector_avg = float(strength.get('sector_avg_pct') or group['pct_chg'].mean() or 0)
-        leaders = group.sort_values('pct_chg', ascending=False).head(max_per_sector)
+        leaders = group[
+            group['pct_chg'].le(A_MINUS_TRIAL_MAX_DAILY_RISE_PCT)
+        ].sort_values('pct_chg', ascending=False).head(max_per_sector)
         for rank, (_, row) in enumerate(leaders.iterrows(), start=1):
             code = str(row.get('code', '')).zfill(6)
             if code in existing_codes:
@@ -1929,6 +2498,8 @@ def _build_sector_watch_candidates(
                 close_5d_ago = float(df_hist['收盘'].iloc[-6])
                 if close_5d_ago > 0:
                     pct_5d = round((close_now - close_5d_ago) / close_5d_ago * 100, 2)
+            if pct_5d > SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT:
+                continue
 
             item: Dict[str, Any] = {
                 '代码': code,
@@ -1997,7 +2568,7 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     if min_data_days is None:
         if strategy_type in {"pine", "tv_zp", "tv_dual", "tv_dual_strict"}:
             min_days = 120
-        elif strategy_type == "early_value":
+        elif strategy_type in {"early_value", "bottom_discovery"}:
             min_days = 80
         elif strategy_type == "consensus":
             min_days = 130 # 需要 60 周或足够长的日线来模拟
@@ -2071,8 +2642,21 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 stats['名称'] = name
                 stats['strategy_type'] = strategy_type
                 return stats
-            else:
-                return stats
+            if strategy_type == "tv_dual_strict" and stats.get("tv_zp_raw_current"):
+                watch_match, watch_stats = check_tv_reversal_watch(
+                    df,
+                    threshold=threshold,
+                    vol_multiplier=vol_multiplier,
+                    rsi_min=rsi_min,
+                    use_macd_filter=use_macd_filter,
+                    sqz_lookback=sqz_lookback,
+                )
+                if watch_match:
+                    watch_stats['代码'] = code
+                    watch_stats['名称'] = name
+                    watch_stats['strategy_type'] = "tv_reversal_watch"
+                    return watch_stats
+            return stats
         elif strategy_type == "both":
             # 同时满足：均线粘合 + Pine Script 共振
             match_sqz, stats_sqz = check_strategy(
@@ -2121,6 +2705,11 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         elif strategy_type == "early_value":
             match, stats = _check_early_value_strategy(df, code, name, price)
             return stats
+        elif strategy_type == "bottom_discovery":
+            match, stats = _check_bottom_discovery_strategy(
+                df, code, name, price, current_vol=vol, current_open=open_price,
+            )
+            return stats
         else:
             # 默认均线粘合策略
             match, stats = check_strategy(
@@ -2166,13 +2755,14 @@ def perform_market_scan(
     use_rs_filter: bool = False,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "tv_dual_strict",
+    strategy_type: str = PRIMARY_TV_STRATEGY,
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,
     stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
     tv_weekly_gate: bool = False,
     require_live_snapshot: bool = False,
+    scan_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Executes the main market scan logic.
@@ -2271,7 +2861,17 @@ def perform_market_scan(
                         f"[RUN_MARKET_SCAN] 扫描被数据预检熔断中止："
                         f"{'; '.join(block_msgs) or '存在 error 级检查项'}"
                     )
+                    if require_live_snapshot:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "实时扫描已中止：数据预检未通过。"
+                                f"{'; '.join(block_msgs) or '存在数据完整性问题'}"
+                            ),
+                        )
                     return []
+            except HTTPException:
+                raise
             except Exception as exc:
                 # 预检本身失败不应阻断扫描（降级为告警，保持可用性）
                 logger.warning(f"[RUN_MARKET_SCAN] 数据预检执行异常，跳过熔断：{exc}")
@@ -2379,11 +2979,21 @@ def perform_market_scan(
                 detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
             raise HTTPException(status_code=503, detail=detail_msg)
         data_mode = "LOCAL_DB" if max_date else "LIVE_SNAPSHOT"
+        snapshot_attrs = getattr(snapshot_df, "attrs", {}) or {}
         snapshot_as_of = (
-            max_date or getattr(snapshot_df, "attrs", {}).get("data_date")
+            max_date or snapshot_attrs.get("data_date")
             if data_mode == "LOCAL_DB"
-            else datetime.now()
+            else snapshot_attrs.get("fetched_at") or datetime.now()
         )
+        resolved_data_date = str(
+            max_date or snapshot_attrs.get("data_date") or datetime.now().strftime("%Y-%m-%d")
+        )[:10]
+        if scan_context is not None:
+            scan_context.update({
+                "data_date": resolved_data_date,
+                "data_mode": data_mode,
+                "as_of": snapshot_as_of,
+            })
         audit_payload.update(_build_snapshot_audit(snapshot_df, data_mode, snapshot_as_of))
         dataset_version = f"{data_mode}:{str(snapshot_as_of)[:19]}"
         audit_payload["version_snapshot"]["dataset_version"] = dataset_version
@@ -2413,17 +3023,27 @@ def perform_market_scan(
         # fallback 模式下 turnover/mkt_cap 可能为 NULL（本地DB无此数据），需特殊处理
         has_turnover = snapshot_df['turnover'].notna()
         has_mkt_cap = snapshot_df['mkt_cap'].notna()
+        has_core_quote = snapshot_df['price'].notna() & snapshot_df['pct_chg'].notna()
 
         discovery_mask, discovery_pool = _discovery_pool_mask(snapshot_df, strategy_type)
         audit_payload["effective_filters"] = [
             item for item in audit_payload.get("effective_filters", [])
             if item != "positive_pct_change"
         ] + [f"discovery_pool:{discovery_pool}"]
+        turnover_filter = (
+            has_turnover & (snapshot_df['turnover'] >= turnover_min)
+            if "turnover_min" in audit_payload.get("effective_filters", [])
+            else pd.Series(True, index=snapshot_df.index)
+        )
+        mkt_cap_filter = (
+            has_mkt_cap & (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)
+            if "market_cap_min" in audit_payload.get("effective_filters", [])
+            else pd.Series(True, index=snapshot_df.index)
+        )
         candidates = snapshot_df[
             discovery_mask &
-            is_target_market & is_not_st &
-            (~has_mkt_cap | (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)) &
-            (~has_turnover | (snapshot_df['turnover'] >= turnover_min))
+            is_target_market & is_not_st & has_core_quote &
+            mkt_cap_filter & turnover_filter
         ].copy()
         candidates["discovery_pool"] = discovery_pool
         audit_payload["params_snapshot"]["discovery_pool"] = discovery_pool
@@ -2494,8 +3114,11 @@ def perform_market_scan(
         logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
         start_time = time.time()
         end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
-        # 深度修复：延长历史数据预热期至 1000 天（约 4 年），以确保 100/200 周期的长效 EMA 完全收敛，精确对齐 TradingView
-        start_date_hist = (datetime.strptime(end_date_hist, "%Y-%m-%d") - timedelta(days=1000)).strftime("%Y-%m-%d")
+        # 图表和扫描共用同一 TV 预热窗口；Alternate Signal 对历史起点敏感。
+        start_date_hist = (
+            datetime.strptime(end_date_hist, "%Y-%m-%d")
+            - timedelta(days=TV_SIGNAL_WARMUP_DAYS)
+        ).strftime("%Y-%m-%d")
         candidate_codes = candidates['code'].tolist()
 
         dfs = []
@@ -2597,7 +3220,7 @@ def perform_market_scan(
                 fund_res = conn.execute(text("SELECT code, roe, net_profit_yoy, revenue_yoy, label FROM stock_fundamentals")).fetchall()
                 for r in fund_res:
                     # 强制使用字符串作为 Key，防止 pandas 类型推断导致 int/str 匹配失败
-                    code_key = str(r[0])
+                    code_key = str(r[0]).zfill(6)
                     fund_map[code_key] = {
                         "roe": float(r[1]) if r[1] is not None else 0.0,
                         "net_profit_yoy": float(r[2]) if r[2] is not None else 0.0,
@@ -2709,6 +3332,21 @@ def perform_market_scan(
             if sector_watch:
                 logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
                 results.extend(sector_watch)
+        elif strategy_type in {"tv_dual", "tv_dual_strict"}:
+            existing_codes = {str(res.get('代码', '')).zfill(6) for res in results}
+            sector_watch = _build_sector_watch_candidates(
+                candidates,
+                existing_codes,
+                hist_map,
+                sector_map,
+                sector_strength,
+                max_per_sector=2,
+            )
+            if sector_watch:
+                logger.info(
+                    f"Added {len(sector_watch)} early strong-sector observation candidates."
+                )
+                results.extend(sector_watch)
 
         active_plan_map: Dict[str, Dict[str, Any]] = {}
         if strategy_type in {"tv_dual", "tv_dual_strict"}:
@@ -2754,6 +3392,7 @@ def perform_market_scan(
             try:
                 if res.get('sector_watch_only'):
                     return res
+                _inject_missing_fundamentals(res, fund_map)
                 code = res['代码']
                 # 1. 计算回测统计
                 # 直接使用 hist_map 中已计算好指标的数据，避免重复计算
@@ -2872,6 +3511,15 @@ def perform_market_scan(
         # 使用线程池并发补充 100 只股票
         with ThreadPoolExecutor(max_workers=15) as executor:
             list(executor.map(process_supplement, results))
+
+        recent_push_counts = load_recent_push_counts(
+            engine,
+            (res.get("代码") for res in results),
+            strategy_type,
+            str(max_date or datetime.now().strftime("%Y-%m-%d")),
+        )
+        for res in results:
+            res["recent_push_days"] = recent_push_counts.get(str(res.get("代码") or "").zfill(6), 1)
 
         for res in results:
             _apply_frozen_execution_plan(
@@ -3012,9 +3660,20 @@ def perform_market_scan(
 
         _apply_money_flow_to_results(results, money_flow_map)
         for res in results:
+            _apply_close_confirmation_timing(res, snapshot_as_of, data_mode)
             history = res.get('revival_history')
             if history:
                 res.update(_classify_historical_revival(res, history))
+
+        # A-受控试仓先读取历史健康度；数据库异常时健康门禁故障安全关闭。
+        from core.a_minus_trial import build_a_minus_trial_health
+        a_minus_trial_health = build_a_minus_trial_health(engine)
+        for res in results:
+            res['a_minus_trial_health'] = a_minus_trial_health
+
+        # 成长板块可能先于宽基指数修复；先注入板块级市场状态，再进行 SOP 评分。
+        growth_segment_context = apply_growth_segment_context(results, snapshot_df, market_regime)
+        market_regime['growth_segments'] = growth_segment_context
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)
@@ -3068,6 +3727,8 @@ def perform_market_scan(
             mode=EVIDENCE_GATE_MODE,
             research_lookup=_cached_research,
         )
+        from core.execution_reachability import apply_execution_reachability
+        reachability_summary = apply_execution_reachability(results)
         # Research-only and evidence gates run after the first presentation pass;
         # refresh derived labels so Bark and persisted snapshots reflect final state.
         apply_decision_semantics(results)
@@ -3075,15 +3736,24 @@ def perform_market_scan(
             row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
             row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
             row["distance_to_trade"] = build_distance_to_trade(row)
+            shadow = assess_persistent_b_shadow(row)
+            row["persistent_b_shadow"] = shadow
+            row["persistent_b_shadow_eligible"] = shadow["eligible"]
+        from core.score_calibration import apply_score_display_contract
+        apply_score_display_contract(results)
         audit_payload["evidence_pipeline"] = evidence_summary
         audit_payload["params_snapshot"]["evidence_pipeline"] = {
             **evidence_summary, "stage": "DECISION_READY",
         }
         audit_payload["version_snapshot"]["candidate_evidence"] = "candidate-evidence-v1"
+        audit_payload["version_snapshot"]["execution_reachability"] = "execution-reachability-v1"
+        audit_payload["params_snapshot"]["execution_reachability"] = reachability_summary
         mark_phase("candidate_evidence")
         audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
-        audit_payload["version_snapshot"]["strategy_health_control"] = "expected-return-circuit-breaker-v1"
-        audit_payload["version_snapshot"]["decision_layer"] = "market-cycle-mainline-leadership-v2"
+        audit_payload["version_snapshot"]["strategy_health_control"] = "execution-cohort-circuit-breaker-v2"
+        audit_payload["version_snapshot"]["decision_layer"] = (
+            decision_context.get("market_sentiment_model_version") or "cycle-unknown"
+        )
         audit_payload["params_snapshot"]["market_sentiment_stage"] = decision_context.get("market_sentiment_stage")
         audit_payload["params_snapshot"]["portfolio_position_cap_pct"] = decision_context.get("portfolio_position_cap_pct")
         logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
@@ -3111,9 +3781,17 @@ def perform_market_scan(
 
         # --- 持久化保存 ---
         persist_started_at = time.perf_counter()
-        scan_data_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
+        scan_data_date = resolved_data_date
         for res in results:
             res['data_date'] = scan_data_date
+            res['data_mode'] = data_mode
+            res['as_of'] = str(snapshot_as_of)
+            if res.get('revival_watch_only'):
+                res['result_group'] = 'HISTORICAL_REVIVAL'
+            elif res.get('momentum_acceleration_watch_only'):
+                res['result_group'] = 'MOMENTUM_WATCH'
+            else:
+                res['result_group'] = 'FORMAL'
         save_scan_results(
             results,
             engine,

@@ -8,7 +8,21 @@ import math
 
 import pandas as pd
 
-from core.risk_constants import MAX_PORTFOLIO_RISK_PER_TRADE_PCT
+from core.risk_constants import (
+    A_EOD_MAX_CONCURRENT_POSITIONS,
+    A_EOD_PORTFOLIO_CAP_PCT,
+    A_EOD_POSITION_PCT,
+    A_MINUS_TRIAL_PORTFOLIO_CAP_PCT,
+    A_MINUS_TRIAL_POSITION_PCT,
+    MAX_PORTFOLIO_RISK_PER_TRADE_PCT,
+    PRIMARY_TV_STRATEGY,
+    SOP_A_GRADE_STRATEGIES,
+    STRUCTURAL_REPAIR_MAX_WEAK_RATIO,
+    STRUCTURAL_REPAIR_MIN_ADVANCE_RATIO,
+    STRUCTURAL_REPAIR_MIN_AVG_RETURN_PCT,
+    STRUCTURAL_REPAIR_MIN_SEGMENT_COUNT,
+    STRUCTURAL_REPAIR_MIN_STRONG_RATIO,
+)
 from sqlalchemy import text
 
 from core.sector_strength import classify_mainline_sector
@@ -23,6 +37,71 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
+
+
+def build_growth_segment_context(
+    snapshot: pd.DataFrame,
+    market_regime: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Measure growth-board breadth without changing the global market regime."""
+    if snapshot is None or snapshot.empty or not {"code", "pct_chg"}.issubset(snapshot.columns):
+        return {}
+
+    codes = snapshot["code"].astype(str).str.zfill(6)
+    pct = pd.to_numeric(snapshot["pct_chg"], errors="coerce")
+    global_status = str(market_regime.get("status") or "UNKNOWN").upper()
+    segments: Dict[str, Dict[str, Any]] = {}
+    for label, prefixes in (("创业板", ("300", "301")), ("科创板", ("688", "689"))):
+        values = pct[codes.str.startswith(prefixes)].dropna()
+        count = int(len(values))
+        if not count:
+            continue
+        advance_ratio = float((values > 0).mean() * 100)
+        strong_ratio = float((values >= 5).mean() * 100)
+        weak_ratio = float((values <= -5).mean() * 100)
+        avg_return = float(values.mean())
+        structural_repair = (
+            global_status in {"CRITICAL", "DEFENSIVE"}
+            and count >= STRUCTURAL_REPAIR_MIN_SEGMENT_COUNT
+            and advance_ratio >= STRUCTURAL_REPAIR_MIN_ADVANCE_RATIO
+            and strong_ratio >= STRUCTURAL_REPAIR_MIN_STRONG_RATIO
+            and avg_return >= STRUCTURAL_REPAIR_MIN_AVG_RETURN_PCT
+            and weak_ratio <= STRUCTURAL_REPAIR_MAX_WEAK_RATIO
+        )
+        segments[label] = {
+            "stage": "STRUCTURAL_REPAIR" if structural_repair else "NEUTRAL",
+            "label": "结构性强修复" if structural_repair else "未形成独立强势",
+            "count": count,
+            "advance_ratio": round(advance_ratio, 1),
+            "strong_ratio": round(strong_ratio, 1),
+            "weak_ratio": round(weak_ratio, 1),
+            "avg_return_pct": round(avg_return, 2),
+        }
+    return segments
+
+
+def apply_growth_segment_context(
+    results: List[Dict[str, Any]],
+    snapshot: pd.DataFrame,
+    market_regime: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    """Attach board-specific repair evidence before SOP grading."""
+    segments = build_growth_segment_context(snapshot, market_regime)
+    global_status = str(market_regime.get("status") or "UNKNOWN").upper()
+    for stock in results:
+        code = str(stock.get("代码") or stock.get("code") or "").zfill(6)
+        segment = "创业板" if code.startswith(("300", "301")) else "科创板" if code.startswith(("688", "689")) else None
+        detail = segments.get(segment or "", {})
+        stock["market_segment"] = segment or "其他"
+        stock["market_segment_stage"] = detail.get("stage", "NEUTRAL")
+        stock["market_segment_label"] = detail.get("label", "跟随全市场")
+        stock["market_segment_breadth"] = detail
+        stock["effective_market_regime"] = (
+            "DEFENSIVE"
+            if global_status == "CRITICAL" and detail.get("stage") == "STRUCTURAL_REPAIR"
+            else global_status
+        )
+    return segments
 
 
 def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
@@ -119,6 +198,8 @@ def build_market_decision_context(
         advance_ratio = float(_fallback.get("advance_ratio", 0.0))
         strong_ratio = float(_fallback.get("strong_ratio", 0.0))
         weak_ratio = float(_fallback.get("weak_ratio", 0.0))
+        limit_up_count = 0
+        limit_down_count = 0
         limit_up_ratio = 0.0
         limit_down_ratio = 0.0
         current_cycle_date = _fallback.get("date")
@@ -128,8 +209,14 @@ def build_market_decision_context(
         advance_ratio = float((pct > 0).sum() / total * 100)
         strong_ratio = float((pct >= 5).sum() / total * 100)
         weak_ratio = float((pct <= -5).sum() / total * 100)
+        limit_up_count = int((pct >= 9.8).sum())
+        limit_down_count = int((pct <= -9.8).sum())
         limit_up_ratio = float((pct >= 9.8).sum() / total * 100)
         limit_down_ratio = float((pct <= -9.8).sum() / total * 100)
+
+    reported_limit_down_count = market_regime.get("limit_down_count")
+    if isinstance(reported_limit_down_count, int) and reported_limit_down_count >= 0:
+        limit_down_count = reported_limit_down_count
 
     # 改动 A3：统一 prior 计算（原来有两段重复逻辑，其中第一段 trend 是被覆盖的死代码）。
     # 用 data_date(_today_str) 判断 cycle 最后一条是否为"当日"需剔除，避免周末/节假日误判。
@@ -147,6 +234,11 @@ def build_market_decision_context(
     weak_days = sum(_num(item.get("advance_ratio"), 50) <= 35 for item in prior3)
     trend = round(advance_ratio - prior3_avg, 1)
 
+    from core.risk_constants import BREADTH_DOWNGRADE_CRITICAL
+
+    if limit_down_count >= BREADTH_DOWNGRADE_CRITICAL:
+        regime = "CRITICAL"
+
     # score 统一计算（snapshot 非空时用宽度+历史加权，空时用 regime 兜底）
     if snapshot is None or snapshot.empty or "pct_chg" not in snapshot.columns:
         score = {"OFFENSIVE": 72, "DEFENSIVE": 42, "CRITICAL": 18}.get(regime, 45)
@@ -155,7 +247,17 @@ def build_market_decision_context(
         regime_score = {"OFFENSIVE": 75, "DEFENSIVE": 50, "CRITICAL": 25}.get(regime, 50)
         score = round(_clamp(current_quality * 0.3 + prior3_avg * 0.35 + prior5_avg * 0.2 + regime_score * 0.15), 1)
 
-    if weak_days >= 2 and advance_ratio <= 30:
+    from core.risk_constants import (
+        V_REPAIR_MIN_ADVANCE_RATIO,
+        V_REPAIR_MIN_BREADTH_IMPROVEMENT,
+        V_REPAIR_MIN_STRONG_RATIO,
+    )
+
+    if limit_down_count >= BREADTH_DOWNGRADE_CRITICAL:
+        stage, label, max_position = "ICE", "冰点", 15
+        allowed, forbidden = ["观察止跌、核心反转试错"], ["重仓抄底", "无确认追涨", "后排股"]
+        reason = f"跌停{limit_down_count}家达到极端宽度阈值，风险状态不得提前修复"
+    elif weak_days >= 2 and advance_ratio <= 30:
         stage, label, max_position = "ICE", "冰点", 15
         allowed, forbidden = ["观察止跌、核心反转试错"], ["重仓抄底", "无确认追涨", "后排股"]
         reason = "近3日持续极弱，等待止跌与首批主动走强"
@@ -171,6 +273,17 @@ def build_market_decision_context(
         stage, label, max_position = "CLIMAX", "高潮", 50
         allowed, forbidden = ["核心持有", "分歧低吸"], ["盲目追高", "后排跟风"]
         reason = "连续高热后进一步扩散，注意次日分歧风险"
+    elif (
+        regime == "CRITICAL"
+        and len(previous) >= 3
+        and advance_ratio >= V_REPAIR_MIN_ADVANCE_RATIO
+        and strong_ratio >= V_REPAIR_MIN_STRONG_RATIO
+        and trend >= V_REPAIR_MIN_BREADTH_IMPROVEMENT
+        and prior3_avg < 52
+    ):
+        stage, label, max_position = "V_REPAIR", "强修复", 30
+        allowed, forbidden = ["首批主线核心观察", "确认后回踩复核"], ["追涨加速票", "后排跟风", "直接扩大仓位"]
+        reason = "前期偏弱后当日宽度快速修复，只观察首批主线核心并等待确认"
     elif prior3_avg >= 52 and prior3_strong_avg >= 5 and advance_ratio >= 55 and regime != "CRITICAL":
         stage, label, max_position = "ADVANCE", "主升", 70
         allowed, forbidden = ["主流核心", "确认后加仓"], ["无主线交易", "冲高追价"]
@@ -203,11 +316,13 @@ def build_market_decision_context(
             "weak_days_3d": weak_days,
             "history_days": len(previous),
         },
-        "market_sentiment_model_version": "cycle-v2",
+        "market_sentiment_model_version": "cycle-v3",
         "market_breadth": {
             "advance_ratio": round(advance_ratio, 1),
             "strong_ratio": round(strong_ratio, 1),
             "weak_ratio": round(weak_ratio, 1),
+            "limit_up_count": limit_up_count,
+            "limit_down_count": limit_down_count,
             "limit_up_ratio": round(limit_up_ratio, 2),
             "limit_down_ratio": round(limit_down_ratio, 2),
         },
@@ -407,21 +522,88 @@ def apply_decision_layer(
             market_blocked = False
             stock["defensive_rotation"] = True
         sector_blocked = mainline == "FADING"
-        score_blocked = opportunity < 60
-        blocked = market_blocked or sector_blocked or score_blocked or stock.get("trade_bucket") == "BLOCK"
-        position = _risk_normalize_position(
-            _position_plan(opportunity, market_cap, mainline, blocked), stock,
+        strategy_type = str(stock.get("strategy_type") or PRIMARY_TV_STRATEGY)
+        score_gate_applicable = strategy_type in SOP_A_GRADE_STRATEGIES
+        score_blocked = (
+            score_gate_applicable
+            and opportunity < 60
+            and not stock.get("a_eod_controlled_trial")
         )
+        blocked = market_blocked or sector_blocked or score_blocked or stock.get("trade_bucket") == "BLOCK"
+        position_blocked = blocked or not score_gate_applicable
+        if stock.get("a_eod_controlled_trial") and not position_blocked:
+            controlled_cap = min(float(market_cap), A_EOD_PORTFOLIO_CAP_PCT)
+            controlled_position = min(A_EOD_POSITION_PCT, controlled_cap)
+            position = _risk_normalize_position({
+                "label": "A-EOD受控小仓" if controlled_position > 0 else "观望",
+                "initial_position_pct": controlled_position,
+                "max_position_pct": controlled_position,
+                "portfolio_position_cap_pct": controlled_cap,
+                "a_eod_max_positions": A_EOD_MAX_CONCURRENT_POSITIONS,
+            }, stock)
+        else:
+            position = _risk_normalize_position(
+                _position_plan(opportunity, market_cap, mainline, position_blocked), stock,
+            )
+        if stock.get("a_minus_trial"):
+            position["initial_position_pct"] = min(
+                float(position.get("initial_position_pct") or 0), A_MINUS_TRIAL_POSITION_PCT,
+            )
+            position["max_position_pct"] = min(
+                float(position.get("max_position_pct") or 0), A_MINUS_TRIAL_POSITION_PCT,
+            )
+            position["label"] = "A-受控试仓" if position["initial_position_pct"] > 0 else "观望"
+            position["a_minus_portfolio_cap_pct"] = A_MINUS_TRIAL_PORTFOLIO_CAP_PCT
+            risk_pct = _num(stock.get("pa_risk_pct"))
+            if risk_pct > 0 and position["initial_position_pct"] > 0:
+                position["estimated_initial_risk_pct"] = round(
+                    position["initial_position_pct"] * risk_pct / 100, 2,
+                )
+            stock["a_minus_portfolio_cap_pct"] = A_MINUS_TRIAL_PORTFOLIO_CAP_PCT
+        if stock.get("a_eod_controlled_trial"):
+            position["a_eod_portfolio_cap_pct"] = A_EOD_PORTFOLIO_CAP_PCT
+            position["a_eod_max_positions"] = A_EOD_MAX_CONCURRENT_POSITIONS
+            stock["a_eod_portfolio_cap_pct"] = A_EOD_PORTFOLIO_CAP_PCT
+            stock["a_eod_max_positions"] = A_EOD_MAX_CONCURRENT_POSITIONS
+        tv_risk_unit = _num(stock.get("tv_execution_risk_unit"), 1.0)
+        if strategy_type == "tv_dual" and 0 < tv_risk_unit < 1:
+            position["initial_position_pct"] = round(
+                float(position.get("initial_position_pct") or 0) * tv_risk_unit, 1,
+            )
+            position["max_position_pct"] = round(
+                float(position.get("max_position_pct") or 0) * tv_risk_unit, 1,
+            )
+            risk_pct = _num(stock.get("pa_risk_pct"))
+            if risk_pct > 0 and position["initial_position_pct"] > 0:
+                position["estimated_initial_risk_pct"] = round(
+                    position["initial_position_pct"] * risk_pct / 100, 2,
+                )
+        position["tv_execution_risk_unit"] = tv_risk_unit
         state = _trade_state(stock, position)
 
         stock.update(context)
         stock["sector_mainline"] = mainline
         stock["leadership_score"] = leader_score
         stock["trade_opportunity_score"] = opportunity
+        stock["opportunity_gate_applicable"] = score_gate_applicable
         stock["trade_opportunity_label"] = position["label"]
         stock["position_plan"] = position
         stock["trade_state"] = state
-        stock["execution_instruction"] = _execution_instruction(stock, state, position)
+        instruction = _execution_instruction(stock, state, position)
+        if stock.get("a_minus_trial") and state != "BLOCKED":
+            instruction = (
+                f"A-受控试仓（单票≤{A_MINUS_TRIAL_POSITION_PCT:g}%，"
+                f"组合≤{A_MINUS_TRIAL_PORTFOLIO_CAP_PCT:g}%）；{instruction}"
+            )
+        elif stock.get("a_eod_controlled_trial") and state != "BLOCKED":
+            cautions = "；".join(str(item) for item in (stock.get("a_eod_trade_cautions") or [])[:2])
+            caution_text = f"；软约束：{cautions}" if cautions else ""
+            instruction = (
+                f"A-EOD受控小仓（单票≤{A_EOD_POSITION_PCT:g}%，"
+                f"组合≤{A_EOD_PORTFOLIO_CAP_PCT:g}%，"
+                f"最多{A_EOD_MAX_CONCURRENT_POSITIONS}只）{caution_text}；{instruction}"
+            )
+        stock["execution_instruction"] = instruction
         stock["decision_score_components"] = {
             "market": stage_score,
             "sector": sector_score,

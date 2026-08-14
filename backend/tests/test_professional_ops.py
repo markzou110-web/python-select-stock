@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 from datetime import datetime
 
 import pandas as pd
@@ -10,6 +11,7 @@ from sqlalchemy import create_engine, inspect, text
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.db import (
+    _price_action_detail_snapshot,
     get_scan_history_by_date,
     init_db,
     save_failure_sample,
@@ -36,6 +38,20 @@ def test_init_db_adds_theme_fields_to_legacy_sqlite_tables():
     inspector = inspect(engine)
     assert {"theme", "rise_logic"} <= {column["name"] for column in inspector.get_columns("paper_trading")}
     assert {"theme", "rise_logic"} <= {column["name"] for column in inspector.get_columns("watchlist")}
+
+
+def test_init_db_adds_tv_execution_state_to_legacy_paper_trades():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE paper_trading (id INTEGER PRIMARY KEY)"))
+
+    init_db(engine)
+
+    columns = {column["name"] for column in inspect(engine).get_columns("paper_trading")}
+    assert {
+        "signal_sources", "execution_tier", "risk_unit", "source_upgraded_at",
+        "pending_exit_reason", "pending_exit_signal_date",
+    } <= columns
 
 
 def test_scan_history_replaces_nan_with_json_safe_null():
@@ -82,6 +98,93 @@ def test_scan_history_keeps_multiple_strategies_for_same_data_date():
     with engine.connect() as conn:
         strategies = conn.execute(text("SELECT code, strategy_type FROM scan_history ORDER BY strategy_type")).fetchall()
     assert strategies == [("000002", "pine"), ("000001", "squeeze")]
+
+
+def test_scan_history_preserves_result_group_snapshot():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    results = [
+        {
+            "代码": "000001", "名称": "正式信号", "现价": 10, "涨幅%": 1,
+            "Score": 70, "strategy_type": "tv_dual_strict", "result_group": "FORMAL",
+        },
+        {
+            "代码": "000002", "名称": "历史复活", "现价": 11, "涨幅%": 2,
+            "Score": 68, "strategy_type": "tv_dual_strict", "result_group": "HISTORICAL_REVIVAL",
+        },
+        {
+            "代码": "000003", "名称": "动量观察", "现价": 12, "涨幅%": 3,
+            "Score": 66, "strategy_type": "tv_dual_strict", "result_group": "MOMENTUM_WATCH",
+        },
+    ]
+
+    assert save_scan_results(results, engine, data_date="2026-06-12") is True
+
+    history = get_scan_history_by_date("2026-06-12", engine)
+    assert {row["代码"]: row.get("result_group") for row in history} == {
+        "000001": "FORMAL",
+        "000002": "HISTORICAL_REVIVAL",
+        "000003": "MOMENTUM_WATCH",
+    }
+
+
+def test_scan_snapshot_detail_keeps_market_data_timestamp():
+    detail = json.loads(_price_action_detail_snapshot({
+        "data_mode": "LIVE_SNAPSHOT",
+        "as_of": "2026-06-12 10:30:00",
+    }))
+
+    assert detail == {
+        "data_mode": "LIVE_SNAPSHOT",
+        "as_of": "2026-06-12 10:30:00",
+    }
+
+
+def test_result_group_migration_does_not_reclassify_explicit_formal_record():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO scan_history (
+                code, date, data_date, name, strategy_type, result_group, sop_checks
+            ) VALUES (
+                '000001', '2026-06-12', '2026-06-12', '正式信号',
+                'tv_dual_strict', 'FORMAL', '["复活条件仅作说明"]'
+            )
+        """))
+
+    init_db(engine)
+
+    with engine.connect() as conn:
+        result_group = conn.execute(text(
+            "SELECT result_group FROM scan_history WHERE code = '000001'"
+        )).scalar_one()
+    assert result_group == "FORMAL"
+
+
+def test_result_group_migration_defaults_legacy_sqlite_rows_without_sop_columns():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE scan_history (
+                id INTEGER PRIMARY KEY,
+                code VARCHAR(20) NOT NULL,
+                date DATE NOT NULL,
+                name VARCHAR(100)
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO scan_history (code, date, name)
+            VALUES ('000001', '2026-06-12', '旧版记录')
+        """))
+
+    init_db(engine)
+
+    with engine.connect() as conn:
+        result_group = conn.execute(text(
+            "SELECT result_group FROM scan_history WHERE code = '000001'"
+        )).scalar_one()
+    assert result_group == "FORMAL"
 
 
 def test_empty_scan_replaces_requested_strategy_snapshot_only():
@@ -299,7 +402,7 @@ def test_recommendation_event_upserts_same_daily_identity_on_sqlite():
         "代码": "000001",
         "名称": "平安银行",
         "现价": 10.5,
-        "strategy_type": "tv_dual_strict",
+        "strategy_type": "tv_dual",
         "trade_bucket": "OBSERVE",
         "final_trade_score": 70,
     }
@@ -341,6 +444,24 @@ def test_portfolio_risk_budget_warns_on_exposure():
     assert result["status"] == "warning"
     assert any("行业" in item for item in result["warnings"])
     assert any("组合计划风险" in item for item in result["warnings"])
+
+
+def test_portfolio_risk_budget_accepts_empty_optional_position_fields():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+
+    result = evaluate_portfolio_risk_budget(
+        engine,
+        {
+            "code": "002192",
+            "price": 146.8,
+            "position_pct": None,
+            "capital_used": None,
+        },
+    )
+
+    assert result["status"] == "ok"
+    assert result["warnings"] == []
 
 
 def test_capital_risk_uses_position_amount_and_stop_distance():
@@ -483,6 +604,62 @@ def test_add_paper_trade_does_not_report_success_when_insert_conflicts(monkeypat
     assert len(notifications) == 1
 
 
+def test_add_paper_trade_accepts_missing_optional_position_fields(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE UNIQUE INDEX uq_paper_trade_code_date ON paper_trading (code, entry_date)"))
+    monkeypatch.setattr(paper_trade, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(paper_trade, "get_sector_map", lambda: {})
+    monkeypatch.setattr(paper_trade, "record_lifecycle_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(paper_trade, "send_paper_trade_notification", lambda *_args: None)
+
+    trade = paper_trade.PaperTradeCreate(
+        code="002192",
+        name="融捷股份",
+        price=146.8,
+        force=True,
+    )
+
+    assert paper_trade.add_paper_trade(trade)["status"] == "success"
+
+
+def test_new_zp_signal_upgrades_existing_ma_position_without_duplicate(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE UNIQUE INDEX uq_paper_trade_code_date ON paper_trading (code, entry_date)"))
+    lifecycle_events = []
+    monkeypatch.setattr(paper_trade, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(paper_trade, "get_sector_map", lambda: {})
+    monkeypatch.setattr(
+        paper_trade,
+        "evaluate_portfolio_risk_budget",
+        lambda *_args, **_kwargs: {"status": "ok"},
+    )
+    monkeypatch.setattr(paper_trade, "record_lifecycle_event", lambda *args, **kwargs: lifecycle_events.append((args, kwargs)))
+    monkeypatch.setattr(paper_trade, "send_paper_trade_notification", lambda *_args: None)
+
+    ma_trade = paper_trade.PaperTradeCreate(
+        code="603259", name="药明康德", price=148.82, strategy_type="tv_dual",
+        signal_sources=["ma"], entry_signal_date="2026-08-05", force=True,
+    )
+    zp_confirmation = paper_trade.PaperTradeCreate(
+        code="603259", name="药明康德", price=154.82, strategy_type="tv_dual",
+        signal_sources=["zp"], entry_signal_date="2026-08-07", force=True,
+    )
+
+    assert paper_trade.add_paper_trade(ma_trade)["status"] == "success"
+    upgraded = paper_trade.add_paper_trade(zp_confirmation)
+
+    assert upgraded["status"] == "upgraded"
+    assert upgraded["signal_sources"] == ["ma", "zp"]
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT signal_sources, execution_tier, risk_unit FROM paper_trading")).fetchall()
+    assert rows == [("ma+zp", "B", 0.6)]
+    assert any(args and args[0] == "POSITION_SIGNAL_UPGRADED" for args, _kwargs in lifecycle_events)
+
+
 def test_real_trade_requires_execution_context_before_open(monkeypatch):
     monkeypatch.setattr(paper_trade, "get_db_engine", lambda: object())
 
@@ -502,7 +679,11 @@ def test_real_trade_requires_execution_context_before_open(monkeypatch):
 
 
 def test_sector_strength_returns_stale_cache_without_recomputing(monkeypatch):
-    stale = {"items": [{"industry": "银行"}], "updated_at": "2026-06-06T09:30:00"}
+    stale = {
+        "items": [{"industry": "银行"}],
+        "data_date": market.datetime.now().strftime("%Y-%m-%d"),
+        "updated_at": "2026-06-06T09:30:00",
+    }
     monkeypatch.setattr(market, "get_cached_data", lambda *args: None)
     monkeypatch.setattr(market, "get_stale_cache", lambda *args: stale)
     monkeypatch.setattr(
@@ -534,6 +715,7 @@ def test_local_market_snapshot_uses_latest_two_trading_days():
 
     assert result.iloc[0]["price"] == 11
     assert result.iloc[0]["pct_chg"] == 10
+    assert result.attrs["data_date"] == "2026-06-05"
 
 
 def test_market_sentiment_prefers_live_snapshot(monkeypatch):

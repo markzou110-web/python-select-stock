@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Play, Loader2, Clock, X, ArrowRight, Star, SlidersHorizontal } from 'lucide-react';
+import { Search, Play, Loader2, Clock, X, ArrowRight, Star, SlidersHorizontal, Menu } from 'lucide-react';
 import api from '@/lib/api';
 
 interface HeaderProps {
@@ -10,6 +10,8 @@ interface HeaderProps {
     lastUpdated: string;
     onOpenFilters: () => void;
     onSelectStock: (stock: StockSearchResult) => void;
+    activeView: string;
+    onOpenNavigation: () => void;
 }
 
 interface StockSearchResult {
@@ -18,15 +20,42 @@ interface StockSearchResult {
     industry: string;
 }
 
-export default function Header({ onScan, loading, lastUpdated, onOpenFilters, onSelectStock }: HeaderProps) {
+const VIEW_META: Record<string, { title: string; description: string }> = {
+    overview: { title: '系统概览', description: '市场、策略与执行状态摘要' },
+    scanner: { title: '多因子共振', description: '全市场扫描与候选股决策' },
+    'sector-radar': { title: '板块雷达', description: '识别主线方向与板块强度' },
+    'research-radar': { title: '资讯雷达', description: '聚合题材信息与个股线索' },
+    paper: { title: '拟合实盘', description: '验证仓位、收益与风险约束' },
+    watchlist: { title: '观察池', description: '跟踪候选股与触发条件' },
+    review: { title: '交易复盘', description: '评估信号质量与执行结果' },
+    'execution-inbox': { title: '执行收件箱', description: '处理待确认的交易意图' },
+    backtest: { title: '策略回测', description: '验证策略参数与历史表现' },
+    alerts: { title: '实时告警', description: '处理止损、破位与止盈提醒' },
+    ops: { title: '专业驾驶舱', description: '监控任务、数据与策略健康度' },
+    search: { title: '代码检索', description: '快速定位个股并进入分析' },
+    templates: { title: '策略模板', description: '管理常用扫描参数组合' },
+    settings: { title: '系统配置', description: '管理数据源与通知偏好' },
+};
+
+export default function Header({
+    onScan,
+    loading,
+    lastUpdated,
+    onOpenFilters,
+    onSelectStock,
+    activeView,
+    onOpenNavigation,
+}: HeaderProps) {
     const [searchQuery, setSearchQuery] = useState('');
     const [results, setResults] = useState<StockSearchResult[]>([]);
     const [isSearching, setIsSearching] = useState(false);
     const [showDropdown, setShowDropdown] = useState(false);
     const [addingWatchCode, setAddingWatchCode] = useState<string | null>(null);
     const [notice, setNotice] = useState<string>('');
+    const [searchError, setSearchError] = useState('');
     const dropdownRef = useRef<HTMLDivElement>(null);
     const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+    const viewMeta = VIEW_META[activeView] || VIEW_META.overview;
 
     // Close dropdown on click outside
     useEffect(() => {
@@ -36,7 +65,14 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
             }
         };
         document.addEventListener('mousedown', handleClickOutside);
-        return () => document.removeEventListener('mousedown', handleClickOutside);
+        const handleEscape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') setShowDropdown(false);
+        };
+        document.addEventListener('keydown', handleEscape);
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+            document.removeEventListener('keydown', handleEscape);
+        };
     }, []);
 
     // Fetch stock search results on query change
@@ -48,10 +84,13 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
         if (!searchQuery.trim()) {
             setResults([]);
             setIsSearching(false);
+            setShowDropdown(false);
+            setSearchError('');
             return;
         }
 
         setIsSearching(true);
+        setSearchError('');
         searchTimeoutRef.current = setTimeout(async () => {
             try {
                 const res = await api.get(`/api/stock/search?query=${encodeURIComponent(searchQuery.trim())}`);
@@ -59,6 +98,9 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
                 setShowDropdown(true);
             } catch (err) {
                 console.error("Fuzzy Search Error:", err);
+                setResults([]);
+                setSearchError('无法搜索，请检查连接后重试。');
+                setShowDropdown(true);
             } finally {
                 setIsSearching(false);
             }
@@ -105,117 +147,159 @@ export default function Header({ onScan, loading, lastUpdated, onOpenFilters, on
     };
 
     return (
-        <header className="flex items-center justify-between gap-4 px-5 py-3 border-b border-slate-300/80 bg-[#fbfaf6]/95">
-            <div className="min-w-0">
-                <h2 className="text-base font-black text-slate-950 tracking-tight">
-                    Alpha Vision
-                </h2>
-                <p className="text-[11px] text-slate-500 font-semibold mt-0.5 flex items-center gap-1.5 truncate">
-                    <Clock size={12} /> {lastUpdated || '等待同步'}
-                </p>
-            </div>
+        <header className="sticky top-0 z-30 border-b border-slate-200/90 bg-[color:oklch(0.99_0.004_90/0.94)] px-3 py-3 backdrop-blur-xl sm:px-5">
+            <div className="mx-auto flex w-full max-w-[1920px] flex-wrap items-center gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <button
+                        type="button"
+                        onClick={onOpenNavigation}
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-700 md:hidden"
+                        aria-label="打开主导航"
+                        aria-controls="app-navigation"
+                    >
+                        <Menu size={20} aria-hidden="true" />
+                    </button>
+                    <div className="min-w-0">
+                        <h1 className="truncate text-lg font-bold tracking-tight text-slate-950 sm:text-xl">
+                            {viewMeta.title}
+                        </h1>
+                        <p className="hidden truncate text-xs text-slate-500 sm:block">{viewMeta.description}</p>
+                    </div>
+                </div>
 
-            <div className="flex flex-1 items-center justify-end gap-2">
-                <button
-                    onClick={onScan}
-                    disabled={loading}
-                    className="primary-button shrink-0"
-                >
-                    {loading ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
-                    {loading ? '分析中' : '扫描'}
-                </button>
-
-                <button
-                    onClick={onOpenFilters}
-                    className="toolbar-button shrink-0"
-                    title="策略参数"
-                >
-                    <SlidersHorizontal size={17} />
-                    参数
-                </button>
-
-                <div className="h-7 w-[1px] bg-slate-300 mx-1 hidden sm:block" />
-
-                {/* Search Container */}
-                <div className="relative w-full max-w-sm" ref={dropdownRef}>
+                <div className="order-3 w-full lg:order-none lg:w-auto lg:flex-1">
+                    {/* Search Container */}
+                    <div className="relative ms-auto w-full lg:max-w-sm" ref={dropdownRef}>
                     <div className="relative group">
-                        <div className="absolute inset-y-0 left-3 flex items-center pointer-events-none text-slate-400 group-focus-within:text-blue-600 transition-colors">
-                            {isSearching ? <Loader2 size={18} className="animate-spin text-blue-600" /> : <Search size={18} />}
+                        <div className="pointer-events-none absolute inset-y-0 start-3 flex items-center text-slate-400 transition-colors group-focus-within:text-blue-600">
+                            {isSearching ? <Loader2 size={18} className="animate-spin text-blue-600" aria-hidden="true" /> : <Search size={18} aria-hidden="true" />}
                         </div>
+                        <label htmlFor="global-stock-search" className="sr-only">搜索股票代码或名称</label>
                         <input
-                            type="text"
+                            id="global-stock-search"
+                            type="search"
+                            name="stock-search"
+                            autoComplete="off"
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
                             onFocus={() => searchQuery.trim() && setShowDropdown(true)}
-                            placeholder="代码/名称搜索..."
-                            className="w-full pl-10 pr-8 py-2 bg-white/80 border border-slate-300 rounded-md text-sm font-semibold shadow-inner focus:ring-2 focus:ring-amber-400/20 focus:border-amber-300 transition-all outline-none"
+                            placeholder="搜索代码、名称或拼音"
+                            role="combobox"
+                            aria-expanded={showDropdown}
+                            aria-controls="header-search-results"
+                            aria-autocomplete="list"
+                            className="min-h-10 w-full rounded-xl border border-slate-200 bg-white py-2 ps-10 pe-11 text-base text-slate-800 shadow-sm transition-[border-color,box-shadow] placeholder:font-normal placeholder:text-slate-400 focus:border-blue-400 focus:outline-none focus:ring-4 focus:ring-blue-500/10 sm:text-sm"
                         />
                         {searchQuery && (
                             <button 
+                                type="button"
                                 onClick={() => setSearchQuery('')}
-                                className="absolute inset-y-0 right-2.5 flex items-center text-slate-400 hover:text-slate-600"
+                                className="absolute inset-y-0 end-1 inline-flex w-10 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                                aria-label="清空股票搜索"
                             >
-                                <X size={16} />
+                                <X size={16} aria-hidden="true" />
                             </button>
                         )}
                     </div>
 
-                    {showDropdown && results.length > 0 && (
-                        <div className="absolute right-0 mt-2 w-[min(24rem,calc(100vw-2rem))] bg-white border border-slate-200 rounded-lg shadow-xl max-h-96 overflow-y-auto z-50 p-2 space-y-1">
-                            <div className="px-3 py-1.5 metric-label border-b border-slate-100">
-                                股票检索结果 ({results.length})
+                        {showDropdown && !isSearching && (
+                            <div
+                                id="header-search-results"
+                                className="absolute end-0 z-50 mt-2 max-h-96 w-full min-w-0 space-y-1 overflow-y-auto rounded-2xl border border-slate-200 bg-white p-2 shadow-[var(--shadow-raised)] lg:w-[26rem]"
+                                aria-label="股票搜索结果"
+                            >
+                                {results.length > 0 ? (
+                                    <>
+                                        <div className="flex items-center justify-between px-3 py-2">
+                                            <p className="text-xs font-semibold text-slate-500">找到 {results.length} 只股票</p>
+                                            <p className="text-xs text-slate-400">选择股票进入详情</p>
+                                        </div>
+                                        {notice && (
+                                            <div className="mx-1 rounded-lg bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-800">
+                                                {notice}
+                                            </div>
+                                        )}
+                                        {results.map((stock) => (
+                                            <div
+                                                key={stock.code}
+                                                className="group flex items-center gap-2 rounded-xl px-2 py-2 hover:bg-blue-50"
+                                            >
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleSelectStock(stock)}
+                                                    className="min-h-10 min-w-0 flex-1 rounded-lg px-1 text-start"
+                                                >
+                                                    <p className="text-sm font-semibold text-slate-800 transition-colors group-hover:text-blue-700">
+                                                        {stock.name}
+                                                    </p>
+                                                    <p className="mt-0.5 truncate text-xs text-slate-500">
+                                                        <span className="font-mono tabular-nums">{stock.code}</span> · {stock.industry}
+                                                    </p>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => addToWatchlist(stock)}
+                                                    disabled={addingWatchCode === stock.code}
+                                                    className="inline-flex min-h-10 shrink-0 items-center gap-1 rounded-lg bg-amber-50 px-2.5 text-xs font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-60"
+                                                >
+                                                    {addingWatchCode === stock.code ? <Loader2 size={15} className="animate-spin" aria-hidden="true" /> : <Star size={15} aria-hidden="true" />}
+                                                    观察
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleSelectStock(stock)}
+                                                    className="inline-flex min-h-10 shrink-0 items-center gap-1 rounded-lg bg-blue-50 px-2.5 text-xs font-semibold text-blue-700 hover:bg-blue-100"
+                                                >
+                                                    <ArrowRight size={15} aria-hidden="true" />
+                                                    详情
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </>
+                                ) : (
+                                    <div className="px-4 py-6 text-center">
+                                        <p className="font-semibold text-slate-700">
+                                            {searchError ? '搜索暂不可用' : `未找到“${searchQuery.trim()}”`}
+                                        </p>
+                                        <p className="mt-1 text-sm text-slate-500">
+                                            {searchError || '请检查代码、名称或拼音后重试。'}
+                                        </p>
+                                    </div>
+                                )}
                             </div>
-                            {notice && (
-                                <div className="mx-1 rounded-md bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700">
-                                    {notice}
-                                </div>
-                            )}
-                            {results.map((stock) => (
-                                <div
-                                    key={stock.code}
-                                    className="flex items-center gap-2 rounded-md px-2 py-2 hover:bg-blue-50 transition-colors group"
-                                >
-                                    <button
-                                        type="button"
-                                        onClick={() => handleSelectStock(stock)}
-                                        className="min-w-0 flex-1 text-left"
-                                    >
-                                        <p className="text-sm font-bold text-slate-800 group-hover:text-blue-700 transition-colors">
-                                            {stock.name}
-                                        </p>
-                                        <p className="text-[10px] text-slate-400 font-bold tracking-wider">
-                                            {stock.code} · {stock.industry}
-                                        </p>
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => addToWatchlist(stock)}
-                                        disabled={addingWatchCode === stock.code}
-                                        className="shrink-0 inline-flex items-center gap-1 rounded-lg bg-amber-50 px-2.5 py-2 text-[11px] font-black text-amber-600 hover:bg-amber-100 disabled:opacity-60"
-                                        title="加入观察池"
-                                    >
-                                        {addingWatchCode === stock.code ? <Loader2 size={15} className="animate-spin" /> : <Star size={15} />}
-                                        观察
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => handleSelectStock(stock)}
-                                        className="shrink-0 inline-flex items-center gap-1 rounded-lg bg-blue-50 px-2.5 py-2 text-[11px] font-black text-blue-600 hover:bg-blue-100"
-                                        title="打开走势详情"
-                                    >
-                                        <ArrowRight size={15} />
-                                        走势
-                                    </button>
-                                </div>
-                            ))}
-                        </div>
-                    )}
+                        )}
+                        <p className="sr-only" role="status" aria-live="polite">
+                            {searchError || notice || (showDropdown && !isSearching ? `找到 ${results.length} 只股票` : '')}
+                        </p>
+                    </div>
+                </div>
 
-                    {showDropdown && searchQuery.trim() && results.length === 0 && !isSearching && (
-                        <div className="absolute right-0 mt-2 w-80 bg-white border border-slate-200 rounded-lg shadow-xl z-50 p-6 text-center text-slate-400 text-sm">
-                            未匹配到相关个股
-                        </div>
-                    )}
+                <div className="flex shrink-0 items-center gap-2">
+                    <div className="me-1 hidden text-end xl:block">
+                        <p className="flex items-center justify-end gap-1.5 text-xs font-medium text-slate-500">
+                            <Clock size={13} aria-hidden="true" />
+                            数据更新
+                        </p>
+                        <p className="mt-0.5 text-xs tabular-nums text-slate-700">{lastUpdated || '等待同步'}</p>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={onOpenFilters}
+                        className="toolbar-button shrink-0"
+                    >
+                        <SlidersHorizontal size={17} aria-hidden="true" />
+                        <span className="hidden sm:inline">策略参数</span>
+                        <span className="sm:hidden">参数</span>
+                    </button>
+                    <button
+                        type="button"
+                        onClick={onScan}
+                        disabled={loading}
+                        className="primary-button shrink-0"
+                    >
+                        {loading ? <Loader2 size={18} className="animate-spin" aria-hidden="true" /> : <Play size={18} fill="currentColor" aria-hidden="true" />}
+                        {loading ? '正在扫描…' : '开始扫描'}
+                    </button>
                 </div>
             </div>
         </header>

@@ -93,6 +93,8 @@ def test_ai_suggestion_gives_trade_plan_for_watch_candidate():
         "is_paper_trade": False,
         "current_price": 10.2,
         "trade_bucket": "TRADE",
+        "trade_eligible": True,
+        "pa_execution_stage": "NEXT_SESSION_EXECUTABLE",
         "final_trade_score": 82,
         "latest_scan_date": "2026-06-04",
         "latest_scan_strategy": "tv_dual_strict",
@@ -109,8 +111,36 @@ def test_ai_suggestion_gives_trade_plan_for_watch_candidate():
     suggestion = _generate_ai_suggestion(df, stock_info, {"market_regime": "OFFENSIVE"}, price_action)
 
     assert suggestion["action"] == "ADD"
-    assert "尾盘确认" in suggestion["action_label"]
+    assert "次日已确认" in suggestion["action_label"]
     assert any("最近入选：2026-06-04" in reason for reason in suggestion["reasoning"])
+
+
+def test_ready_plan_without_next_session_confirmation_is_observation_only():
+    df = pd.DataFrame({
+        "收盘": [10.0] * 25,
+        "RSI": [58.0] * 25,
+        "MACD_HIST": [0.1] * 25,
+        "EMA5": [10.5] * 25,
+        "EMA20": [10.0] * 25,
+        "EMA60": [9.5] * 25,
+    })
+    stock_info = {
+        "is_paper_trade": False,
+        "current_price": 10.2,
+        "trade_bucket": "OBSERVE",
+        "trade_eligible": False,
+        "pa_execution_stage": "EOD_CONFIRMED",
+    }
+
+    suggestion = _generate_ai_suggestion(
+        df,
+        stock_info,
+        {"market_regime": "OFFENSIVE"},
+        {"pa_trade_plan": {"action": "READY", "setup": "强势回踩确认"}},
+    )
+
+    assert suggestion["action"] == "HOLD"
+    assert "次日" in suggestion["action_label"]
 
 
 def test_ai_suggestion_avoids_blocked_watch_candidate():

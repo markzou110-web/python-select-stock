@@ -14,6 +14,9 @@ def test_task_result_summary_keeps_business_fields_without_large_body():
         "errors": ["scan: snapshot unavailable"],
         "body": "x" * 5000,
         "notification": {"bark": True},
+        "next_day_reviewed": 5,
+        "next_day_confirmed": 1,
+        "next_day_confirmation_bark": 1,
     })
 
     payload = json.loads(summary)
@@ -22,4 +25,6 @@ def test_task_result_summary_keeps_business_fields_without_large_body():
     assert payload["scan_count"] == 4
     assert payload["errors"] == ["scan: snapshot unavailable"]
     assert payload["notification"] == {"bark": True}
+    assert payload["next_day_reviewed"] == 5
+    assert payload["next_day_confirmed"] == 1
     assert "body" not in payload

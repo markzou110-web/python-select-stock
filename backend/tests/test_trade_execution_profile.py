@@ -7,6 +7,7 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.scanner import (
+    _apply_close_confirmation_timing,
     _apply_frozen_execution_plan,
     _apply_sop_filter,
     _build_momentum_acceleration_candidates,
@@ -28,6 +29,52 @@ def test_confirmation_tolerance_accepts_one_tick_rounding_gap():
     assert _confirmation_price_reached(85.80, 86.00) is False
 
 
+def test_close_confirmation_is_provisional_before_late_session():
+    result = _base_candidate()
+
+    _apply_close_confirmation_timing(result, "2026-07-15T11:30:00", "LIVE_SNAPSHOT")
+    _apply_sop_filter([result], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert result["pa_close_confirmation_phase"] == "INTRADAY_PROVISIONAL"
+    assert result["pa_close_time_eligible"] is False
+    assert result["pa_volume_confirmation_state"] == "PROVISIONAL"
+    assert result["pa_close_confirmed"] is False
+    assert result["pa_confirmation_state"] == "PRICE_TRIGGERED"
+    assert any("14:30" in blocker for blocker in result["trade_blockers"])
+
+
+def test_close_confirmation_is_eligible_at_late_session_and_for_daily_close():
+    late = _base_candidate()
+    daily = _base_candidate()
+
+    _apply_close_confirmation_timing(late, "2026-07-15T14:30:00", "LIVE_SNAPSHOT")
+    _apply_close_confirmation_timing(
+        daily,
+        "2026-07-14",
+        "LOCAL_DB",
+        now="2026-07-15T11:30:00",
+    )
+
+    assert late["pa_close_confirmation_phase"] == "LATE_SESSION"
+    assert late["pa_close_time_eligible"] is True
+    assert daily["pa_close_confirmation_phase"] == "AFTER_CLOSE"
+    assert daily["pa_close_time_eligible"] is True
+
+
+def test_current_day_local_snapshot_stays_provisional_before_late_session():
+    result = _base_candidate()
+
+    _apply_close_confirmation_timing(
+        result,
+        "2026-07-15",
+        "LOCAL_DB",
+        now="2026-07-15T11:35:00",
+    )
+
+    assert result["pa_close_confirmation_phase"] == "INTRADAY_PROVISIONAL"
+    assert result["pa_close_time_eligible"] is False
+
+
 def test_frozen_plan_preserves_prior_trigger_and_keeps_generated_plan_for_audit():
     result = {"现价": 93.67, "pa_entry_price": 94.39, "pa_stop_price": 90.35}
     plan = {
@@ -35,6 +82,7 @@ def test_frozen_plan_preserves_prior_trigger_and_keeps_generated_plan_for_audit(
         "pa_entry_price": 86.00,
         "pa_stop_price": 82.02,
         "pa_target_price": 94.40,
+        "price_action_detail": {"pa_close_guard_price": 84.20},
     }
 
     _apply_frozen_execution_plan(result, plan)
@@ -44,6 +92,44 @@ def test_frozen_plan_preserves_prior_trigger_and_keeps_generated_plan_for_audit(
     assert result["frozen_entry_extension_pct"] == 8.92
     assert result["frozen_confirmation_triggered"] is True
     assert result["execution_plan_frozen"] is True
+    assert result["active_confirmation_price"] == 86.00
+    assert result["frozen_close_guard_price"] == 84.20
+    assert result["active_close_guard_price"] == 84.20
+    assert result["active_execution_plan_source"] == "FROZEN"
+
+
+def test_observation_candidates_do_not_inherit_old_execution_plan():
+    for flag in ("revival_watch_only", "momentum_acceleration_watch_only"):
+        result = {
+            "现价": 10.2,
+            "pa_entry_price": 10.3,
+            "pa_stop_price": 9.7,
+            flag: True,
+        }
+
+        _apply_frozen_execution_plan(result, {
+            "plan_date": "2026-07-01",
+            "pa_entry_price": 9.5,
+            "pa_stop_price": 9.0,
+            "pa_target_price": 11.0,
+        })
+
+        assert result.get("execution_plan_frozen") is not True
+        assert result.get("active_confirmation_price") is None
+
+
+def test_frozen_plan_trigger_does_not_wait_for_new_daily_high():
+    result = _base_candidate(现价=10.1, pa_entry_price=10.5)
+    _apply_frozen_execution_plan(result, {
+        "plan_date": "2026-07-01", "pa_entry_price": 10.0,
+        "pa_stop_price": 9.5, "pa_target_price": 11.5,
+    })
+
+    _apply_sop_filter([result], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert result["pa_plan_triggered"] is True
+    assert result["pa_confirmation_state"] == "ENTRY_CONFIRMED"
+    assert not any("未站上确认价" in blocker for blocker in result["trade_blockers"])
 
 
 def test_frozen_plan_above_three_percent_is_observe_only():
@@ -101,7 +187,12 @@ def _base_candidate(**overrides):
         "pa_close_position": 0.72,
         "pa_upper_shadow_pct": 1.2,
         "pa_risk_pct": 6.0,
+        "pa_risk_reward": 2.5,
         "现价": 10.05,
+        "execution_plan_frozen": True,
+        "frozen_plan_date": "2026-07-14",
+        "frozen_confirmation_price": 10.0,
+        "frozen_stop_price": 9.4,
         "sector_momentum_score": 82,
         "sector_breadth": 70,
         "sector_strength_score": 82,
@@ -109,6 +200,7 @@ def _base_candidate(**overrides):
         "sector_alignment_score": 80,
         "sector_role": "CORE",
         "共振": "🔥 核心热点",  # 多重共振标记（调整3 严格门槛要求）
+        "a_minus_trial_health": {"enabled": True, "status": "COLLECTING"},
     }
     candidate.update(overrides)
     return candidate
@@ -142,21 +234,249 @@ def test_ready_candidate_enters_trade_bucket():
     assert result["sector_core_role_candidate"] is True
     assert result["sector_core_role_label"] == "强板块核心股"
     assert result["trade_blockers"] == []
+    assert result["pa_execution_stage"] == "NEXT_SESSION_EXECUTABLE"
     assert result["final_trade_score"] > result["final_rank_score"]
 
 
-def test_plain_tv_dual_is_discovery_only_not_trade():
+def test_signal_day_ready_setup_waits_for_next_session():
+    result = _base_candidate(
+        execution_plan_frozen=False,
+        frozen_plan_date=None,
+        frozen_confirmation_price=None,
+        frozen_stop_price=None,
+    )
+
+    _apply_sop_filter([result], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert result["pa_execution_stage"] == "EOD_CONFIRMED"
+    assert any("次一交易日" in blocker for blocker in result["trade_blockers"])
+
+
+def test_structural_growth_repair_uses_defensive_score_without_bypassing_quality_gates():
+    result = _base_candidate(
+        代码="300001",
+        market_segment="创业板",
+        market_segment_stage="STRUCTURAL_REPAIR",
+        effective_market_regime="DEFENSIVE",
+    )
+
+    _apply_sop_filter([result], {"status": "CRITICAL"}, {"小金属": {"trend": "LEAD"}})
+
+    assert result["sop_quality_dimensions"]["regime"] == 50
+    assert "创业板结构性强修复" in result["sop_checks"]
+    assert "成长板块独立强势" in result["sop_bonuses"]
+    assert result["trade_eligible"] is True
+
+
+def test_confirmed_quality_between_60_and_65_enters_controlled_a_minus_trial():
+    candidate = _base_candidate(
+        历史胜率="40%",
+        回测统计={"profit_factor": 1.2, "expectancy": 0},
+        ROE=3,
+        净利YOY=0,
+        sector_phase="SECTOR_NEUTRAL",
+        pa_trade_setup="趋势突破",
+        price_action_signal="普通突破",
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert 60 <= candidate["sop_quality_score"] < 65
+    assert candidate["sop_grade"] == "B"
+    assert candidate["a_minus_trial"] is True
+    assert candidate["a_minus_trial_grade"] == "A-"
+    assert candidate["trade_eligible"] is True
+    assert candidate["trade_bucket"] == "TRADE"
+    assert candidate["trade_execution_policy"] == "A_MINUS_CONTROLLED_TRIAL"
+
+
+def test_calibrated_a_eod_trial_softens_only_sector_and_weekly_blockers():
+    candidate = _base_candidate(
+        strategy_type="tv_dual",
+        sector_momentum_score=65,
+        sector_strength_score=65,
+        stock_sector_fit_score=55,
+        sector_alignment_score=62,
+        sector_role="FOLLOWER",
+        pa_weekly_context="周线中性",
+        price_action_score=72,
+        pa_trade_setup="趋势突破",
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert candidate["sop_grade"] == "B"
+    assert candidate["a_eod_controlled_trial"] is True
+    assert candidate["trade_eligible"] is True
+    assert candidate["trade_bucket"] == "TRADE"
+    assert candidate["trade_execution_policy"] == "A_EOD_CONTROLLED_TRIAL"
+    assert candidate["trade_blockers"] == []
+    assert candidate["a_eod_trade_cautions"] == [
+        "板块强度不足，降级观察",
+        "板块联动<70，降级观察",
+        "周线中性，降级观察",
+    ]
+
+
+def test_pa_60_to_69_waits_for_t1_instead_of_same_day_trade():
+    candidate = _base_candidate(
+        price_action_score=65,
+        pa_trade_setup="趋势突破",
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert candidate["pa_execution_tier"] == "T1_CONFIRM"
+    assert candidate["trade_eligible"] is False
+    assert candidate["trade_bucket"] == "OBSERVE"
+    assert candidate["trade_execution_policy"] == "PA_T1_CONFIRMATION"
+    assert candidate.get("a_eod_controlled_trial") is not True
+
+
+def test_pa_50_to_59_is_pullback_watch_not_trade():
+    candidate = _base_candidate(
+        price_action_score=55,
+        pa_trade_setup="趋势突破",
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert candidate["pa_execution_tier"] == "PULLBACK_WATCH"
+    assert candidate["trade_eligible"] is False
+    assert candidate["trade_bucket"] == "OBSERVE"
+    assert candidate["trade_execution_policy"] == "PA_PULLBACK_WATCH"
+
+
+def test_calibrated_a_eod_trial_keeps_confirmation_extension_and_chase_hard_gates():
+    cases = (
+        _base_candidate(
+            现价=9.90,
+            pa_trade_setup="趋势突破",
+            price_action_score=65,
+        ),
+        _base_candidate(
+            现价=10.40,
+            pa_entry_price=10.00,
+            pa_trade_setup="趋势突破",
+            price_action_score=65,
+        ),
+        _base_candidate(
+            pct_5d=10.01,
+            pa_trade_setup="趋势突破",
+            price_action_score=65,
+        ),
+        _base_candidate(
+            pa_trade_setup="趋势突破",
+            price_action_score=65,
+            **{"涨幅%": 9.95},
+        ),
+    )
+
+    for candidate in cases:
+        _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+        assert candidate.get("a_eod_controlled_trial") is not True
+
+
+def test_calibrated_a_eod_trial_does_not_soften_fatal_sector_blocker():
+    candidate = _base_candidate(
+        sector_momentum_score=65,
+        sector_strength_score=65,
+        stock_sector_fit_score=55,
+        sector_alignment_score=62,
+        pa_weekly_context="周线中性",
+        pa_trade_setup="趋势突破",
+        price_action_score=65,
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "DOWN"}})
+
+    assert candidate.get("a_eod_controlled_trial") is not True
+    assert candidate["trade_eligible"] is False
+    assert "板块下跌" in candidate["sop_vetoes"]
+
+
+def test_confirmed_quality_between_65_and_70_reaches_relaxed_a_grade():
+    candidate = _base_candidate(
+        历史胜率="50%",
+        回测统计={"profit_factor": 1.5, "expectancy": 0},
+        ROE=6,
+        净利YOY=8,
+        sector_phase="SECTOR_NEUTRAL",
+        pa_trade_setup="趋势突破",
+        price_action_signal="普通突破",
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert 65 <= candidate["sop_quality_score"] < 70
+    assert candidate["sop_grade"] == "A"
+    assert candidate["trade_eligible"] is True
+    assert candidate.get("a_minus_trial") is not True
+
+
+def test_a_minus_trial_requires_volume_risk_reward_and_live_health():
+    no_volume = _base_candidate(pa_volume_confirmed=False)
+    weak_rr = _base_candidate(pa_risk_reward=1.5)
+    paused = _base_candidate(a_minus_trial_health={"enabled": False, "status": "PAUSED"})
+    for candidate in (no_volume, weak_rr, paused):
+        candidate.update({
+            "历史胜率": "50%",
+            "回测统计": {"profit_factor": 1.5, "expectancy": 0},
+            "ROE": 6,
+            "净利YOY": 8,
+            "sector_phase": "SECTOR_NEUTRAL",
+            "pa_trade_setup": "趋势突破",
+            "price_action_signal": "普通突破",
+        })
+
+    _apply_sop_filter(
+        [no_volume, weak_rr, paused],
+        {"status": "OFFENSIVE"},
+        {"小金属": {"trend": "LEAD"}},
+    )
+
+    assert no_volume.get("a_minus_trial") is not True
+    assert weak_rr.get("a_minus_trial") is not True
+    assert paused.get("a_minus_trial") is not True
+
+
+def test_plain_tv_dual_is_now_core_trade_strategy():
+    # tv_dual 已从发现层升格为核心交易策略，与 tv_dual_strict 同样可评A且可交易。
     results = [_base_candidate(strategy_type="tv_dual")]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
     assert result["sop_grade"] == "A"
-    assert result["trade_eligible"] is False
-    assert result["trade_bucket"] == "OBSERVE"
-    assert result["trade_execution_policy"] == "WAIT_CONFIRMATION"
-    assert result["requires_bark_confirmation"] is True
-    assert "普通tv_dual仅用于发现，需严格双策略确认" in result["trade_blockers"]
+    assert result["sop_a_grade_eligible"] is True
+    assert result["trade_eligible"] is True
+    assert result["trade_bucket"] == "TRADE"
+    assert result["trade_execution_policy"] == "BARK_CONFIRMED_TRADE"
+    assert result["requires_bark_confirmation"] is False
+    # 发现层 blocker 不应再触发
+    assert "普通tv_dual仅用于发现，需严格双策略确认" not in result["trade_blockers"]
+
+
+def test_soft_veto_caps_high_quality_candidate_at_b():
+    candidate = _base_candidate(
+        Score=120,
+        raw_score=120,
+        回测统计={"adjusted_win_rate": 100, "profit_factor": 3, "expectancy": 2},
+        ROE=15,
+        净利YOY=30,
+        pa_structure_score=100,
+        sector_alignment_score=100,
+        mkt_cap_yi=20,
+    )
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert candidate["sop_quality_score"] >= 70
+    assert candidate["sop_grade"] == "B"
+    assert candidate["sop_a_grade_eligible"] is False
+    assert "存在SOP否决项" in candidate["sop_a_grade_gate_reasons"]
 
 
 def test_avoid_action_is_blocked_even_with_good_scores():
@@ -290,7 +610,7 @@ def test_strong_stock_in_weak_sector_is_watch_not_trade():
     assert "板块强度弱，个股强势不直接交易" in result["sop_risks"]
 
 
-def test_strong_sector_weak_stock_fit_is_observe_not_trade():
+def test_strong_sector_weak_stock_fit_uses_a_eod_controlled_trade():
     results = [_base_candidate(
         sector_strength_score=82,
         stock_sector_fit_score=42,
@@ -300,13 +620,14 @@ def test_strong_sector_weak_stock_fit_is_observe_not_trade():
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["trade_eligible"] is False
-    assert result["trade_bucket"] == "OBSERVE"
-    assert "强板块但个股适配不足，降级观察" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert result["trade_bucket"] == "TRADE"
+    assert result["a_eod_controlled_trial"] is True
+    assert "强板块但个股适配不足，降级观察" in result["a_eod_trade_cautions"]
     assert "板块强但个股适配不足，偏补涨观察" in result["sop_risks"]
 
 
-def test_strong_sector_rear_role_is_observe_not_trade():
+def test_strong_sector_rear_role_uses_a_eod_controlled_trade():
     results = [_base_candidate(
         sector_strength_score=82,
         stock_sector_fit_score=68,
@@ -319,9 +640,10 @@ def test_strong_sector_rear_role_is_observe_not_trade():
     result = results[0]
     assert result["sector_rear_role_watch"] is True
     assert result["sector_core_role_label"] == "强板块后排观察"
-    assert result["trade_eligible"] is False
-    assert result["trade_bucket"] == "OBSERVE"
-    assert "强板块后排角色，等待转强为核心股" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert result["trade_bucket"] == "TRADE"
+    assert result["a_eod_controlled_trial"] is True
+    assert "强板块后排角色，等待转强为核心股" in result["a_eod_trade_cautions"]
     assert "强板块后排角色，等待转强为核心股" in result["sop_risks"]
 
 
@@ -395,15 +717,16 @@ def test_trade_setup_quality_helper_classifies_raw_and_tradable_shapes():
     assert _trade_setup_quality(h1_tradable, "H1首次入场", 90, 82) == "H1_TRADABLE"
 
 
-def test_neutral_weekly_range_downgrades_to_observe():
+def test_neutral_weekly_range_uses_a_eod_controlled_trade():
     results = [_base_candidate(pa_weekly_context="周线交易区间")]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["trade_eligible"] is False
-    assert result["trade_bucket"] == "OBSERVE"
-    assert "周线交易区间，降级观察" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert result["trade_bucket"] == "TRADE"
+    assert result["a_eod_controlled_trial"] is True
+    assert "周线交易区间，降级观察" in result["a_eod_trade_cautions"]
     assert "周线交易区间，等待右侧确认" in result["sop_risks"]
 
 
@@ -475,16 +798,58 @@ def test_near_limit_threshold_respects_board_limit():
 
 
 def test_five_day_surge_is_ranking_risk_not_sop_veto():
+    # pct_5d=16% 落在软起扣(10%)与硬否决(25%)之间：走递减扣分，不硬否决A级。
     normal = _base_candidate()
     surged = _base_candidate(**{"pct_5d": 16.0, "pa_volume_confirmed": False, "price_action_signal": "普通突破"})
 
     _apply_sop_filter([normal, surged], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    assert surged["sop_grade"] == "A"
+    # 16%不再硬否决：gate_reasons 不应出现"5日涨幅超过25%"
+    assert "5日涨幅超过25%" not in surged["sop_a_grade_gate_reasons"]
     assert "5日涨>15%" not in surged["sop_vetoes"]
+    # 递减扣分文案应出现在 risks（每超1%扣0.5分，16-10=6，扣3分）
+    assert any("超10%起扣线" in r for r in surged["sop_risks"])
+    # 15%以上的排序风险标注仍保留
     assert "5日涨幅>15%，排序扣分" in surged["sop_risks"]
+    # 量能未确认+涨幅偏高仍产生 blocker（但不是因为5日涨幅硬否决）
     assert surged["trade_eligible"] is False
     assert "5日涨幅偏高且质量未确认" in surged["trade_blockers"]
+
+
+def test_a_grade_requires_kline_calibrated_price_action_score():
+    candidate = _base_candidate(price_action_score=59)
+
+    _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert candidate["sop_grade"] == "B"
+    assert candidate["sop_a_grade_eligible"] is False
+    assert "价格行为评分低于60" in candidate["sop_a_grade_gate_reasons"]
+
+
+def test_a_grade_allows_moderate_5d_gain_with_penalty():
+    # pct_5d=20% 落在软起扣(10%)与硬否决(25%)之间：应评A，但质量分被扣5分。
+    baseline = _base_candidate(pct_5d=4.0)
+    moderate = _base_candidate(pct_5d=20.0)
+
+    _apply_sop_filter([baseline, moderate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert moderate["sop_grade"] == "A"
+    assert moderate["sop_a_grade_eligible"] is True
+    # 20-10=10，每超1%扣0.5 → 扣5分
+    assert baseline["sop_quality_score"] - moderate["sop_quality_score"] == 5.0
+    # 扣分文案应记录在 risks
+    assert any("超10%起扣线" in r for r in moderate["sop_risks"])
+
+
+def test_a_grade_hard_blocks_excessive_5d_gain():
+    # pct_5d=26% 超过硬否决线(25%)：不得评A，gate_reasons 含"5日涨幅超过25%"。
+    excessive = _base_candidate(pct_5d=26.0)
+
+    _apply_sop_filter([excessive], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+
+    assert excessive["sop_grade"] == "B"
+    assert excessive["sop_a_grade_eligible"] is False
+    assert "5日涨幅超过25%" in excessive["sop_a_grade_gate_reasons"]
 
 
 def test_watch_action_is_observe_not_executable():

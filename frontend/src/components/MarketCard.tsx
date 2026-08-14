@@ -16,38 +16,38 @@ export default function MarketCard({ name, price, pct, loading = false }: Market
 
     if (loading) {
         return (
-            <div className="glass-card p-3 animate-pulse">
-                <div className="h-3 w-12 bg-slate-200 rounded mb-3" />
-                <div className="h-6 w-24 bg-slate-200 rounded mb-2" />
-                <div className="h-4 w-16 bg-slate-200 rounded" />
+            <div className="glass-card p-4" aria-hidden="true">
+                <div className="mb-4 h-3 w-16 animate-pulse rounded bg-slate-200" />
+                <div className="mb-2 h-7 w-28 animate-pulse rounded bg-slate-200" />
+                <div className="h-4 w-20 animate-pulse rounded bg-slate-100" />
             </div>
         );
     }
 
     return (
-        <div className="glass-card p-3 group transition-colors duration-150 hover:border-blue-200">
-            <div className="flex justify-between items-start mb-2">
+        <article className="glass-card group p-4 transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-lg">
+            <div className="mb-3 flex items-start justify-between">
                 <span className="metric-label">{name}</span>
                 <div className={cn(
-                    "p-1 rounded-md transition-colors",
-                    isUp ? "bg-rose-50 text-rose-600 group-hover:bg-rose-100" : "bg-teal-50 text-teal-600 group-hover:bg-teal-100"
-                )}>
-                    {isUp ? <ArrowUpRight size={14} /> : <ArrowDownRight size={14} />}
+                    "flex size-8 items-center justify-center rounded-lg transition-colors",
+                    isUp ? "bg-rose-50 text-rose-700 group-hover:bg-rose-100" : "bg-teal-50 text-teal-700 group-hover:bg-teal-100"
+                )} aria-hidden="true">
+                    {isUp ? <ArrowUpRight size={16} /> : <ArrowDownRight size={16} />}
                 </div>
             </div>
 
             <div className="space-y-1">
-                <div className="metric-value text-xl">
+                <div className="metric-value text-2xl tracking-tight">
                     {price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </div>
                 <div className={cn(
-                    "text-xs font-black flex items-center gap-1",
-                    isUp ? "text-rose-600" : "text-teal-600"
+                    "flex items-center gap-2 text-sm font-semibold tabular-nums",
+                    isUp ? "text-rose-700" : "text-teal-700"
                 )}>
                     {isUp ? '+' : ''}{pct.toFixed(2)}%
-                    <span className="text-[10px] text-slate-400 font-bold ml-1">今日涨跌幅</span>
+                    <span className="text-xs font-normal text-slate-500">今日涨跌幅</span>
                 </div>
             </div>
-        </div>
+        </article>
     );
 }

@@ -258,10 +258,10 @@ def calculate_pnl_attribution(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     strategy_labels = {
         "tv_dual_strict": "TV强共振",
         "tv_dual": "TV双策略",
-        "squeeze": "均线粘合",
-        "pine": "Pine共振",
-        "tv_zp": "TV-ZP",
-        "both": "双重共振",
+        "squeeze": "均线粘合（单策略）",
+        "pine": "五指标投票共振",
+        "tv_zp": "TV-ZP趋势信号",
+        "both": "均线+五指标共振",
         "consensus": "共识策略",
         "unknown": "未知"
     }

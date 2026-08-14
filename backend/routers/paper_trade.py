@@ -7,10 +7,11 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
+import json
 import pandas as pd
 
 from core.logging_config import logger
-from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db
+from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db, get_setting
 from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache, is_snapshot_stale
 from core.indicators import calculate_indicators
 from core.price_action import analyze_price_action
@@ -25,6 +26,8 @@ from core.risk_constants import (
     FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_RATIO, FIRST_PROFIT_TAKE_PCT,
     EARLY_WARN_MILD_PCT, EARLY_WARN_MODERATE_PCT, EARLY_WARN_TIER_COOLDOWN_DAYS,
     WIND_CONTROL_INTERVAL_URGENT_MINUTES, URGENT_STOP_BUFFER_PCT,
+    SIGNAL_REVERSE_SELL_ENABLED,
+    MA_STRATEGY_TAKE_PROFIT_PCT,
 )
 from core.portfolio_risk import evaluate_portfolio_risk_budget, evaluate_floating_loss_circuit_breaker
 from core.operation_plan import alert_priority, build_position_decision_snapshot, evaluate_operation_trigger, operation_bands, position_health_score, pre_trade_check, price_instruction, safe_num
@@ -32,6 +35,123 @@ from core.audit_log import record_lifecycle_event
 from schemas.paper_trade import PaperTradeCreate, PaperTradeClose
 
 router = APIRouter(prefix="/api/paper", tags=["paper-trading"])
+
+
+def _normalize_signal_sources(value: Any) -> List[str]:
+    if not value:
+        return []
+    raw = value if isinstance(value, (list, tuple, set)) else str(value).replace(",", "+").split("+")
+    return [source for source in ("ma", "zp") if source in {str(item).strip().lower() for item in raw}]
+
+
+def _tv_position_state(sources: List[str], same_day_dual: bool = False) -> tuple[str | None, float | None]:
+    if set(sources) == {"ma", "zp"}:
+        return ("A", 1.0) if same_day_dual else ("B", 0.6)
+    if sources == ["ma"]:
+        return "B", 0.6
+    if sources == ["zp"]:
+        return "C", 0.25
+    return None, None
+
+
+def _resolve_trade_signal_sources(engine, trade: PaperTradeCreate) -> List[str]:
+    direct = _normalize_signal_sources(trade.signal_sources)
+    if direct or trade.strategy_type != "tv_dual":
+        return direct
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT price_action_detail
+            FROM scan_history
+            WHERE code = :code AND strategy_type = 'tv_dual'
+            ORDER BY date DESC
+            LIMIT 1
+        """), {"code": trade.code}).fetchone()
+    detail = row[0] if row else {}
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except (TypeError, ValueError):
+            detail = {}
+    return _normalize_signal_sources(detail.get("signal_sources") if isinstance(detail, dict) else None)
+
+
+def _upgrade_open_tv_position(
+    engine,
+    trade: PaperTradeCreate,
+    incoming: List[str],
+) -> Dict[str, Any] | None:
+    if not incoming:
+        return None
+    with engine.begin() as conn:
+        existing = conn.execute(text("""
+            SELECT id, code, name, strategy_type, theme, watchlist_id,
+                   entry_signal_date, signal_sources, execution_tier, risk_unit
+            FROM paper_trading
+            WHERE code = :code AND status = 'OPEN' AND trade_mode = :trade_mode
+            ORDER BY entry_date DESC, id DESC
+            LIMIT 1
+        """), {"code": trade.code, "trade_mode": trade.trade_mode}).mappings().first()
+        if not existing:
+            return None
+        current = _normalize_signal_sources(existing.get("signal_sources"))
+        merged = _normalize_signal_sources(current + incoming)
+        if set(merged) == set(current):
+            return {
+                "status": "error",
+                "detail": "该股票已有相同信号来源的持仓，请勿重复开仓。",
+            }
+        existing_date = str(existing.get("entry_signal_date") or "")[:10]
+        incoming_date = str(trade.entry_signal_date or datetime.now().date())[:10]
+        tier, risk_unit = _tv_position_state(
+            merged,
+            same_day_dual=bool(existing_date and existing_date == incoming_date),
+        )
+        upgraded_at = datetime.now()
+        conn.execute(text("""
+            UPDATE paper_trading
+            SET signal_sources = :sources,
+                execution_tier = :tier,
+                risk_unit = :risk_unit,
+                source_upgraded_at = :upgraded_at,
+                updated_at = :upgraded_at
+            WHERE id = :trade_id
+        """), {
+            "sources": "+".join(merged),
+            "tier": tier,
+            "risk_unit": risk_unit,
+            "upgraded_at": upgraded_at,
+            "trade_id": existing["id"],
+        })
+
+    record_lifecycle_event(
+        "POSITION_SIGNAL_UPGRADED",
+        source=trade.entry_source or "signal_confirmation",
+        code=trade.code,
+        name=trade.name,
+        watchlist_id=existing.get("watchlist_id"),
+        trade_id=existing["id"],
+        strategy_type=existing.get("strategy_type") or trade.strategy_type,
+        theme=existing.get("theme"),
+        payload={
+            "previous_sources": current,
+            "incoming_sources": incoming,
+            "signal_sources": merged,
+            "execution_tier": tier,
+            "risk_unit": risk_unit,
+            "kept_original_entry": True,
+        },
+    )
+    send_paper_trade_notification(
+        f"【持仓信号升级】{trade.name} ({trade.code})",
+        f"原持仓不重复加仓；信号来源升级为 {'+'.join(merged).upper()}，执行层级 {tier}，风险单位 {risk_unit:g}。",
+    )
+    return {
+        "status": "upgraded",
+        "trade_id": int(existing["id"]),
+        "signal_sources": merged,
+        "execution_tier": tier,
+        "risk_unit": risk_unit,
+    }
 
 
 def _empty_mode_stats() -> Dict[str, Any]:
@@ -386,25 +506,40 @@ def _ensure_trade_journal_table(engine) -> None:
 
 def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entry: float, risk: Dict[str, Any]) -> Dict[str, Any]:
     entry = safe_num(row.get("entry_price"))
-    active_stop = safe_num(risk.get("active_stop_price") or risk.get("stop_price"))
-    structure_stop = safe_num(risk.get("structure_stop_price") or risk.get("initial_stop_price"))
+    signal_sources = _normalize_signal_sources(row.get("signal_sources"))
+    if signal_sources:
+        active_stop = entry * (1 + FIXED_STOP_LOSS_PCT / 100)
+        structure_stop = active_stop
+    else:
+        active_stop = safe_num(risk.get("active_stop_price") or risk.get("stop_price"))
+        structure_stop = safe_num(risk.get("structure_stop_price") or risk.get("initial_stop_price"))
     trigger = max(current_price * 1.02, high_since_entry)
     guard = max(active_stop, trigger * 0.985)
     entry_date = pd.to_datetime(row.get("entry_date") or datetime.now())
     policy = _time_stop_policy(row.get("strategy_type"))
-    time_stop_date = (entry_date + pd.tseries.offsets.BDay(policy["force_days"])).date().isoformat()
+    time_stop_date = None if signal_sources else (
+        entry_date + pd.tseries.offsets.BDay(policy["force_days"])
+    ).date().isoformat()
     stop_buffer = (current_price - active_stop) / current_price * 100 if current_price > 0 and active_stop > 0 else 0
     pl_pct = (current_price - entry) / entry * 100 if entry > 0 else 0
     health = position_health_score(pl_pct=pl_pct, stop_buffer_pct=stop_buffer)
-    instruction = price_instruction(
-        trigger=trigger,
-        guard=guard,
-        active_stop=active_stop,
-        structure_stop=structure_stop,
-        confirmed=False,
-        profitable=pl_pct > 0,
-        trigger_action="放量突破后小幅加仓",
-    )
+    if signal_sources:
+        policies = []
+        if "ma" in signal_sources:
+            policies.append("MA按+15%目标或收盘跌破EMA20后次日开盘退出")
+        if "zp" in signal_sources:
+            policies.append("ZP按short，或盈利+15%后EMA20破位，次日开盘退出")
+        instruction = f"固定{FIXED_STOP_LOSS_PCT:g}%保护止损；{'；'.join(policies)}"
+    else:
+        instruction = price_instruction(
+            trigger=trigger,
+            guard=guard,
+            active_stop=active_stop,
+            structure_stop=structure_stop,
+            confirmed=False,
+            profitable=pl_pct > 0,
+            trigger_action="放量突破后小幅加仓",
+        )
     plan = {
         "entry_price": round(entry, 2),
         "current_price": round(current_price, 2),
@@ -413,19 +548,29 @@ def _build_trade_plan(row: Dict[str, Any], current_price: float, high_since_entr
         "active_stop_price": round(active_stop, 2) if active_stop > 0 else None,
         "structure_stop_price": round(structure_stop, 2) if structure_stop > 0 else None,
         "time_stop_date": time_stop_date,
+        "signal_sources": signal_sources,
         "health": health,
         "instruction": instruction,
         "bands": operation_bands(trigger=trigger, guard=guard, active_stop=active_stop, structure_stop=structure_stop),
     }
-    plan["decision_snapshot"] = build_position_decision_snapshot(
-        current_price=current_price,
-        entry_price=entry,
-        risk=risk,
-        plan=plan,
-        entry_date=row.get("entry_date"),
-        price_source="paper_cached_price",
-        price_updated_at=row.get("updated_at"),
-    )
+    if signal_sources:
+        plan["decision_snapshot"] = {
+            "action": "HOLD",
+            "label": "TV来源策略持有",
+            "trigger": instruction,
+            "executable": False,
+            "t1_locked": False,
+        }
+    else:
+        plan["decision_snapshot"] = build_position_decision_snapshot(
+            current_price=current_price,
+            entry_price=entry,
+            risk=risk,
+            plan=plan,
+            entry_date=row.get("entry_date"),
+            price_source="paper_cached_price",
+            price_updated_at=row.get("updated_at"),
+        )
     return plan
 
 
@@ -508,6 +653,11 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "execution_quality": "INCOMPLETE",
             }
 
+        signal_sources = _resolve_trade_signal_sources(engine, trade)
+        upgraded = _upgrade_open_tv_position(engine, trade, signal_sources)
+        if upgraded is not None:
+            return upgraded
+
         budget_check = evaluate_portfolio_risk_budget(engine, trade.model_dump(), force=bool(trade.force))
         if budget_check["status"] == "warning":
             return {
@@ -555,6 +705,10 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
         planned_price = float(trade.planned_entry_price or trade.price)
         actual_price = float(trade.actual_entry_price or trade.price)
         slippage_pct = (actual_price - planned_price) / planned_price * 100 if planned_price > 0 else 0
+        execution_tier, risk_unit = _tv_position_state(
+            signal_sources,
+            same_day_dual=set(signal_sources) == {"ma", "zp"},
+        )
         resolved_theme, resolved_rise_logic = _resolve_trade_theme_and_logic(engine, trade, new_industry)
         with engine.connect() as conn:
             result = conn.execute(text('''
@@ -562,6 +716,7 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                     code, name, entry_price, entry_date, current_price, high_since_entry,
                     status, strategy_type, remark, theme, rise_logic, trade_mode,
                     entry_source, entry_signal_date, entry_reason_snapshot,
+                    signal_sources, execution_tier, risk_unit,
                     pa_trade_action, pa_trade_setup, pa_entry_condition, pa_invalidation, pa_risk_pct,
                     logic_status, planned_entry_price, actual_entry_price, entry_slippage_pct,
                     position_pct, shares, capital_used, execution_note, plan_adherence, watchlist_id
@@ -570,6 +725,7 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                     :code, :name, :price, :date, :price, :price,
                     'OPEN', :strategy_type, :remark, :theme, :rise_logic, :trade_mode,
                     :entry_source, CAST(:entry_signal_date AS DATE), :entry_reason_snapshot,
+                    :signal_sources, :execution_tier, :risk_unit,
                     :pa_trade_action, :pa_trade_setup, :pa_entry_condition, :pa_invalidation, :pa_risk_pct,
                     'UNVERIFIED', :planned_entry_price, :actual_entry_price, :entry_slippage_pct,
                     :position_pct, :shares, :capital_used, :execution_note, :plan_adherence, :watchlist_id
@@ -589,6 +745,9 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "entry_source": trade.entry_source or "manual_current_price",
                 "entry_signal_date": trade.entry_signal_date or datetime.now().strftime("%Y-%m-%d"),
                 "entry_reason_snapshot": trade.entry_reason_snapshot or trade.remark,
+                "signal_sources": "+".join(signal_sources) or None,
+                "execution_tier": execution_tier,
+                "risk_unit": risk_unit,
                 "pa_trade_action": trade.pa_trade_action,
                 "pa_trade_setup": trade.pa_trade_setup,
                 "pa_entry_condition": trade.pa_entry_condition,
@@ -651,7 +810,12 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
         )
         send_paper_trade_notification(title, body)
 
-        return {"status": "success"}
+        return {
+            "status": "success",
+            "signal_sources": signal_sources,
+            "execution_tier": execution_tier,
+            "risk_unit": risk_unit,
+        }
     except Exception as e:
         logger.error(f"Error adding paper trade: {e}")
         return {"status": "error", "detail": "Internal server error"}
@@ -685,6 +849,9 @@ def get_open_trade_plans() -> Dict[str, Any]:
                 "name": row["name"],
                 "trade_mode": row.get("trade_mode") or "SIMULATED",
                 "strategy_type": row.get("strategy_type"),
+                "signal_sources": _normalize_signal_sources(row.get("signal_sources")),
+                "execution_tier": row.get("execution_tier"),
+                "risk_unit": _optional_value(row.get("risk_unit")),
                 "plan": plan,
             })
         return {"items": items}
@@ -1496,6 +1663,11 @@ def run_wind_control() -> Dict[str, Any]:
     """
     engine = get_db_engine()
     if not engine: return {"status": "error"}
+
+    # 混合退出策略开关：默认 SIGNAL_REVERSE_SELL_ENABLED(False)，DB key 可运行时覆盖
+    signal_reverse_enabled = str(
+        get_setting("signal_reverse_sell_enabled", str(SIGNAL_REVERSE_SELL_ENABLED), engine=engine)
+    ).strip().lower() in {"1", "true", "yes", "on"}
     
     try:
         df = pd.read_sql(text("SELECT * FROM paper_trading WHERE status = :status"), engine, params={"status": "OPEN"})
@@ -1518,6 +1690,16 @@ def run_wind_control() -> Dict[str, Any]:
         close_updates = []  # 收集批量更新参数
         reduce_updates = []  # 收集分批止盈/减仓的拆行参数
         close_date_str = datetime.now().strftime("%Y-%m-%d")
+        pending_exit_count = 0
+        snapshot_trade_date = pd.to_datetime(
+            snapshot.attrs.get("data_date") or close_date_str,
+            errors="coerce",
+        )
+        current_trade_date = (
+            snapshot_trade_date.date()
+            if not pd.isna(snapshot_trade_date)
+            else datetime.now().date()
+        )
         # 改动 B1：累计本次风控的最小 stop_buffer，供 sentinel 动态调整间隔
         min_stop_buffer_pct = None
 
@@ -1539,6 +1721,7 @@ def run_wind_control() -> Dict[str, Any]:
             match = snapshot[snapshot['code'] == code]
             if match.empty: continue
             curr_price = float(match.iloc[0]['price'])
+            curr_open = safe_float(match.iloc[0].get('open'), curr_price)
             curr_high = safe_float(match.iloc[0].get('high'), curr_price)
             # 改动 B1：读取当日最低价。急跌行情下 30 分钟 tick 可能错过盘中击穿
             # 止损线又反弹的场景（上班族完全无感）。后续止损判定用 effective_price
@@ -1569,23 +1752,139 @@ def run_wind_control() -> Dict[str, Any]:
                 snapshot=snapshot,
             )
 
-            # --- 风控逻辑判定 (按优先级, 使用统一风控引擎) ---
-            pa_summary = _local_price_action_summary(engine, str(code))
-            # 把 price action 摘要中的 latest_atr 提取出来，喂给风控引擎做自适应止损，
-            # 使实盘 active_stop_price 与回测行为一致（只收紧不放宽）。
-            latest_atr = safe_float(pa_summary.get("latest_atr")) or None
-            # 弱市（bear/volatile）时进一步收紧已有仓位止损（regime 已在循环外加载）。
-            # 修复 BUG1：get_market_regime 返回 {"status":"OFFENSIVE"...}，无 "regime" 键。
-            # 需用 map_status_to_regime 把 status 词表映射到 bull/bear/volatile。
-            from core.market_regime import map_status_to_regime
-            regime_status = map_status_to_regime(regime.get("status")) if isinstance(regime, dict) else None
-            risk_levels = compute_paper_risk_levels(entry_price, high_since_entry, curr_price, pa_summary, atr=latest_atr, market_regime=regime_status)
-            time_stop = _evaluate_time_stop(
-                hold_trading_days,
-                pl_pct,
-                row.get("strategy_type"),
+            # --- 风控逻辑判定 ---
+            # 有明确 MA/ZP 来源的 TV 持仓只执行用户声明的退出规则；旧持仓继续走通用风控。
+            signal_sources = _normalize_signal_sources(row.get("signal_sources"))
+            forced_exec_price = None
+            pending_reason = str(row.get("pending_exit_reason") or "").strip()
+            pending_date = pd.to_datetime(row.get("pending_exit_signal_date"), errors="coerce")
+            pending_due = bool(
+                signal_sources
+                and pending_reason
+                and not pd.isna(pending_date)
+                and pending_date.date() < current_trade_date
             )
-            plan = _build_trade_plan(row.to_dict(), curr_price, high_since_entry, risk_levels)
+            pa_summary: Dict[str, Any] = {}
+            if signal_sources:
+                fixed_stop = entry_price * (1 + FIXED_STOP_LOSS_PCT / 100)
+                risk_levels = {
+                    "active_stop_price": fixed_stop,
+                    "stop_price": fixed_stop,
+                    "initial_stop_price": fixed_stop,
+                    "structure_stop_price": fixed_stop,
+                    "risk_stage": "TV固定-9%保护",
+                    "max_pl_pct": round((high_since_entry - entry_price) / entry_price * 100, 2),
+                }
+                time_stop = None
+                plan = _build_trade_plan(row.to_dict(), curr_price, high_since_entry, risk_levels)
+                if pending_due:
+                    decision = {
+                        "reason": f"{pending_reason}（下一交易日开盘执行）",
+                        "should_close": True,
+                    }
+                    forced_exec_price = curr_open
+                else:
+                    if curr_price <= fixed_stop:
+                        tv_signals = [{
+                            "level": "critical",
+                            "reason": f"触发TV策略固定保护止损 ({FIXED_STOP_LOSS_PCT:g}%)",
+                            "suggestion": "立即退出",
+                        }]
+                    elif (
+                        "ma" in signal_sources
+                        and high_since_entry >= entry_price * (1 + MA_STRATEGY_TAKE_PROFIT_PCT / 100)
+                    ):
+                        tv_signals = [{
+                            "level": "critical",
+                            "reason": f"均线策略达到+{MA_STRATEGY_TAKE_PROFIT_PCT:g}%目标",
+                            "suggestion": "立即退出",
+                        }]
+                    else:
+                        tv_signals = []
+                    query = text("""
+                        SELECT date as "日期", close as "收盘", open as "开盘",
+                               high as "最高", low as "最低", vol as "成交量"
+                        FROM daily_k
+                        WHERE code = :code
+                        ORDER BY date DESC LIMIT 260
+                    """)
+                    with engine.connect() as conn:
+                        tv_history = pd.read_sql(query, conn, params={"code": code}).sort_values("日期")
+                    if not tv_signals and len(tv_history) >= 20:
+                        from core.strategy import evaluate_exit_signals
+                        tv_labeled = calculate_indicators(tv_history, current_price=curr_price)
+                        tv_signals = evaluate_exit_signals(
+                            tv_labeled,
+                            entry_price,
+                            high_since_entry,
+                            code=str(code),
+                            signal_sources=signal_sources,
+                            close_confirmed=now.hour >= 15,
+                        )
+                    signal = tv_signals[0] if tv_signals else None
+                    if signal and "下一交易日开盘退出" in str(signal.get("suggestion") or ""):
+                        scheduled_reason = str(signal.get("reason") or "TV策略收盘卖点确认")
+                        with engine.begin() as conn:
+                            conn.execute(text("""
+                                UPDATE paper_trading
+                                SET pending_exit_reason = :reason,
+                                    pending_exit_signal_date = :signal_date,
+                                    updated_at = :updated_at
+                                WHERE id = :trade_id AND status = 'OPEN'
+                            """), {
+                                "reason": scheduled_reason,
+                                "signal_date": current_trade_date,
+                                "updated_at": now,
+                                "trade_id": int(row["id"]),
+                            })
+                        pending_exit_count += 1
+                        trade_mode = row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
+                        if trade_mode == "REAL":
+                            warned_real_count += 1
+                        else:
+                            warned_simulated_count += 1
+                        alerts.append(f"{row['name']}({code}) 已记录次日开盘退出: {scheduled_reason}")
+                        send_paper_trade_notification(
+                            f"【TV卖点确认·次日开盘】{row['name']} ({code})",
+                            f"{scheduled_reason}\n本次不按收盘价卖出；已登记下一交易日开盘退出。",
+                        )
+                        record_lifecycle_event(
+                            "POSITION_EXIT_SCHEDULED",
+                            source="wind_control",
+                            code=str(code),
+                            name=str(row.get("name") or ""),
+                            trade_id=int(row["id"]),
+                            strategy_type=str(row.get("strategy_type") or ""),
+                            payload={
+                                "signal_sources": signal_sources,
+                                "reason": scheduled_reason,
+                                "signal_date": current_trade_date.isoformat(),
+                            },
+                        )
+                        continue
+                    decision = {
+                        "reason": str(signal.get("reason") or "") if signal else "",
+                        "should_close": bool(signal),
+                    }
+            else:
+                pa_summary = _local_price_action_summary(engine, str(code))
+                latest_atr = safe_float(pa_summary.get("latest_atr")) or None
+                from core.market_regime import map_status_to_regime
+                regime_status = map_status_to_regime(regime.get("status")) if isinstance(regime, dict) else None
+                risk_levels = compute_paper_risk_levels(
+                    entry_price,
+                    high_since_entry,
+                    curr_price,
+                    pa_summary,
+                    atr=latest_atr,
+                    market_regime=regime_status,
+                )
+                time_stop = _evaluate_time_stop(
+                    hold_trading_days,
+                    pl_pct,
+                    row.get("strategy_type"),
+                )
+                plan = _build_trade_plan(row.to_dict(), curr_price, high_since_entry, risk_levels)
             # 改动 B1：跟踪本次循环的最小 stop_buffer，用于 sentinel 动态间隔
             _buf = safe_num(plan.get("health", {}).get("stop_buffer_pct")) if isinstance(plan.get("health"), dict) else safe_num(plan.get("stop_buffer_pct"))
             _active_stop_buf = safe_num(risk_levels.get("active_stop_price"))
@@ -1601,21 +1900,31 @@ def run_wind_control() -> Dict[str, Any]:
             # sector_phase: 持仓记录中存储的板块阶段（开仓时写入）
             _close_pos = safe_float(pa_summary.get("last_close_position") or pa_summary.get("close_position"))
             _sector_phase = str(row.get("sector_phase") or "")
-            decision_snapshot = build_position_decision_snapshot(
-                current_price=curr_price,
-                entry_price=entry_price,
-                risk=risk_levels,
-                plan=plan,
-                time_stop=time_stop,
-                entry_date=entry_date,
-                price_source="market_snapshot",
-                price_updated_at=now,
-                now=now,
-                already_reduced=already_reduced,
-                sector_phase=_sector_phase,
-                close_position=_close_pos,
-            )
-            decision = _wind_control_decision(curr_price, risk_levels, time_stop, decision_snapshot, entry_price=entry_price)
+            _pa_regime = str(pa_summary.get("price_action_regime") or "")
+            if not signal_sources:
+                decision_snapshot = build_position_decision_snapshot(
+                    current_price=curr_price,
+                    entry_price=entry_price,
+                    risk=risk_levels,
+                    plan=plan,
+                    time_stop=time_stop,
+                    entry_date=entry_date,
+                    price_source="market_snapshot",
+                    price_updated_at=now,
+                    now=now,
+                    already_reduced=already_reduced,
+                    sector_phase=_sector_phase,
+                    close_position=_close_pos,
+                    pa_regime=_pa_regime,
+                    signal_reverse_enabled=signal_reverse_enabled,
+                )
+                decision = _wind_control_decision(
+                    curr_price,
+                    risk_levels,
+                    time_stop,
+                    decision_snapshot,
+                    entry_price=entry_price,
+                )
             reason = decision["reason"]
             should_close = decision["should_close"]
             should_reduce = decision.get("should_reduce", False)
@@ -1647,7 +1956,12 @@ def run_wind_control() -> Dict[str, Any]:
                 trade_mode = row.get('trade_mode', 'SIMULATED') or 'SIMULATED'
                 # 改动 B1：平仓成交价。若盘中击穿止损线，按击穿价(当日最低)保守成交，
                 # 让模拟盘 PnL 与实盘真实滑点一致（回测引擎已用 gap-through-stop 建模）。
-                exec_price = min(curr_price, curr_low) if _pierced_by_low else curr_price
+                exec_price = (
+                    forced_exec_price
+                    if forced_exec_price is not None
+                    else min(curr_price, curr_low) if _pierced_by_low
+                    else curr_price
+                )
                 if trade_mode == "REAL":
                     warned_real_count += 1
                     # 改动 B2：实盘告警升级。首次普通推送，后续每次 tick（~30分钟）仍未
@@ -1766,6 +2080,8 @@ def run_wind_control() -> Dict[str, Any]:
                         remark = :r,
                         close_source = 'wind_control_auto',
                         closed_by = 'system',
+                        pending_exit_reason = NULL,
+                        pending_exit_signal_date = NULL,
                         updated_at = :u
                     WHERE id = :id
                 """), close_updates)
@@ -1840,6 +2156,7 @@ def run_wind_control() -> Dict[str, Any]:
             "closed_count": closed_count,
             "warned_real_count": warned_real_count,
             "warned_simulated_count": warned_simulated_count,
+            "pending_exit_count": pending_exit_count,
             "alerts": alerts,
             # 改动 B1：暴露 urgency 状态给 sentinel 动态间隔
             "min_stop_buffer_pct": round(min_stop_buffer_pct, 2) if min_stop_buffer_pct is not None else None,

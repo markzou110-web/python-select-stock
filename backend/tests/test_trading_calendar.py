@@ -6,6 +6,7 @@ from core.trading_calendar import (
     is_a_share_after_close_sync_window,
     is_a_share_intraday_session,
     is_a_share_trading_day,
+    previous_a_share_trading_date,
 )
 
 
@@ -64,3 +65,11 @@ def test_no_calendar_falls_back_to_weekday(monkeypatch):
     assert is_a_share_trading_day(datetime(2026, 3, 16))  # 周一
     # 周末 → False
     assert not is_a_share_trading_day(datetime(2026, 3, 21))  # 周六
+
+
+def test_previous_trading_date_uses_calendar_and_weekday_fallback():
+    _inject_mock_calendar({"2026-09-30", "2026-10-08"})
+    assert previous_a_share_trading_date("2026-10-08") == "2026-09-30"
+
+    _inject_mock_calendar(set())
+    assert previous_a_share_trading_date("2026-07-27") == "2026-07-24"

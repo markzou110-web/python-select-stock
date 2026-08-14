@@ -1,11 +1,21 @@
 import json
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from sqlalchemy import text
 
 from core.db import _json_safe, get_db_engine
 from core.logging_config import logger
+
+
+NOTIFICATION_MAX_AGE_MINUTES = 90
+NOTIFICATION_MAX_RETRY_ATTEMPTS = 5
+
+
+def _notification_dedupe_key(channel: str, title: str, body: str, now: Optional[datetime] = None) -> str:
+    day = (now or datetime.now()).strftime("%Y-%m-%d")
+    return hashlib.sha256(f"{day}|{channel}|{title}|{body}".encode("utf-8")).hexdigest()
 
 
 def record_lifecycle_event(event_type: str, **values: Any) -> bool:
@@ -187,6 +197,188 @@ def record_notification_audit(
         return False
 
 
+def enqueue_notification(
+    channel: str,
+    title: str,
+    body: str,
+    *,
+    url: Optional[str] = None,
+    group: Optional[str] = None,
+    is_archive: int = 1,
+) -> bool:
+    """Persist a failed configured notification without storing channel credentials."""
+    engine = get_db_engine()
+    if not engine or not channel or not title or not body:
+        return False
+    dedupe_key = _notification_dedupe_key(channel, title, body)
+    now = datetime.now()
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO notification_outbox (
+                    dedupe_key, channel, title, body, url, group_name, is_archive,
+                    status, attempts, next_retry_at, created_at
+                ) VALUES (
+                    :dedupe_key, :channel, :title, :body, :url, :group_name, :is_archive,
+                    'PENDING', 0, :next_retry_at, :created_at
+                )
+                ON CONFLICT(dedupe_key) DO NOTHING
+            """), {
+                "dedupe_key": dedupe_key,
+                "channel": channel[:30],
+                "title": title[:200],
+                "body": body,
+                "url": url,
+                "group_name": group,
+                "is_archive": int(is_archive),
+                "next_retry_at": now + timedelta(minutes=5),
+                "created_at": now,
+            })
+        return bool(result.rowcount)
+    except Exception as exc:
+        logger.warning(f"Notification outbox enqueue skipped: {exc}")
+        return False
+
+
+def load_due_notifications(
+    limit: int = 20,
+    *,
+    now: Optional[datetime] = None,
+) -> list[Dict[str, Any]]:
+    engine = get_db_engine()
+    if not engine:
+        return []
+    now = now or datetime.now()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE notification_outbox
+                SET status = 'DEAD', last_error = 'expired_before_delivery'
+                WHERE status IN ('PENDING', 'PROCESSING') AND created_at < :stale_before
+            """), {
+                "stale_before": now - timedelta(minutes=NOTIFICATION_MAX_AGE_MINUTES),
+            })
+            lock_clause = " FOR UPDATE SKIP LOCKED" if engine.dialect.name != "sqlite" else ""
+            rows = conn.execute(text(f"""
+                SELECT id, channel, title, body, url, group_name, is_archive, attempts
+                FROM notification_outbox
+                WHERE status IN ('PENDING', 'PROCESSING') AND next_retry_at <= :now
+                ORDER BY next_retry_at, id
+                LIMIT :limit
+                {lock_clause}
+            """), {"now": now, "limit": max(1, min(int(limit), 100))}).mappings().all()
+            ids = [int(row["id"]) for row in rows]
+            if ids:
+                placeholders = ", ".join(f":id_{index}" for index in range(len(ids)))
+                params = {f"id_{index}": value for index, value in enumerate(ids)}
+                params["next_retry_at"] = now + timedelta(minutes=15)
+                conn.execute(text(f"""
+                    UPDATE notification_outbox
+                    SET status = 'PROCESSING', next_retry_at = :next_retry_at
+                    WHERE id IN ({placeholders})
+                """), params)
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.warning(f"Notification outbox load skipped: {exc}")
+        return []
+
+
+def record_notification_retry(
+    outbox_id: int,
+    sent: bool,
+    error: Optional[str] = None,
+    *,
+    permanent: bool = False,
+) -> bool:
+    engine = get_db_engine()
+    if not engine:
+        return False
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text(
+                "SELECT attempts FROM notification_outbox WHERE id = :id"
+            ), {"id": outbox_id}).first()
+            if not row:
+                return False
+            attempts = int(row[0] or 0) + 1
+            if sent:
+                conn.execute(text("""
+                    UPDATE notification_outbox
+                    SET status = 'SENT', attempts = :attempts, sent_at = :now, last_error = NULL
+                    WHERE id = :id
+                """), {"attempts": attempts, "now": datetime.now(), "id": outbox_id})
+            else:
+                status = "DEAD" if permanent or attempts >= NOTIFICATION_MAX_RETRY_ATTEMPTS else "PENDING"
+                delay_minutes = min(60, 5 * (2 ** min(attempts, 4)))
+                conn.execute(text("""
+                    UPDATE notification_outbox
+                    SET status = :status, attempts = :attempts, next_retry_at = :next_retry_at,
+                        last_error = :last_error
+                    WHERE id = :id
+                """), {
+                    "status": status,
+                    "attempts": attempts,
+                    "next_retry_at": datetime.now() + timedelta(minutes=delay_minutes),
+                    "last_error": (error or "delivery_failed")[:2000],
+                    "id": outbox_id,
+                })
+        return True
+    except Exception as exc:
+        logger.warning(f"Notification outbox update skipped: {exc}")
+        return False
+
+
+def resolve_queued_notification(channel: str, title: str, body: str) -> bool:
+    """Close a queued duplicate when a caller's immediate retry already succeeded."""
+    engine = get_db_engine()
+    if not engine:
+        return False
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                UPDATE notification_outbox
+                SET status = 'SENT', sent_at = :now, last_error = NULL
+                WHERE dedupe_key = :dedupe_key AND status IN ('PENDING', 'PROCESSING')
+            """), {
+                "now": datetime.now(),
+                "dedupe_key": _notification_dedupe_key(channel, title, body),
+            })
+        return bool(result.rowcount)
+    except Exception as exc:
+        logger.warning(f"Notification outbox resolve skipped: {exc}")
+        return False
+
+
+def requeue_dead_notifications(limit: int = 20) -> int:
+    """Move a bounded number of dead deliveries back to the retry queue."""
+    engine = get_db_engine()
+    if not engine:
+        return 0
+    try:
+        with engine.begin() as conn:
+            lock_clause = " FOR UPDATE SKIP LOCKED" if engine.dialect.name != "sqlite" else ""
+            rows = conn.execute(text(f"""
+                SELECT id FROM notification_outbox
+                WHERE status = 'DEAD' AND COALESCE(last_error, '') != 'expired_before_delivery'
+                ORDER BY created_at, id
+                LIMIT :limit
+                {lock_clause}
+            """), {"limit": max(1, min(int(limit), 100))}).all()
+            ids = [int(row[0]) for row in rows]
+            if not ids:
+                return 0
+            placeholders = ", ".join(f":id_{index}" for index in range(len(ids)))
+            params = {f"id_{index}": value for index, value in enumerate(ids)}
+            params["next_retry_at"] = datetime.now()
+            result = conn.execute(text(f"""
+                UPDATE notification_outbox
+                SET status = 'PENDING', attempts = 0, next_retry_at = :next_retry_at
+                WHERE id IN ({placeholders}) AND status = 'DEAD'
+            """), params)
+        return int(result.rowcount or 0)
+    except Exception as exc:
+        logger.warning(f"Notification outbox requeue skipped: {exc}")
+        return 0
 def record_task_run(
     task_id: str,
     task_name: Optional[str],

@@ -32,7 +32,7 @@ import {
     BookOpen,
     Save
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { clampScore, cn } from '@/lib/utils';
 import api from '@/lib/api';
 import SplitKLineCharts from './SplitKLineCharts';
 
@@ -251,11 +251,11 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const activeStopPrice = info.active_stop_price || info.stop_price || 0;
     const chartStrategy = data.signals?.strategy_type || info.chart_strategy_type || info.strategy_type || 'squeeze';
     const strategyLabels: Record<string, string> = {
-        squeeze: '均线粘合',
-        pine: 'Pine 多指标',
-        tv_zp: 'TV ZP',
+        squeeze: '均线粘合（单策略）',
+        pine: '五指标投票共振',
+        tv_zp: 'TV-ZP趋势信号',
         consensus: 'Azul 共识',
-        both: '双重共振',
+        both: '均线 + 五指标共振',
     };
     const buySignalCount = data.signals?.buy_count ?? data.signals?.buy_signals?.length ?? 0;
     const sellSignalCount = data.signals?.sell_count ?? data.signals?.sell_signals?.length ?? 0;
@@ -264,6 +264,27 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
         : info.price_source === 'paper_cached_price'
             ? '持仓缓存价'
             : '日线收盘价';
+    const paExecutionStage = info.pa_execution_stage || (
+        data.price_action?.pa_trade_plan?.action === 'READY' ? 'SETUP_READY' : 'WAITING_SETUP'
+    );
+    const paStageLabels: Record<string, string> = {
+        OBSERVATION_ONLY: '观察策略｜需生成新计划',
+        BLOCKED: '结构失效｜禁止买入',
+        INTRADAY_PREVIEW: '盘中预观察｜14:30后确认',
+        SETUP_READY: '结构就绪｜等待价量确认',
+        EOD_CONFIRMED: '尾盘已确认｜次一交易日复核',
+        NEXT_SESSION_REVIEW: '次日复核｜尚不可执行',
+        NEXT_SESSION_EXECUTABLE: '次日确认｜可执行候选',
+        WAITING_SETUP: '等待新结构',
+    };
+    const paStageLabel = info.pa_execution_stage_label || paStageLabels[paExecutionStage] || paExecutionStage;
+    const paPlanDate = info.frozen_plan_date || info.pa_signal_date || info.latest_scan_date || data.kline?.[data.kline.length - 1]?.time;
+    const paPlanExpiry = info.frozen_plan_expiry_date;
+    const paConfirmationPrice = info.active_confirmation_price || data.price_action?.pa_entry_price;
+    const paInvalidationPrice = info.active_stop_price || data.price_action?.pa_stop_price;
+    const paNextStep = info.distance_to_trade?.steps?.[0] || (
+        paExecutionStage === 'NEXT_SESSION_EXECUTABLE' ? '按仓位与风险预算小仓复核' : '等待系统完成下一阶段确认'
+    );
 
     const actionColors: Record<string, { bg: string; text: string; border: string; glow: string }> = {
         ADD: { bg: 'bg-emerald-50', text: 'text-emerald-700', border: 'border-emerald-200', glow: 'shadow-emerald-100' },
@@ -303,6 +324,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 trade_mode: 'SIMULATED',
                 entry_source: info.price_source === 'realtime_snapshot' ? 'detail_realtime_snapshot' : 'detail_current_price',
                 entry_signal_date: data.kline?.[data.kline.length - 1]?.time,
+                signal_sources: data.signals?.signal_sources || info.signal_sources,
                 entry_reason_snapshot: `${plan.setup || data.price_action?.pa_trade_setup || '详情页分析'} / ${plan.action_label || suggestion.action_label || '未分级'} / Score ${info.Score ?? '--'}`,
                 pa_trade_action: plan.action || data.price_action?.pa_trade_action,
                 pa_trade_setup: plan.setup || data.price_action?.pa_trade_setup,
@@ -316,11 +338,15 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 }
                 return;
             }
-            if (res.data?.status !== 'success') {
+            if (!['success', 'upgraded'].includes(res.data?.status)) {
                 showToast(res.data?.detail || '加入模拟盘失败', 'error');
                 return;
             }
-            showToast(`${info.名称} 已加入模拟盘`);
+            showToast(
+                res.data.status === 'upgraded'
+                    ? `${info.名称} 信号已升级，未重复加仓`
+                    : `${info.名称} 已加入模拟盘`,
+            );
             await fetchData(false);
         } catch (err: any) {
             console.error("Add to paper trade error:", err);
@@ -404,7 +430,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                             )}>
                                 {info['涨幅%'] >= 0 ? '+' : ''}{info['涨幅%']}%
                             </span>
-                            <span className="text-xs font-bold text-slate-400">综合强度 {info.Score}</span>
+                            <span className="text-xs font-bold text-slate-400">信号强度 {clampScore(info.display_signal_score ?? info.Score).toFixed(1)}/100</span>
                             <span className="text-xs font-bold text-slate-400">RSI {info.RSI}</span>
                         </div>
                     </div>
@@ -513,19 +539,19 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                 <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">Brooks 交易计划</h4>
                                 <span className={cn(
                                     "text-[10px] font-black px-2 py-0.5 rounded-lg border",
-                                    data.price_action.pa_trade_plan.action === 'READY' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
-                                        data.price_action.pa_trade_plan.action === 'AVOID' ? "bg-rose-50 text-rose-700 border-rose-100" :
+                                    paExecutionStage === 'NEXT_SESSION_EXECUTABLE' ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                        paExecutionStage === 'BLOCKED' ? "bg-rose-50 text-rose-700 border-rose-100" :
                                             "bg-amber-50 text-amber-700 border-amber-100"
                                 )}>
-                                    {data.price_action.pa_trade_plan.action_label}
+                                    {paStageLabel}
                                 </span>
-                                {data.price_action.pa_trade_plan.action === 'READY'
-                                    && info.trade_bucket
-                                    && info.trade_bucket !== 'TRADE' && (
-                                    <span className="text-[10px] font-bold text-slate-400">
-                                        (待执行确认)
-                                    </span>
-                                )}
+                            </div>
+                            <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-100 bg-slate-50/70 p-3 text-[11px] font-bold text-slate-600 md:grid-cols-5">
+                                <p><span className="text-slate-400">计划日：</span>{paPlanDate || '--'}</p>
+                                <p><span className="text-slate-400">有效至：</span>{paPlanExpiry || '待生成冻结计划'}</p>
+                                <p><span className="text-slate-400">确认价：</span>{paConfirmationPrice ? Number(paConfirmationPrice).toFixed(2) : '--'}</p>
+                                <p><span className="text-slate-400">失效价：</span>{paInvalidationPrice ? Number(paInvalidationPrice).toFixed(2) : '--'}</p>
+                                <p className="col-span-2 md:col-span-1"><span className="text-slate-400">下一步：</span>{paNextStep}</p>
                             </div>
                             <div className="text-base font-black text-slate-800">{data.price_action.pa_trade_plan.setup}</div>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-semibold text-slate-600">
@@ -660,7 +686,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                     )}
                                     {(info.display_trade_score ?? info.final_trade_score) != null && (
                                         <span className="px-2 py-0.5 rounded-md bg-slate-50 border border-slate-100 text-[10px] font-black text-slate-500">
-                                            交易分 {Number(info.display_trade_score ?? Math.min(100, info.final_trade_score)).toFixed(0)}
+                                            交易分 {clampScore(info.display_trade_score ?? info.final_trade_score).toFixed(0)}/100
                                         </span>
                                     )}
                                 </div>

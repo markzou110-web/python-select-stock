@@ -41,15 +41,44 @@ celery_app.conf.update(
     task_time_limit=3600, # 一次任务最长1小时
     task_always_eager=not redis_available, # 如果没有 Redis，就在当前线程同步执行！
     task_eager_propagates=True,
+    broker_connection_retry_on_startup=True,
+    task_default_queue='maintenance',
+    task_routes={
+        'tasks.check_realtime_alerts': {'queue': 'realtime'},
+        'tasks.retry_pending_notifications': {'queue': 'realtime'},
+        'tasks.collect_limit_up_leadership': {'queue': 'realtime'},
+        'tasks.collect_candidate_minute_bars': {'queue': 'realtime'},
+        'tasks.theme_momentum_watch': {'queue': 'realtime'},
+        # Checkpoints can run a full-market primary TV scan; keeping them on the
+        # realtime queue would still block price/risk alerts for 1-2 minutes.
+        'tasks.intraday_monitor_checkpoint': {'queue': 'scan'},
+        'tasks.recover_late_formal_scan': {'queue': 'scan'},
+        'scan.run_market_scan_task': {'queue': 'scan'},
+        'tasks.noon_sync_scan_review': {'queue': 'scan'},
+        'tasks.early_value_scan': {'queue': 'scan'},
+        'tasks.bottom_discovery_scan': {'queue': 'scan'},
+        'tasks.daily_sync': {'queue': 'maintenance'},
+        'tasks.database_backup': {'queue': 'maintenance'},
+        'tasks.discover_event_catalysts': {'queue': 'maintenance'},
+        'tasks.expire_execution_intents': {'queue': 'maintenance'},
+        'tasks.weekly_entry_timing_report': {'queue': 'maintenance'},
+    },
     # 定时任务配置 (Beat)
     beat_schedule={
         'check-alerts-every-5-minutes': {
             'task': 'tasks.check_realtime_alerts',
-            'schedule': 300.0, # 每 5 分钟检查一次
+            'schedule': crontab(minute='*/5', hour='9-11,13-14', day_of_week='1-5'),
+            'options': {'expires': 240},
+        },
+        'retry-pending-notifications-every-5-minutes': {
+            'task': 'tasks.retry_pending_notifications',
+            'schedule': crontab(minute='*/5', hour='8-22'),
+            'options': {'expires': 240},
         },
         'collect-limit-up-leadership-every-minute': {
             'task': 'tasks.collect_limit_up_leadership',
             'schedule': crontab(minute='*', hour='9-11,13-14', day_of_week='1-5'),
+            'options': {'expires': 50},
         },
         'collect-limit-up-leadership-after-close': {
             'task': 'tasks.collect_limit_up_leadership',
@@ -58,11 +87,13 @@ celery_app.conf.update(
         'collect-candidate-minute-bars-every-5-minutes': {
             'task': 'tasks.collect_candidate_minute_bars',
             'schedule': crontab(minute='*/5', hour='9-11,13-14', day_of_week='1-5'),
+            'options': {'expires': 240},
         },
         'intraday-open-risk-0935': {
             'task': 'tasks.intraday_monitor_checkpoint',
-            'schedule': crontab(hour=9, minute=35),
+            'schedule': crontab(hour=9, minute=35, day_of_week='1-5'),
             'kwargs': {'slot': 'open_risk'},
+            'options': {'expires': 600},
         },
         'theme-momentum-watch-0935': {
             'task': 'tasks.theme_momentum_watch',
@@ -79,39 +110,57 @@ celery_app.conf.update(
             'schedule': crontab(hour=10, minute=0, day_of_week='1-5'),
             'kwargs': {'slot': '10:00'},
         },
+        'theme-momentum-watch-1310': {
+            'task': 'tasks.theme_momentum_watch',
+            'schedule': crontab(hour=13, minute=10, day_of_week='1-5'),
+            'kwargs': {'slot': '13:10'},
+        },
+        'theme-momentum-watch-1400': {
+            'task': 'tasks.theme_momentum_watch',
+            'schedule': crontab(hour=14, minute=0, day_of_week='1-5'),
+            'kwargs': {'slot': '14:00'},
+        },
         'intraday-morning-confirm-1030': {
             'task': 'tasks.intraday_monitor_checkpoint',
-            'schedule': crontab(hour=10, minute=30),
+            'schedule': crontab(hour=10, minute=30, day_of_week='1-5'),
             'kwargs': {'slot': 'morning_confirm'},
+            'options': {'expires': 600},
         },
         'noon-sync-1135': {
             'task': 'tasks.noon_sync_scan_review',
             'schedule': crontab(hour=11, minute=35, day_of_week='1-5'),
             'kwargs': {'sync_first': True, 'run_review': False},
         },
-        'noon-scan-review-1305': {
-            'task': 'tasks.noon_sync_scan_review',
-            'schedule': crontab(hour=13, minute=5, day_of_week='1-5'),
-            'kwargs': {'sync_first': False, 'run_review': True},
-        },
         'early-value-independent-scan-1315': {
             'task': 'tasks.early_value_scan',
             'schedule': crontab(hour=13, minute=15, day_of_week='1-5'),
         },
-        'intraday-candidate-scan-1420': {
-            'task': 'tasks.intraday_monitor_checkpoint',
-            'schedule': crontab(hour=14, minute=20),
-            'kwargs': {'slot': 'candidate_scan'},
+        'bottom-discovery-morning-0945': {
+            'task': 'tasks.bottom_discovery_scan',
+            'schedule': crontab(hour=9, minute=45, day_of_week='1-5'),
+            'kwargs': {'slot': '09:45'},
+        },
+        'bottom-discovery-afternoon-1325': {
+            'task': 'tasks.bottom_discovery_scan',
+            'schedule': crontab(hour=13, minute=25, day_of_week='1-5'),
+            'kwargs': {'slot': '13:25'},
         },
         'intraday-late-decision-1450': {
             'task': 'tasks.intraday_monitor_checkpoint',
-            'schedule': crontab(hour=14, minute=50),
+            'schedule': crontab(hour=14, minute=50, day_of_week='1-5'),
             'kwargs': {'slot': 'late_decision'},
+            'options': {'expires': 300},
+        },
+        'intraday-late-recovery-1455': {
+            'task': 'tasks.recover_late_formal_scan',
+            'schedule': crontab(hour=14, minute=55, day_of_week='1-5'),
+            'options': {'expires': 240},
         },
         'intraday-after-close-review-1510': {
             'task': 'tasks.intraday_monitor_checkpoint',
-            'schedule': crontab(hour=15, minute=10),
+            'schedule': crontab(hour=15, minute=10, day_of_week='1-5'),
             'kwargs': {'slot': 'after_close_review'},
+            'options': {'expires': 900},
         },
         'expire-execution-intents-1510': {
             'task': 'tasks.expire_execution_intents',
@@ -184,7 +233,9 @@ def _task_result_summary(retval) -> str:
     keep_keys = (
         "status", "reason", "slot", "sync", "scan_count", "scan_push",
         "operation_alerts", "watch_alerts", "watch_status_push",
-        "pruned", "next_day_push", "bark_self_check", "codes", "bars",
+        "formal_scan_completed", "formal_scan_count", "formal_scan_push", "pruned", "next_day_push",
+        "next_day_reviewed", "next_day_confirmed", "next_day_confirmation_bark",
+        "daily_report_push", "bark_self_check", "codes", "bars", "sent", "failed",
         "snapshot_bars", "eastmoney_bars", "errors", "source_paused", "sealed", "broken", "saved",
         "notification", "count", "bark",
     )

@@ -17,13 +17,175 @@ from core.strategy import (
     _apply_tv_zp_expiry_and_alternate,
     check_pine_strategy,
     check_tv_dual_strategy,
+    check_tv_reversal_watch,
     get_signal_details,
     calculate_pine_win_rate,
     calculate_historical_win_rate,
     calculate_tv_dual_win_rate,
+    classify_tv_execution_tier,
     evaluate_exit_signals,
 )
-from core.scanner import _apply_sop_filter
+from core.scanner import _apply_sop_filter, _apply_trade_execution_profile
+
+
+def test_tv_execution_tier_prioritizes_same_day_dual_and_limits_zp_only():
+    assert classify_tv_execution_tier([150], [150]) == {
+        "tier": "A",
+        "label": "MA+ZP同日强共振",
+        "risk_unit": 1.0,
+        "auto_execute": True,
+        "same_day_dual": True,
+    }
+    assert classify_tv_execution_tier([150], [])['tier'] == "B"
+    assert classify_tv_execution_tier([], [150]) == {
+        "tier": "C",
+        "label": "ZP单信号研究层",
+        "risk_unit": 0.25,
+        "auto_execute": False,
+        "same_day_dual": False,
+    }
+
+
+def test_tv_execution_tier_does_not_promote_different_day_window_to_a():
+    tier = classify_tv_execution_tier([150], [149])
+
+    assert tier["tier"] == "B"
+    assert tier["same_day_dual"] is False
+
+
+def test_tv_execution_profile_blocks_zp_only_and_gates_ma_only():
+    zp_only = {
+        "strategy_type": "tv_dual",
+        "tv_execution_tier": "C",
+        "Score": 80,
+        "price_action_score": 80,
+        "effective_market_regime": "OFFENSIVE",
+    }
+    _apply_trade_execution_profile(zp_only)
+    assert "ZP单信号仅研究观察，禁止自动执行" in zp_only["trade_blockers"]
+    assert zp_only["trade_eligible"] is False
+
+    ma_only = {
+        "strategy_type": "tv_dual",
+        "tv_execution_tier": "B",
+        "Score": 80,
+        "price_action_score": 55,
+        "effective_market_regime": "DEFENSIVE",
+    }
+    _apply_trade_execution_profile(ma_only)
+    assert "MA单信号价格行为分<60，只观察" in ma_only["trade_blockers"]
+    assert "MA单信号仅进攻市场允许执行" in ma_only["trade_blockers"]
+
+
+def test_source_aware_tv_exit_signals_follow_declared_next_open_rules(monkeypatch):
+    from core import strategy
+
+    dates = pd.date_range("2026-01-01", periods=130, freq="B")
+    frame = pd.DataFrame({
+        "日期": dates,
+        "开盘": np.full(130, 10.5),
+        "最高": np.full(130, 10.8),
+        "最低": np.full(130, 10.2),
+        "收盘": np.full(130, 10.5),
+        "成交量": np.full(130, 100000.0),
+        "EMA5": np.full(130, 10.6),
+        "EMA20": np.full(130, 10.7),
+    })
+    monkeypatch.setattr(
+        strategy,
+        "_find_tv_zp_signal_indices",
+        lambda _df: ([], [len(_df) - 1], {}),
+    )
+
+    zp_short = evaluate_exit_signals(
+        frame,
+        entry_price=10.0,
+        high_since_entry=11.0,
+        signal_sources=["zp"],
+    )
+    assert zp_short[0]["reason"] == "TV-ZP short收盘确认"
+    assert "下一交易日开盘退出" in zp_short[0]["suggestion"]
+
+    ma_target = evaluate_exit_signals(
+        frame,
+        entry_price=10.0,
+        high_since_entry=11.6,
+        signal_sources=["ma"],
+    )
+    assert ma_target[0]["reason"] == "均线策略达到+15%目标"
+
+
+def test_zp_profit_protection_requires_fifteen_percent_activation(monkeypatch):
+    from core import strategy
+
+    dates = pd.date_range("2026-01-01", periods=130, freq="B")
+    frame = pd.DataFrame({
+        "日期": dates,
+        "开盘": np.full(130, 10.5),
+        "最高": np.full(130, 10.8),
+        "最低": np.full(130, 10.2),
+        "收盘": np.full(130, 10.5),
+        "成交量": np.full(130, 100000.0),
+        "EMA5": np.full(130, 10.6),
+        "EMA20": np.full(130, 10.7),
+    })
+    monkeypatch.setattr(strategy, "_find_tv_zp_signal_indices", lambda _df: ([], [], {}))
+
+    assert evaluate_exit_signals(
+        frame,
+        entry_price=10.0,
+        high_since_entry=11.0,
+        signal_sources=["zp"],
+    ) == []
+
+    protected = evaluate_exit_signals(
+        frame,
+        entry_price=10.0,
+        high_since_entry=11.6,
+        signal_sources=["zp"],
+    )
+    assert protected[0]["reason"] == "TV-ZP盈利保护触发EMA20破位"
+    assert "下一交易日开盘退出" in protected[0]["suggestion"]
+
+
+def test_tv_reversal_watch_requires_raw_long_daily_b_and_missing_weekly(monkeypatch):
+    from core import strategy
+
+    rows = 130
+    close = np.linspace(10, 13, rows)
+    df = pd.DataFrame({
+        "开盘": close - 0.2,
+        "最高": close + 0.1,
+        "最低": close - 0.1,
+        "收盘": close,
+        "成交量": np.full(rows, 200000.0),
+        "Vol_MA20": np.full(rows, 100000.0),
+        "RSI_WILDER": np.full(rows, 65.0),
+    })
+    raw = pd.Series(False, index=df.index)
+    raw.iloc[-1] = True
+    monkeypatch.setattr(
+        strategy,
+        "_find_tv_zp_signal_indices",
+        lambda _df: ([], [], {
+            "leading_long": raw,
+            "volume_confirm": raw,
+            "qqe_long": raw,
+        }),
+    )
+    monkeypatch.setattr(
+        strategy,
+        "_find_squeeze_signal_indices",
+        lambda _df, **kwargs: [] if kwargs["use_weekly_filter"] else [df.index[-1]],
+    )
+
+    match, stats = check_tv_reversal_watch(df)
+
+    assert match is True
+    assert stats["tv_reversal_watch_only"] is True
+    assert stats["trade_eligible"] is False
+    assert stats["trade_bucket"] == "OBSERVE"
+    assert "周线尚未转强" in stats["reason"]
 
 
 class TestSimulateBacktestBasic:
@@ -441,6 +603,8 @@ class TestStrategySignalAlignment:
 
         assert match is True
         assert stats["tv_ma_signal"] == "B共振"
+        assert stats["signal_sources"] == ["ma"]
+        assert "EMA20破位次日开盘" in stats["trade_exit_policy"]
 
         strict_match, strict_stats = check_tv_dual_strategy(df, require_both=True)
 

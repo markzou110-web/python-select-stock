@@ -32,12 +32,27 @@ from core.strategy import (
     check_strategy, check_pine_strategy, check_consensus_strategy,
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_consensus_win_rate
 )
-from core.risk_constants import BACKTEST_STOP_LOSS_PCT  # 与实盘硬止损同源，保证回测胜率反映真实规则
+from core.risk_constants import BACKTEST_STOP_LOSS_PCT, PRIMARY_TV_STRATEGY  # 与实盘硬止损同源，保证回测胜率反映真实规则
 from core.celery_app import celery_app
 from core.scan_preflight import build_scan_preflight
 from core.audit_log import record_lifecycle_event, record_task_run
+from core.trading_calendar import is_a_share_intraday_session
 
 router = APIRouter(prefix="/api", tags=["scan"])
+
+MANUAL_LIVE_TV_STRATEGIES = {PRIMARY_TV_STRATEGY, "tv_dual_strict"}
+
+
+def manual_scan_requires_live_snapshot(
+    strategy_type: str,
+    data_date: Optional[str],
+    now: Optional[datetime] = None,
+) -> bool:
+    return (
+        strategy_type in MANUAL_LIVE_TV_STRATEGIES
+        and not data_date
+        and is_a_share_intraday_session(now)
+    )
 
 
 @router.get("/scan/preflight")
@@ -69,14 +84,20 @@ def run_market_scan_task(
     use_rs_filter: bool = False,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "tv_dual_strict",
+    strategy_type: str = PRIMARY_TV_STRATEGY,
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期 (10/20/30/60)
     stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
     require_live_snapshot: bool = False,
+    include_scan_metadata: bool = False,
 ):
     from core.scanner import perform_market_scan
+    scan_metadata = {
+        "data_date": data_date,
+        "data_mode": None,
+        "as_of": None,
+    }
     results = perform_market_scan(
         threshold=threshold,
         vol_multiplier=vol_multiplier,
@@ -97,8 +118,9 @@ def run_market_scan_task(
         weekly_ma_period=weekly_ma_period,
         stop_loss_pct=stop_loss_pct,
         require_live_snapshot=require_live_snapshot,
+        scan_context=scan_metadata,
     )
-    if strategy_type == "tv_dual_strict" and results:
+    if strategy_type == PRIMARY_TV_STRATEGY and results:
         try:
             from core.sentinel import send_after_close_watchlist
             send_after_close_watchlist(results, scan_date=results[0].get("data_date"))
@@ -114,7 +136,10 @@ def run_market_scan_task(
             theme=item.get("题材") or item.get("行业") or item.get("industry"),
             payload={"score": item.get("Score") or item.get("score")},
         )
-    return _json_safe(results)
+    safe_results = _json_safe(results)
+    if include_scan_metadata:
+        return {"results": safe_results, "scan_meta": _json_safe(scan_metadata)}
+    return safe_results
 
 @router.get("/scan")
 def scan_market(
@@ -131,7 +156,7 @@ def scan_market(
     use_rs_filter: bool = False,
     local_only: bool = True,
     data_date: Optional[str] = None,
-    strategy_type: str = "tv_dual_strict",
+    strategy_type: str = PRIMARY_TV_STRATEGY,
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期
@@ -140,6 +165,13 @@ def scan_market(
     """
     API Endpoint for market scan (Asynchronous via Celery)
     """
+    data_date = data_date.strip() if data_date and data_date.strip() else None
+    require_live_snapshot = manual_scan_requires_live_snapshot(strategy_type, data_date)
+    if require_live_snapshot:
+        local_only = False
+        logger.info(
+            "[SCAN API] Intraday TV scan forced to live snapshot; historical fallback disabled."
+        )
     logger.info(f"[SCAN API] Submitting task: strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}, stop_loss_pct={stop_loss_pct}")
     
     # 异步发送任务给 Celery Queue
@@ -147,12 +179,20 @@ def scan_market(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
         turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days,
-        weekly_ma_period, stop_loss_pct
+        weekly_ma_period, stop_loss_pct, require_live_snapshot, True
     )
     
     # 无 Redis 的兜底处理：任务已同步完成，直接把结果交给前端 (前端的 fallback 机制接收)
     if celery_app.conf.task_always_eager and task.state == 'SUCCESS':
-        return {"status": "SUCCESS", "results": task.result, "message": "同步扫描完成"}
+        task_result = task.result
+        if isinstance(task_result, dict) and "results" in task_result:
+            return {
+                "status": "SUCCESS",
+                "results": task_result["results"],
+                "scan_meta": task_result.get("scan_meta") or {},
+                "message": "同步扫描完成",
+            }
+        return {"status": "SUCCESS", "results": task_result, "message": "同步扫描完成"}
 
     return {"task_id": task.id, "status": "PENDING", "message": "扫描任务已提交队列"}
 
@@ -187,6 +227,14 @@ def get_scan_status(task_id: str):
     if task.state == 'SUCCESS':
         # Result is either list of items or serialized JSON
         result = task.result
+        if isinstance(result, dict) and "results" in result:
+            return {
+                "task_id": task_id,
+                "status": task.state,
+                "results": result["results"],
+                "scan_meta": result.get("scan_meta") or {},
+                "message": "扫描完成",
+            }
         return {"task_id": task_id, "status": task.state, "results": result, "message": "扫描完成"}
     elif task.state == 'FAILURE':
         return {"task_id": task_id, "status": task.state, "message": str(task.info)}

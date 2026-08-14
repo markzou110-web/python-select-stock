@@ -1,7 +1,8 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pandas as pd
 from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -11,11 +12,106 @@ from routers.paper_trade import (
     close_paper_trade,
     _count_holding_trading_days,
     _evaluate_time_stop,
+    _build_trade_plan,
     _wind_control_decision,
     _tier_early_warning,
     _tier_alert_sent,
 )
 from schemas.paper_trade import PaperTradeClose
+
+
+def test_tv_ema20_exit_is_scheduled_then_filled_at_next_open(monkeypatch):
+    from core import data
+    from routers import paper_trade
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    dates = [datetime(2026, 6, 15) + timedelta(days=day) for day in range(54)]
+    dates = [value for value in dates if value.weekday() < 5][-40:]
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_trading (
+                code, name, entry_price, entry_date, current_price, high_since_entry,
+                status, strategy_type, trade_mode, signal_sources, execution_tier, risk_unit
+            ) VALUES (
+                '603259', '药明康德', 10.0, '2026-07-01', 9.8, 10.8,
+                'OPEN', 'tv_dual', 'SIMULATED', 'ma', 'B', 0.6
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO daily_k (code, date, open, high, low, close, vol)
+            VALUES (:code, :date, :open, :high, :low, :close, :vol)
+        """), [
+            {
+                "code": "603259",
+                "date": value.date(),
+                "open": 10.5,
+                "high": 10.8,
+                "low": 9.7 if idx == len(dates) - 1 else 10.2,
+                "close": 9.8 if idx == len(dates) - 1 else 10.5,
+                "vol": 100000,
+            }
+            for idx, value in enumerate(dates)
+        ])
+
+    class FakeAfterClose:
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 7, 16, 0)
+
+    snapshot = pd.DataFrame([{
+        "code": "603259", "price": 9.8, "open": 9.9, "high": 10.0, "low": 9.7,
+    }])
+    snapshot.attrs["data_date"] = "2026-08-07"
+    snapshot_holder = {"value": snapshot}
+    monkeypatch.setattr(paper_trade, "datetime", FakeAfterClose)
+    monkeypatch.setattr(paper_trade, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(data, "get_market_snapshot", lambda: snapshot_holder["value"])
+    monkeypatch.setattr(data, "get_market_regime", lambda: {"status": "OFFENSIVE", "desc": "进攻"})
+    monkeypatch.setattr(
+        data,
+        "get_index_hist",
+        lambda _code: pd.DataFrame({"日期": dates, "收盘": [3000 + idx for idx in range(len(dates))]}),
+    )
+    monkeypatch.setattr(paper_trade, "is_snapshot_stale", lambda _snapshot: False)
+    monkeypatch.setattr(paper_trade, "evaluate_floating_loss_circuit_breaker", lambda *_args: {"halted": False})
+    monkeypatch.setattr(paper_trade, "_count_holding_trading_days", lambda *_args: 10)
+    monkeypatch.setattr(paper_trade, "_tier_early_warning", lambda **_kwargs: None)
+    monkeypatch.setattr(paper_trade, "send_paper_trade_notification", lambda *_args: None)
+    monkeypatch.setattr(paper_trade, "record_lifecycle_event", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(paper_trade, "get_setting", lambda *_args, **_kwargs: "false")
+
+    scheduled = paper_trade.run_wind_control()
+    assert scheduled["pending_exit_count"] == 1
+    with engine.connect() as conn:
+        pending = conn.execute(text("""
+            SELECT status, pending_exit_reason, pending_exit_signal_date
+            FROM paper_trading WHERE code = '603259'
+        """)).fetchone()
+    assert pending[0] == "OPEN"
+    assert "EMA20破位" in pending[1]
+    assert str(pending[2]) == "2026-08-07"
+
+    class FakeNextOpen:
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 10, 9, 31)
+
+    next_snapshot = pd.DataFrame([{
+        "code": "603259", "price": 9.6, "open": 9.7, "high": 9.8, "low": 9.5,
+    }])
+    next_snapshot.attrs["data_date"] = "2026-08-10"
+    snapshot_holder["value"] = next_snapshot
+    monkeypatch.setattr(paper_trade, "datetime", FakeNextOpen)
+
+    executed = paper_trade.run_wind_control()
+    assert executed["closed_count"] == 1
+    with engine.connect() as conn:
+        closed = conn.execute(text("""
+            SELECT status, close_price, pending_exit_reason
+            FROM paper_trading WHERE code = '603259'
+        """)).fetchone()
+    assert closed == ("CLOSED", 9.7, None)
 
 
 def test_holding_days_use_trading_days_from_daily_k():
@@ -166,6 +262,26 @@ def test_wind_control_only_closes_on_price_or_confirmed_time_stop():
     assert warning == {"reason": "时间风控预警", "should_close": False}
     assert stop["should_close"] is True
     assert "21.28" in stop["reason"]
+
+
+def test_tv_trade_plan_disables_generic_trailing_and_time_stop():
+    plan = _build_trade_plan(
+        {
+            "entry_price": 10.0,
+            "entry_date": "2026-08-01",
+            "strategy_type": "tv_dual",
+            "signal_sources": "ma",
+        },
+        current_price=11.0,
+        high_since_entry=11.2,
+        risk={"active_stop_price": 10.5, "structure_stop_price": 10.2},
+    )
+
+    assert plan["active_stop_price"] == 9.1
+    assert plan["structure_stop_price"] == 9.1
+    assert plan["time_stop_date"] is None
+    assert plan["signal_sources"] == ["ma"]
+    assert "+15%目标" in plan["instruction"]
 
 
 def test_wind_control_respects_t1_locked_snapshot():
@@ -439,3 +555,71 @@ def test_operation_plan_close_on_initial_stage_not_breakeven():
         risk=risk,
     )
     assert decision["action"] == "CLOSE", f"初始档应 CLOSE，实际 {decision['action']}"
+
+
+def test_signal_reverse_closes_position_when_regime_turns_bearish():
+    """混合退出策略：开启信号反转开关 + PA判定空头趋势 → 应 CLOSE 清仓。"""
+    from core.operation_plan import build_position_decision_snapshot
+
+    # 持仓未触发任何价格止损/止盈，但 PA 趋势反转
+    risk = {
+        "active_stop_price": 9.1,
+        "structure_stop_price": 0.0,
+        "initial_stop_price": 9.1,
+        "max_pl_pct": 5.0,
+        "risk_stage": "初始/结构防守",
+    }
+    decision = build_position_decision_snapshot(
+        current_price=10.2,   # 未跌破止损线（9.1），也未达止盈（+8%=10.8）
+        entry_price=10.0,
+        risk=risk,
+        pa_regime="空头趋势",
+        signal_reverse_enabled=True,
+    )
+    assert decision["action"] == "CLOSE", f"PA趋势反转应 CLOSE，实际 {decision['action']}"
+    assert "趋势反转" in decision["trigger"]
+    assert "空头趋势" in decision["trigger"]
+
+
+def test_signal_reverse_disabled_by_default():
+    """混合退出策略：开关关闭时，即使 PA 判定空头趋势也不应触发平仓（向后兼容）。"""
+    from core.operation_plan import build_position_decision_snapshot
+
+    risk = {
+        "active_stop_price": 9.1,
+        "structure_stop_price": 0.0,
+        "initial_stop_price": 9.1,
+        "max_pl_pct": 5.0,
+        "risk_stage": "初始/结构防守",
+    }
+    # signal_reverse_enabled 默认 False，不传也应关闭
+    decision = build_position_decision_snapshot(
+        current_price=10.2,
+        entry_price=10.0,
+        risk=risk,
+        pa_regime="向下破位",
+    )
+    assert decision["action"] == "HOLD", f"开关关闭时应 HOLD，实际 {decision['action']}"
+
+
+def test_signal_reverse_does_not_override_stop_loss():
+    """混合退出策略：-9%硬止损优先级高于信号反转（价格已破止损线应走止损分支）。"""
+    from core.operation_plan import build_position_decision_snapshot
+
+    risk = {
+        "active_stop_price": 9.1,
+        "structure_stop_price": 0.0,
+        "initial_stop_price": 9.1,
+        "max_pl_pct": 0.0,
+        "risk_stage": "初始/结构防守",
+    }
+    decision = build_position_decision_snapshot(
+        current_price=9.05,   # 已跌破 active_stop 9.1
+        entry_price=10.0,
+        risk=risk,
+        pa_regime="空头趋势",
+        signal_reverse_enabled=True,
+    )
+    assert decision["action"] == "CLOSE"
+    assert "止损线" in decision["trigger"] or "执行" in decision["trigger"]
+    assert "趋势反转" not in decision["trigger"]  # 走的是止损分支，不是信号反转分支

@@ -61,3 +61,32 @@ def test_daily_strategy_report_body_is_compact_for_bark():
     assert "扫描4只 | TRADE 1 | EARLY 1 | OBSERVE 1 | BLOCK 1" in body
     assert "机器人：候选偏后排，暂不追" in body
     assert "明日动作：" in body
+
+
+def test_daily_report_uses_bounded_display_score_and_non_trade_action():
+    report = build_daily_strategy_report([{
+        "代码": "000001",
+        "名称": "示例",
+        "trade_bucket": "OBSERVE",
+        "trade_eligible": False,
+        "final_trade_score": 107.03,
+        "display_opportunity_score": 69.3,
+        "trade_opportunity_label": "试错仓",
+    }])
+
+    candidate = report["top_candidates"][0]
+    assert candidate["score"] == 69.3
+    assert candidate["action"] == "仅观察"
+
+
+def test_daily_report_does_not_count_blocked_trade_bucket_as_trade():
+    report = build_daily_strategy_report([{
+        "代码": "000001",
+        "trade_bucket": "TRADE",
+        "trade_eligible": False,
+        "display_opportunity_score": 0,
+        "final_trade_score": 88,
+    }])
+
+    assert report["summary"]["trade_count"] == 0
+    assert report["top_candidates"] == []

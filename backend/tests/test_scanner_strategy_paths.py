@@ -42,14 +42,33 @@ def test_snapshot_audit_marks_missing_local_fields_research_only():
     assert len(audit["degradation_reasons"]) == 2
 
 
+def test_snapshot_audit_quarantines_sparse_turnover_gaps_without_global_block():
+    snapshot = pd.DataFrame({
+        "price": [10.0] * 1000,
+        "pct_chg": [1.0] * 1000,
+        "turnover": [3.0] * 996 + [None] * 4,
+        "mkt_cap": [1e10] * 1000,
+    })
+
+    audit = scanner._build_snapshot_audit(snapshot, "LIVE_SNAPSHOT", "2026-07-14 15:00:00")
+
+    assert audit["research_only"] is False
+    assert "turnover_min" in audit["effective_filters"]
+    assert audit["blocking_degradation_reasons"] == []
+    assert "少量股票缺少换手率，已按股票隔离" in audit["degradation_reasons"]
+
+
 def test_discovery_pools_keep_pullbacks_out_of_momentum_pool():
     snapshot = pd.DataFrame({"pct_chg": [-2.5, -1.0, 1.0, 6.0]})
     momentum, momentum_name = scanner._discovery_pool_mask(snapshot, "tv_dual_strict")
     early, early_name = scanner._discovery_pool_mask(snapshot, "early_value")
+    bottom, bottom_name = scanner._discovery_pool_mask(snapshot, "bottom_discovery")
     assert momentum_name == "MOMENTUM_DISCOVERY"
     assert momentum.tolist() == [False, False, True, True]
     assert early_name == "EARLY_DISCOVERY"
     assert early.tolist() == [True, True, True, False]
+    assert bottom_name == "BOTTOM_DISCOVERY"
+    assert bottom.tolist() == [True, True, True, False]
 
 
 def test_research_only_gate_removes_all_trade_permission():
@@ -141,6 +160,133 @@ def test_strategy_registry_includes_early_value():
     assert item["supports_scan"] is True
     assert item["supports_backtest"] is False
     assert item["name"] == "早期性价比追踪"
+
+
+def _make_bottom_discovery_df(*, reversing: bool = True, new_low: bool = False) -> pd.DataFrame:
+    n = 100
+    close = np.full(n, 10.4)
+    high = np.full(n, 10.7)
+    low = np.full(n, 10.1)
+    open_ = np.full(n, 10.35)
+    volume = np.full(n, 100000.0)
+    low[-20] = 10.0
+    close[-6:] = [10.22, 10.25, 10.28, 10.32, 10.36, 10.5]
+    high[-5:] = [10.4, 10.42, 10.45, 10.48, 10.6]
+    low[-6:-3] = [10.08, 10.1, 10.12]
+    low[-3:] = [10.2, 10.24, 10.3]
+    open_[-1] = 10.25 if reversing else 10.55
+    volume[-5:-1] = 60000
+    volume[-1] = 110000
+    if new_low:
+        low[-1] = 9.8
+    return pd.DataFrame({
+        "日期": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "开盘": open_, "收盘": close, "最高": high, "最低": low, "成交量": volume,
+        "RSI": np.full(n, 48.0), "MACD_DIF": np.full(n, -0.02),
+        "MACD_DEA": np.full(n, -0.03),
+    })
+
+
+def test_bottom_discovery_finds_b1_reversal_without_trade_permission():
+    result = scanner.single_stock_task(
+        "000001", "底部票", price=10.5, vol=110000, open_price=10.25,
+        threshold=0.12, vol_multiplier=1.5, rsi_min=55,
+        use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10,
+        use_weekly=False, preloaded_df=_make_bottom_discovery_df(),
+        strategy_type="bottom_discovery",
+    )
+
+    assert result["strategy_type"] == "bottom_discovery"
+    assert result["bottom_discovery_stage"] == "B1_REVERSAL"
+    assert result["bottom_discovery_watch_only"] is True
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
+    assert result["涨幅%"] == 1.35
+    assert result["RSI"] == 48.0
+    assert result["DIF"] == -0.02
+
+
+def test_bottom_discovery_rejects_falling_knife_new_low():
+    result = scanner.single_stock_task(
+        "000001", "破位票", price=10.0, vol=110000, open_price=10.25,
+        threshold=0.12, vol_multiplier=1.5, rsi_min=55,
+        use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10,
+        use_weekly=False, preloaded_df=_make_bottom_discovery_df(new_low=True),
+        strategy_type="bottom_discovery",
+    )
+
+    assert "仍在创新低" in result["reason"]
+
+
+def test_bottom_discovery_registry_is_scan_only():
+    from core.strategy_registry import get_strategy
+
+    item = get_strategy("bottom_discovery")
+
+    assert item["supports_scan"] is True
+    assert item["supports_backtest"] is False
+    assert item["name"] == "底部起涨发现"
+
+
+def test_bottom_discovery_sop_remains_observation_only_even_with_high_score():
+    rows = [{
+        "代码": "000001", "名称": "底部票", "行业": "测试", "Score": 99,
+        "历史胜率": "90%", "影线比": 0.1, "pct_5d": 2,
+        "bottom_discovery_watch_only": True, "bottom_discovery_stage": "B1_REVERSAL",
+    }]
+
+    scanner._apply_sop_filter(rows, {"status": "OFFENSIVE"}, {})
+
+    assert rows[0]["sop_grade"] == "C"
+    assert rows[0]["trade_eligible"] is False
+    assert rows[0]["trade_bucket"] == "OBSERVE"
+    assert any("底部起涨发现仅供观察" in item for item in rows[0]["trade_blockers"])
+
+
+def test_strong_sector_watch_prefers_not_extended_leader(monkeypatch):
+    monkeypatch.setattr(scanner, "classify_sector_role", lambda *args, **kwargs: "LEADER")
+    monkeypatch.setattr(
+        scanner,
+        "analyze_price_action",
+        lambda df: {"pa_trade_plan": {"action": "WATCH"}, "pa_entry_price": 11.0},
+    )
+    monkeypatch.setattr(
+        scanner,
+        "compute_paper_risk_levels",
+        lambda *args, **kwargs: {
+            "active_stop_price": 9.5,
+            "initial_stop_price": 9.5,
+            "structure_stop_price": 9.4,
+            "take_profit_price": 13.0,
+            "risk_reward": 2.0,
+            "risk_notes": [],
+        },
+    )
+    hist = pd.DataFrame({
+        "收盘": [10.0, 10.1, 10.2, 10.3, 10.5, 10.8],
+        "最高": [10.2, 10.3, 10.4, 10.5, 10.7, 11.0],
+        "RSI": [55] * 6,
+        "DIF": [0.1] * 6,
+        "BB": [0.05] * 6,
+        "粘合度": [0.08] * 6,
+    })
+    candidates = pd.DataFrame([
+        {"code": "000001", "name": "过度加速", "pct_chg": 8.2, "price": 11.2},
+        {"code": "000002", "name": "早期核心", "pct_chg": 4.5, "price": 10.8},
+    ])
+
+    rows = scanner._build_sector_watch_candidates(
+        candidates,
+        set(),
+        {"000001": hist, "000002": hist},
+        {"000001": "半导体", "000002": "半导体"},
+        {"半导体": {"sector_phase": "SECTOR_CONFIRM", "sector_avg_pct": 3.0}},
+        max_per_sector=2,
+    )
+
+    assert [row["代码"] for row in rows] == ["000002"]
+    assert rows[0]["sector_watch_only"] is True
+    assert rows[0]["strategy_type"] == "sector_watch"
 
 
 def test_early_value_keeps_pending_candidates_when_sector_not_started():
@@ -312,6 +458,39 @@ def test_tv_dual_weekly_gate_passes_bullish_weekly(monkeypatch):
     )
 
     assert result.get("Score") == 88  # 通过门槛，命中策略
+
+
+def test_tv_dual_strict_falls_back_to_reversal_watch(monkeypatch):
+    monkeypatch.setattr(
+        scanner,
+        "check_tv_dual_strategy",
+        lambda df, **kw: (False, {"reason": "未双命中", "tv_zp_raw_current": True}),
+    )
+    monkeypatch.setattr(
+        scanner,
+        "check_tv_reversal_watch",
+        lambda df, **kw: (
+            True,
+            {
+                "Score": 82,
+                "signal": "强修复观察",
+                "tv_reversal_watch_only": True,
+                "trade_eligible": False,
+                "trade_bucket": "OBSERVE",
+            },
+        ),
+    )
+
+    result = scanner.single_stock_task(
+        "000001", "测试", price=13, vol=200000, open_price=12.7,
+        threshold=0.12, vol_multiplier=1.5, rsi_min=55, use_macd_filter=True,
+        use_bb_sqz=False, sqz_lookback=10, use_weekly=False,
+        preloaded_df=_make_tv_dual_df(), strategy_type="tv_dual_strict",
+    )
+
+    assert result["strategy_type"] == "tv_reversal_watch"
+    assert result["tv_reversal_watch_only"] is True
+    assert result["trade_eligible"] is False
 
 
 # ── 数据预检熔断（改动 #2）──
@@ -534,6 +713,50 @@ def test_failure_pattern_below_threshold_not_vetoed():
     }]
     scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
     assert results[0].get("sop_grade") != "D"
+
+
+def test_sop_explains_base_grade_to_revival_final_grade():
+    """质量评分与执行语义分开：A级结构因次日确认要求降为B时必须说明原因。"""
+    from core import scanner
+
+    results = [{
+        "代码": "000003", "名称": "复活样本", "行业": "测试",
+        "Score": 120, "影线比": 0.1, "pct_5d": 2, "历史胜率": "90%",
+        "回测统计": {"adjusted_win_rate": 90, "profit_factor": 3, "expectancy": 2},
+            "ROE": 15, "净利YOY": 30, "price_action_score": 100, "pa_structure_score": 100,
+        "sector_alignment_score": 100, "mkt_cap_yi": 200,
+        "strategy_type": "tv_dual_strict",
+        "revival_watch_only": True, "revival_level": "NEXT_DAY_CONFIRM",
+    }]
+
+    scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
+
+    assert results[0]["sop_base_grade"] == "A"
+    assert results[0]["sop_grade"] == "B"
+    assert results[0]["sop_quality_gap_to_a"] == 0
+    assert "基础A→最终B" in results[0]["sop_grade_reason"]
+    assert "历史信号复活" in results[0]["sop_grade_transition_reasons"][0]
+
+
+def test_sop_explains_momentum_watch_grade_without_making_it_tradable():
+    """强势异动可以进入M观察，但解释字段不能把观察态误写成可交易。"""
+    from core import scanner
+
+    results = [{
+        "代码": "000004", "名称": "加速样本", "行业": "测试",
+        "Score": 45, "影线比": 0.1, "pct_5d": 8, "历史胜率": "40%",
+        "回测统计": {"adjusted_win_rate": 40, "profit_factor": 1, "expectancy": 1},
+        "pa_structure_score": 45, "sector_alignment_score": 45,
+        "momentum_acceleration_watch_only": True,
+    }]
+
+    scanner._apply_sop_filter(results, {"status": "DEFENSIVE"}, {})
+
+    assert results[0]["sop_base_grade"] == "C"
+    assert results[0]["sop_grade"] == "M"
+    assert results[0]["trade_eligible"] is False
+    assert "基础C→最终M" in results[0]["sop_grade_reason"]
+    assert "禁止追高" in results[0]["sop_grade_transition_reasons"][0]
 
 
 # ── 破位反抽陷阱多维评分（调整2 v2，上班族 Bark 场景）──

@@ -21,7 +21,7 @@ _TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 def _validate_schedule_times(raw: str) -> str:
     """校验逗号分隔的 HH:MM 时间字符串。无效则返回默认值并记录。"""
     if not raw or not raw.strip():
-        return ""
+        raise HTTPException(status_code=400, detail="schedule_times不能为空")
     times = [t.strip() for t in str(raw).split(",") if t.strip()]
     valid = [t for t in times if _TIME_PATTERN.match(t)]
     if not valid:
@@ -35,7 +35,9 @@ def get_settings_api() -> Dict[str, Any]:
     return {
         "configured": config.is_bark_configured(),
         "bark_key": get_setting("bark_key", ""),
-        "sentinel_schedule_times": get_setting("sentinel_schedule_times", "14:20"),
+        "sentinel_schedule_times": get_setting(
+            "sentinel_schedule_times", config.SENTINEL_SCHEDULE_TIMES
+        ),
         "market_sync_schedule_times": get_setting("market_sync_schedule_times", SYNC_SCHEDULE_DEFAULT),
     }
 
@@ -102,8 +104,14 @@ def test_webhook(channel: str = "bark") -> Dict[str, Any]:
     body = "这是一条测试消息，确认推送渠道已连通。"
 
     try:
-        notifier.send(title, body, channels=[channel])
-        return {"status": "success", "message": f"Test message sent via {channel}"}
+        import asyncio
+        result = asyncio.run(notifier.send(title, body, channels=[channel]))
+        sent = bool(result.get(channel.lower().strip()))
+        return {
+            "status": "success" if sent else "error",
+            "message": f"Test message sent via {channel}" if sent else f"Test message failed via {channel}",
+            "delivery": result,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -124,7 +132,13 @@ def test_push_notification() -> Dict[str, Any]:
     body = f"【测试推送】\n发现 {len(names)} 只标的：\n" + "、".join([f"{n}({c})" for n, c in zip(names, codes)])
 
     try:
-        notifier.send(title, body)
-        return {"status": "success", "message": f"Push sent: {body}"}
+        import asyncio
+        result = asyncio.run(notifier.send(title, body, channels=["bark"]))
+        sent = bool(result.get("bark"))
+        return {
+            "status": "success" if sent else "error",
+            "message": f"Push sent: {body}" if sent else "Bark push failed and was queued for retry",
+            "delivery": result,
+        }
     except Exception as e:
         return {"status": "error", "message": "Internal server error"}

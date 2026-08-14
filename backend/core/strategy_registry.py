@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 _STRATEGIES: Dict[str, Dict[str, Any]] = {
     "squeeze": {
-        "name": "均线粘合突破",
+        "name": "均线粘合（单策略）",
         "description": "EMA 粘合后结合量能、RSI、MACD 和布林收缩寻找突破。",
         "supports_scan": True,
         "supports_backtest": True,
@@ -13,7 +13,7 @@ _STRATEGIES: Dict[str, Dict[str, Any]] = {
         "default_params": {"threshold": 0.12, "vol_multiplier": 1.5, "rsi_min": 55, "use_macd_filter": True},
     },
     "pine": {
-        "name": "Pine 多指标共振",
+        "name": "五指标投票共振",
         "description": "Range Filter、QQE、SuperTrend、核回归和 HalfTrend 多信号共振。",
         "supports_scan": True,
         "supports_backtest": True,
@@ -31,7 +31,7 @@ _STRATEGIES: Dict[str, Dict[str, Any]] = {
         "default_params": {},
     },
     "tv_zp": {
-        "name": "TV ZP 趋势",
+        "name": "TV-ZP趋势信号",
         "description": "基于 TradingView ZP 趋势信号的方向策略。",
         "supports_scan": True,
         "supports_backtest": True,
@@ -40,8 +40,8 @@ _STRATEGIES: Dict[str, Dict[str, Any]] = {
         "default_params": {},
     },
     "tv_dual": {
-        "name": "TV 双信号",
-        "description": "组合 TV 趋势信号，任一有效即可进入候选。",
+        "name": "TV 均线或ZP",
+        "description": "均线 B 或 TV-ZP long 任一有效即可进入候选，并按信号来源执行卖点。",
         "supports_scan": True,
         "supports_backtest": False,
         "required_indicators": ["RF_Upward", "ST_Signal"],
@@ -73,6 +73,15 @@ _STRATEGIES: Dict[str, Dict[str, Any]] = {
         "supports_backtest": False,
         "required_indicators": ["EMA20", "EMA60", "Vol_MA20", "sector_phase"],
         "explain_fields": ["early_value_metrics", "early_value_action", "sector_phase"],
+        "default_params": {},
+    },
+    "bottom_discovery": {
+        "name": "底部起涨发现",
+        "description": "识别60日低位的缩量止跌与首次转强候选；只进入观察池，不产生交易指令。",
+        "supports_scan": True,
+        "supports_backtest": False,
+        "required_indicators": ["EMA5", "EMA10", "EMA20", "Vol_MA20"],
+        "explain_fields": ["bottom_discovery_stage", "bottom_discovery_metrics", "bottom_discovery_action"],
         "default_params": {},
     },
 }

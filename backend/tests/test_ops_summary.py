@@ -38,6 +38,17 @@ def test_ops_summary_aggregates_scans_and_failures():
         "result_count": 0,
         "fail_reasons": {"量能不足": 3},
     }, engine)
+    save_scan_audit_log({
+        "started_at": datetime.now(),
+        "finished_at": datetime.now(),
+        "duration_sec": 3.0,
+        "status": "RESEARCH_ONLY",
+        "strategy_type": "pine",
+        "version_snapshot": {"strategy": "v1"},
+        "candidate_count": 15,
+        "result_count": 2,
+        "fail_reasons": {},
+    }, engine)
     save_failure_sample({
         "code": "000001",
         "sample_date": "2026-05-31",
@@ -49,14 +60,22 @@ def test_ops_summary_aggregates_scans_and_failures():
     summary = build_ops_summary(engine, limit=20)
 
     assert summary["status"] == "ok"
-    assert summary["scan_quality"]["total_scans"] == 2
-    assert summary["scan_quality"]["success_rate"] == 50.0
+    assert summary["scan_quality"]["total_scans"] == 3
+    assert summary["scan_quality"]["success_rate"] == 33.3
+    assert summary["scan_quality"]["completion_rate"] == 66.7
+    assert summary["scan_quality"]["research_only_rate"] == 33.3
+    assert summary["scan_quality"]["failure_rate"] == 33.3
+    assert summary["scan_quality"]["status_distribution"] == {
+        "FAILED": 1,
+        "RESEARCH_ONLY": 1,
+        "SUCCESS": 1,
+    }
     assert summary["scan_quality"]["avg_duration_sec"] == 3.0
     assert summary["failure_reason_top"][0] == {"reason": "量能不足", "count": 9}
     assert summary["strategy_distribution"][0]["strategy_type"] == "pine"
     assert summary["strategy_distribution"][0]["avg_results"] == 2.0
     assert summary["failure_sample_by_strategy"][0]["avg_pnl_pct"] == -4.0
-    assert summary["version_distribution"][0] == {"version": "strategy:v1", "count": 2}
+    assert summary["version_distribution"][0] == {"version": "strategy:v1", "count": 3}
     assert summary["performance_phases"][0] == {"phase": "indicator_batch", "avg_duration_sec": 1.2, "samples": 1}
 
 

@@ -37,6 +37,88 @@ def test_execution_label_respects_t_plus_one():
     assert result["exit_reason"] == "持有期结束"
 
 
+def test_confirmation_trigger_requires_price_reach_and_caps_open_extension():
+    bars = _bars()
+    bars.loc[0, ["开盘", "最高", "最低", "收盘"]] = [10.0, 10.4, 9.9, 10.2]
+    not_reached = evaluate_execution_path(
+        "000001",
+        10.0,
+        bars,
+        max_hold_days=3,
+        planned_entry_price=10.5,
+    )
+    assert not_reached["mature"] is True
+    assert not_reached["filled"] is False
+    assert not_reached["reason"] == "确认价未触及"
+
+    bars.loc[0, ["开盘", "最高", "最低", "收盘"]] = [10.0, 10.6, 9.9, 10.5]
+    reached = evaluate_execution_path(
+        "000001",
+        10.0,
+        bars,
+        max_hold_days=3,
+        planned_entry_price=10.5,
+    )
+    assert reached["filled"] is True
+    assert reached["entry_price"] > 10.5
+    assert reached["entry_trigger_price"] == 10.5
+
+    bars.loc[0, ["开盘", "最高", "最低", "收盘"]] = [10.9, 11.0, 10.8, 10.9]
+    extended = evaluate_execution_path(
+        "000001",
+        10.0,
+        bars,
+        max_hold_days=3,
+        planned_entry_price=10.5,
+    )
+    assert extended["filled"] is False
+    assert extended["reason"] == "开盘超过确认价偏离上限"
+
+
+def test_expired_confirmation_is_mature_once_t_plus_one_bar_exists():
+    t_plus_one = _bars().head(1).copy()
+    t_plus_one.loc[0, ["开盘", "最高", "最低", "收盘"]] = [10.0, 10.4, 9.9, 10.2]
+
+    expired = evaluate_execution_path(
+        "000001",
+        10.0,
+        t_plus_one,
+        max_hold_days=10,
+        planned_entry_price=10.5,
+    )
+    assert expired["mature"] is True
+    assert expired["filled"] is False
+    assert expired["reason"] == "确认价未触及"
+
+    triggered = evaluate_execution_path(
+        "000001",
+        10.0,
+        t_plus_one.assign(最高=10.6),
+        max_hold_days=10,
+        planned_entry_price=10.5,
+    )
+    assert triggered["mature"] is False
+    assert triggered["filled"] is False
+    assert triggered["reason"] == "持有期未成熟"
+
+
+def test_t_plus_one_capacity_rejection_does_not_wait_for_holding_horizon():
+    t_plus_one = _bars().head(1).assign(成交量=100).copy()
+
+    rejected = evaluate_execution_path(
+        "688001",
+        10.0,
+        t_plus_one,
+        max_hold_days=10,
+        planned_entry_price=10.0,
+        planned_order_value=1500,
+    )
+
+    assert rejected["mature"] is True
+    assert rejected["filled"] is False
+    assert rejected["reason"] == "计划资金不足最低申报数量"
+
+
 def test_execution_label_rejects_unbuyable_limit_up():
     result = evaluate_execution_path("000001", 10.0, _bars([11.0, 10.0, 10.0]), max_hold_days=3)
     assert result["mature"] is True
@@ -59,7 +141,7 @@ def test_build_labels_only_uses_bars_after_signal_date():
     prices["code"] = "000001"
     result = build_executable_labels(signals, prices, max_hold_days=3)
     assert result.loc[0, "exec_filled"]
-    assert result.loc[0, "exec_execution_model_version"] == "a-share-next-open-v2"
+    assert result.loc[0, "exec_execution_model_version"] == "a-share-confirmation-trigger-v3"
 
 
 def test_capital_sized_label_applies_lot_capacity_and_minimum_commission():

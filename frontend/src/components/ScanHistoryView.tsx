@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar, ChevronRight, TrendingUp, TrendingDown, RefreshCw, BarChart2 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { clampScore, cn } from '@/lib/utils';
 import api from '@/lib/api';
 
 interface ScanHistoryViewProps {
@@ -142,7 +142,7 @@ export default function ScanHistoryView({ availableDates }: ScanHistoryViewProps
                                             </td>
                                             <td className="px-3 py-3 text-right">
                                                 <span className="font-bold text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg">
-                                                    {res['Score']?.toFixed(1)}
+                                                    {clampScore(res['display_signal_score'] ?? res['Score']).toFixed(1)}/100
                                                 </span>
                                             </td>
                                         </tr>

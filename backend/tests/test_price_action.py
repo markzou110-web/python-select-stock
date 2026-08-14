@@ -113,6 +113,19 @@ def test_pullback_validity_confirms_only_after_price_and_volume_confirmation():
     assert result["score"] >= 5
 
 
+def test_pullback_validity_does_not_confirm_below_published_confirmation_price():
+    df = _ohlc_from_closes([10 + i * 0.08 for i in range(25)])
+    avg_volume = df["成交量"].iloc[:-1].mean()
+    df.loc[df.index[-1], ["开盘", "最高", "最低", "收盘", "成交量"]] = [11.8, 12.35, 11.75, 12.3, avg_volume * 1.4]
+    result = _evaluate_pullback_validity(
+        df, support_price=11.7, confirmation_price=12.31,
+        invalidation_price=11.5, bull_context=True, trend_damage="无",
+    )
+    assert result["status"] == "PENDING_CONFIRMATION"
+    confirmation = next(item for item in result["checks"] if item["key"] == "confirmation")
+    assert confirmation["passed"] is False
+
+
 def test_pullback_validity_invalidates_on_volume_breakdown():
     df = _ohlc_from_closes([10 + i * 0.08 for i in range(25)])
     avg_volume = df["成交量"].iloc[:-1].mean()
@@ -231,7 +244,7 @@ def test_price_action_uses_calendar_weeks_when_dates_are_available():
     result = analyze_price_action(df)
 
     assert result["pa_weekly_context"] != "周线数据不足"
-    assert result["price_action_version"] == "price-action-v3"
+    assert result["price_action_version"] == "price-action-v4"
     assert result["target_model_version"] == "structure-target-v2"
     assert result["score_model_version"] == "pa-three-score-v1"
 
@@ -325,6 +338,33 @@ def test_stop_price_uses_signal_bar_low():
     if stop and entry:
         assert stop <= last_low + 0.02, f"止损应≈信号棒低点({last_low:.2f})，实际{stop:.2f}"
         assert stop < entry, "止损应低于入场价"
+
+
+def test_price_action_exposes_two_stage_invalidation_profile():
+    """结构防线用于收盘复核，硬止损保留盘中风险边界。"""
+    from core.indicators import calculate_indicators
+
+    closes = [10 + i * 0.08 for i in range(50)] + [14.1, 14.2, 14.3, 15.2]
+    df = _ohlc_from_closes(closes)
+    last_idx = df.index[-1]
+    df.loc[last_idx, "开盘"] = 14.35
+    df.loc[last_idx, "最高"] = 15.3
+    df.loc[last_idx, "最低"] = 14.3
+    df.loc[last_idx, "收盘"] = 15.2
+    df = calculate_indicators(df, periods=[5, 10, 20, 60])
+
+    summary = analyze_price_action(df)
+
+    assert summary["pa_hard_stop_price"] == summary["pa_stop_price"]
+    assert 0 < summary["pa_close_guard_price"] < summary["pa_entry_price"]
+    assert summary["pa_invalidation_basis"] in {
+        "突破位收盘防线",
+        "回踩支撑收盘防线",
+        "信号K结构防线",
+    }
+    assert summary["pa_invalidation_rule"]
+    assert "收盘" in summary["pa_trade_plan"]["invalidation"]
+    assert "盘中" in summary["pa_trade_plan"]["invalidation"]
 
 
 def test_limit_up_bar_gets_executable_stop_distance():

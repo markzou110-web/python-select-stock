@@ -142,6 +142,29 @@ def test_weekly_entry_timing_report_task_sends_bark(monkeypatch):
     assert "样本：5 只票" in sent[0]["body"]
 
 
+def test_weekly_entry_timing_report_task_reports_failed_bark(monkeypatch):
+    """通知器返回字典但 Bark 失败时，不应误报推送成功。"""
+    from core import tasks
+
+    fake_report = {
+        "meta": {"effective_size": 5},
+        "body": "买入时点周报",
+    }
+    monkeypatch.setattr(
+        "core.entry_timing_report.build_entry_timing_report",
+        lambda days=30, max_codes=50: fake_report,
+    )
+
+    async def fake_send(*args, **kwargs):
+        return {"bark": False}
+
+    monkeypatch.setattr(tasks.notifier, "send", fake_send)
+
+    result = tasks.weekly_entry_timing_report()
+
+    assert result["bark"] is False
+
+
 def test_weekly_entry_timing_report_task_skips_when_no_samples(monkeypatch):
     """无有效样本时任务应静默跳过，不发 bark。"""
     from core import tasks

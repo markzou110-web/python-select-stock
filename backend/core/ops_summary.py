@@ -31,6 +31,10 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
             "scan_quality": {
                 "total_scans": 0,
                 "success_rate": 0,
+                "completion_rate": 0,
+                "research_only_rate": 0,
+                "failure_rate": 0,
+                "status_distribution": {},
                 "avg_duration_sec": 0,
                 "avg_candidates": 0,
                 "avg_results": 0,
@@ -71,9 +75,12 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
     candidates: List[float] = []
     results: List[float] = []
     success_count = 0
+    status_counts: Counter[str] = Counter()
 
     for row in scans:
-        if row.get("status") == "SUCCESS":
+        status = str(row.get("status") or "UNKNOWN").upper()
+        status_counts[status] += 1
+        if status == "SUCCESS":
             success_count += 1
 
         if row.get("duration_sec") is not None:
@@ -117,6 +124,9 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
             failure_by_strategy[strategy]["pnl_values"].append(float(row["pnl_pct"]))
 
     total_scans = len(scans)
+    research_only_count = status_counts["RESEARCH_ONLY"]
+    completed_count = success_count + research_only_count
+    failure_count = total_scans - completed_count
     strategy_distribution = [
         {
             "strategy_type": strategy,
@@ -143,6 +153,10 @@ def build_ops_summary(engine, limit: int = 50) -> Dict[str, Any]:
         "scan_quality": {
             "total_scans": total_scans,
             "success_rate": round(success_count / total_scans * 100, 1) if total_scans else 0,
+            "completion_rate": round(completed_count / total_scans * 100, 1) if total_scans else 0,
+            "research_only_rate": round(research_only_count / total_scans * 100, 1) if total_scans else 0,
+            "failure_rate": round(failure_count / total_scans * 100, 1) if total_scans else 0,
+            "status_distribution": dict(sorted(status_counts.items())),
             "avg_duration_sec": _avg(durations),
             "avg_candidates": _avg(candidates),
             "avg_results": _avg(results),

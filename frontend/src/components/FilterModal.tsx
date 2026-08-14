@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { X, Check, Zap, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useMarketStore } from '@/stores/marketStore';
@@ -23,10 +23,63 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [highlightedFields, setHighlightedFields] = useState<string[]>([]);
     const fetchMarketRegime = useMarketStore(s => s.fetchMarketRegime);
+    const dialogRef = useRef<HTMLDivElement>(null);
+    const onCloseRef = useRef(onClose);
+
+    useEffect(() => {
+        onCloseRef.current = onClose;
+    }, [onClose]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+
+        const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        const appContent = document.getElementById('app-content');
+        const appNavigation = document.getElementById('app-navigation');
+        appContent?.setAttribute('inert', '');
+        appNavigation?.setAttribute('inert', '');
+
+        const dialog = dialogRef.current;
+        const focusableSelector = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+        const focusable = dialog?.querySelectorAll<HTMLElement>(focusableSelector);
+        focusable?.[0]?.focus();
+
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                onCloseRef.current();
+                return;
+            }
+            if (event.key !== 'Tab' || !dialog) return;
+
+            const controls = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
+            if (controls.length === 0) {
+                event.preventDefault();
+                dialog.focus();
+                return;
+            }
+            const first = controls[0];
+            const last = controls[controls.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        };
+
+        document.addEventListener('keydown', handleKeyDown);
+        return () => {
+            document.removeEventListener('keydown', handleKeyDown);
+            appContent?.removeAttribute('inert');
+            appNavigation?.removeAttribute('inert');
+            previousFocus?.focus();
+        };
+    }, [isOpen]);
 
     const showToast = (message: string, type: 'success' | 'error' = 'success') => {
         setToast({ message, type });
-        setTimeout(() => setToast(null), 4500);
+        if (type === 'success') setTimeout(() => setToast(null), 4500);
     };
 
     const handleSmartRecommend = async () => {
@@ -96,24 +149,32 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
     if (!isOpen) return null;
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-3 sm:p-4 text-slate-800">
-            <div className="bg-white rounded-3xl w-full max-w-5xl max-h-[calc(100dvh-2rem)] shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-200 flex flex-col">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 p-3 text-slate-800 backdrop-blur-sm sm:p-4">
+            <div
+                ref={dialogRef}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="filter-dialog-title"
+                tabIndex={-1}
+                className="flex max-h-[calc(100dvh-2rem)] w-full max-w-5xl flex-col overflow-hidden rounded-3xl bg-white shadow-[var(--shadow-raised)]"
+            >
                 <div className="flex shrink-0 items-center justify-between px-5 sm:px-8 py-4 sm:py-5 border-b border-slate-100 bg-slate-50/50">
                     <div>
-                        <h3 className="text-xl font-bold text-slate-800">🔬 高级策略筛选</h3>
-                        <p className="text-xs text-slate-400 font-medium mt-0.5 uppercase tracking-wider">TradingView Pro Logic Configuration</p>
+                        <h2 id="filter-dialog-title" className="text-xl font-bold text-slate-900">高级策略筛选</h2>
+                        <p className="mt-0.5 text-sm text-slate-500">选择策略并调整本次扫描参数</p>
                     </div>
                     <div className="flex items-center gap-3">
                         <button 
+                            type="button"
                             onClick={handleSmartRecommend} 
                             disabled={recommending}
                             className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-xl text-sm font-bold hover:bg-indigo-100 transition-colors disabled:opacity-50"
                         >
-                            {recommending ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
-                            智能推荐
+                            {recommending ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <Zap size={16} aria-hidden="true" />}
+                            推荐参数
                         </button>
-                        <button onClick={onClose} className="p-2 hover:bg-slate-200 rounded-xl transition-colors">
-                            <X size={20} className="text-slate-500" />
+                        <button type="button" onClick={onClose} className="inline-flex size-10 items-center justify-center rounded-xl text-slate-500 transition-colors hover:bg-slate-200" aria-label="关闭策略参数">
+                            <X size={20} aria-hidden="true" />
                         </button>
                     </div>
                 </div>
@@ -123,10 +184,13 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     <div className="px-5 sm:px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
                         <FilterItem label="🎯 选择选股策略">
                             <div className="space-y-3">
+                                <div className="text-xs font-black uppercase tracking-wider text-slate-500">
+                                    正式选股与观察
+                                </div>
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
                                     <StrategyOption
                                         title="宽松观察池"
-                                        description="均线B共振 或 TV-ZP long，数量更多"
+                                        description="均线B 或 TV-ZP趋势信号，数量更多"
                                         active={params.strategy_type === "tv_dual"}
                                         onClick={() => setParams({
                                             ...params,
@@ -142,7 +206,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     />
                                     <StrategyOption
                                         title="强确认精选"
-                                        description="均线B共振 + TV-ZP long，少而精"
+                                        description="均线B + TV-ZP趋势信号（非五指标），少而精"
                                         active={params.strategy_type === "tv_dual_strict"}
                                         onClick={() => setParams({
                                             ...params,
@@ -183,36 +247,53 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         })}
                                         icon="A-"
                                     />
+                                    <StrategyOption
+                                        title="底部起涨发现"
+                                        description="60日低位缩量止跌与首次转强；仅观察"
+                                        active={params.strategy_type === "bottom_discovery"}
+                                        onClick={() => setParams({
+                                            ...params,
+                                            strategy_type: "bottom_discovery",
+                                            min_data_days: 80,
+                                            threshold: 0.15,
+                                            vol_multiplier: 0.5,
+                                            rsi_min: 45,
+                                            use_bb_sqz: false,
+                                            use_rs_filter: false,
+                                            use_weekly: false,
+                                        })}
+                                        icon="B0"
+                                    />
                                 </div>
                                 <details className="rounded-2xl border border-indigo-100 bg-white/60 p-3">
                                     <summary className="cursor-pointer select-none text-xs font-black uppercase tracking-wider text-indigo-600">
-                                        进阶策略
+                                        单信号研究 / 策略对照
                                     </summary>
                                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
                                         <StrategyOption
-                                            title="均线粘合"
-                                            description="TV均线B共振"
+                                            title="均线粘合（单策略）"
+                                            description="仅检查TV均线B信号"
                                             active={params.strategy_type === "squeeze"}
                                             onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
                                             icon="📊"
                                         />
                                         <StrategyOption
-                                            title="Pine Script 多指标"
-                                            description="五指标趋势共振"
+                                            title="五指标投票共振"
+                                            description="RF、ST、RQK、HalfTrend、QQE至少3项"
                                             active={params.strategy_type === "pine"}
                                             onClick={() => setParams({ ...params, strategy_type: "pine" })}
                                             icon="🚀"
                                         />
                                         <StrategyOption
-                                            title="TV-ZP"
-                                            description="RF主导+Volume/QQE确认"
+                                            title="TV-ZP趋势信号"
+                                            description="RF主导 + Volume/QQE确认"
                                             active={params.strategy_type === "tv_zp"}
                                             onClick={() => setParams({ ...params, strategy_type: "tv_zp" })}
                                             icon="ZP"
                                         />
                                         <StrategyOption
-                                            title="双重共振"
-                                            description="均线粘合 + Pine 信号"
+                                            title="均线 + 五指标共振"
+                                            description="均线粘合 + 五指标投票（不是ZP双确认）"
                                             active={params.strategy_type === "both"}
                                             onClick={() => setParams({ ...params, strategy_type: "both" })}
                                             icon="🔥"
@@ -522,8 +603,8 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                         <div className="pt-4 border-t border-slate-100">
                             <label className="flex items-center gap-3 px-4 py-3 rounded-xl border-2 border-indigo-100 bg-indigo-50/20 cursor-pointer transition-all hover:bg-indigo-50/40">
                                 <div className="flex-1">
-                                    <span className="block font-bold text-indigo-700">🚀 本地极速扫描模式</span>
-                                    <span className="text-[10px] text-indigo-400 font-medium">仅使用本地数据库，无需网络，秒级出结果</span>
+                                    <span className="block font-bold text-indigo-700">📚 历史日K优先模式</span>
+                                    <span className="text-[10px] text-indigo-400 font-medium">盘中 TV / TV+ 会强制使用实时行情；指定历史日期时使用本地日K</span>
                                 </div>
                                 <input
                                     type="checkbox"
@@ -538,21 +619,23 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 </div>
 
                 <div className="shrink-0 px-5 sm:px-8 py-4 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
-                    <button onClick={onClose} className="px-6 py-2.5 rounded-xl font-bold text-slate-500 hover:bg-slate-200 transition-all">取消</button>
+                    <button type="button" onClick={onClose} className="toolbar-button">取消</button>
                     <button
+                        type="button"
                         onClick={() => { onScan(); onClose(); }}
                         className={cn(
-                            "px-8 py-2.5 text-white rounded-xl font-bold shadow-lg transition-all hover:scale-105 active:scale-95",
+                            "primary-button px-8",
                             params.strategy_type === "tv_dual_strict" ? "bg-gradient-to-r from-emerald-600 to-teal-600 shadow-emerald-100" :
                             params.strategy_type === "tv_dual" ? "bg-gradient-to-r from-sky-600 to-emerald-600 shadow-emerald-100" :
                             params.strategy_type === "pine" ? "bg-gradient-to-r from-purple-600 to-indigo-600 shadow-purple-100" : 
                             params.strategy_type === "both" ? "bg-gradient-to-r from-indigo-600 to-emerald-600 shadow-emerald-100" :
                             params.strategy_type === "consensus" ? "bg-gradient-to-r from-blue-600 to-cyan-600 shadow-blue-100" :
                             params.strategy_type === "early_value" ? "bg-gradient-to-r from-amber-600 to-orange-600 shadow-amber-100" :
+                            params.strategy_type === "bottom_discovery" ? "bg-gradient-to-r from-cyan-600 to-blue-600 shadow-cyan-100" :
                             "premium-gradient"
                         )}
                     >
-                        保存并执行
+                        应用参数并扫描
                     </button>
                 </div>
             </div>
@@ -561,15 +644,18 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
             {toast && (
                 <div className={cn(
                     "fixed top-6 right-6 z-[60] max-w-md px-5 py-4 rounded-2xl shadow-2xl text-sm font-bold animate-in fade-in slide-in-from-top-4 duration-300 bg-indigo-600 text-white"
-                )}>
+                )} role={toast.type === 'error' ? 'alert' : 'status'}>
                     <div className="flex items-start gap-3">
                         <div className="mt-0.5 p-1 bg-white/10 rounded-lg">
-                            <Zap size={16} className="text-amber-300 fill-amber-300 animate-bounce" />
+                            <Zap size={16} className="text-amber-300 fill-amber-300" aria-hidden="true" />
                         </div>
-                        <div className="space-y-1">
-                            <p className="font-extrabold tracking-wide">💡 智能推荐反馈</p>
+                        <div className="min-w-0 flex-1 space-y-1">
+                            <p className="font-semibold">参数推荐结果</p>
                             <p className="text-xs text-white/95 font-medium leading-relaxed">{toast.message}</p>
                         </div>
+                        <button type="button" onClick={() => setToast(null)} className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-white/80 hover:bg-white/10 hover:text-white" aria-label="关闭参数推荐结果">
+                            <X size={16} aria-hidden="true" />
+                        </button>
                     </div>
                 </div>
             )}
@@ -580,13 +666,13 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
 function FilterItem({ label, children, highlighted = false }: { label: string, children: React.ReactNode, highlighted?: boolean }) {
     return (
         <div className={cn(
-            "space-y-2 p-2 rounded-2xl transition-all duration-500",
+            "space-y-2 p-2 rounded-2xl transition-[background-color,box-shadow,transform] duration-500",
             highlighted ? "bg-amber-50 ring-2 ring-amber-400/50 shadow-md shadow-amber-100 scale-[1.02]" : "border border-transparent"
         )}>
-            <label className="text-xs font-extrabold text-slate-500 uppercase tracking-wider flex items-center gap-1">
+            <p className="text-xs font-bold text-slate-600 flex items-center gap-1">
                 {label}
                 {highlighted && <span className="text-[10px] bg-amber-500 text-white px-1.5 py-0.5 rounded-full font-black animate-pulse">推荐更新</span>}
-            </label>
+            </p>
             {children}
         </div>
     );
@@ -594,10 +680,12 @@ function FilterItem({ label, children, highlighted = false }: { label: string, c
 
 function ToggleItem({ label, active, onClick, highlighted = false }: { label: string, active: boolean, onClick: () => void, highlighted?: boolean }) {
     return (
-        <div
+        <button
+            type="button"
             onClick={onClick}
+            aria-pressed={active}
             className={cn(
-                "flex items-center justify-between p-3 rounded-xl border-2 cursor-pointer transition-all duration-500",
+                "flex w-full items-center justify-between rounded-xl border-2 p-3 text-start transition-[background-color,border-color,box-shadow,transform] duration-500",
                 highlighted ? "border-amber-400 bg-amber-50/50 scale-[1.02] ring-2 ring-amber-400/30" : 
                 active ? "border-indigo-600 bg-indigo-50/50" : "border-slate-100 bg-slate-50/30 hover:border-slate-200"
             )}
@@ -607,12 +695,12 @@ function ToggleItem({ label, active, onClick, highlighted = false }: { label: st
                 {highlighted && <span className="text-[9px] bg-amber-500 text-white px-1 py-0.5 rounded-full font-black">更新</span>}
             </span>
             <div className={cn(
-                "w-5 h-5 rounded-md flex items-center justify-center transition-all",
+                "w-5 h-5 rounded-md flex items-center justify-center transition-colors",
                 highlighted ? "bg-amber-500 text-white" : active ? "bg-indigo-600 text-white" : "bg-slate-200 text-transparent"
-            )}>
+            )} aria-hidden="true">
                 <Check size={14} strokeWidth={3} />
             </div>
-        </div>
+        </button>
     );
 }
 
@@ -630,10 +718,12 @@ function StrategyOption({
     icon: string;
 }) {
     return (
-        <div
+        <button
+            type="button"
             onClick={onClick}
+            aria-pressed={active}
             className={cn(
-                "relative p-4 rounded-xl border-2 cursor-pointer transition-all",
+                "relative w-full rounded-xl border-2 p-4 text-start transition-[background-color,border-color,box-shadow]",
                 active
                     ? "border-indigo-500 bg-indigo-50/50 ring-2 ring-indigo-200"
                     : "border-slate-200 bg-white hover:border-indigo-200 hover:bg-indigo-50/20"
@@ -647,7 +737,7 @@ function StrategyOption({
                             {title}
                         </h4>
                         {active && (
-                            <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center">
+                            <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center" aria-hidden="true">
                                 <Check size={12} className="text-white" strokeWidth={3} />
                             </div>
                         )}
@@ -655,6 +745,6 @@ function StrategyOption({
                     <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">{description}</p>
                 </div>
             </div>
-        </div>
+        </button>
     );
 }

@@ -18,7 +18,11 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
         blockers = [str(item) for item in raw_blockers if str(item)]
         pullback = str(row.get("pa_pullback_status") or "").upper()
 
-        if bool(row.get("trade_eligible")) and bucket == "TRADE":
+        if row.get("a_eod_controlled_trial") and bool(row.get("trade_eligible")) and bucket == "TRADE":
+            stage, label, action = "A-EOD-TRIAL", "A-EOD级受控交易", "可执行"
+        elif row.get("a_minus_trial") and bool(row.get("trade_eligible")) and bucket == "TRADE":
+            stage, label, action = "A--TRIAL", "A-级受控试仓", "可执行"
+        elif bool(row.get("trade_eligible")) and bucket == "TRADE":
             stage, label, action = f"{grade}-TRADE", f"{grade}级可交易", "可执行"
         elif grade == "A" and bucket == "EARLY":
             stage, label, action = "A-EARLY", "A级提前复核", "小仓复核"
@@ -27,7 +31,11 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
         else:
             stage, label, action = f"{grade}-STRUCTURE", f"{grade}级结构", "仅观察"
 
-        if pullback == "INVALIDATED":
+        if row.get("bottom_discovery_watch_only"):
+            bottom_stage = str(row.get("bottom_discovery_stage") or "B0_BASE")
+            lifecycle = "BOTTOM_REVERSAL_FOUND" if bottom_stage == "B1_REVERSAL" else "BOTTOM_BASE_FOUND"
+            confirmation = "WAIT_SECTOR_AND_PRICE_CONFIRMATION"
+        elif pullback == "INVALIDATED":
             lifecycle, confirmation = "INVALIDATED", "INVALIDATED"
         elif bool(row.get("trade_eligible")):
             lifecycle, confirmation = "ENTRY_CONFIRMED", "CONFIRMED"
@@ -55,6 +63,10 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
             else:
                 early_state = "TECHNICAL_MATCH"
 
+        bottom_state = None
+        if str(row.get("strategy_type") or "") == "bottom_discovery":
+            bottom_state = str(row.get("bottom_discovery_stage") or "B0_BASE")
+
         row.update({
             "grade_stage": stage,
             "grade_label": label,
@@ -65,4 +77,5 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
             "confirmation_event_state": confirmation,
             "confirmation_event_reason": "；".join(blockers[:2]) or "等待既有确认条件满足",
             "early_value_transition_state": early_state,
+            "bottom_discovery_transition_state": bottom_state,
         })

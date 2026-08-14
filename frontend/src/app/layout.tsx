@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Alpha Vision | 极光量化终端",
-  description: "专业均线粘合与强共振突破监控系统 (v5.0 Pro)",
+  title: "Alpha Vision | A 股决策终端",
+  description: "A 股量化选股、风险监控与交易复盘工作台",
 };
 
 export default function RootLayout({
@@ -13,7 +13,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN" suppressHydrationWarning>
-      <body className="antialiased text-slate-900 bg-slate-50">
+      <body className="antialiased">
         {children}
       </body>
     </html>

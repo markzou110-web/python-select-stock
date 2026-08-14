@@ -3,12 +3,14 @@ import sys
 
 import numpy as np
 import pandas as pd
+from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.outcome_calibration import (
-    build_blocker_report, build_calibration_report, build_execution_cohort_report,
+    build_a_grade_policy_report, build_blocker_report, build_bottom_discovery_report, build_calibration_report, build_execution_cohort_report,
     build_feature_ablation_report, build_opportunity_threshold_report,
+    load_scan_outcomes,
 )
 
 
@@ -86,6 +88,31 @@ def test_grade_monotonicity_passes_with_mature_a_b_c_samples():
     assert report["grade_monotonicity"]["metric"] == "avg_return_5d"
 
 
+def test_a_grade_policy_report_caps_discovery_and_vetoed_candidates():
+    df = pd.DataFrame([
+        {
+            "strategy_type": "tv_dual", "sop_grade": "A", "sop_quality_score": 80,
+            "sop_vetoes": [], "ret_1d": 1, "ret_3d": 1, "ret_5d": 5, "ret_10d": 5,
+        },
+        {
+            "strategy_type": "tv_dual_strict", "sop_grade": "D", "sop_quality_score": 80,
+            "sop_vetoes": ["地雷预警"], "ret_1d": 1, "ret_3d": 1, "ret_5d": 5, "ret_10d": 5,
+        },
+        {
+            "strategy_type": "tv_dual_strict", "sop_grade": "B", "sop_quality_score": 72,
+            "price_action_score": 65, "pct_5d": 8,
+            "sop_vetoes": [], "ret_1d": 1, "ret_3d": 2, "ret_5d": 3, "ret_10d": 4,
+        },
+    ])
+
+    report = build_a_grade_policy_report(df, min_samples=30)
+
+    assert report["baseline"]["signals"] == 1
+    assert report["proposed"]["signals"] == 1
+    assert report["proposed"]["metrics"]["5d"]["win_rate"] == 100.0
+    assert report["status"] == "INSUFFICIENT_DATA"
+
+
 def test_blocker_report_compares_hit_and_miss_groups():
     df = _sample_frame()
     report = build_blocker_report(df, min_samples=10)
@@ -132,3 +159,115 @@ def test_opportunity_threshold_report_is_diagnostic_only():
     assert rows[60.0]["signals"] == 12
     assert report["production_threshold"] == 60
     assert report["status"] == "DIAGNOSTIC_ONLY"
+
+
+def test_bottom_discovery_report_separates_stages_and_tracks_conversion():
+    rows = []
+    for code, stage, date, ret, mfe, mae in (
+        ("000001", "B0_BASE", "2026-07-01", 1.0, 6.0, -2.0),
+        ("000001", "B1_REVERSAL", "2026-07-04", 4.0, 9.0, -1.0),
+        ("000002", "B0_BASE", "2026-07-01", -2.0, 2.0, -5.0),
+    ):
+        rows.append({
+            "code": code, "signal_date": date, "strategy_type": "bottom_discovery",
+            "bottom_discovery_stage": stage, "ret_1d": ret, "ret_3d": ret,
+            "ret_5d": ret, "ret_10d": np.nan, "mfe_5d": mfe, "mae_5d": mae,
+        })
+
+    report = build_bottom_discovery_report(pd.DataFrame(rows), min_samples=1)
+    stages = {row["value"]: row for row in report["by_stage"]}
+
+    assert report["status"] == "VALIDATED"
+    assert report["conversion"]["b0_unique_stocks"] == 2
+    assert report["conversion"]["converted_to_b1"] == 1
+    assert report["conversion"]["conversion_rate"] == 50.0
+    assert report["conversion"]["median_wait_calendar_days"] == 3.0
+    assert stages["B1_REVERSAL"]["excursion_5d"]["avg_mfe"] == 9.0
+    assert stages["B0_BASE"]["excursion_5d"]["mae_le_minus_4_rate"] == 50.0
+
+
+def test_bottom_discovery_validation_gate_uses_mature_b1_samples():
+    row = {
+        "code": "000001", "signal_date": "2026-07-01", "strategy_type": "bottom_discovery",
+        "bottom_discovery_stage": "B1_REVERSAL", "ret_1d": 1.0, "ret_3d": 1.0,
+        "ret_5d": 1.0, "ret_10d": np.nan, "mfe_5d": 3.0, "mae_5d": -1.0,
+    }
+
+    assert build_bottom_discovery_report(pd.DataFrame([row]), min_samples=1)["status"] == "VALIDATED"
+    assert build_bottom_discovery_report(pd.DataFrame([row]), min_samples=2)["status"] == "INSUFFICIENT_DATA"
+
+
+def test_bottom_discovery_followup_only_links_later_events_inside_window():
+    def event(code, date, strategy, *, stage=None, eligible=False, bucket="OBSERVE"):
+        return {
+            "code": code, "signal_date": date[:10], "scanned_at": date,
+            "strategy_type": strategy, "bottom_discovery_stage": stage,
+            "trade_eligible": eligible, "trade_bucket": bucket,
+            "ret_1d": 1.0, "ret_3d": 1.0, "ret_5d": 1.0, "ret_10d": np.nan,
+            "mfe_5d": 3.0, "mae_5d": -1.0,
+        }
+
+    frame = pd.DataFrame([
+        event("000001", "2026-06-30T09:00:00Z", "squeeze", eligible=True, bucket="TRADE"),
+        event("000001", "2026-07-01T09:00:00Z", "bottom_discovery", stage="B1_REVERSAL"),
+        event("000001", "2026-07-04T09:00:00Z", "tv_dual_strict"),
+        event("000001", "2026-07-06T09:00:00Z", "squeeze", eligible=True, bucket="TRADE"),
+        event("000002", "2026-07-01T09:00:00Z", "bottom_discovery", stage="B1_REVERSAL"),
+        event("000002", "2026-08-10T09:00:00Z", "tv_dual_strict", eligible=True, bucket="TRADE"),
+        event("000003", "2026-08-05T09:00:00Z", "bottom_discovery", stage="B1_REVERSAL"),
+    ])
+
+    report = build_bottom_discovery_report(frame, min_samples=1)
+
+    assert report["formal_confirmation"]["b1_unique_stocks"] == 3
+    assert report["formal_confirmation"]["mature_b1_followups"] == 2
+    assert report["formal_confirmation"]["confirmed_stocks"] == 1
+    assert report["formal_confirmation"]["confirmation_rate"] == 50.0
+    assert report["formal_confirmation"]["median_wait_calendar_days"] == 5.0
+    assert report["formal_confirmation"]["confirmed_by_strategy"] == {"squeeze": 1}
+    assert report["strict_strategy_lead"]["matched_stocks"] == 1
+    assert report["strict_strategy_lead"]["match_rate"] == 50.0
+    assert report["strict_strategy_lead"]["median_lead_calendar_days"] == 3.0
+
+
+def test_load_scan_outcomes_uses_exactly_five_future_trading_rows_for_excursion():
+    engine = create_engine("sqlite:///:memory:")
+    signal_date = pd.Timestamp.now().normalize() - pd.Timedelta(days=10)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE scan_history (
+                signal_id INTEGER PRIMARY KEY, code TEXT, name TEXT, data_date TEXT, date TEXT,
+                strategy_type TEXT, sop_grade TEXT, sop_quality_score REAL, sop_vetoes TEXT,
+                price_action_detail TEXT, scanned_at TEXT
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE daily_k (code TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL)
+        """))
+        connection.execute(text("""
+            INSERT INTO scan_history VALUES (
+                1, '000001', '测试', :signal_date, :signal_date, 'bottom_discovery',
+                'C', 50, '[]', '{"bottom_discovery_stage":"B0_BASE"}', :scanned_at
+            )
+        """), {"signal_date": signal_date.date().isoformat(), "scanned_at": signal_date.isoformat()})
+        bars = [{
+            "code": "000001", "date": (signal_date + pd.Timedelta(days=offset)).date().isoformat(),
+            "open": close, "high": high, "low": low, "close": close,
+        } for offset, close, high, low in (
+            (0, 10, 10, 10), (1, 11, 11, 9), (2, 12, 12, 8),
+            (3, 13, 13, 9), (4, 14, 14, 9), (5, 15, 15, 9), (6, 16, 99, 1),
+        )]
+        connection.execute(text("""
+            INSERT INTO daily_k (code, date, open, high, low, close)
+            VALUES (:code, :date, :open, :high, :low, :close)
+        """), bars)
+
+    outcomes = load_scan_outcomes(engine, days=30)
+
+    assert len(outcomes) == 1
+    assert outcomes.iloc[0]["ret_5d"] == 50.0
+    assert outcomes.iloc[0]["mfe_5d"] == 50.0
+    assert outcomes.iloc[0]["mae_5d"] == -20.0
+    assert outcomes.iloc[0]["bottom_discovery_stage"] == "B0_BASE"
+    assert bool(outcomes.iloc[0]["research_eligible"]) is False
+    assert pd.isna(outcomes.iloc[0]["trade_opportunity_score"])

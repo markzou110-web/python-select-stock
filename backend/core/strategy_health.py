@@ -44,6 +44,50 @@ def _segment_key(strategy: str, regime: str, sector_phase: str) -> str:
     return f"{strategy}|{regime}|{sector_phase}"
 
 
+def _prepare_health_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach mature point-in-time returns and cohort dimensions."""
+    if df.empty:
+        return df.assign(ret_5d=pd.Series(dtype="float64"))
+    future_bars = [
+        [tuple(float(value) for value in bar.split(":")) for bar in csv.split(",")]
+        if csv else []
+        for csv in df.get("future_csv", [])
+    ]
+    df = df.copy()
+    df["ret_5d"] = [
+        _apply_stop_take_model(float(price), bars) if len(bars) >= 5 else None
+        for price, bars in zip(df["price"], future_bars)
+    ]
+    df["market_regime"] = df["price_action_detail"].apply(lambda value: _detail_value(value, "market_regime"))
+    df["sector_phase"] = df["price_action_detail"].apply(lambda value: _detail_value(value, "sector_phase"))
+    return df
+
+
+def _aggregate_health(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    strategies: Dict[str, Dict[str, Any]] = {}
+    segments: Dict[str, Dict[str, Any]] = {}
+    if df.empty:
+        return {"strategies": strategies, "segments": segments}
+    for strategy, group in df.groupby("strategy_type", dropna=False):
+        metrics = return_metrics(group["ret_5d"])
+        strategies[str(strategy or "unknown")] = {**metrics, **classify_strategy_health(metrics)}
+    for (strategy, regime, sector_phase), group in df.groupby(
+        ["strategy_type", "market_regime", "sector_phase"], dropna=False
+    ):
+        metrics = return_metrics(group["ret_5d"])
+        strategy_name = str(strategy or "unknown")
+        regime_name = str(regime or "UNKNOWN")
+        phase_name = str(sector_phase or "UNKNOWN")
+        segments[_segment_key(strategy_name, regime_name, phase_name)] = {
+            "strategy_type": strategy_name,
+            "market_regime": regime_name,
+            "sector_phase": phase_name,
+            **metrics,
+            **classify_strategy_health(metrics),
+        }
+    return {"strategies": strategies, "segments": segments}
+
+
 def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
     """Evaluate recent verified 5-day returns for automatic strategy controls.
 
@@ -88,7 +132,7 @@ def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
             if is_sqlite
             else "AND COALESCE((s.price_action_detail->>'research_eligible')::boolean, false) = true"
         )
-        df = pd.read_sql(text(f"""
+        selection_df = pd.read_sql(text(f"""
             SELECT s.strategy_type, s.code, s.date, s.price, s.price_action_detail,
                    {future_subquery}
             FROM scan_history s
@@ -96,48 +140,42 @@ def build_strategy_health(engine, days: int = 120) -> Dict[str, Any]:
               AND s.price > 0
               {eligible_filter}
         """), engine, params={"cutoff": cutoff})
+
+        execution_future_subquery = future_subquery.replace("s.code", "e.code").replace("s.date", "e.signal_date")
+        execution_df = pd.read_sql(text(f"""
+            SELECT e.strategy_type, e.code, e.signal_date AS date,
+                   COALESCE(e.actual_price, e.planned_entry_price) AS price,
+                   e.signal_snapshot AS price_action_detail,
+                   {execution_future_subquery}
+            FROM execution_intents e
+            WHERE e.signal_date >= :cutoff
+              AND e.instruction = '可交易'
+              AND COALESCE(e.actual_price, e.planned_entry_price) > 0
+        """), engine, params={"cutoff": cutoff})
     except Exception as exc:
         return {"status": "error", "strategies": {}, "error": str(exc)}
 
-    # 在 Python 端应用止损/止盈模型（跨库一致、易测试）
-    future_bars = [
-        [tuple(float(value) for value in bar.split(":")) for bar in csv.split(",")]
-        if csv else []
-        for csv in df.get("future_csv", [])
-    ]
-    # 未满 5 个未来交易日的信号不参与健康判定，避免把未成熟样本记成 0% 收益。
-    df["ret_5d"] = [
-        _apply_stop_take_model(float(price), bars) if len(bars) >= 5 else None
-        for price, bars in zip(df["price"], future_bars)
-    ]
-    df["market_regime"] = df["price_action_detail"].apply(lambda value: _detail_value(value, "market_regime"))
-    df["sector_phase"] = df["price_action_detail"].apply(lambda value: _detail_value(value, "sector_phase"))
-
-    strategies = {}
-    for strategy, group in df.groupby("strategy_type", dropna=False):
-        metrics = return_metrics(group["ret_5d"])
-        strategies[str(strategy or "unknown")] = {**metrics, **classify_strategy_health(metrics)}
-    segments = {}
-    for (strategy, regime, sector_phase), group in df.groupby(
-        ["strategy_type", "market_regime", "sector_phase"], dropna=False
-    ):
-        metrics = return_metrics(group["ret_5d"])
-        strategy_name = str(strategy or "unknown")
-        regime_name = str(regime or "UNKNOWN")
-        phase_name = str(sector_phase or "UNKNOWN")
-        segments[_segment_key(strategy_name, regime_name, phase_name)] = {
-            "strategy_type": strategy_name,
-            "market_regime": regime_name,
-            "sector_phase": phase_name,
-            **metrics,
-            **classify_strategy_health(metrics),
-        }
-    return {"status": "ok", "strategies": strategies, "segments": segments}
+    selection = _aggregate_health(_prepare_health_frame(selection_df))
+    execution = _aggregate_health(_prepare_health_frame(execution_df))
+    return {
+        "status": "ok",
+        "selection": selection,
+        "execution": execution,
+        # Backward-compatible read path for existing research dashboards.
+        "strategies": selection["strategies"],
+        "segments": selection["segments"],
+        "control_cohort": "execution",
+    }
 
 
 def apply_strategy_health_controls(results: list[dict], health: Dict[str, Any]) -> None:
-    strategies = health.get("strategies") or {}
-    segments = health.get("segments") or {}
+    selection = health.get("selection") or {}
+    control = health.get("execution") or {}
+    legacy_mode = not selection and not control
+    strategies = (control.get("strategies") if not legacy_mode else health.get("strategies")) or {}
+    segments = (control.get("segments") if not legacy_mode else health.get("segments")) or {}
+    selection_strategies = selection.get("strategies") or {}
+    selection_segments = selection.get("segments") or {}
     for row in results:
         strategy = str(row.get("strategy_type") or "unknown")
         segment_key = _segment_key(
@@ -147,8 +185,19 @@ def apply_strategy_health_controls(results: list[dict], health: Dict[str, Any]) 
         )
         segment_health = segments.get(segment_key)
         strategy_health = segment_health if int((segment_health or {}).get("signals") or 0) >= 20 else strategies.get(strategy)
+        selection_segment = selection_segments.get(segment_key)
+        selection_health = selection_segment if int((selection_segment or {}).get("signals") or 0) >= 20 else selection_strategies.get(strategy)
+        if selection_health:
+            row["selection_health"] = selection_health
+        row["strategy_health_control_cohort"] = "legacy" if legacy_mode else "execution"
         if not strategy_health:
+            if not legacy_mode:
+                row["execution_health"] = {
+                    "signals": 0, "status": "OBSERVE", "weight": 0.5,
+                    "reason": "暂无成熟Bark可交易样本，不自动暂停策略",
+                }
             continue
+        row["execution_health"] = strategy_health
         if row.get("event_driven_candidate"):
             row["strategy_health"] = strategy_health
             row["strategy_health_scope"] = "event_shadow"

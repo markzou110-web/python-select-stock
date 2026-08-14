@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.bark_health import build_bark_self_check
+from core.bark_health import build_bark_self_check, send_bark_self_check
 from core.models import Base
 
 
@@ -52,3 +52,23 @@ def test_bark_self_check_warns_when_snapshot_missing(monkeypatch):
     assert payload["summary"]["bark_configured"] is False
     assert payload["summary"]["snapshot_status"] == "error"
     assert "先处理配置或行情快照问题" in payload["body"]
+
+
+def test_healthy_bark_self_check_is_silent(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "core.bark_health.build_bark_self_check",
+        lambda: {"status": "ok", "body": "ready", "summary": {}},
+    )
+
+    async def fake_send(*args, **kwargs):
+        sent.append((args, kwargs))
+        return {"bark": True}
+
+    monkeypatch.setattr("core.bark_health.notifier.send", fake_send)
+
+    payload = send_bark_self_check()
+
+    assert payload["reason"] == "healthy_silent"
+    assert payload["notification"] == {"bark": False}
+    assert sent == []

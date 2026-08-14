@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,48 @@ def is_a_share_trading_day(now: datetime | None = None) -> bool:
         return now.strftime("%Y-%m-%d") in trade_dates
     # 日历不可用时回退到原逻辑（仅 weekday）
     return True
+
+
+def previous_a_share_trading_date(value: str) -> str:
+    """Return the trading date immediately before ``value``."""
+    target = datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    trade_dates = _load_trade_dates()
+    if trade_dates:
+        previous = [item for item in trade_dates if item < target.isoformat()]
+        if previous:
+            return max(previous)
+
+    current = target - timedelta(days=1)
+    while current.weekday() >= 5:
+        current -= timedelta(days=1)
+    return current.isoformat()
+
+
+def shift_a_share_trading_date(value: str, sessions: int) -> str:
+    """Shift by A-share trading sessions, with a weekday fallback."""
+    target = datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    if sessions == 0:
+        return target.isoformat()
+
+    trade_dates = sorted(_load_trade_dates())
+    if trade_dates:
+        if sessions > 0:
+            candidates = [item for item in trade_dates if item > target.isoformat()]
+            if len(candidates) >= sessions:
+                return candidates[sessions - 1]
+        else:
+            candidates = [item for item in trade_dates if item < target.isoformat()]
+            if len(candidates) >= abs(sessions):
+                return candidates[sessions]
+
+    direction = 1 if sessions > 0 else -1
+    remaining = abs(sessions)
+    current = target
+    while remaining:
+        current += timedelta(days=direction)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current.isoformat()
 
 
 def is_a_share_intraday_session(now: datetime | None = None) -> bool:

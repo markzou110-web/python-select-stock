@@ -7,12 +7,39 @@ from core.risk_constants import (
     BACKTEST_TRAILING_ATR_MULT,
     ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT,
     BACKTEST_STOP_LOSS_PCT,
+    MA_STRATEGY_TAKE_PROFIT_PCT,
+    TV_EXECUTION_POLICY_VERSION,
+    TV_EXECUTION_TIER_RISK_UNITS,
+    ZP_PROFIT_PROTECT_TRIGGER_PCT,
 )
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context
 
-STRATEGY_LOGIC_VERSION = "2026.07-tv-source-aligned"
+STRATEGY_LOGIC_VERSION = "2026.08-tv-or-tiered-execution-v1"
 BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
-EXIT_RULE_VERSION = "fixed-stop-atr-trailing-time-stop"
+EXIT_RULE_VERSION = "tv-source-aware-next-open-v1"
+
+
+def classify_tv_execution_tier(
+    ma_indices: List[int],
+    zp_indices: List[int],
+) -> Dict[str, Any]:
+    """Classify an OR signal without pretending windowed hits are same-day confirmation."""
+    ma_set = {int(idx) for idx in ma_indices}
+    zp_set = {int(idx) for idx in zp_indices}
+    same_day_dual = bool(ma_set & zp_set)
+    if same_day_dual:
+        tier, label, auto_execute = "A", "MA+ZP同日强共振", True
+    elif ma_set:
+        tier, label, auto_execute = "B", "MA单信号条件执行", True
+    else:
+        tier, label, auto_execute = "C", "ZP单信号研究层", False
+    return {
+        "tier": tier,
+        "label": label,
+        "risk_unit": TV_EXECUTION_TIER_RISK_UNITS[tier],
+        "auto_execute": auto_execute,
+        "same_day_dual": same_day_dual,
+    }
 
 
 def _empty_backtest_result() -> Dict[str, Any]:
@@ -1393,11 +1420,18 @@ def check_tv_dual_strategy(
     latest_short = max(zp_short_indices) if zp_short_indices else None
 
     if require_both and (not recent_ma or not recent_zp):
+        raw_zp_current = bool(
+            _debug
+            and bool(_debug["leading_long"].iloc[-1])
+            and bool(_debug["volume_confirm"].iloc[-1])
+            and bool(_debug["qqe_long"].iloc[-1])
+        )
         return False, {
             "reason": f"最近{signal_window}根K线未同时出现均线B共振和TV-ZP long",
             "tv_ma_signal": "B共振" if recent_ma else "无",
             "tv_zp_signal": "long" if recent_zp else "无",
             "tv_match": "未双命中",
+            "tv_zp_raw_current": raw_zp_current,
         }
     if latest_long is None:
         return False, {"reason": f"最近{signal_window}根K线无均线B共振或TV-ZP long"}
@@ -1407,6 +1441,8 @@ def check_tv_dual_strategy(
     fund_score, fund_ui_data = _calculate_fundamental_score(fund_data)
     ma_hit = bool(recent_ma)
     zp_hit = bool(recent_zp)
+    execution_tier = classify_tv_execution_tier(recent_ma, recent_zp)
+    signal_sources = [source for source, hit in (("ma", ma_hit), ("zp", zp_hit)) if hit]
     pct_change = (curr['收盘'] - prev['收盘']) / prev['收盘'] * 100 if prev['收盘'] else 0
     # 信号强度连续化：在双命中/单命中基准上叠加量能与涨幅，让"强突破"高于"弱突破"。
     # 不改变入选门槛（哪些股票被选中不变），只影响候选之间的相对排名。
@@ -1428,7 +1464,24 @@ def check_tv_dual_strategy(
         "tv_ma_signal": "B共振" if ma_hit else "无",
         "tv_zp_signal": "long" if zp_hit else "无",
         "tv_match": "双命中" if ma_hit and zp_hit else "单命中",
-        "reason": ("TV双策略强共振：" if require_both else "TV双策略对齐：") + " + ".join(
+        "signal_sources": signal_sources,
+        "tv_execution_policy_version": TV_EXECUTION_POLICY_VERSION,
+        "tv_execution_tier": execution_tier["tier"],
+        "tv_execution_tier_label": execution_tier["label"],
+        "tv_execution_risk_unit": execution_tier["risk_unit"],
+        "tv_execution_auto": execution_tier["auto_execute"],
+        "tv_same_day_dual": execution_tier["same_day_dual"],
+        "trade_exit_policy": (
+            f"最早有效卖点：均线+{MA_STRATEGY_TAKE_PROFIT_PCT:g}%/EMA20破位次日开盘；"
+            f"TV-ZP short次日开盘；{BACKTEST_STOP_LOSS_PCT:g}%保护止损"
+            if ma_hit and zp_hit
+            else f"均线+{MA_STRATEGY_TAKE_PROFIT_PCT:g}%或EMA20破位次日开盘；"
+            f"{BACKTEST_STOP_LOSS_PCT:g}%保护止损"
+            if ma_hit
+            else f"TV-ZP short次日开盘；盈利达到{ZP_PROFIT_PROTECT_TRIGGER_PCT:g}%后"
+            f"EMA20破位次日开盘；{BACKTEST_STOP_LOSS_PCT:g}%保护止损"
+        ),
+        "reason": ("TV双策略强共振：" if require_both else "TV均线或ZP：") + " + ".join(
             part for part in [
                 "均线B共振" if ma_hit else "",
                 "TV-ZP long" if zp_hit else "",
@@ -1438,6 +1491,84 @@ def check_tv_dual_strategy(
     }
     res.update(fund_ui_data)
     return True, res
+
+
+def check_tv_reversal_watch(
+    df,
+    threshold=0.12,
+    vol_multiplier=1.5,
+    rsi_min=55,
+    use_macd_filter=True,
+    sqz_lookback=10,
+):
+    """识别日线强修复但周线尚未确认的观察信号，不授予交易权限。"""
+    if df is None or df.empty or len(df) < 130:
+        return False, {"reason": f"历史数据不足({0 if df is None else len(df)})"}
+
+    current_idx = df.index[-1]
+    _zp_long, _zp_short, debug = _find_tv_zp_signal_indices(df)
+    required_debug = ("leading_long", "volume_confirm", "qqe_long")
+    if not all(key in debug for key in required_debug):
+        return False, {"reason": "TV-ZP原始条件不可用"}
+
+    raw_zp_long = (
+        debug["leading_long"].fillna(False)
+        & debug["volume_confirm"].fillna(False)
+        & debug["qqe_long"].fillna(False)
+    )
+    if not bool(raw_zp_long.loc[current_idx]):
+        return False, {"reason": "当日TV-ZP原始long条件未同时满足"}
+
+    daily_ma_indices = _find_squeeze_signal_indices(
+        df,
+        threshold=threshold,
+        vol_multiplier=vol_multiplier,
+        rsi_min=rsi_min,
+        use_macd_filter=use_macd_filter,
+        use_bb_sqz=False,
+        sqz_lookback=sqz_lookback,
+        use_rs_filter=True,
+        use_weekly_filter=False,
+    )
+    if current_idx not in daily_ma_indices:
+        return False, {"reason": "当日均线B日线条件未全部满足"}
+
+    weekly_ma_indices = _find_squeeze_signal_indices(
+        df,
+        threshold=threshold,
+        vol_multiplier=vol_multiplier,
+        rsi_min=rsi_min,
+        use_macd_filter=use_macd_filter,
+        use_bb_sqz=False,
+        sqz_lookback=sqz_lookback,
+        use_rs_filter=True,
+        use_weekly_filter=True,
+    )
+    if current_idx in weekly_ma_indices:
+        return False, {"reason": "周线已确认，不属于强修复观察入口"}
+
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
+    pct_change = (
+        (float(curr["收盘"]) - float(prev["收盘"])) / float(prev["收盘"]) * 100
+        if float(prev["收盘"]) else 0.0
+    )
+    vol_ma20 = float(curr.get("Vol_MA20", 0) or 0)
+    vol_ratio = float(curr["成交量"]) / vol_ma20 if vol_ma20 > 0 else 0.0
+    return True, {
+        "Score": round(68 + min(vol_ratio, 3.0) * 3 + min(max(pct_change, 0), 5), 1),
+        "现价": float(curr["收盘"]),
+        "涨幅%": round(pct_change, 2),
+        "RSI": round(float(curr.get("RSI_WILDER", curr.get("RSI", 0)) or 0), 1),
+        "signal": "强修复观察",
+        "reason": "TV-ZP原始long + 均线B日线确认；周线尚未转强，等待次日确认",
+        "tv_ma_signal": "日线B共振",
+        "tv_zp_signal": "原始long",
+        "tv_match": "强修复观察",
+        "tv_reversal_watch_only": True,
+        "trade_eligible": False,
+        "trade_bucket": "OBSERVE",
+    }
 
 
 def calculate_tv_zp_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
@@ -1698,6 +1829,8 @@ def evaluate_exit_signals(
     high_since_entry: float,
     stop_loss_pct: float = FIXED_STOP_LOSS_PCT,
     code: Optional[str] = None,
+    signal_sources: Optional[List[str]] = None,
+    close_confirmed: bool = True,
 ) -> List[Dict[str, str]]:
     """
     高度优化的卖出/预警评估引擎。
@@ -1715,6 +1848,54 @@ def evaluate_exit_signals(
     
     pl_pct = (curr_price - entry_price) / entry_price * 100
     max_pl_pct = (high_price - entry_price) / entry_price * 100
+
+    tv_sources = {
+        str(source).strip().lower()
+        for source in (signal_sources or [])
+        if str(source).strip().lower() in {"ma", "zp"}
+    }
+    if tv_sources:
+        if pl_pct <= FIXED_STOP_LOSS_PCT:
+            return [{
+                "level": "critical",
+                "reason": f"触发TV策略固定保护止损 ({FIXED_STOP_LOSS_PCT:g}%)",
+                "suggestion": "按计划立即退出，不使用ATR或移动止损替代固定止损",
+            }]
+
+        if "ma" in tv_sources and max_pl_pct >= MA_STRATEGY_TAKE_PROFIT_PCT:
+            return [{
+                "level": "critical",
+                "reason": f"均线策略达到+{MA_STRATEGY_TAKE_PROFIT_PCT:g}%目标",
+                "suggestion": "达到既定目标，按计划退出均线策略持仓",
+            }]
+
+        ema20 = float(latest.get("EMA20", 0) or 0)
+        if close_confirmed and "ma" in tv_sources and ema20 > 0 and curr_price < ema20:
+            return [{
+                "level": "critical",
+                "reason": "均线策略EMA20破位收盘确认",
+                "suggestion": "下一交易日开盘退出",
+            }]
+
+        if close_confirmed and "zp" in tv_sources:
+            _long_indices, short_indices, _debug = _find_tv_zp_signal_indices(df)
+            if short_indices and int(short_indices[-1]) == len(df) - 1:
+                return [{
+                    "level": "critical",
+                    "reason": "TV-ZP short收盘确认",
+                    "suggestion": "下一交易日开盘退出",
+                }]
+            if (
+                max_pl_pct >= ZP_PROFIT_PROTECT_TRIGGER_PCT
+                and ema20 > 0
+                and curr_price < ema20
+            ):
+                return [{
+                    "level": "critical",
+                    "reason": "TV-ZP盈利保护触发EMA20破位",
+                    "suggestion": "盈利曾达到+15%，EMA20破位已确认；下一交易日开盘退出",
+                }]
+        return []
     
     alerts = []
     risk = compute_paper_risk_levels_with_context(entry_price, high_price, curr_price, None, code)

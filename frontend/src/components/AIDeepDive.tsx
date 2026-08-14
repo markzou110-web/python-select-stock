@@ -4,26 +4,16 @@ import React, { useEffect, useState } from 'react';
 import {
     X,
     Zap,
-    TrendingUp,
     ShieldCheck,
     Activity,
     Info,
     ChevronRight,
-    Target,
     BarChart3,
-    History,
     Loader2,
     Plus,
     AlertTriangle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import {
-    Radar,
-    RadarChart,
-    PolarGrid,
-    PolarAngleAxis,
-    ResponsiveContainer
-} from 'recharts';
 import api from '@/lib/api';
 import { useTradeStore } from '@/stores/tradeStore';
 import SplitKLineCharts from './SplitKLineCharts';
@@ -33,13 +23,46 @@ interface AIDeepDiveProps {
     onClose: () => void;
 }
 
+function toFiniteNumber(...values: unknown[]): number | null {
+    for (const value of values) {
+        if (value === null || value === undefined || value === '') continue;
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+}
+
+function toPercentNumber(...values: unknown[]): number | null {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim().endsWith('%')) {
+            const parsed = Number(value.trim().slice(0, -1));
+            if (Number.isFinite(parsed)) return parsed;
+        }
+        const parsed = toFiniteNumber(value);
+        if (parsed !== null) return parsed;
+    }
+    return null;
+}
+
+function formatNumber(value: number | null, digits = 1): string {
+    return value === null ? '暂无数据' : value.toFixed(digits);
+}
+
+function formatPercent(value: number | null, digits = 1): string {
+    return value === null ? '暂无数据' : `${value >= 0 ? '+' : ''}${value.toFixed(digits)}%`;
+}
+
+function formatRate(value: number | null, digits = 1): string {
+    return value === null ? '暂无数据' : `${value.toFixed(digits)}%`;
+}
+
 export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
-    const [radarData, setRadarData] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
     const [chartData, setChartData] = useState<any[]>([]);
     const [stockInfo, setStockInfo] = useState<any>(null);
     const [priceAction, setPriceAction] = useState<any>(null);
     const [priceActionLines, setPriceActionLines] = useState<any[]>([]);
+    const [loadedCode, setLoadedCode] = useState<string | null>(null);
 
     // Simulated trading addition states
     const [showRemarkModal, setShowRemarkModal] = useState(false);
@@ -54,37 +77,121 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
     };
 
     useEffect(() => {
+        let cancelled = false;
+
         const fetchData = async () => {
             setLoading(true);
+            setLoadedCode(null);
+            setChartData([]);
+            setStockInfo(null);
+            setPriceAction(null);
+            setPriceActionLines([]);
             try {
                 const res = await api.get(`/api/stock/detail?code=${stock.代码}`);
+                if (cancelled) return;
                 const data = res.data.data;
                 setChartData(data);
                 setPriceAction(res.data.price_action || null);
                 setPriceActionLines(res.data.price_action_lines || []);
 
-                // Use API-returned stock_info values if available, fallback to props
-                const info = res.data.stock_info || stock;
-                setStockInfo(info);
-
-                // Radar mapping
-                setRadarData([
-                    { subject: '趋势', A: Math.min((info.Score || 60) / 1.5, 100), fullMark: 100 },
-                    { subject: '动能', A: info.RSI || 60, fullMark: 100 },
-                    { subject: '量能', A: ((info.Score || 60) % 30) * 3, fullMark: 100 },
-                    { subject: '板块', A: info.共振 === "🔥 核心热点" ? 95 : 60, fullMark: 100 },
-                    { subject: '资金', A: info.北向?.includes("流入") ? 90 : 50, fullMark: 100 },
-                    { subject: '形态', A: (1 - (info.影线比 || 0)) * 100, fullMark: 100 },
-                ]);
+                // Detail data supplies current measurements. Strategy scan fields stay tied to
+                // the selected scan row so a generic detail fallback cannot masquerade as a signal.
+                const info = res.data.stock_info || {};
+                const selectedScanScore = stock.display_signal_score ?? stock.latest_scan_score ?? stock.Score ?? null;
+                const selectedScanDate = stock.data_date ?? stock.scan_date ?? stock.date ?? stock.日期 ?? null;
+                const selectedScanStrategy = stock.strategy_type ?? null;
+                const hasSelectedScan = selectedScanScore !== null || selectedScanDate !== null || selectedScanStrategy !== null;
+                setStockInfo({
+                    ...stock,
+                    ...info,
+                    Score: hasSelectedScan ? selectedScanScore : info.latest_scan_score ?? null,
+                    display_signal_score: hasSelectedScan ? selectedScanScore : info.latest_scan_score ?? null,
+                    回测统计: stock.回测统计 ?? null,
+                    sector_alignment_score: info.sector_alignment_score ?? stock.sector_alignment_score ?? null,
+                    latest_scan_date: hasSelectedScan ? selectedScanDate : info.latest_scan_date ?? null,
+                    latest_scan_strategy: hasSelectedScan ? selectedScanStrategy : info.latest_scan_strategy ?? null,
+                });
+                setLoadedCode(stock.代码);
             } catch (err) {
-                console.error("Deep Dive Fetch Error:", err);
+                if (!cancelled) {
+                    console.error("Deep Dive Fetch Error:", err);
+                    setLoadedCode(stock.代码);
+                }
             } finally {
-                setLoading(false);
+                if (!cancelled) setLoading(false);
             }
         };
 
         fetchData();
+        return () => {
+            cancelled = true;
+        };
     }, [stock]);
+
+    const hasCurrentDetail = loadedCode === stock.代码;
+    const facts = hasCurrentDetail && stockInfo ? stockInfo : stock;
+    const currentPriceAction = hasCurrentDetail ? priceAction : null;
+    const signalScore = toFiniteNumber(facts.display_signal_score, facts.Score);
+    const rsi = toFiniteNumber(facts.RSI);
+    const priceActionScore = toFiniteNumber(currentPriceAction?.price_action_score, stock.price_action_score);
+    const volumeRatio = toFiniteNumber(currentPriceAction?.pa_volume_ratio, stock.pa_volume_ratio);
+    const volumePercentile = toFiniteNumber(currentPriceAction?.pa_volume_ratio_percentile, stock.pa_volume_ratio_percentile);
+    const sectorAlignment = toFiniteNumber(facts.sector_alignment_score);
+    const moneyFlow5d = toFiniteNumber(facts.money_flow_5d_yi);
+    const backtest = stock.回测统计 || null;
+    const backtestSamples = toFiniteNumber(backtest?.signal_count, stock.信号次数);
+    const rawWinRate = toPercentNumber(backtest?.win_rate, stock.历史胜率);
+    const hasBacktest = backtestSamples !== null && backtestSamples > 0;
+
+    const verifiedMetrics = [
+        {
+            label: '扫描信号分',
+            value: signalScore === null ? '暂无记录' : `${signalScore.toFixed(1)}/100`,
+            note: facts.latest_scan_date ? `扫描日 ${facts.latest_scan_date}` : '扫描日期未提供',
+        },
+        {
+            label: '价格结构',
+            value: formatNumber(priceActionScore, 0),
+            note: currentPriceAction?.price_action_regime || currentPriceAction?.price_action_signal || '暂无结构描述',
+        },
+        {
+            label: '当前 RSI',
+            value: formatNumber(rsi, 1),
+            note: '来自最新日线指标',
+        },
+        {
+            label: '成交量比',
+            value: volumeRatio === null ? '暂无数据' : `${volumeRatio.toFixed(2)}x`,
+            note: volumePercentile === null ? '暂无量能分位' : `历史分位 ${volumePercentile.toFixed(0)}%`,
+        },
+        {
+            label: '板块联动',
+            value: formatNumber(sectorAlignment, 0),
+            note: facts.sector_phase || '暂无板块联动数据',
+        },
+        {
+            label: '主力 5 日净额',
+            value: moneyFlow5d === null ? '暂无数据' : `${moneyFlow5d >= 0 ? '+' : ''}${moneyFlow5d.toFixed(2)} 亿`,
+            note: facts.money_flow_bias || '暂无资金方向数据',
+        },
+    ];
+
+    const factLines = [
+        facts.latest_scan_date
+            ? `最近扫描：${facts.latest_scan_date}${facts.latest_scan_strategy ? ` · ${facts.latest_scan_strategy}` : ''}。`
+            : signalScore === null
+                ? '最近扫描：暂无可核验记录，因此不生成买入结论。'
+                : `最近扫描：记录了 ${signalScore.toFixed(1)} 分，但未提供扫描日期，因此不生成买入结论。`,
+        currentPriceAction?.price_action_regime || currentPriceAction?.price_action_signal
+            ? `价格行为：${[currentPriceAction.price_action_regime, currentPriceAction.price_action_signal].filter(Boolean).join(' · ')}${priceActionScore === null ? '' : `（${priceActionScore.toFixed(0)}分）`}。`
+            : '价格行为：暂无结构识别数据。',
+        volumeRatio === null
+            ? '量能：暂无可核验数据。'
+            : `量能：成交量比 ${volumeRatio.toFixed(2)}x${volumePercentile === null ? '' : `，历史分位 ${volumePercentile.toFixed(0)}%`}。`,
+        moneyFlow5d === null
+            ? '资金：暂无主力资金净额数据，不推断资金加仓。'
+            : `资金：主力 5 日净额 ${moneyFlow5d >= 0 ? '+' : ''}${moneyFlow5d.toFixed(2)} 亿元${facts.money_flow_bias ? `，方向为${facts.money_flow_bias}` : ''}。`,
+    ];
 
     const handleAddToWatchlist = async (force: boolean = false, customRemark?: string, mode?: 'SIMULATED' | 'REAL') => {
         const selectedMode = mode || addTradeMode;
@@ -102,12 +209,17 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                 trade_mode: selectedMode,
                 entry_source: stock.现价 ? 'scan_current_price' : 'last_kline_close',
                 entry_signal_date: chartData.length > 0 ? chartData[chartData.length - 1].time : undefined,
+                signal_sources: stock.signal_sources,
                 entry_reason_snapshot: `${stock.结构 || stock.price_action_pattern || '策略信号'} / Score ${stock.Score ?? '--'}`
             });
 
-            if (res.data.status === 'success') {
+            if (res.data.status === 'success' || res.data.status === 'upgraded') {
                 const modeLabel = selectedMode === 'REAL' ? '实盘' : '模拟仓';
-                showToast(`${stock.名称} 已成功加入${modeLabel}！`);
+                showToast(
+                    res.data.status === 'upgraded'
+                        ? `${stock.名称} 已升级为 ${res.data.signal_sources?.join('+')?.toUpperCase()} 信号持仓，未重复加仓`
+                        : `${stock.名称} 已成功加入${modeLabel}！`,
+                );
                 setShowRemarkModal(false);
                 setRemarkText('');
                 // Automatically refresh simulated portfolio state
@@ -211,115 +323,103 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     </div>
                 )}
 
-                {/* 1. Radar View */}
+                {/* 1. Verified data snapshot */}
                 <div className="space-y-4">
-                    <div className="flex items-center gap-2">
-                        <Activity size={16} className="text-indigo-500" />
-                        <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">六维实力雷达</h4>
+                    <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                            <Activity size={16} className="text-indigo-500" />
+                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">可核验数据快照</h4>
+                        </div>
+                        <span className="text-[9px] font-bold text-slate-400">缺失项不估算</span>
                     </div>
-                    <div className="h-64 w-full bg-slate-50/50 rounded-2xl border border-slate-100 p-4">
-                        <ResponsiveContainer width="100%" height="100%">
-                            <RadarChart cx="50%" cy="50%" outerRadius="80%" data={radarData}>
-                                <PolarGrid stroke="#e2e8f0" />
-                                <PolarAngleAxis dataKey="subject" tick={{ fill: '#94a3b8', fontSize: 10, fontWeight: 800 }} />
-                                <Radar
-                                    name="Score"
-                                    dataKey="A"
-                                    stroke="#6366f1"
-                                    fill="#6366f1"
-                                    fillOpacity={0.6}
-                                />
-                            </RadarChart>
-                        </ResponsiveContainer>
+                    <div className="grid grid-cols-2 gap-3">
+                        {verifiedMetrics.map(metric => (
+                            <div key={metric.label} className="min-w-0 p-4 bg-white border border-slate-100 rounded-2xl shadow-sm">
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider">{metric.label}</p>
+                                <p className="mt-1.5 text-lg font-black text-slate-900 break-words">{metric.value}</p>
+                                <p className="mt-1 text-[9px] font-semibold text-slate-400 leading-relaxed break-words">{metric.note}</p>
+                            </div>
+                        ))}
                     </div>
                 </div>
 
-                {/* 2. AI Narrative Summary */}
+                {/* 2. Factual summary */}
                 <div className="space-y-4">
                     <div className="flex items-center gap-2">
                         <ShieldCheck size={16} className="text-emerald-500" />
-                        <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">AI 智能简报</h4>
+                        <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">事实数据简报</h4>
                     </div>
-                    <div className="bg-indigo-600 rounded-2xl p-5 text-white shadow-lg shadow-indigo-100 relative overflow-hidden">
-                        <p className="text-sm font-medium leading-relaxed relative z-10">
-                            "{stock.名称} 今日展现极强强度，综合得分 <span className="font-black text-amber-300 font-mono">{stock.Score?.toFixed(1) || 'N/A'}</span>。
-                            所属 <span className="px-1.5 py-0.5 bg-white/20 rounded-lg text-xs font-bold">【{stock.行业 || '未知'}】</span>
-                            {stock.共振 === "🔥 核心热点" ? "处于板块强势共振中。" : "个股独立活跃。"}
-                            {stock.北向?.includes("流入") ? "北向资金近期持续加仓，资金面健康。" : "资金融入度一般，需关注量能持续性。"}
-                            {stock.粘合度 != null ? (
-                                <>均线粘合度 <span className="font-bold underline decoration-indigo-300 underline-offset-4">{stock.粘合度.toFixed(4)}</span>，</>
-                            ) : stock.体质 ? (
-                                <>沉积体质 <span className="font-bold underline decoration-indigo-300 underline-offset-4">{stock.体质}</span>，</>
-                            ) : null}
-                            属于典型的高胜率共振突破模型。"
+                    <div className="bg-slate-900 rounded-2xl p-5 text-white shadow-lg shadow-slate-200">
+                        <ul className="space-y-2.5">
+                            {factLines.map(line => (
+                                <li key={line} className="flex gap-2 text-xs font-medium leading-relaxed text-slate-200">
+                                    <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-indigo-400" />
+                                    <span>{line}</span>
+                                </li>
+                            ))}
+                        </ul>
+                        <p className="mt-4 pt-3 border-t border-white/10 text-[9px] font-bold text-slate-400 leading-relaxed">
+                            只陈述接口返回的原始数据；不自动推断“高胜率”“板块强势”或“资金持续加仓”。
                         </p>
-                        <div className="absolute -bottom-4 -right-4 w-24 h-24 bg-white/10 rounded-full blur-2xl" />
                     </div>
                 </div>
 
-                {/* 3. Indicators Grid */}
-                <div className="grid grid-cols-2 gap-4">
-                    <IndicatorCard
-                        icon={<TrendingUp size={14} />}
-                        label="RSI 强度"
-                        value={stock.RSI}
-                        color="text-indigo-500"
-                    />
-                    <IndicatorCard
-                        icon={<History size={14} />}
-                        label="历史胜率"
-                        value={stock.历史胜率}
-                        color="text-emerald-500"
-                    />
-                    <IndicatorCard
-                        icon={<Target size={14} />}
-                        label={stock.体质 ? "沉积体质" : "粘合位"}
-                        value={stock.粘合度 != null ? stock.粘合度.toFixed(3) : stock.体质 || "N/A"}
-                        color="text-amber-500"
-                    />
-                    <IndicatorCard
-                        icon={<BarChart3 size={14} />}
-                        label="上影比"
-                        value={stock.影线比?.toFixed(2) || "0.00"}
-                        color="text-rose-500"
-                    />
-                </div>
-
-                {/* 3.5 Backtest Stats */}
-                {stock.回测统计 && stock.回测统计.avg_return !== 0 && (
-                    <div className="space-y-3">
+                {/* 3. Historical sample replay */}
+                <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
                         <div className="flex items-center gap-2">
                             <BarChart3 size={16} className="text-amber-500" />
-                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">回测概览</h4>
+                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest">历史样本回放</h4>
                         </div>
+                        <span className="text-[9px] font-bold text-amber-600 bg-amber-50 px-2 py-1 rounded-lg">非实盘业绩</span>
+                    </div>
+                    {hasBacktest ? (
+                        <>
                         <div className="grid grid-cols-3 gap-3">
                             <div className="p-3 bg-white border border-slate-100 rounded-xl text-center">
-                                <p className="text-[9px] font-bold text-slate-400 uppercase">平均收益</p>
-                                <p className={`text-lg font-black ${stock.回测统计.avg_return >= 0 ? 'text-rose-600' : 'text-emerald-600'}`}>
-                                    {stock.回测统计.avg_return >= 0 ? '+' : ''}{stock.回测统计.avg_return}%
+                                <p className="text-[9px] font-bold text-slate-400 uppercase">样本胜率</p>
+                                <p className="text-lg font-black text-slate-900">
+                                    {formatRate(rawWinRate, 1)}
                                 </p>
                             </div>
                             <div className="p-3 bg-white border border-slate-100 rounded-xl text-center">
-                                <p className="text-[9px] font-bold text-slate-400 uppercase">最大回撤</p>
-                                <p className="text-lg font-black text-emerald-600">{stock.回测统计.max_drawdown}%</p>
+                                <p className="text-[9px] font-bold text-slate-400 uppercase">保守胜率</p>
+                                <p className="text-lg font-black text-slate-900">
+                                    {formatRate(toFiniteNumber(backtest?.adjusted_win_rate_99, backtest?.adjusted_win_rate), 1)}
+                                </p>
                             </div>
                             <div className="p-3 bg-white border border-slate-100 rounded-xl text-center">
-                                <p className="text-[9px] font-bold text-slate-400 uppercase">盈亏比</p>
-                                <p className="text-lg font-black text-amber-600">{stock.回测统计.profit_factor}</p>
+                                <p className="text-[9px] font-bold text-slate-400 uppercase">历史样本</p>
+                                <p className="text-lg font-black text-indigo-600">{Math.trunc(backtestSamples!)} 笔</p>
                             </div>
                         </div>
-                        <div className="flex justify-between px-2">
-                            <span className="text-[9px] font-bold text-slate-400">
-                                平均持仓 {stock.回测统计.avg_hold_days} 天
-                            </span>
-                            {stock.回测统计.stop_loss_hits > 0 && (
-                                <span className="text-[9px] font-bold text-rose-400">
-                                    触发止损 {stock.回测统计.stop_loss_hits} 次
-                                </span>
-                            )}
+                        <div className="grid grid-cols-3 gap-3">
+                            <div className="p-3 bg-slate-50 rounded-xl text-center">
+                                <p className="text-[9px] font-bold text-slate-400">平均收益</p>
+                                <p className="text-sm font-black text-slate-700">{formatPercent(toFiniteNumber(backtest?.avg_return), 2)}</p>
+                            </div>
+                            <div className="p-3 bg-slate-50 rounded-xl text-center">
+                                <p className="text-[9px] font-bold text-slate-400">最大回撤</p>
+                                <p className="text-sm font-black text-slate-700">{formatPercent(toFiniteNumber(backtest?.max_drawdown), 2)}</p>
+                            </div>
+                            <div className="p-3 bg-slate-50 rounded-xl text-center">
+                                <p className="text-[9px] font-bold text-slate-400">盈亏比</p>
+                                <p className="text-sm font-black text-slate-700">{formatNumber(toFiniteNumber(backtest?.profit_factor), 2)}</p>
+                            </div>
                         </div>
-                    </div>
-                )}
+                        <p className="px-1 text-[9px] font-semibold text-slate-400 leading-relaxed">
+                            平均持仓 {formatNumber(toFiniteNumber(backtest?.avg_hold_days), 1)} 天
+                            {toFiniteNumber(backtest?.stop_loss_hits) !== null ? ` · 触发止损 ${Math.trunc(toFiniteNumber(backtest?.stop_loss_hits)!)} 次` : ''}
+                            {backtest?.sample_warning ? ` · ${backtest.sample_warning}` : ' · 历史回放不代表未来收益'}
+                        </p>
+                        </>
+                    ) : (
+                        <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-5 text-center">
+                            <p className="text-xs font-bold text-slate-500">当前扫描策略暂无可核验的回测样本</p>
+                            <p className="mt-1 text-[9px] font-semibold text-slate-400">不再用其他策略的胜率代替，也不把 0 当作缺省值展示。</p>
+                        </div>
+                    )}
+                </div>
 
                 {/* 4. Split Mini Charts */}
                 <div className="space-y-3">
@@ -331,9 +431,9 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     </div>
                     <div className={cn(
                         "bg-slate-50/50 rounded-2xl border border-slate-100 relative group overflow-hidden",
-                        loading && "min-h-[220px] flex items-center justify-center"
+                        (loading || !hasCurrentDetail) && "min-h-[220px] flex items-center justify-center"
                     )}>
-                        {loading ? (
+                        {loading || !hasCurrentDetail ? (
                             <Loader2 className="animate-spin text-slate-300" size={24} />
                         ) : (
                             <SplitKLineCharts
@@ -342,8 +442,8 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                                     { key: 'EMA5', label: 'EMA5', color: '#6366f1' },
                                     { key: 'EMA20', label: 'EMA20', color: '#f59e0b' },
                                 ]}
-                                priceAction={priceAction}
-                                priceActionLines={priceActionLines}
+                                priceAction={currentPriceAction}
+                                priceActionLines={hasCurrentDetail ? priceActionLines : []}
                                 riskLevels={stockInfo}
                                 paperLines={stockInfo?.is_paper_trade ? [
                                     { price: stockInfo.buy_price, label: '买入价', color: '#6366f1', date: stockInfo.entry_date },
@@ -476,18 +576,6 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                     {toast.message}
                 </div>
             )}
-        </div>
-    );
-}
-
-function IndicatorCard({ icon, label, value, color }: { icon: any, label: string, value: any, color: string }) {
-    return (
-        <div className="p-4 bg-white border border-slate-100 rounded-2xl shadow-sm">
-            <div className="flex items-center gap-2 mb-2">
-                <span className={cn("p-1.5 rounded-lg bg-slate-50", color)}>{icon}</span>
-                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{label}</span>
-            </div>
-            <div className="text-lg font-black text-slate-900">{value !== undefined && value !== null ? value : "---"}</div>
         </div>
     );
 }

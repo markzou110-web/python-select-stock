@@ -144,6 +144,7 @@ def tencent_quote(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             "last_close": _safe_float(values[4]),
             "open": _safe_float(values[5]),
             "vol": _safe_float(values[6]),
+            "quote_time": values[30] if len(values) > 30 else "",
             "change_amt": _safe_float(values[31]),
             "change_pct": _safe_float(values[32]),
             "high": _safe_float(values[33]),
@@ -939,6 +940,11 @@ def snapshot_from_sina(codes: List[str]) -> pd.DataFrame:
                         "low": float(parts[5]) if parts[5] else None,
                         "pct_chg": pct_chg,
                         "vol": float(parts[8]) / 100.0 if parts[8] else 0.0,  # 股→手
+                        "quote_time": (
+                            f"{parts[30]} {parts[31]}"
+                            if len(parts) > 31 and parts[30]
+                            else ""
+                        ),
                         "turnover": None,
                         "mkt_cap": None,
                         "pe": None,

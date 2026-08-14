@@ -71,7 +71,8 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                         <span className="font-bold text-blue-700">{priceAction.price_action_regime} · {priceAction.price_action_entry_quality}</span>
                     )}
                     <span className="font-bold text-slate-500">入场 {priceAction.pa_entry_price || '--'}</span>
-                    <span className="font-bold text-rose-600">失效 {priceAction.pa_stop_price || '--'}</span>
+                    <span className="font-bold text-amber-700">收盘防线 {priceAction.pa_close_guard_price || priceAction.pa_stop_price || '--'}</span>
+                    <span className="font-bold text-rose-600">盘中硬止损 {priceAction.pa_hard_stop_price || priceAction.pa_stop_price || '--'}</span>
                     <span className="font-bold text-emerald-700">目标 {priceAction.pa_target_price || '--'}</span>
                     {priceAction.pa_pullback_structure && (
                         <span className="font-bold text-blue-700">{priceAction.pa_pullback_structure}</span>

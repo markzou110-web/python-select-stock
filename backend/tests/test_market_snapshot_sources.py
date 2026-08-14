@@ -57,8 +57,8 @@ def test_market_snapshot_prefers_tencent_direct_source(monkeypatch):
     ])
 
     monkeypatch.setattr(data, "get_stock_basic_map", lambda: {
-        "000001": {"name": "平安银行"},
-        "000002": {"name": "万科A"},
+        "000001": "银行",
+        "000002": "房地产",
     })
     monkeypatch.setattr(data.requests, "get", lambda *args, **kwargs: response)
     monkeypatch.setattr(ds.requests, "get", lambda *args, **kwargs: response)
@@ -84,6 +84,7 @@ def test_market_snapshot_prefers_tencent_direct_source(monkeypatch):
     assert snapshot.iloc[0]["limit_up"] == 11.0
     assert snapshot.iloc[0]["limit_down"] == 9.0
     assert snapshot.iloc[0]["vol_ratio"] == 1.8
+    assert snapshot.iloc[0]["industry"] == "银行"
 
 
 def test_market_snapshot_force_refresh_skips_fresh_cache(monkeypatch):
@@ -124,6 +125,7 @@ def test_market_snapshot_injects_attrs_metadata(monkeypatch):
 
     snapshot = data.get_market_snapshot()
     assert "fetched_at" in snapshot.attrs
+    assert snapshot.attrs["data_date"] == data._expected_snapshot_date()
     assert snapshot.attrs["source"] == "akshare东财"
 
 
@@ -135,6 +137,11 @@ def test_market_snapshot_falls_back_to_stale_cache(monkeypatch):
 
     # 预置一份 stale 缓存（时间戳设为 2 分钟前，绕过 60s TTL，确保走全失败→stale 分支）
     stale_df = pd.DataFrame({"code": ["000001"], "name": ["X"], "price": [9.0]})
+    stale_df.attrs = {
+        "fetched_at": data.datetime.now() - data.timedelta(minutes=2),
+        "data_date": data._expected_snapshot_date(),
+        "source": "腾讯",
+    }
     with data._cache_lock:
         data.CACHE["market_snapshot"] = (stale_df, _time.time() - 120)
 
@@ -146,10 +153,80 @@ def test_market_snapshot_falls_back_to_stale_cache(monkeypatch):
     import core.direct_sources as ds
     monkeypatch.setattr(ds, "snapshot_from_eastmoney", lambda: (_ for _ in ()).throw(Exception("em direct banned")))
     monkeypatch.setattr(ds, "snapshot_from_sina", lambda *a, **k: (_ for _ in ()).throw(Exception("sina direct banned")))
+    monkeypatch.setattr("core.db.load_recent_point_in_time_snapshot", lambda max_age_minutes: pd.DataFrame())
 
     snapshot = data.get_market_snapshot()
     assert not snapshot.empty
     assert snapshot.attrs["source"] == STALE_SNAPSHOT_WARN
+
+
+def test_market_snapshot_rejects_cross_day_stale_cache(monkeypatch):
+    import pandas as pd
+    import time as _time
+
+    stale_df = pd.DataFrame({"code": ["000001"], "name": ["旧行情"], "price": [9.0]})
+    stale_df.attrs = {
+        "fetched_at": data.datetime(2026, 7, 20, 15, 0),
+        "data_date": "2026-07-20",
+        "source": "腾讯",
+    }
+    with data._cache_lock:
+        data.CACHE["market_snapshot"] = (stale_df, _time.time() - 120)
+    monkeypatch.setattr(data, "resilient_fetch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(data, "_expected_snapshot_date", lambda now=None: "2026-07-21")
+    monkeypatch.setattr("core.db.load_recent_point_in_time_snapshot", lambda max_age_minutes: pd.DataFrame())
+
+    snapshot = data.get_market_snapshot(force_refresh=True)
+
+    assert snapshot.empty
+
+
+def test_market_snapshot_falls_back_to_recent_persisted_snapshot(monkeypatch):
+    """Different Celery workers can reuse a fresh auditable snapshot from the database."""
+    import pandas as pd
+
+    persisted = pd.DataFrame({
+        "code": ["000001"], "name": ["X"], "price": [9.5], "pct_chg": [1.2],
+    })
+    persisted.attrs = {
+        "fetched_at": data.datetime.now(),
+        "data_date": data._expected_snapshot_date(),
+        "source": "持久化短时快照·腾讯",
+    }
+    monkeypatch.setattr(data, "resilient_fetch", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.db.load_recent_point_in_time_snapshot", lambda max_age_minutes: persisted)
+
+    snapshot = data.get_market_snapshot(force_refresh=True)
+
+    assert snapshot.iloc[0]["price"] == 9.5
+    assert snapshot.attrs["source"].startswith("持久化短时快照")
+
+
+def test_recent_persisted_snapshot_wins_over_older_in_process_cache(monkeypatch):
+    import pandas as pd
+    import time as _time
+
+    stale = pd.DataFrame({"code": ["000001"], "name": ["旧"], "price": [9.0]})
+    stale.attrs = {
+        "fetched_at": data.datetime.now() - data.timedelta(minutes=10),
+        "data_date": data._expected_snapshot_date(),
+        "source": "腾讯",
+    }
+    with data._cache_lock:
+        data.CACHE["market_snapshot"] = (stale, _time.time() - 120)
+    persisted = pd.DataFrame({"code": ["000001"], "name": ["新"], "price": [10.0], "pct_chg": [1.0]})
+    persisted.attrs = {
+        "fetched_at": data.datetime.now(),
+        "data_date": data._expected_snapshot_date(),
+        "source": "持久化短时快照·腾讯",
+    }
+    monkeypatch.setattr(data, "resilient_fetch", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.db.load_recent_point_in_time_snapshot", lambda max_age_minutes: persisted)
+
+    snapshot = data.get_market_snapshot(force_refresh=True)
+
+    assert snapshot.iloc[0]["name"] == "新"
+    assert snapshot.attrs["source"].startswith("持久化短时快照")
 
 
 def test_market_snapshot_uses_eastmoney_direct(monkeypatch):

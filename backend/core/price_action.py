@@ -15,7 +15,7 @@ import pandas as pd
 
 from core.eight_rules import detect_eight_rules
 
-PRICE_ACTION_VERSION = "price-action-v3"
+PRICE_ACTION_VERSION = "price-action-v4"
 TARGET_MODEL_VERSION = "structure-target-v2"
 SCORE_MODEL_VERSION = "pa-three-score-v1"
 
@@ -109,7 +109,7 @@ def _count_pullback_legs(work: pd.DataFrame, direction: str, lookback: int = 12)
                     retrace_pct = pullback / impulse
                     if 0.382 <= retrace_pct <= 0.618:
                         legs += 1
-        return legs or fallback_count()
+        return legs
     else:
         # bear 回调：找 低点→高点 的反弹，幅度在前下跌推力的 38.2%-61.8%
         legs = 0
@@ -127,7 +127,7 @@ def _count_pullback_legs(work: pd.DataFrame, direction: str, lookback: int = 12)
                     retrace_pct = pullback / impulse
                     if 0.382 <= retrace_pct <= 0.618:
                         legs += 1
-        return legs or fallback_count()
+        return legs
 
 
 def _volume_series(work: pd.DataFrame) -> pd.Series:
@@ -147,7 +147,6 @@ def _evaluate_pullback_validity(
 ) -> Dict[str, Any]:
     """Classify a bullish pullback using structure, volume, close strength, and confirmation."""
     last = work.iloc[-1]
-    prev = work.iloc[-2]
     volumes = _volume_series(work)
     avg_volume_20 = _safe_float(volumes.iloc[-21:-1].mean()) if len(volumes) >= 21 else _safe_float(volumes.iloc[:-1].mean())
     last_volume = _safe_float(volumes.iloc[-1])
@@ -160,14 +159,13 @@ def _evaluate_pullback_validity(
     low = _safe_float(last["最低"])
     high = _safe_float(last["最高"])
     open_price = _safe_float(last["开盘"])
-    prev_high = _safe_float(prev["最高"])
     bar_range = max(high - low, 0.01)
     close_position = (close - low) / bar_range
     structure_intact = invalidation_price <= 0 or close > invalidation_price
     support_held = support_price <= 0 or close >= support_price or low >= support_price * 0.985
     pullback_shrinking = pullback_volume <= 0 or avg_volume_20 <= 0 or pullback_volume <= avg_volume_20 * 0.8
     close_strength = close > open_price and close_position >= 0.6
-    price_confirmed = close > prev_high and close > open_price
+    price_confirmed = close >= confirmation_price and close > open_price
     volume_confirmed = avg_volume_20 > 0 and last_volume >= avg_volume_20 * 1.15
     trend_intact = bull_context and trend_damage not in {"跌破EMA20", "跌破EMA60", "短线低点破坏"}
     volume_breakdown = avg_volume_20 > 0 and last_volume >= avg_volume_20 * 1.3 and close < open_price and close_position <= 0.35
@@ -291,6 +289,9 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
     quality = str(summary.get("price_action_entry_quality") or "观望")
     entry_price = _safe_float(summary.get("pa_entry_price"))
     stop_price = _safe_float(summary.get("pa_stop_price"))
+    close_guard_price = _safe_float(summary.get("pa_close_guard_price"))
+    hard_stop_price = _safe_float(summary.get("pa_hard_stop_price") or stop_price)
+    invalidation_basis = str(summary.get("pa_invalidation_basis") or "信号K结构防线")
     target_price = _safe_float(summary.get("pa_target_price"))
     risk_reward = _safe_float(summary.get("pa_risk_reward"))
     trap_risk = int(summary.get("pa_trap_risk") or 0)
@@ -305,8 +306,13 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
 
     setup_name = pattern if pattern and pattern != "无明确形态" else signal
     invalidation = "暂无明确结构失效位。"
-    if stop_price > 0:
-        invalidation = f"收盘或次日盘中有效跌破 {stop_price:.2f}，视为结构失效。"
+    if close_guard_price > 0 and hard_stop_price > 0:
+        invalidation = (
+            f"收盘跌破 {close_guard_price:.2f}（{invalidation_basis}）先降级；"
+            f"盘中触及 {hard_stop_price:.2f} 视为硬失效。"
+        )
+    elif stop_price > 0:
+        invalidation = f"盘中触及 {stop_price:.2f}，视为结构硬失效。"
 
     risk_pct = 0.0
     if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
@@ -414,6 +420,9 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
         "invalidation": invalidation,
         "risk_pct": risk_pct,
         "risk_reward": risk_reward,
+        "close_guard_price": close_guard_price or None,
+        "hard_stop_price": hard_stop_price or None,
+        "invalidation_basis": invalidation_basis,
         "execution_score": execution_score,
         "risk_score": risk_score,
         "position_hint": "轻仓/观察" if risk_pct >= 8 or action != "READY" else "标准仓位候选",
@@ -442,6 +451,10 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_range_location": "未知",
         "pa_entry_price": None,
         "pa_stop_price": None,
+        "pa_close_guard_price": None,
+        "pa_hard_stop_price": None,
+        "pa_invalidation_basis": "数据不足",
+        "pa_invalidation_rule": "数据不足，暂不生成失效规则。",
         "pa_target_price": None,
         "pa_risk_reward": 0,
         "pa_actual_space_rr": 0,
@@ -534,7 +547,10 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         _safe_float(upper_shadow.iloc[-1]) / max(_safe_float(last["收盘"]), 0.01) * 100
     )
     atr20 = _safe_float(bar_range.tail(20).mean(), 0.01)
-    avg_volume_20 = _safe_float(volumes.tail(20).mean())
+    avg_volume_20 = (
+        _safe_float(volumes.iloc[-21:-1].mean())
+        if len(volumes) >= 21 else _safe_float(volumes.iloc[:-1].mean())
+    )
     last_volume = _safe_float(volumes.iloc[-1])
     prev_volume = _safe_float(volumes.iloc[-2])
     volume_ratio = last_volume / max(avg_volume_20, 1.0) if avg_volume_20 > 0 else 0.0
@@ -788,9 +804,9 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         work["收盘"].iloc[-2] < work["收盘"].iloc[-3]
     )
     h1_entry = bull_context and bull_pullback_legs == 1 and breaks_prev_high and last["收盘"] > last["开盘"]
-    h2_entry = bull_context and bull_pullback_legs >= 2 and breaks_prev_high and last["收盘"] > last["开盘"]
+    h2_entry = bull_context and bull_pullback_legs == 2 and breaks_prev_high and last["收盘"] > last["开盘"]
     l1_entry = bear_context and bear_pullback_legs == 1 and breaks_prev_low and last["收盘"] < last["开盘"]
-    l2_entry = bear_context and bear_pullback_legs >= 2 and breaks_prev_low and last["收盘"] < last["开盘"]
+    l2_entry = bear_context and bear_pullback_legs == 2 and breaks_prev_low and last["收盘"] < last["开盘"]
 
     failed_second_entry = None
     second_entry_risk = 0
@@ -889,8 +905,10 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
             range_rule = "中部无交易优势"
 
     pullback_legs = bull_pullback_legs if bull_context else bear_pullback_legs
-    if pullback_legs >= 2:
+    if pullback_legs == 2:
         pullback_structure = "双腿回调"
+    elif pullback_legs > 2:
+        pullback_structure = "复杂多腿回调"
     elif pullback_legs == 1:
         pullback_structure = "单腿回调"
     else:
@@ -974,7 +992,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
             entry_quality_score += 20
         if regime != "交易区间" or range_location != "区间上沿":
             entry_quality_score += 15
-        if bull_pullback_legs >= 2:
+        if bull_pullback_legs == 2:
             entry_quality_score += 10
         if failed_breakout_type:
             entry_quality_score -= 20
@@ -1017,6 +1035,21 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     if stop_price >= entry_price and entry_price > 0:
         stop_price = round(entry_price * 0.97, 2)
     support_price = max(stop_price, round(ema20_now, 2)) if bull_context else stop_price
+    if broke_recent_high or regime == "向上突破":
+        close_guard_price = prior_high_20
+        invalidation_basis = "突破位收盘防线"
+    elif h2_entry or pullback_then_bull:
+        close_guard_price = support_price
+        invalidation_basis = "回踩支撑收盘防线"
+    else:
+        close_guard_price = stop_price
+        invalidation_basis = "信号K结构防线"
+    close_guard_price = round(min(max(close_guard_price, stop_price), entry_price - 0.01), 2)
+    hard_stop_price = stop_price
+    invalidation_rule = (
+        f"收盘跌破{close_guard_price:.2f}先降级观察；"
+        f"盘中触及{hard_stop_price:.2f}判定结构硬失效。"
+    )
     pullback_validity = _evaluate_pullback_validity(
         work,
         support_price=support_price,
@@ -1202,6 +1235,10 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_range_location": range_location,
         "pa_entry_price": entry_price,
         "pa_stop_price": stop_price,
+        "pa_close_guard_price": close_guard_price,
+        "pa_hard_stop_price": hard_stop_price,
+        "pa_invalidation_basis": invalidation_basis,
+        "pa_invalidation_rule": invalidation_rule,
         "pa_target_price": target_price,
         "pa_risk_reward": rr,
         "pa_actual_space_rr": actual_space_rr,

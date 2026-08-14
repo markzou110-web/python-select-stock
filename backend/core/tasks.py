@@ -9,6 +9,7 @@ from core.strategy import evaluate_exit_signals
 from core.risk_engine import safe_float
 from core.trading_calendar import is_a_share_intraday_session, is_a_share_trading_day
 import asyncio
+import json
 import pandas as pd
 from datetime import datetime
 from sqlalchemy import text
@@ -89,12 +90,105 @@ def theme_momentum_watch(slot: str = "morning"):
     try:
         from routers.watchlist import send_theme_momentum_alert
 
-        result = send_theme_momentum_alert(slot=slot, notify=True)
+        # Research observations remain available in the app; Bark is reserved
+        # for executable signals and position-risk actions.
+        result = send_theme_momentum_alert(slot=slot, notify=False)
         logger.info(f"Theme momentum watch completed: {result}")
         return result
     except Exception as exc:
         logger.error(f"Theme momentum watch failed: {exc}")
         return {"bark": False, "count": 0, "reason": "error", "slot": slot, "detail": str(exc)}
+
+
+@celery_app.task(name="tasks.retry_pending_notifications")
+def retry_pending_notifications():
+    """Retry durable notification failures without creating duplicate outbox rows."""
+    from core.audit_log import load_due_notifications, record_notification_retry
+
+    pending = load_due_notifications(limit=20)
+    sent_count = 0
+    for item in pending:
+        try:
+            from core.notifier import bark_body_too_large
+            if item["channel"] == "bark" and bark_body_too_large(item["body"]):
+                record_notification_retry(
+                    item["id"], False, "payload_too_large", permanent=True,
+                )
+                continue
+            result = asyncio.run(notifier.send(
+                item["title"],
+                item["body"],
+                channels=[item["channel"]],
+                url=item.get("url"),
+                group=item.get("group_name"),
+                is_archive=int(item.get("is_archive") or 1),
+                enqueue_failed=False,
+            ))
+            sent = bool(result.get(item["channel"]))
+            record_notification_retry(item["id"], sent, None if sent else "delivery_failed")
+            sent_count += int(sent)
+        except Exception as exc:
+            record_notification_retry(item["id"], False, str(exc))
+    return {"count": len(pending), "sent": sent_count, "failed": len(pending) - sent_count}
+
+
+def _late_formal_scan_state(now: datetime | None = None) -> dict:
+    """Return today's 14:50 scan state from durable task audit evidence."""
+    now = now or datetime.now()
+    engine = get_db_engine()
+    if engine is None:
+        return {"completed": False, "running": False, "reason": "db_unavailable"}
+    try:
+        with engine.connect() as conn:
+            slot_status = conn.execute(text("""
+                SELECT status FROM task_slot_claims WHERE slot_key = :slot_key
+            """), {"slot_key": f"intraday-monitor:{now:%Y-%m-%d}:late_decision"}).scalar()
+            if str(slot_status or "") == "RUNNING":
+                return {"completed": False, "running": True, "reason": "still_running"}
+            row = conn.execute(text("""
+                SELECT status, result_summary
+                FROM task_run_audits
+                WHERE task_name = 'tasks.intraday_monitor_checkpoint'
+                  AND CAST(COALESCE(finished_at, started_at) AS DATE) = :today
+                  AND result_summary LIKE '%late_decision%'
+                ORDER BY COALESCE(finished_at, started_at) DESC
+                LIMIT 1
+            """), {"today": now.date()}).mappings().first()
+        if not row:
+            return {"completed": False, "running": False, "reason": "missing_audit"}
+        status = str(row.get("status") or "")
+        if status in {"STARTED", "RECEIVED", "RETRY"}:
+            return {"completed": False, "running": True, "reason": "still_running"}
+        try:
+            summary = json.loads(row.get("result_summary") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            summary = {}
+        completed = bool(summary.get("formal_scan_completed"))
+        return {
+            "completed": completed,
+            "running": False,
+            "reason": "completed" if completed else "incomplete",
+            "status": status,
+        }
+    except Exception as exc:
+        logger.warning(f"Late formal scan audit unavailable: {exc}")
+        return {"completed": False, "running": False, "reason": "audit_unavailable"}
+
+
+@celery_app.task(name="tasks.recover_late_formal_scan")
+@daily_task_slot("late-formal-scan-recovery", timeout_minutes=30)
+def recover_late_formal_scan():
+    """Run one 14:55 compensation scan only when the 14:50 scan did not complete."""
+    now = datetime.now()
+    if not is_a_share_trading_day(now) or not is_a_share_intraday_session(now):
+        return {"status": "skipped", "reason": "market_closed"}
+    state = _late_formal_scan_state(now)
+    if state.get("completed"):
+        return {"status": "skipped", "reason": "late_scan_already_completed"}
+    if state.get("running"):
+        return {"status": "skipped", "reason": "late_scan_still_running"}
+    logger.warning(f"14:50 formal scan incomplete ({state.get('reason')}); starting 14:55 recovery.")
+    return intraday_monitor_checkpoint(slot="late_recovery")
 
 
 def _alert_action(signal: dict, trade_mode: str, pl_pct: float) -> str:
@@ -175,7 +269,7 @@ def check_realtime_alerts():
                        high as "最高", low as "最低", vol as "成交量"
                 FROM daily_k
                 WHERE code = :code
-                ORDER BY date DESC LIMIT 40
+                ORDER BY date DESC LIMIT 260
             """)
             with engine.connect() as conn:
                 df_hist = pd.read_sql(query, conn, params={"code": code})
@@ -187,7 +281,14 @@ def check_realtime_alerts():
             df_labeled = calculate_indicators(df_hist, current_price=curr_price, bench_df=bench_df)
             
             # 4. 评估信号
-            signals = evaluate_exit_signals(df_labeled, entry_price, high_since_entry, code=code)
+            signals = evaluate_exit_signals(
+                df_labeled,
+                entry_price,
+                high_since_entry,
+                code=code,
+                signal_sources=str(row.get("signal_sources") or "").split("+") if row.get("signal_sources") else None,
+                close_confirmed=now.hour >= 15,
+            )
             
             if signals:
                 # 过滤出需要推送的信号 (warning 和 critical)
@@ -227,13 +328,17 @@ def check_realtime_alerts():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             
-            loop.run_until_complete(notifier.send(
+            delivery = loop.run_until_complete(notifier.send(
                 title, 
                 body, 
+                channels=["bark"],
                 group="AlphaVision_Alert",
                 url="http://localhost:3000"  # 默认跳转到仪表板
             ))
-            logger.info(f"Sent {len(alerts_triggered)} alerts via push channels.")
+            if delivery.get("bark"):
+                logger.info(f"Sent {len(alerts_triggered)} alerts via Bark.")
+            else:
+                logger.warning(f"Bark delivery failed for {len(alerts_triggered)} alerts; queued for retry.")
 
         return f"Processed {len(df_paper)} positions, triggered {len(alerts_triggered)} alerts"
 
@@ -251,14 +356,26 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
         logger.info(f"Checkpoint {slot} skipped: market closed.")
         return "Market closed"
 
+    periodic_strategy_scan = slot.startswith("strategy_scan_")
+    noon_periodic_scan = slot == "strategy_scan_1300"
+    candidate_periodic_scan = slot == "strategy_scan_1430"
     summary = {
         "slot": slot,
         "operation_alerts": 0,
         "watch_alerts": 0,
         "watch_status_push": 0,
+        "formal_scan_count": 0,
+        "formal_scan_push": 0,
+        "formal_scan_completed": 0,
         "pruned": 0,
         "next_day_push": 0,
+        "next_day_confirmation": {"reviewed": 0, "confirmed": 0, "bark": False},
+        "next_day_reviewed": 0,
+        "next_day_confirmed": 0,
+        "next_day_confirmation_bark": 0,
         "bark_self_check": 0,
+        "shadow_close_push": 0,
+        "errors": [],
     }
     try:
         from core.bark_health import send_bark_self_check
@@ -267,58 +384,97 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
             auto_prune_watchlist,
             check_watchlist_triggers,
             refresh_watchlist_decisions,
-            send_watchlist_status_report,
         )
 
         if slot == "open_risk":
             self_check = send_bark_self_check()
             summary["bark_self_check"] = 1 if (self_check.get("notification") or {}).get("bark") else 0
 
-        if slot in {"open_risk", "morning_confirm", "late_decision", "price_watch"}:
+        if noon_periodic_scan or slot in {"open_risk", "morning_confirm", "late_decision", "price_watch"}:
             operation = check_operation_triggers(notify=True, trade_mode="REAL")
             summary["operation_alerts"] = len(operation.get("alerts") or [])
 
-        if slot in {"morning_confirm", "candidate_scan", "late_decision"}:
-            watch = check_watchlist_triggers(notify=True)
+        if noon_periodic_scan or candidate_periodic_scan or slot in {"morning_confirm", "candidate_scan", "late_decision"}:
+            watch = check_watchlist_triggers(notify=False)
             summary["watch_alerts"] = int(watch.get("count") or 0)
 
-        if slot == "open_risk":
-            report = send_watchlist_status_report("morning")
-            summary["watch_status_push"] = int(report.get("count") or 0) if report.get("bark") else 0
-        elif slot == "late_decision":
-            report = send_watchlist_status_report("late")
-            summary["watch_status_push"] = int(report.get("count") or 0) if report.get("bark") else 0
+        if periodic_strategy_scan or slot in {"morning_confirm", "candidate_scan", "late_decision", "late_recovery"}:
+            try:
+                from core.bark_scan_selection import run_bark_tv_observation_scan
+                from core.sentinel import send_intraday_notification
 
-        if slot in {"candidate_scan", "after_close_review"}:
+                results = run_bark_tv_observation_scan(
+                    local_only=True,
+                    require_live_snapshot=True,
+                ) or []
+                summary["formal_scan_completed"] = 1
+                summary["formal_scan_count"] = len(results)
+                pushed = send_intraday_notification(results) if results else None
+                summary["formal_scan_push"] = 1 if pushed else 0
+                if periodic_strategy_scan and results:
+                    try:
+                        from core.db import get_setting
+                        shadow_enabled = str(
+                            get_setting("new_strategy_shadow_enabled", "true")
+                        ).strip().lower() in {"1", "true", "yes", "on"}
+                        if shadow_enabled:
+                            from core.sentinel import run_new_strategy_shadow_cycle
+                            run_new_strategy_shadow_cycle(results, notify=False)
+                    except Exception as shadow_exc:
+                        logger.warning(f"{slot} shadow scan skipped: {shadow_exc}")
+                if slot == "morning_confirm":
+                    from core.next_day_confirmation import send_next_day_confirmation
+                    confirmation = send_next_day_confirmation(
+                        get_db_engine(), results, now=now,
+                    )
+                    summary["next_day_confirmation"] = confirmation
+                    summary["next_day_reviewed"] = int(confirmation.get("reviewed") or 0)
+                    summary["next_day_confirmed"] = int(confirmation.get("confirmed") or 0)
+                    summary["next_day_confirmation_bark"] = int(bool(confirmation.get("bark")))
+            except Exception as scan_exc:
+                logger.error(f"{slot} formal scan error: {scan_exc}")
+                summary["errors"].append(f"formal_scan: {scan_exc}")
+
+        if candidate_periodic_scan or slot in {"candidate_scan", "after_close_review"}:
             refresh_watchlist_decisions()
             pruned = auto_prune_watchlist(max_watch_days=15)
             summary["pruned"] = int(pruned.get("updated") or 0)
 
         if slot == "after_close_review":
             from core.db import get_scan_history_by_date
-            from core.sentinel import send_after_close_watchlist, _send_bark_message
+            from core.sentinel import send_after_close_watchlist
 
             scan_date = now.strftime("%Y-%m-%d")
             scan_results = get_scan_history_by_date(scan_date)
             pushed_body = send_after_close_watchlist(scan_results, scan_date=scan_date, now=now)
             summary["next_day_push"] = 1 if pushed_body else 0
-            try:
-                from core.db import get_setting, save_setting
-                from routers.review import get_daily_strategy_report
+            if is_a_share_trading_day(now):
+                try:
+                    from core.db import get_setting
+                    from core.sentinel import run_new_strategy_shadow_cycle
 
-                if get_setting("daily_strategy_report_last_date") != scan_date:
-                    report_payload = get_daily_strategy_report(date=scan_date)
-                    report_body = report_payload.get("body") or ""
-                    if report_body and _send_bark_message(f"Alpha Vision 收盘策略日报 {scan_date}", report_body):
-                        save_setting("daily_strategy_report_last_date", scan_date)
-                        summary["daily_report_push"] = 1
-                    else:
-                        summary["daily_report_push"] = 0
-                else:
-                    summary["daily_report_push"] = 0
-            except Exception as exc:
-                logger.warning(f"Daily strategy report push skipped: {exc}")
-                summary["daily_report_push"] = 0
+                    shadow_enabled = str(
+                        get_setting("new_strategy_shadow_enabled", "true")
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                    tv_candidates = [
+                        item
+                        for item in scan_results
+                        if item.get("strategy_type") == "tv_dual"
+                    ]
+                    if shadow_enabled:
+                        shadow_body = run_new_strategy_shadow_cycle(
+                            tv_candidates,
+                            completed_day=True,
+                            notify=False,
+                        )
+                        summary["shadow_close_push"] = int(bool(shadow_body))
+                except Exception as exc:
+                    logger.warning(f"New-strategy close shadow skipped: {exc}")
+                    summary["errors"].append(f"shadow_close: {exc}")
+            # The next-day watchlist now carries the compact close summary.
+            # Keep the detailed strategy report in the app instead of sending
+            # a second Bark message for the same close.
+            summary["daily_report_push"] = 0
 
         logger.info(f"Intraday checkpoint completed: {summary}")
         return summary
@@ -354,28 +510,6 @@ def daily_sync(slot: str = "晚上"):
         from routers.sync import background_sync_task
         # background_sync_task 会处理多源同步、重试和错误处理
         result = background_sync_task()
-        
-        # 同步完成后发送摘要推送
-        try:
-            import asyncio
-            title = f"📊 Alpha Vision {slot}数据同步完成"
-            body = "全市场行情数据已同步，板块雷达和选股模块将使用最新本地数据。"
-            
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            loop.run_until_complete(notifier.send(
-                title, 
-                body, 
-                group="AlphaVision_Sync",
-                url="http://localhost:3000"
-            ))
-        except Exception as push_err:
-            logger.error(f"Failed to send sync summary push: {push_err}")
-            
         return f"Scheduled sync completed successfully ({slot})"
     except Exception as e:
         logger.error(f"Error in scheduled daily_sync task: {e}")
@@ -420,10 +554,14 @@ def _noon_action_text(item: dict) -> str:
 
 
 def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
-    if not results:
+    actionable = [
+        item for item in results
+        if item.get("trade_bucket") == "TRADE" and item.get("trade_eligible") is True
+    ]
+    if not actionable:
         return False
 
-    selected = sorted(results, key=_scan_score, reverse=True)[:limit]
+    selected = sorted(actionable, key=_scan_score, reverse=True)[:limit]
     scan_date = selected[0].get("data_date") or datetime.now().strftime("%Y-%m-%d")
     lines = [
         f"午间全量同步后选股 {scan_date}",
@@ -437,6 +575,8 @@ def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
         score = _scan_display_score(item)
         grade = item.get("early_trade_grade") or item.get("sop_grade") or item.get("评级") or item.get("grade") or "--"
         lines.append(f"{name}({code}) 现价 {price} | 评分 {score:.1f} | {grade}")
+        if item.get("bark_selection_source_label"):
+            lines.append(f"  候选来源：{item['bark_selection_source_label']}")
         lines.append(f"  建议：{_noon_action_text(item)}")
         if item.get("early_trade_candidate") and item.get("early_trade_reason"):
             lines.append(f"  提前复核：{item['early_trade_reason']}；仅小仓，不追高")
@@ -454,13 +594,14 @@ def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
 
     body = "\n".join(lines).rstrip()
     try:
-        return bool(asyncio.run(notifier.send(
+        delivery = asyncio.run(notifier.send(
             f"Alpha Vision 午间选股 {scan_date}",
             body,
             channels=["bark"],
             group="AlphaVision_Noon",
             url="http://localhost:3000",
-        )))
+        ))
+        return bool(delivery.get("bark"))
     except Exception as exc:
         logger.error(f"Noon scan Bark push failed: {exc}")
         return False
@@ -496,10 +637,9 @@ def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
             logger.info(f"Noon sync workflow completed: {summary}")
             return summary
 
-        from routers.scan import run_market_scan_task
+        from core.bark_scan_selection import run_bark_tv_observation_scan
         try:
-            results = run_market_scan_task(
-                strategy_type="tv_dual_strict",
+            results = run_bark_tv_observation_scan(
                 local_only=True,
                 require_live_snapshot=True,
             ) or []
@@ -510,7 +650,7 @@ def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
             summary["errors"].append(f"scan: {scan_exc}")
 
         from routers.paper_trade import check_operation_triggers
-        from routers.watchlist import check_watchlist_triggers, send_watchlist_status_report
+        from routers.watchlist import check_watchlist_triggers
 
         try:
             operation = check_operation_triggers(notify=True, trade_mode="REAL")
@@ -519,17 +659,11 @@ def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
             logger.error(f"Noon operation trigger step error: {operation_exc}")
             summary["errors"].append(f"operation: {operation_exc}")
         try:
-            watch = check_watchlist_triggers(notify=True)
+            watch = check_watchlist_triggers(notify=False)
             summary["watch_alerts"] = int(watch.get("count") or 0)
         except Exception as watch_exc:
             logger.error(f"Noon watch trigger step error: {watch_exc}")
             summary["errors"].append(f"watch: {watch_exc}")
-        try:
-            report = send_watchlist_status_report("noon")
-            summary["watch_status_push"] = int(report.get("count") or 0) if report.get("bark") else 0
-        except Exception as report_exc:
-            logger.error(f"Noon watch status step error: {report_exc}")
-            summary["errors"].append(f"watch_report: {report_exc}")
         logger.info(f"Noon workflow completed: {summary}")
         return summary
     except Exception as exc:
@@ -563,6 +697,42 @@ def early_value_scan():
         }
 
 
+@celery_app.task(name="tasks.bottom_discovery_scan")
+def bottom_discovery_scan(slot: str = "scheduled"):
+    """Run the independent bottom-discovery research strategy and push observation-only Bark."""
+    now = datetime.now()
+    if not is_a_share_trading_day(now):
+        return {"status": "skipped", "reason": "non_trading_day", "strategy_type": "bottom_discovery"}
+    try:
+        from routers.scan import run_market_scan_task
+        from core.sentinel import send_intraday_notification
+
+        results = run_market_scan_task(
+            strategy_type="bottom_discovery",
+            local_only=True,
+            require_live_snapshot=True,
+            turnover_min=0.5,
+            min_data_days=80,
+        ) or []
+        pushed = send_intraday_notification(results) if results else None
+        return {
+            "status": "ok",
+            "strategy_type": "bottom_discovery",
+            "slot": slot,
+            "scan_count": len(results),
+            "bark_status": "sent" if pushed else "none",
+        }
+    except Exception as exc:
+        logger.error(f"Bottom-discovery independent scan failed: {exc}")
+        return {
+            "status": "error",
+            "strategy_type": "bottom_discovery",
+            "slot": slot,
+            "scan_count": 0,
+            "error": str(exc),
+        }
+
+
 @celery_app.task(name="tasks.weekly_entry_timing_report")
 def weekly_entry_timing_report():
     """每周一 09:00 生成"买入时点周报"，对比尾盘买 vs 次日开盘买的胜率。
@@ -587,13 +757,18 @@ def weekly_entry_timing_report():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-        loop.run_until_complete(notifier.send(
+        delivery = loop.run_until_complete(notifier.send(
             title, body,
+            channels=["bark"],
             group="AlphaVision_Report",
             url="http://localhost:3000"
         ))
-        logger.info(f"Weekly entry timing report sent: {meta.get('effective_size')} stocks")
-        return {"bark": True, "meta": meta, "aggregate": report.get("aggregate", {})}
+        bark_sent = bool(delivery.get("bark"))
+        logger.info(
+            f"Weekly entry timing report {'sent' if bark_sent else 'queued for retry'}: "
+            f"{meta.get('effective_size')} stocks"
+        )
+        return {"bark": bark_sent, "meta": meta, "aggregate": report.get("aggregate", {})}
     except Exception as e:
         logger.error(f"Error in weekly_entry_timing_report task: {e}")
         return {"bark": False, "error": str(e)}

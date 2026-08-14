@@ -1,91 +1,217 @@
 @import "tailwindcss";
 
 :root {
-  --background: #eef1f5;
-  --foreground: #111827;
-  --card: #ffffff;
-  --card-foreground: #1f2937;
-  --primary: #1f5eff;
-  --primary-foreground: #ffffff;
-  --border: #d8dee8;
-  --muted: #667085;
-  --surface: #fdfcf9;
-  --surface-subtle: #f3f5f8;
-  --radius: 0.5rem;
+  color-scheme: light;
+  --background: oklch(0.965 0.008 255);
+  --foreground: oklch(0.205 0.025 255);
+  --card: oklch(0.995 0.004 90);
+  --card-foreground: oklch(0.235 0.025 255);
+  --primary: oklch(0.535 0.205 257);
+  --primary-hover: oklch(0.475 0.195 257);
+  --primary-foreground: oklch(0.985 0.003 255);
+  --border: oklch(0.89 0.018 255);
+  --muted: oklch(0.48 0.025 255);
+  --surface: oklch(0.992 0.006 90);
+  --surface-subtle: oklch(0.945 0.012 255);
+  --sidebar: oklch(0.19 0.028 255);
+  --sidebar-raised: oklch(0.225 0.032 255);
+  --focus: oklch(0.63 0.185 252);
+  --positive: oklch(0.56 0.205 24);
+  --negative: oklch(0.48 0.105 186);
+  --warning: oklch(0.61 0.15 72);
+  --radius-sm: 0.625rem;
+  --radius-md: 0.875rem;
+  --radius-lg: 1.125rem;
+  --shadow-surface: 0 1px 2px oklch(0.2 0.02 255 / 0.05), 0 10px 30px oklch(0.2 0.02 255 / 0.06);
+  --shadow-raised: 0 14px 40px oklch(0.16 0.03 255 / 0.16), 0 2px 8px oklch(0.16 0.03 255 / 0.08);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0f172a;
-    --foreground: #f8fafc;
-    --card: #1e293b;
-    --card-foreground: #f8fafc;
-    --border: #334155;
-  }
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--background);
+  scroll-behavior: smooth;
 }
 
 body {
+  min-width: 320px;
+  min-height: 100dvh;
   color: var(--foreground);
   background: var(--background);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
-  font-size: 14px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
   letter-spacing: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+select {
+  touch-action: manipulation;
+}
+
+button:not(:disabled) {
+  cursor: pointer;
+}
+
+:where(a, button, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  color: var(--foreground);
+  background: oklch(0.84 0.08 252);
 }
 
 @layer components {
   .glass-card {
-    @apply border border-slate-200/80 shadow-sm;
-    background: linear-gradient(180deg, #ffffff 0%, #fbfaf7 100%);
-    border-radius: 8px !important;
-    backdrop-filter: none !important;
+    background: var(--card);
+    color: var(--card-foreground);
+    border: 1px solid oklch(0.92 0.012 255);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-surface);
   }
   
   .premium-gradient {
-    background: linear-gradient(135deg, #162033 0%, #24324b 55%, #8a6a2f 100%);
+    background: linear-gradient(135deg, oklch(0.28 0.06 257), var(--primary));
   }
 
   .nav-item {
-    @apply flex items-center gap-3 px-3 py-2 rounded-md transition-colors duration-150;
+    @apply flex w-full items-center gap-3 px-3 py-2.5 text-left;
+    min-height: 44px;
+    border-radius: var(--radius-sm);
+    transition-property: color, background-color, box-shadow;
+    transition-duration: 150ms;
   }
 
   .nav-item.active {
-    @apply shadow-none;
-    background: rgba(255, 255, 255, 0.08);
-    box-shadow: inset 2px 0 0 #d6ad60;
+    color: white;
+    background: oklch(1 0 0 / 0.1);
+    box-shadow: inset 3px 0 0 oklch(0.72 0.14 70);
   }
 
   .workspace-panel {
-    @apply border border-slate-200/80 shadow-sm;
-    background: linear-gradient(180deg, #ffffff 0%, #fbfaf7 100%);
-    border-radius: 8px;
+    background: var(--card);
+    color: var(--card-foreground);
+    border: 1px solid oklch(0.92 0.012 255);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-surface);
   }
 
   .toolbar-button {
-    @apply inline-flex items-center justify-center gap-2 rounded-md border border-slate-300 bg-white/80 px-3 py-2 text-xs font-semibold text-slate-700 transition-colors hover:border-amber-300 hover:bg-amber-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex items-center justify-center gap-2 border bg-white px-3.5 py-2 text-[13px] font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-50;
+    min-height: 40px;
+    border-color: var(--border);
+    border-radius: var(--radius-sm);
+    transition-property: color, background-color, border-color, transform;
+    transition-duration: 150ms;
+  }
+
+  .toolbar-button:hover:not(:disabled) {
+    border-color: oklch(0.75 0.08 257);
+    background: oklch(0.965 0.025 257);
+    color: oklch(0.35 0.15 257);
   }
 
   .primary-button {
-    @apply inline-flex items-center justify-center gap-2 rounded-md px-3.5 py-2 text-xs font-semibold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50;
-    background: linear-gradient(135deg, #1f5eff 0%, #1b3f92 100%);
-    box-shadow: 0 8px 18px rgba(31, 94, 255, 0.18);
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-[13px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50;
+    min-height: 40px;
+    border-radius: var(--radius-sm);
+    background: var(--primary);
+    box-shadow: 0 8px 20px oklch(0.42 0.18 257 / 0.22);
+    transition-property: background-color, box-shadow, transform;
+    transition-duration: 150ms;
+  }
+
+  .primary-button:hover:not(:disabled) {
+    background: var(--primary-hover);
+    box-shadow: 0 10px 24px oklch(0.42 0.18 257 / 0.28);
+  }
+
+  .toolbar-button:active:not(:disabled),
+  .primary-button:active:not(:disabled) {
+    transform: scale(0.96);
   }
 
   .metric-label {
-    @apply text-[10px] font-semibold uppercase tracking-widest text-slate-500;
+    @apply text-xs font-semibold text-slate-500;
+    letter-spacing: 0.02em;
   }
 
   .metric-value {
     @apply font-mono font-bold tabular-nums text-slate-900;
   }
+
+  .app-canvas {
+    background:
+      radial-gradient(circle at 88% 0%, oklch(0.9 0.05 257 / 0.5), transparent 32rem),
+      linear-gradient(180deg, var(--background), oklch(0.975 0.008 80));
+  }
+
+  .page-heading {
+    @apply text-2xl font-bold tracking-tight text-slate-950 sm:text-[28px];
+    line-height: 1.15;
+    text-wrap: balance;
+  }
+
+  .page-description {
+    @apply mt-1 max-w-2xl text-sm text-slate-500;
+    text-wrap: pretty;
+  }
+
+  .skip-link {
+    @apply fixed start-3 top-3 z-[100] -translate-y-20 rounded-lg bg-white px-4 py-2 font-semibold text-slate-950 shadow-xl;
+    transition-property: transform;
+    transition-duration: 150ms;
+  }
+
+  .skip-link:focus {
+    transform: translateY(0);
+  }
 }
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   @apply bg-transparent;
 }
 ::-webkit-scrollbar-thumb {
-  @apply bg-slate-200 rounded-full hover:bg-slate-300 transition-colors;
+  @apply rounded-full bg-slate-300 hover:bg-slate-400;
+}
+
+@media (max-width: 640px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  :where(a, button, input, select, textarea, summary):focus-visible {
+    outline-color: Highlight;
+  }
 }

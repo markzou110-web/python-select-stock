@@ -122,8 +122,8 @@ class TestPnlAttribution:
     def test_strategy_attribution(self, sample_trades):
         result = calculate_pnl_attribution(sample_trades)
         strategies = {item["name"] for item in result["by_strategy"]}
-        assert "均线粘合" in strategies  # squeeze → 均线粘合
-        assert "Pine共振" in strategies  # pine → Pine共振
+        assert "均线粘合（单策略）" in strategies
+        assert "五指标投票共振" in strategies
 
     def test_attribution_sorted_by_pnl(self, sample_trades):
         result = calculate_pnl_attribution(sample_trades)

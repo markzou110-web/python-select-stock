@@ -12,6 +12,9 @@ load_dotenv()
 
 import platform
 
+
+DEFAULT_SENTINEL_SCHEDULE_TIMES = "09:30,10:00,10:30,11:00,13:00,13:30,14:00,14:30"
+
 # Base directory
 BASE_DIR = Path(__file__).parent.parent
 
@@ -51,8 +54,10 @@ class Config:
     RATE_LIMIT_SYNC: str = os.getenv("RATE_LIMIT_SYNC", "30/minute")
 
     # Sentinel
-    SENTINEL_DEFAULT_TIME: str = os.getenv("SENTINEL_DEFAULT_TIME", "14:20")
-    SENTINEL_SCHEDULE_TIMES: str = os.getenv("SENTINEL_SCHEDULE_TIMES", "14:20")
+    SENTINEL_DEFAULT_TIME: str = os.getenv("SENTINEL_DEFAULT_TIME", "09:30")
+    SENTINEL_SCHEDULE_TIMES: str = os.getenv(
+        "SENTINEL_SCHEDULE_TIMES", DEFAULT_SENTINEL_SCHEDULE_TIMES
+    )
 
     # Scanning defaults
     DEFAULT_THRESHOLD: float = float(os.getenv("DEFAULT_THRESHOLD", "0.12"))

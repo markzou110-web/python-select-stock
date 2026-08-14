@@ -19,7 +19,7 @@ from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
 from core.price_action import build_price_action_annotations
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context, safe_float, track_high_since_entry
-from core.risk_constants import FIXED_STOP_LOSS_PCT  # 实盘硬止损，与回测同源
+from core.risk_constants import FIXED_STOP_LOSS_PCT, TV_SIGNAL_WARMUP_DAYS  # 实盘硬止损，与回测同源
 from core.operation_plan import build_position_decision_snapshot, operation_bands, price_instruction
 from core.money_flow import get_stock_money_flow
 from core.audit_log import get_position_decision_timeline, record_position_decision_change
@@ -274,7 +274,7 @@ async def get_stock_kline(code: str, local_only: bool = False):
 def fetch_stock_data_with_indicators(code: str):
     engine = get_db_engine()
     target_date = datetime.now()
-    start_db = (target_date - timedelta(days=365)).strftime("%Y-%m-%d")
+    start_db = (target_date - timedelta(days=TV_SIGNAL_WARMUP_DAYS)).strftime("%Y-%m-%d")
     df = load_from_db(code, start_db, engine)
 
     is_stale = True
@@ -289,13 +289,16 @@ def fetch_stock_data_with_indicators(code: str):
 
     if is_stale or df.empty:
         try:
-            start_date = (target_date - timedelta(days=365)).strftime("%Y%m%d")
+            start_date = (target_date - timedelta(days=TV_SIGNAL_WARMUP_DAYS)).strftime("%Y%m%d")
             df_new = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq")
             if not df_new.empty:
                 df = df_new
                 save_to_db(df, code, engine)
         except Exception as e:
-            logger.error(f"Fetch error for {code}: {e}")
+            if df.empty:
+                logger.error(f"Fetch error for {code} with no local fallback: {e}")
+            else:
+                logger.warning(f"Network refresh failed for {code}; using local K-line data: {e}")
 
     if df.empty:
         return df
@@ -774,6 +777,7 @@ def _generate_watch_suggestion(df, stock_info: dict, risk: dict, price_action: d
 
     plan = price_action.get("pa_trade_plan") or {}
     plan_action = plan.get("action") or stock_info.get("latest_scan_pa_action") or ""
+    execution_stage = str(stock_info.get("pa_execution_stage") or "")
     setup = plan.get("setup") or stock_info.get("latest_scan_pa_setup") or "观察池候选"
     entry = safe_float(plan.get("entry_price") or price_action.get("pa_entry_price"))
     stop = safe_float(plan.get("stop_price") or price_action.get("pa_stop_price"))
@@ -804,7 +808,23 @@ def _generate_watch_suggestion(df, stock_info: dict, risk: dict, price_action: d
     if regime == "CRITICAL":
         reasons.append("🌍 大盘：严格防守，新开仓需降级")
 
-    if trade_bucket == "BLOCK" or trade_eligible is False or plan_action == "AVOID":
+    if execution_stage in {"INTRADAY_PREVIEW", "SETUP_READY", "EOD_CONFIRMED", "NEXT_SESSION_REVIEW"}:
+        stage_labels = {
+            "INTRADAY_PREVIEW": "🟡 盘中预观察 — 14:30后再确认",
+            "SETUP_READY": "🟡 结构就绪 — 等待价量确认",
+            "EOD_CONFIRMED": "🟡 尾盘已确认 — 次日复核，不是买入指令",
+            "NEXT_SESSION_REVIEW": "🟡 次日复核 — 条件未齐，不买入",
+        }
+        if blockers:
+            reasons.append(f"⏳ 待完成：{' / '.join(str(x) for x in blockers[:2])}")
+        return {
+            "action": "HOLD",
+            "confidence": 0.72,
+            "reasoning": reasons,
+            "action_label": stage_labels[execution_stage],
+        }
+
+    if trade_bucket == "BLOCK" or plan_action == "AVOID":
         if blockers:
             reasons.append(f"🚫 过滤原因：{' / '.join(str(x) for x in blockers[:3])}")
         return {
@@ -814,8 +834,8 @@ def _generate_watch_suggestion(df, stock_info: dict, risk: dict, price_action: d
             "action_label": "🚫 回避 — 观察池风险样本，不买入"
         }
 
-    if trade_bucket == "TRADE" or plan_action == "READY":
-        label = "🟢 观察买点 — 尾盘确认后可小仓"
+    if trade_bucket == "TRADE" and trade_eligible is True and execution_stage in {"", "NEXT_SESSION_EXECUTABLE"}:
+        label = "🟢 次日已确认 — 可小仓复核"
         confidence = 0.78 if final_score >= 75 else 0.68
         reasons.append("⏱️ 执行：只在 14:40-14:55 确认，贴近触发价且未破失效线才考虑")
         if regime == "CRITICAL":
@@ -826,6 +846,15 @@ def _generate_watch_suggestion(df, stock_info: dict, risk: dict, price_action: d
             "confidence": confidence,
             "reasoning": reasons,
             "action_label": label
+        }
+
+    if plan_action == "READY":
+        reasons.append("⏱️ 执行：结构就绪不等于买入，等待系统生成并确认次日计划")
+        return {
+            "action": "HOLD",
+            "confidence": 0.68,
+            "reasoning": reasons,
+            "action_label": "🟡 结构就绪 — 等待次日执行确认",
         }
 
     reasons.append("⏱️ 执行：先放观察池，等待回踩不破或再次被系统选出")
@@ -1118,6 +1147,12 @@ def get_stock_full_analysis(code: str):
         latest_final_trade_score = None
         latest_display_trade_score = None
         latest_trade_blockers = None
+        latest_signal_sources = None
+        latest_tv_execution_tier = None
+        latest_tv_execution_risk_unit = None
+        position_signal_sources = None
+        position_execution_tier = None
+        position_risk_unit = None
         hold_days = 0
         pl_pct = 0.0
         current_price = safe_float(df.iloc[-1]['收盘'])
@@ -1131,7 +1166,8 @@ def get_stock_full_analysis(code: str):
 
             paper_res = conn.execute(text("""
                 SELECT entry_price, high_since_entry, status, remark, entry_date, current_price,
-                       entry_source, entry_signal_date, entry_reason_snapshot, strategy_type, id
+                       entry_source, entry_signal_date, entry_reason_snapshot, strategy_type, id,
+                       signal_sources, execution_tier, risk_unit
                 FROM paper_trading
                 WHERE code = :code AND status = 'OPEN'
                 LIMIT 1
@@ -1194,6 +1230,9 @@ def get_stock_full_analysis(code: str):
                 entry_signal_date = str(paper_res[7]) if paper_res[7] else None
                 entry_reason_snapshot = paper_res[8]
                 paper_trade_id = int(paper_res[10])
+                position_signal_sources = str(paper_res[11]).split("+") if paper_res[11] else None
+                position_execution_tier = paper_res[12]
+                position_risk_unit = safe_float(paper_res[13]) if paper_res[13] is not None else None
                 if paper_res[4]:
                     entry_date = paper_res[4]
                     if isinstance(entry_date, str):
@@ -1232,6 +1271,9 @@ def get_stock_full_analysis(code: str):
                 latest_final_trade_score = detail.get("final_trade_score")
                 latest_display_trade_score = detail.get("display_trade_score")
                 latest_trade_blockers = detail.get("trade_blockers")
+                latest_signal_sources = detail.get("signal_sources")
+                latest_tv_execution_tier = detail.get("tv_execution_tier")
+                latest_tv_execution_risk_unit = detail.get("tv_execution_risk_unit")
 
         close = current_price
         prev_close = float(df.iloc[-2]['收盘']) if len(df) > 1 else close
@@ -1286,6 +1328,13 @@ def get_stock_full_analysis(code: str):
             "final_trade_score": latest_final_trade_score,
             "display_trade_score": latest_display_trade_score,
             "trade_blockers": latest_trade_blockers,
+            "signal_sources": position_signal_sources or latest_signal_sources,
+            "tv_execution_tier": position_execution_tier or latest_tv_execution_tier,
+            "tv_execution_risk_unit": (
+                position_risk_unit
+                if position_risk_unit is not None
+                else latest_tv_execution_risk_unit
+            ),
             "sector_phase": latest_sector_phase,
             "sector_momentum_score": latest_sector_momentum_score,
             "sector_alignment_score": latest_sector_alignment_score,

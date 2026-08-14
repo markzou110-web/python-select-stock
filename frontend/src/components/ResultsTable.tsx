@@ -21,7 +21,7 @@ import {
     Shield,
     Eye
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { clampScore, cn } from '@/lib/utils';
 import api from '@/lib/api';
 import dynamic from 'next/dynamic';
 const StockChart = dynamic(() => import('./StockChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
@@ -194,9 +194,11 @@ export default function ResultsTable({
     };
 
     const handleExport = () => {
-        const headers = ['代码', '名称', '行业', '现价', '涨幅%', 'Score', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', 'TV均线', 'TV-ZP', 'TV命中', '影线比', 'strategy_type'];
+        const headers = ['代码', '名称', '行业', '现价', '涨幅%', '信号强度(0-100)', '结构质量(0-100)', '机会分(0-100)', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', 'TV均线', 'TV-ZP', 'TV命中', '影线比', 'strategy_type'];
         const rows = results.map(r => [
-            r.代码, r.名称, r.行业, r.现价, r['涨幅%'], r.Score, r.RSI, r.DIF, r.BB,
+            r.代码, r.名称, r.行业, r.现价, r['涨幅%'], clampScore(r.display_signal_score ?? r.Score),
+            r.sop_quality_score == null ? '' : clampScore(r.display_quality_score ?? r.sop_quality_score),
+            r.trade_opportunity_score == null ? '' : clampScore(r.display_opportunity_score ?? r.trade_opportunity_score), r.RSI, r.DIF, r.BB,
             r.粘合度, r.ROE || '', r.净利YOY || '', r.历史胜率, r.信号次数, r.北向 || '', r.共振 || '',
             r.tv_ma_signal || '', r.tv_zp_signal || '', r.tv_match || '',
             r.影线比 || '', r.strategy_type || ''
@@ -225,7 +227,7 @@ export default function ResultsTable({
     const addToWatchlist = async (stock: ScanResult, remark?: string, mode: 'SIMULATED' | 'REAL' = 'SIMULATED') => {
         try {
             const plan = stock.pa_trade_plan;
-            await api.post('/api/paper/add', {
+            const res = await api.post('/api/paper/add', {
                 code: stock.代码,
                 name: stock.名称,
                 price: stock.现价,
@@ -234,6 +236,7 @@ export default function ResultsTable({
                 trade_mode: mode,
                 entry_source: 'scan_current_price',
                 entry_signal_date: stock.date || stock.日期 || undefined,
+                signal_sources: stock.signal_sources,
                 entry_reason_snapshot: `${plan?.setup || stock.结构 || stock.price_action_pattern || '扫描入选'} / ${plan?.action_label || '未分级'} / Score ${stock.Score ?? '--'}`,
                 pa_trade_action: plan?.action || stock.pa_trade_action,
                 pa_trade_setup: plan?.setup || stock.pa_trade_setup,
@@ -241,8 +244,16 @@ export default function ResultsTable({
                 pa_invalidation: plan?.invalidation,
                 pa_risk_pct: plan?.risk_pct ?? stock.pa_risk_pct,
             });
+            if (!['success', 'upgraded'].includes(res.data?.status)) {
+                showToast(res.data?.detail || '加入失败，请在详情页补齐执行信息', 'error');
+                return;
+            }
             const modeLabel = mode === 'REAL' ? '实盘' : '模拟池';
-            showToast(`${stock.名称} 已加入${modeLabel}`);
+            showToast(
+                res.data?.status === 'upgraded'
+                    ? `${stock.名称} 已升级现有持仓信号，未重复加仓`
+                    : `${stock.名称} 已加入${modeLabel}`,
+            );
         } catch (err) {
             console.error(err);
             showToast('加入失败，请重试', 'error');
@@ -290,6 +301,12 @@ export default function ResultsTable({
         const isVetoed = res.sop_grade === 'D';
         const sopHint = buildSopUpgradeHint(res);
         const rowKey = getRowKey(res, index);
+        const signalDisplayScore = clampScore(res.display_signal_score ?? res.Score);
+        const qualityDisplayScore = clampScore(res.display_quality_score ?? res.sop_quality_score);
+        const opportunityDisplayScore = clampScore(res.display_opportunity_score ?? res.trade_opportunity_score);
+        const pctChange = typeof res["涨幅%"] === 'number' && Number.isFinite(res["涨幅%"])
+            ? res["涨幅%"]
+            : null;
         return (
         <React.Fragment key={rowKey}>
             <tr
@@ -321,7 +338,7 @@ export default function ResultsTable({
                                 )}
                             </div>
                             <span className={cn("text-[10px] font-mono font-bold text-slate-400 tracking-tighter", isVetoed && "line-through")}>{res.代码}</span>
-                            {(res.strategy_type === 'tv_dual' || res.strategy_type === 'tv_dual_strict' || res.strategy_type === 'sector_watch') && (
+                            {(res.strategy_type === 'tv_dual' || res.strategy_type === 'tv_dual_strict' || res.strategy_type === 'sector_watch' || res.strategy_type === 'bottom_discovery') && (
                                 <div className="mt-1 flex flex-wrap gap-1">
                                     <span className="rounded border border-rose-100 bg-rose-50 px-1.5 py-0.5 text-[8px] font-black text-rose-600">
                                         均线 {res.tv_ma_signal || '--'}
@@ -347,6 +364,11 @@ export default function ResultsTable({
                                             板块观察
                                         </span>
                                     )}
+                                    {res.bottom_discovery_watch_only && (
+                                        <span className="rounded border border-cyan-100 bg-cyan-50 px-1.5 py-0.5 text-[8px] font-black text-cyan-700">
+                                            {res.bottom_discovery_stage === 'B1_REVERSAL' ? '起涨预警' : '底部观察'}
+                                        </span>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -357,6 +379,9 @@ export default function ResultsTable({
                 <td className="px-3 py-5">
                     <div className="flex flex-col items-center gap-1">
                         <SopGradeBadge grade={res.sop_grade} detail={buildSopDetail(res)} />
+                        {res.sop_quality_score != null && (
+                            <span className="text-[8px] font-black text-slate-400">质量分 {qualityDisplayScore.toFixed(0)}/100</span>
+                        )}
                         {isVetoed && res.sop_vetoes && res.sop_vetoes.length > 0 && (
                             <span className="text-[8px] text-rose-400 font-bold text-center leading-tight max-w-[60px]">
                                 {res.sop_vetoes[0]}
@@ -385,10 +410,10 @@ export default function ResultsTable({
                 <td className="px-6 py-5">
                     <div className="flex flex-col items-center">
                         <div className="flex items-baseline gap-1">
-                            <span className="text-lg font-black text-slate-800">{res.Score.toFixed(1)}</span>
-                            <span className="text-[10px] font-bold text-indigo-500">PT</span>
+                            <span className="text-lg font-black text-slate-800">{signalDisplayScore.toFixed(1)}</span>
+                            <span className="text-[10px] font-bold text-indigo-500">信号/100</span>
                         </div>
-                        <ConfidenceBadge score={res.Score} />
+                        <ConfidenceBadge score={signalDisplayScore} />
                     </div>
                 </td>
 
@@ -396,9 +421,10 @@ export default function ResultsTable({
                     <div className="flex flex-col items-center gap-2">
                         <div className={cn(
                             "text-sm font-bold px-2 py-0.5 rounded-lg",
-                            res["涨幅%"] >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"
+                            pctChange == null ? "text-slate-400 bg-slate-50" :
+                                pctChange >= 0 ? "text-rose-600 bg-rose-50" : "text-emerald-600 bg-emerald-50"
                         )}>
-                            {res["涨幅%"] >= 0 ? '+' : ''}{res["涨幅%"].toFixed(2)}%
+                            {pctChange == null ? '--' : `${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(2)}%`}
                         </div>
                         <div className="flex gap-3">
                             <div className="flex items-center gap-1">
@@ -487,7 +513,7 @@ export default function ResultsTable({
                         )}
                         {res.trade_opportunity_score != null && (
                             <div className="text-[9px] font-black text-blue-700">
-                                机会分 {res.trade_opportunity_score.toFixed(0)} · {res.trade_opportunity_label}
+                                机会分 {opportunityDisplayScore.toFixed(0)}/100 · {res.trade_opportunity_label}
                             </div>
                         )}
                     </div>
@@ -666,7 +692,12 @@ export default function ResultsTable({
                                             )}
                                             <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 mt-3 text-xs">
                                                 <BrooksInfo label="触发价" value={res.pa_entry_price ? `¥${res.pa_entry_price}` : '--'} note="有效突破后才算入场" tone="blue" />
-                                                <BrooksInfo label="失效位" value={res.pa_stop_price ? `¥${res.pa_stop_price}` : '--'} note="跌破则结构失效" tone="rose" />
+                                                <BrooksInfo
+                                                    label="双层失效"
+                                                    value={res.pa_close_guard_price ? `收盘 ¥${res.pa_close_guard_price}` : (res.pa_stop_price ? `¥${res.pa_stop_price}` : '--')}
+                                                    note={res.pa_hard_stop_price ? `盘中硬止损 ¥${res.pa_hard_stop_price}` : '跌破则结构失效'}
+                                                    tone="rose"
+                                                />
                                                 <BrooksInfo label="目标价" value={res.pa_target_price ? `¥${res.pa_target_price}` : '--'} note="按结构风险测算" tone="emerald" />
                                                 <BrooksInfo label="策略倾向" value={res.pa_position_strategy || '--'} note={res.final_rank_score != null ? `排序分 ${res.final_rank_score} / Brooks ${res.brooks_rank_adjustment || 0}` : (res.pa_risk_reward ? `${res.pa_risk_reward}R · ${explainRiskReward(res.pa_risk_reward)}` : '等待结构确认')} />
                                             </div>
@@ -815,7 +846,7 @@ export default function ResultsTable({
 
     // ── Sector group header row ──
     const renderSectorHeader = (sector: string, stocks: ScanResult[]) => {
-        const avgScore = (stocks.reduce((s, r) => s + r.Score, 0) / stocks.length).toFixed(1);
+        const avgScore = (stocks.reduce((s, r) => s + clampScore(r.display_signal_score ?? r.Score), 0) / stocks.length).toFixed(1);
         const roeStocks = stocks.filter(r => r.ROE !== undefined && r.ROE !== null && r.ROE > 0);
         const avgROE = roeStocks.length > 0 ? (roeStocks.reduce((s, r) => s + (r.ROE || 0), 0) / roeStocks.length).toFixed(1) : null;
         const isCollapsed = collapsedSectors.has(sector);
@@ -868,7 +899,7 @@ export default function ResultsTable({
                         </div>
                         <div className="flex items-center gap-4">
                             <div className="flex items-center gap-1">
-                                <span className="text-[10px] font-bold text-slate-400">均分</span>
+                                <span className="text-[10px] font-bold text-slate-400">信号均分/100</span>
                                 <span className="text-sm font-black text-indigo-600">{avgScore}</span>
                             </div>
                             {avgROE && (

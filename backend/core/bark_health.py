@@ -73,6 +73,12 @@ def build_bark_self_check(engine=None) -> Dict[str, Any]:
 
 def send_bark_self_check() -> Dict[str, Any]:
     payload = build_bark_self_check()
+    if payload["status"] == "ok":
+        return {
+            **payload,
+            "notification": {"bark": False},
+            "reason": "healthy_silent",
+        }
     body = payload["body"]
     try:
         result = asyncio.run(notifier.send("Alpha Vision Bark 实盘自检", body, channels=["bark"]))

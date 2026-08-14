@@ -9,42 +9,38 @@ echo " Alpha Vision 停止"
 echo "============================================================"
 echo ""
 
-# 1. 停止后端
-if [ -f ".backend_pid" ]; then
-    BACKEND_PID=$(cat .backend_pid)
-    echo "停止记录的后端 (PID: $BACKEND_PID)..."
-    kill $BACKEND_PID 2>/dev/null
-    rm -f .backend_pid
-fi
+stop_pid_file() {
+    local pid_file="$1"
+    local label="$2"
+    local expected="$3"
+    [ -f "$pid_file" ] || return 0
+    local pid command
+    pid=$(tr -cd '0-9' < "$pid_file")
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    if [ -n "$pid" ] && [[ "$command" == *"$expected"* ]]; then
+        echo "停止 $label (PID: $pid)..."
+        kill -TERM "$pid" 2>/dev/null || true
+        for _ in {1..10}; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  $label 未及时退出，仅终止记录的 PID"
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    elif [ -n "$command" ]; then
+        echo "跳过 $label：PID $pid 已属于其他进程"
+    fi
+    rm -f "$pid_file"
+}
 
-# 强制清理所有 api.py 相关的 Python 进程
-echo "清理所有残留的后端进程 (api.py)..."
-pkill -9 -f "api.py" && echo "  已清理" || echo "  未发现残留进程"
-
-# 2. 停止 Celery (任务队列和定时调度)
-if [ -f ".celery_pid" ]; then
-    CELERY_PID=$(cat .celery_pid)
-    echo "停止记录的 Celery (PID: $CELERY_PID)..."
-    kill $CELERY_PID 2>/dev/null
-    rm -f .celery_pid
-fi
-
-echo "清理所有残留的 Celery 进程..."
-pkill -9 -f "celery" && echo "  已清理" || echo "  未发现残留进程"
-
-# 2. 停止前端
-if [ -f ".frontend_pid" ]; then
-    FRONTEND_PID=$(cat .frontend_pid)
-    echo "停止记录的前端 (PID: $FRONTEND_PID)..."
-    kill $FRONTEND_PID 2>/dev/null
-    rm -f .frontend_pid
-fi
-
-# 强制清理所有 Next.js/Node 相关的开发进程
-echo "清理所有残留的前端进程 (next/node)..."
-pkill -9 -f "next-dev" 2>/dev/null
-pkill -9 -f "next dev" 2>/dev/null
-echo "  前端进程已清理"
+stop_pid_file ".backend_pid" "后端" "api.py"
+stop_pid_file ".celery_realtime_pid" "Celery 实时队列" "celery"
+stop_pid_file ".celery_scan_pid" "Celery 扫描队列" "celery"
+stop_pid_file ".celery_maintenance_pid" "Celery 维护队列" "celery"
+stop_pid_file ".celery_beat_pid" "Celery 调度器" "celery"
+stop_pid_file ".celery_pid" "旧版 Celery" "celery"
+stop_pid_file ".frontend_pid" "前端" "next"
 
 echo ""
 echo "============================================================"

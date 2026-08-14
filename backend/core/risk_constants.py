@@ -13,6 +13,103 @@ import os
 # 默认 SHADOW，必须通过点时验证并经人工批准后才允许切换 ENFORCED。
 EVIDENCE_GATE_MODE = os.getenv("EVIDENCE_GATE_MODE", "SHADOW").upper()
 
+# 正式 TV 买入关系：均线 B 或 TV-ZP long 任一命中。
+# tv_dual_strict 仅保留用于历史兼容和对照研究，不再作为生产默认。
+PRIMARY_TV_STRATEGY = "tv_dual"
+MA_STRATEGY_TAKE_PROFIT_PCT = 15.0
+TV_EXECUTION_POLICY_VERSION = "tv-or-tiered-v1"
+TV_EXECUTION_TIER_RISK_UNITS = {"A": 1.0, "B": 0.6, "C": 0.25}
+TV_MA_ONLY_MIN_PA_SCORE = 60.0
+ZP_PROFIT_PROTECT_TRIGGER_PCT = 15.0
+
+# A级结构只授予 TV 或策略命中、没有SOP否决项、价格结构合格且未明显追高的候选。
+# 价格行为与5日涨幅门槛来自2022-2026全市场逐日K线回放（8429个独立事件）。
+# tv_dual 经白名单升格为可交易核心策略（与 tv_dual_strict 并列），但同等追高/否决硬门槛仍生效。
+# 质量分线从70受控降至65；价格行为、否决与执行确认硬门槛保持不变。
+#
+# 5日涨幅采用渐进模型（消除"强势但未超涨"的逻辑死区）：
+#   - SOP_A_GRADE_MAX_5D_GAIN_PCT(10%) 为软起扣点：超过后每涨1%扣 quality_score；
+#   - SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT(25%) 为硬否决线：超过则不得评A。
+SOP_A_GRADE_MIN_SCORE = 65.0
+SOP_A_GRADE_STRATEGIES = ("tv_dual_strict", "tv_dual")
+SOP_A_GRADE_MIN_PRICE_ACTION_SCORE = 60.0
+SOP_A_GRADE_MAX_5D_GAIN_PCT = 10.0        # 软起扣点（与 score_calibration.extension_penalty 复用，保持口径一致）
+SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT = 25.0   # 硬否决线（>此值不得评A）
+SOP_A_GRADE_5D_PENALTY_PER_PCT = 0.5      # 软区间(10-25%)每超1%扣 quality_score 的分值
+SOP_A_GRADE_POLICY_VERSION = "kline-calibrated-v4-relaxed-score"
+SOP_A_GRADE_MIN_MATURE_SAMPLES = 30
+
+# ── A-受控试仓 ──
+# 正式A级标准保持不变；A-只为已完成价量确认的高质量B级提供小仓验证入口。
+A_MINUS_TRIAL_POLICY_VERSION = "a-minus-controlled-trial-v1"
+A_MINUS_TRIAL_MIN_QUALITY_SCORE = 60.0
+A_MINUS_TRIAL_MIN_PRICE_ACTION_SCORE = 70.0
+A_MINUS_TRIAL_MIN_RISK_REWARD = 2.0
+A_MINUS_TRIAL_MAX_DAILY_RISE_PCT = 7.0
+A_MINUS_TRIAL_POSITION_PCT = 5.0
+A_MINUS_TRIAL_PORTFOLIO_CAP_PCT = 10.0
+A_MINUS_TRIAL_MIN_MATURE_SAMPLES = 30
+A_MINUS_TRIAL_PROMOTION_MIN_AVG_RETURN = 0.8
+A_MINUS_TRIAL_PROMOTION_MIN_PROFIT_FACTOR = 1.3
+A_MINUS_TRIAL_ROUND_TRIP_COST_PCT = 0.15
+
+# ── A-EOD 校准受控通道 ──
+# 2022-05-12~2026-08-04 全市场点时K线回放中，严格双共振 + PA>=60
+# + 5日涨幅<=10% 是唯一在开发/验证/研究三段均保持正平均收益和 PF>1 的门槛。
+# 该通道只软化重复的板块/周线执行阻断，不放宽确认价、追高、涨停和结构失效门禁。
+A_EOD_CONTROLLED_POLICY_VERSION = "a-eod-controlled-trial-v1"
+A_EOD_MIN_QUALITY_SCORE = 60.0
+A_EOD_MIN_PRICE_ACTION_SCORE = 60.0
+A_EOD_MIN_RISK_REWARD = 1.5
+A_EOD_MAX_5D_GAIN_PCT = 10.0
+A_EOD_MAX_ENTRY_EXTENSION_PCT = 3.0
+A_EOD_POSITION_PCT = 5.0
+A_EOD_PORTFOLIO_CAP_PCT = 15.0
+A_EOD_MAX_CONCURRENT_POSITIONS = 3
+
+# A-EOD signal-day candidates remain non-tradable. Only a valid next-session
+# price confirmation may create an execution intent, with deliberately small exposure.
+A_EOD_T1_POLICY_VERSION = "a-eod-t1-confirmation-v1"
+A_EOD_T1_POSITION_PCT = 2.0
+A_EOD_T1_PORTFOLIO_CAP_PCT = 6.0
+A_EOD_T1_MAX_POSITIONS = 3
+
+# 价格行为只管理已入选股票的执行权限，不参与股票发现。
+PA_EXECUTION_NORMAL_MIN_SCORE = 70.0
+PA_EXECUTION_T1_MIN_SCORE = A_EOD_MIN_PRICE_ACTION_SCORE
+PA_PULLBACK_WATCH_MIN_SCORE = 50.0
+
+# ── 强势例外影子验证与涨停可达性 ──
+# 只生成反事实样本，不提升生产交易权限。
+STRONG_EXCEPTION_MIN_OPPORTUNITY_SCORE = 60.0
+STRONG_EXCEPTION_MIN_RISK_REWARD = 1.5
+LIMIT_PRICE_TOLERANCE = 0.01
+
+# 连续推送的高质量 B 级只进入影子验证，不改变生产交易权限。
+PERSISTENT_B_SHADOW_LOOKBACK_DAYS = 10
+PERSISTENT_B_SHADOW_MIN_PUSH_DAYS = 2
+PERSISTENT_B_SHADOW_MIN_QUALITY_SCORE = 60.0
+PERSISTENT_B_SHADOW_MIN_SECTOR_ALIGNMENT = 80.0
+PERSISTENT_B_SHADOW_MAX_DAILY_RISE_PCT = 7.0
+
+# 点时行情完整性：少量缺失按股票隔离，只有覆盖明显不足才降为全局研究模式。
+POINT_IN_TIME_CORE_FIELD_MIN_COVERAGE = 0.995
+POINT_IN_TIME_FILTER_FIELD_MIN_COVERAGE = 0.98
+
+# V 型强修复识别：只改变市场解释和观察入口，不直接提升交易权限。
+V_REPAIR_MIN_ADVANCE_RATIO = 70.0
+V_REPAIR_MIN_STRONG_RATIO = 8.0
+V_REPAIR_MIN_BREADTH_IMPROVEMENT = 20.0
+
+# ── 成长板块结构性强修复 ──
+# 全市场仍在 EMA20 下方时，创业板/科创板可能先于宽基指数形成独立修复。
+# 该状态只把对应板块的市场评分恢复到 DEFENSIVE，不绕过交易确认与追高限制。
+STRUCTURAL_REPAIR_MIN_SEGMENT_COUNT = 100
+STRUCTURAL_REPAIR_MIN_ADVANCE_RATIO = 70.0
+STRUCTURAL_REPAIR_MIN_STRONG_RATIO = 15.0
+STRUCTURAL_REPAIR_MIN_AVG_RETURN_PCT = 1.5
+STRUCTURAL_REPAIR_MAX_WEAK_RATIO = 3.0
+
 # ── 固定止损 (Absolute Stop Loss) ──
 # 跌破买入成本的百分比即触发硬性止损
 FIXED_STOP_LOSS_PCT = -9.0          # -9% (e.g. entry * 0.91)
@@ -121,6 +218,13 @@ TIME_STOP_PROFIT_EXEMPT_PCT = 2.0
 # 改动 B4：微盈震荡仓的复核减仓比例（review 档 pl_pct∈(0,2%] 时减此比例）
 TIME_STOP_REVIEW_REDUCE_RATIO = 1.0 / 3.0
 
+# ── 混合退出策略：信号反转卖出 ──
+# 在保留 -9%止损 / +8%减仓 / 10天时间止损 的基础上，新增"趋势反转清仓"退出。
+# 当 price_action_regime 判定为以下状态时，视为趋势反转 → 清仓剩余仓位。
+# 默认关闭，通过 DB key 'signal_reverse_sell_enabled' 运行时覆盖（热改）。
+SIGNAL_REVERSE_SELL_ENABLED = False  # 默认关闭，安全上线
+SIGNAL_REVERSE_REGIMES = ("空头趋势", "向下破位")  # price_action_regime 命中即视为趋势反转
+
 # ── 回测引擎参数 (Backtest Engine Defaults) ──
 BACKTEST_MAX_HOLD_DAYS = 10         # 最大持有天数 (从 5 改为 10，更适合均线粘合中线策略)
 BACKTEST_TRAILING_ATR_MULT = 2.2    # ATR 移动止盈倍数
@@ -160,3 +264,8 @@ BREADTH_DOWNGRADE_CRITICAL = 40     # 跌停家数 >= 此值：直接 → CRITIC
 # stale 兜底虽牺牲实时性，但比"断数据"对上班族盯盘更友好（有价可看 > 没价报错）。
 STALE_SNAPSHOT_WARN = "过期快照(可能滞后)"  # stale 兜底分支的 source 标记，P1 据此加 ⚠️
 FRESHNESS_WARN_THRESHOLD_MIN = 5    # 行情滞后超过此分钟数，Bark 推送前置 ⚠️ 提醒
+
+# ── TradingView 信号预热窗口 ──
+# 图表、单股分析和全市场扫描必须使用同一段历史预热数据。TV-ZP 的
+# Alternate Signal 是有状态计算，历史起点不同会导致同一天的 long 标记不一致。
+TV_SIGNAL_WARMUP_DAYS = 1000

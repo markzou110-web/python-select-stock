@@ -1,5 +1,7 @@
 from typing import Any, Dict, List
 
+from core.risk_constants import PRIMARY_TV_STRATEGY
+
 
 def classify_strategy_health(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """Turn verified return metrics into an actionable strategy operating state."""
@@ -53,9 +55,9 @@ def recommend_strategy_template(
     if regime in {"BULL", "RISK_ON", "CONFIRM"} or recent_win_rate >= 55:
         return {
             "profile": "进攻共振",
-            "strategy_type": "tv_dual_strict",
+            "strategy_type": PRIMARY_TV_STRATEGY,
             "params": {
-                "strategy_type": "tv_dual_strict",
+                "strategy_type": PRIMARY_TV_STRATEGY,
                 "pine_min_signals": 3,
                 "vol_multiplier": 1.5,
                 "rsi_min": 55,

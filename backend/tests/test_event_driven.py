@@ -107,7 +107,8 @@ def test_000977_event_path_never_turns_strength_into_chase_signal():
         assert row["trade_bucket"] == "OBSERVE"
 
 
-def test_000977_event_appears_in_bark_strong_watch_section(monkeypatch):
+def test_000977_event_observation_stays_out_of_interruptive_bark(monkeypatch):
+    sent = []
     row = {
         "代码": "000977", "名称": "浪潮信息", "涨幅%": 10.0,
         "limit_up_status": "SEALED", "sop_grade": "A", "Score": 90,
@@ -118,18 +119,43 @@ def test_000977_event_appears_in_bark_strong_watch_section(monkeypatch):
     monkeypatch.setattr(sentinel, "_load_recommendation_priority_adjustments", lambda: {})
     monkeypatch.setattr(sentinel, "_format_market_line", lambda *_: "测试行情")
     monkeypatch.setattr(sentinel, "_should_send_intraday_state", lambda *_: True)
-    monkeypatch.setattr(sentinel, "_send_bark_message", lambda *_: False)
+    monkeypatch.setattr(
+        sentinel, "_send_bark_message",
+        lambda title, message, **kwargs: sent.append((title, message, kwargs)) or False,
+    )
     monkeypatch.setattr(sentinel, "_append_real_position_status", lambda *_: None)
     monkeypatch.setattr("core.data.get_market_regime", lambda: {"status": "TEST"})
     monkeypatch.setattr("core.data.get_market_snapshot", lambda: {})
     monkeypatch.setattr("core.data.format_freshness", lambda *_: "测试快照")
     monkeypatch.setattr("core.db.save_recommendation_events", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("core.db.get_db_engine", lambda: None)
+    monkeypatch.setattr("core.signal_performance.save_intraday_signal_snapshots", lambda *_args, **_kwargs: 0)
 
     body = sentinel.send_intraday_notification([row])
+    assert body is None
+    assert sent == []
 
-    assert "【强势异动｜只观察不追高】" in body
-    assert "浪潮信息" in body
-    assert "指令：不可交易" in body
-    assert "强势观察不追高" in body
-    assert "指令：可交易｜" not in body
-    assert "【可交易候选】" not in body
+
+def test_bottom_discovery_observation_does_not_push_bark(monkeypatch):
+    sent = []
+    row = {
+        "代码": "000001", "名称": "底部票", "strategy_type": "bottom_discovery",
+        "bottom_discovery_watch_only": True, "bottom_discovery_stage": "B1_REVERSAL",
+        "sop_grade": "C", "trade_eligible": False, "trade_bucket": "OBSERVE",
+    }
+    monkeypatch.setattr(sentinel, "is_a_share_intraday_session", lambda: True)
+    monkeypatch.setattr(sentinel, "_load_recommendation_priority_adjustments", lambda: {})
+    monkeypatch.setattr(sentinel, "_format_market_line", lambda *_: "测试行情")
+    monkeypatch.setattr(sentinel, "_should_send_intraday_state", lambda *_: True)
+    monkeypatch.setattr(sentinel, "_send_bark_message", lambda title, body, **kwargs: sent.append((title, body)) or False)
+    monkeypatch.setattr(sentinel, "_append_real_position_status", lambda *_: None)
+    monkeypatch.setattr("core.data.get_market_regime", lambda: {"status": "TEST"})
+    monkeypatch.setattr("core.data.get_market_snapshot", lambda: {})
+    monkeypatch.setattr("core.data.format_freshness", lambda *_: "测试快照")
+    monkeypatch.setattr("core.db.save_recommendation_events", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("core.db.get_db_engine", lambda: None)
+    monkeypatch.setattr("core.signal_performance.save_intraday_signal_snapshots", lambda *_args, **_kwargs: 0)
+
+    sentinel.send_intraday_notification([row])
+
+    assert sent == []

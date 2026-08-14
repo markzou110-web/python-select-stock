@@ -67,7 +67,7 @@ interface StrategyReleaseState {
 
 export default function SettingsView() {
     const [settings, setSettings] = useState({
-        sentinel_schedule_times: "14:20",
+        sentinel_schedule_times: "09:30,10:00,10:30,11:00,13:00,13:30,14:00,14:30",
         market_sync_schedule_times: "08:30,12:10,18:00",
         bark_key: ""
     });
@@ -80,6 +80,8 @@ export default function SettingsView() {
     const [strategyStates, setStrategyStates] = useState<StrategyReleaseState[]>([]);
     const [apiToken, setApiToken] = useState('');
     const [apiTokenActive, setApiTokenActive] = useState(false);
+    const [retryingNotifications, setRetryingNotifications] = useState(false);
+    const [notificationRetryMessage, setNotificationRetryMessage] = useState('');
 
     useEffect(() => {
         setApiTokenActive(hasSessionApiToken());
@@ -115,6 +117,22 @@ export default function SettingsView() {
             console.error("Save Settings Error:", err);
         } finally {
             setSaving(false);
+        }
+    };
+
+    const handleRetryDeadNotifications = async () => {
+        setRetryingNotifications(true);
+        setNotificationRetryMessage('');
+        try {
+            const response = await api.post('/api/system/notification-outbox/retry-dead');
+            const count = Number(response.data?.requeued || 0);
+            setNotificationRetryMessage(count > 0 ? `已重新排队 ${count} 条通知` : '没有需要重新排队的通知');
+            await fetchSettings();
+        } catch (err) {
+            console.error('Notification retry error:', err);
+            setNotificationRetryMessage('重新排队失败，请检查 API 令牌或后端状态');
+        } finally {
+            setRetryingNotifications(false);
         }
     };
 
@@ -194,11 +212,11 @@ export default function SettingsView() {
                                 type="text"
                                 value={settings.sentinel_schedule_times || ""}
                                 onChange={(e) => setSettings({ ...settings, sentinel_schedule_times: e.target.value })}
-                                placeholder="例如: 10:30, 14:20, 14:50"
+                                placeholder="例如: 09:30,10:00,10:30,11:00,13:00,13:30,14:00,14:30"
                                 className="w-full bg-slate-50 border border-slate-100 text-slate-600 font-mono font-bold rounded-xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 focus:bg-white transition-all"
                             />
                             <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
-                                💡 支持配置多个时间点（用英文逗号分隔，如 <code className="bg-slate-100 px-1 py-0.5 rounded">14:20, 14:50</code>）。系统将在每日配置时刻自动获取最新行情、分析全市场标的，并触发推送通知。
+                                💡 默认从开盘起每30分钟扫描一次（午间休市暂停）。支持用英文逗号自定义时间点；系统会获取最新行情、分析全市场标的，并根据状态去重推送。
                             </p>
                         </div>
 
@@ -334,10 +352,32 @@ export default function SettingsView() {
                     metrics={[
                         ['最新行情', operationalMetrics?.metrics.latest_daily_date || '--'],
                         ['最新扫描', operationalMetrics?.metrics.latest_scan_at || '--'],
-                        ['24h任务失败', operationalMetrics?.metrics.failed_tasks_24h ?? '--'],
-                        ['最新备份', operationalMetrics?.metrics.latest_backup_at || '--'],
+                        ['24h带错误任务', operationalMetrics?.metrics.degraded_tasks_24h ?? '--'],
+                        ['尾盘正式扫描', Number(operationalMetrics?.metrics.late_formal_scan_completed || 0) ? '已完成' : '未确认'],
+                        ['通知待重试', operationalMetrics?.metrics.notification_pending ?? '--'],
+                        ['通知永久失败', operationalMetrics?.metrics.notification_dead ?? '--'],
+                        ['24h恢复送达', operationalMetrics?.metrics.notification_recovered_24h ?? '--'],
+                        [
+                            '最长恢复延迟',
+                            operationalMetrics?.metrics.notification_max_recovery_seconds_24h != null
+                                ? `${Math.round(Number(operationalMetrics.metrics.notification_max_recovery_seconds_24h) / 60)}分钟`
+                                : '--',
+                        ],
                     ]}
-                    messages={operationalMetrics?.alerts.map(item => item.message) || ['运行指标暂不可用']}
+                    messages={[
+                        ...(operationalMetrics?.alerts.map(item => item.message) || ['运行指标暂不可用']),
+                        ...(notificationRetryMessage ? [notificationRetryMessage] : []),
+                    ]}
+                    action={Number(operationalMetrics?.metrics.notification_dead || 0) > 0 ? (
+                        <button
+                            type="button"
+                            onClick={handleRetryDeadNotifications}
+                            disabled={retryingNotifications}
+                            className="w-full rounded-xl bg-rose-600 px-3 py-2 text-[11px] font-black text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            {retryingNotifications ? '正在重新排队…' : '重新尝试失败通知'}
+                        </button>
+                    ) : undefined}
                 />
                 <DiagnosticCard
                     title="点时证据覆盖"
@@ -388,11 +428,12 @@ function HealthMetric({ label, value }: { label: string; value: string | number 
     );
 }
 
-function DiagnosticCard({ title, status, metrics, messages }: {
+function DiagnosticCard({ title, status, metrics, messages, action }: {
     title: string;
     status: string;
     metrics: Array<[string, string | number]>;
     messages: string[];
+    action?: React.ReactNode;
 }) {
     const healthy = status === 'ok';
     const critical = status === 'critical' || status === 'error';
@@ -416,6 +457,7 @@ function DiagnosticCard({ title, status, metrics, messages }: {
             <div className={cn("rounded-xl px-3 py-2 text-[10px] font-medium leading-relaxed", critical ? "bg-rose-50 text-rose-600" : "bg-slate-50 text-slate-500")}>
                 {messages.slice(0, 3).map(message => <p key={message}>{message}</p>)}
             </div>
+            {action}
         </div>
     );
 }

@@ -44,6 +44,7 @@ class ScanHistory(Base):
     resonance = Column(String(50))
     shadow_ratio = Column(Float)
     strategy_type = Column(String(20))
+    result_group = Column(String(30), nullable=False, default="FORMAL", server_default="FORMAL")
     roe = Column(Float, nullable=True)
     net_profit_yoy = Column(Float, nullable=True)
     price_action_score = Column(Float, nullable=True)
@@ -102,6 +103,12 @@ class PaperTrading(Base):
     entry_source = Column(String(50), nullable=True)
     entry_signal_date = Column(Date, nullable=True)
     entry_reason_snapshot = Column(Text, nullable=True)
+    signal_sources = Column(String(20), nullable=True)
+    execution_tier = Column(String(5), nullable=True)
+    risk_unit = Column(Float, nullable=True)
+    source_upgraded_at = Column(DateTime, nullable=True)
+    pending_exit_reason = Column(Text, nullable=True)
+    pending_exit_signal_date = Column(Date, nullable=True)
     pa_trade_action = Column(String(20), nullable=True)
     pa_trade_setup = Column(String(80), nullable=True)
     pa_entry_condition = Column(Text, nullable=True)
@@ -207,6 +214,15 @@ class PointInTimeStockSnapshot(Base):
     turnover = Column(Float, nullable=True)
     mkt_cap = Column(Float, nullable=True)
     source = Column(String(50), nullable=True)
+    price = Column(Float, nullable=True)
+    open = Column(Float, nullable=True)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    pct_chg = Column(Float, nullable=True)
+    vol = Column(Float, nullable=True)
+    amount = Column(Float, nullable=True)
+    limit_up = Column(Float, nullable=True)
+    limit_down = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -292,6 +308,32 @@ class RecommendationEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class IntradaySignalSnapshot(Base):
+    """Append-only point-in-time candidate state for signal performance attribution."""
+    __tablename__ = "intraday_signal_snapshots"
+    signal_id = Column(String(64), primary_key=True)
+    signal_date = Column(Date, nullable=False)
+    signal_time = Column(DateTime, nullable=False)
+    source = Column(String(40), nullable=False)
+    code = Column(String(20), nullable=False)
+    name = Column(String(80), nullable=True)
+    strategy_type = Column(String(40), nullable=False)
+    grade = Column(String(10), nullable=True)
+    signal_price = Column(Float, nullable=False)
+    confirmation_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    trade_bucket = Column(String(20), nullable=True)
+    trade_eligible = Column(Integer, default=0)
+    instruction_state = Column(String(30), nullable=False)
+    market_stage = Column(String(30), nullable=True)
+    sector_phase = Column(String(40), nullable=True)
+    sector_mainline = Column(String(30), nullable=True)
+    reachability = Column(String(40), nullable=True)
+    strong_exception_shadow = Column(Integer, default=0)
+    snapshot_payload = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class LifecycleEvent(Base):
     __tablename__ = "lifecycle_events"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -328,6 +370,24 @@ class NotificationAudit(Base):
     results = Column(JSON, nullable=True)
     group_name = Column(String(100), nullable=True)
     body_preview = Column(Text, nullable=True)
+
+
+class NotificationOutbox(Base):
+    __tablename__ = "notification_outbox"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    dedupe_key = Column(String(64), unique=True, nullable=False)
+    channel = Column(String(30), nullable=False)
+    title = Column(String(200), nullable=False)
+    body = Column(Text, nullable=False)
+    url = Column(Text, nullable=True)
+    group_name = Column(String(100), nullable=True)
+    is_archive = Column(Integer, default=1)
+    status = Column(String(20), default="PENDING", nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    next_retry_at = Column(DateTime, nullable=False)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    sent_at = Column(DateTime, nullable=True)
 
 
 class StrategyReleaseState(Base):

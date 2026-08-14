@@ -78,7 +78,7 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
             """, 0) or 0)
             notification_total = int(_safe_scalar(conn, "SELECT COUNT(*) FROM notification_audits WHERE sent_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'", 0) or 0)
             notification_success = int(_safe_scalar(conn, "SELECT COUNT(*) FROM notification_audits WHERE sent_at >= CURRENT_TIMESTAMP - INTERVAL '7 days' AND CAST(results AS text) LIKE '%true%'", 0) or 0)
-            task_failures = int(_safe_scalar(conn, "SELECT COUNT(*) FROM task_run_audits WHERE COALESCE(started_at, finished_at) >= CURRENT_TIMESTAMP - INTERVAL '7 days' AND status='FAILURE'", 0) or 0)
+            task_failures = int(_safe_scalar(conn, "SELECT COUNT(*) FROM task_run_audits WHERE COALESCE(started_at, finished_at) >= CURRENT_TIMESTAMP - INTERVAL '7 days' AND status IN ('FAILURE', 'SUCCESS_WITH_ERRORS')", 0) or 0)
 
             table_counts = {}
             missing_tables = []
@@ -196,7 +196,7 @@ def build_system_health_snapshot(engine: Optional[Engine]) -> Dict[str, Any]:
     elif notification_total:
         checks.append({"name": "notification_delivery", "status": "ok", "message": "近7日通知审计均成功"})
     if task_failures:
-        checks.append({"name": "background_tasks", "status": "warn", "message": f"近7日后台任务失败 {task_failures} 次"})
+        checks.append({"name": "background_tasks", "status": "warn", "message": f"近7日后台任务失败或降级 {task_failures} 次"})
         recommendations.append("检查 task-runs 中最近失败的同步或扫描任务")
 
     if same_day_high_anomalies:

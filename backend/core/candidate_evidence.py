@@ -6,6 +6,8 @@ import math
 from datetime import date, datetime, time
 from typing import Any, Callable, Dict, Iterable, Optional
 
+from core.execution_insights import get_active_execution_plan
+
 
 CONTRACT_VERSION = "candidate-evidence-v1"
 VALID_MODES = {"OFF", "SHADOW", "ENFORCED"}
@@ -217,9 +219,10 @@ def build_candidate_evidence(
     if candidate.get("snapshot_stale") or "过期" in str(candidate.get("data_source") or candidate.get("source") or ""):
         quote_status = "STALE"
 
-    entry = _number(candidate.get("pa_entry_price") or candidate.get("entry_price") or candidate.get("frozen_confirmation_price"))
-    stop = _number(candidate.get("pa_stop_price") or candidate.get("stop_price") or candidate.get("frozen_stop_price"))
-    target = _number(candidate.get("pa_target_price") or candidate.get("target_price") or candidate.get("frozen_target_price"))
+    active_plan = get_active_execution_plan(candidate)
+    entry = _number(active_plan["entry"])
+    stop = _number(active_plan["stop"])
+    target = _number(active_plan["target"])
     execution_valid = bool(entry and stop and entry > stop)
     technical_valid = any(candidate.get(key) not in (None, "", []) for key in (
         "price_action_score", "price_action_signal", "price_action_regime", "pa_trade_plan"

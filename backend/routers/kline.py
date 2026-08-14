@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from core.logging_config import logger
 from core.db import get_db_engine
 from core.operation_plan import operation_bands, safe_num
+from core.risk_constants import TV_SIGNAL_WARMUP_DAYS
 from sqlalchemy import text
 
 router = APIRouter(prefix="/api", tags=["kline"])
@@ -19,8 +20,11 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
     try:
         engine = get_db_engine()
         
-        # Calculate start date
-        start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        # 信号计算预热窗口与全市场扫描一致；图表展示范围仍由 days 控制。
+        display_start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        start_date = (
+            datetime.now() - timedelta(days=max(days, TV_SIGNAL_WARMUP_DAYS))
+        ).strftime("%Y-%m-%d")
         
         query = text("""
             SELECT date as "日期", close as "收盘", open as "开盘", 
@@ -51,7 +55,8 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         rf_filter_data = []
         markers_data = []
         
-        for index, row in df.iterrows():
+        display_df = df[df["日期"] >= display_start_date]
+        for index, row in display_df.iterrows():
             date_str = str(row['日期'])
             
             # 1. Candlestick
@@ -98,7 +103,7 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
 
         for b in signals.get("buy_signals", []):
             time_str = b["time"]
-            if time_str not in added_dates:
+            if time_str >= display_start_date and time_str not in added_dates:
                 markers_data.append({
                     "time": time_str,
                     "position": "belowBar",
@@ -110,7 +115,7 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                 
         for s in signals.get("sell_signals", []):
             time_str = s["time"]
-            if time_str not in added_dates:
+            if time_str >= display_start_date and time_str not in added_dates:
                 # 止损标记红色，止盈/超时标记绿色
                 color = "#e91e63" if "止损" in s["reason"] else "#4caf50"
                 reason = s.get("reason", "")
@@ -129,7 +134,8 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         # 4. Al Brooks-style price action annotations
         price_action = build_price_action_annotations(df)
         for marker in price_action.get("markers", []):
-            markers_data.append(marker)
+            if str(marker.get("time", "")) >= display_start_date:
+                markers_data.append(marker)
 
         # 确保 markers 严格按照时间升序排列，解决 lightweight-charts 的 Assertion failed 崩溃问题
         markers_data.sort(key=lambda x: x["time"])
@@ -139,7 +145,7 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         for ts in signals.get("trailing_stops", []):
             t = ts["time"]
             val = ts["value"]
-            if t not in trailing_stops_dict or val < trailing_stops_dict[t]:
+            if t >= display_start_date and (t not in trailing_stops_dict or val < trailing_stops_dict[t]):
                 trailing_stops_dict[t] = val
         
         trailing_stops_data = [{"time": t, "value": v} for t, v in sorted(trailing_stops_dict.items())]

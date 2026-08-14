@@ -12,6 +12,11 @@ from core.notifier import notifier
 from core.risk_constants import FIXED_STOP_LOSS_RATIO, TAKE_PROFIT_RATIO
 from core.operation_plan import watch_exit_decision, watch_instruction
 from core.audit_log import record_lifecycle_event, record_watchlist_theme_state_change
+from core.theme_leadership import (
+    build_theme_leadership_body,
+    discover_theme_leadership,
+    load_theme_leadership_review,
+)
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -272,7 +277,7 @@ def _send_trigger_notification(alerts) -> Dict[str, bool]:
             loop = None
         if loop and loop.is_running():
             loop.create_task(notifier.send(title, body, channels=["bark"]))
-            return {"bark": True}
+            return {"bark": False, "pending": True}
         return asyncio.run(notifier.send(title, body, channels=["bark"]))
     except Exception as exc:
         logger.error(f"Watchlist trigger notification error: {exc}")
@@ -588,20 +593,34 @@ def _build_theme_momentum_alert(items, min_theme_count: int = 3) -> Dict[str, An
     for theme, group in groups.items():
         rising = [i for i in group if float(i.get("pct_chg") or 0) >= 3]
         leaders = [i for i in group if float(i.get("pct_chg") or 0) >= 7 or _is_limit_like(i)]
-        if len(rising) < min_theme_count or not leaders:
+        advancing = [i for i in group if float(i.get("pct_chg") or 0) > 0]
+        strong = [i for i in group if float(i.get("pct_chg") or 0) >= 5 or _is_limit_like(i)]
+        group_avg = sum(float(i.get("pct_chg") or 0) for i in group) / len(group)
+        advance_ratio = len(advancing) / len(group) * 100
+        cluster_breakout = len(rising) >= min_theme_count and bool(leaders)
+        breadth_breakout = (
+            len(group) >= 8
+            and advance_ratio >= 70
+            and group_avg >= 1.5
+            and len(strong) >= 2
+        )
+        if not cluster_breakout and not breadth_breakout:
             continue
-        rising = sorted(rising, key=lambda x: float(x.get("pct_chg") or 0), reverse=True)
+        display_pool = rising if rising else advancing
+        display_pool = sorted(display_pool, key=lambda x: float(x.get("pct_chg") or 0), reverse=True)
         watchable = [
-            i for i in rising
+            i for i in display_pool
             if not _is_limit_like(i) and float(i.get("pct_chg") or 0) < 8
         ]
         alerts.append({
             "theme": theme,
             "rising_count": len(rising),
-            "leader_count": len(leaders),
-            "leaders": rising[:5],
+            "leader_count": len(strong),
+            "leaders": display_pool[:5],
             "watchable": watchable[:5],
-            "avg_pct": round(sum(float(i.get("pct_chg") or 0) for i in rising) / len(rising), 2),
+            "avg_pct": round(group_avg, 2),
+            "advance_ratio": round(advance_ratio, 1),
+            "signal_mode": "BREADTH" if breadth_breakout and not cluster_breakout else "CLUSTER",
         })
     alerts.sort(key=lambda x: (x["leader_count"], x["rising_count"], x["avg_pct"]), reverse=True)
     return {"alerts": alerts, "count": len(alerts)}
@@ -617,7 +636,8 @@ def _build_theme_momentum_body(alerts: list, slot: str) -> str:
     for alert in alerts[:3]:
         lines.append(
             f"【{alert['theme']}】{alert['rising_count']}只上涨>3%，"
-            f"{alert['leader_count']}只强势，均涨 {alert['avg_pct']}%"
+            f"{alert['leader_count']}只强势，板块均涨 {alert['avg_pct']}%，"
+            f"上涨占比 {alert.get('advance_ratio', 0)}%"
         )
         leader_text = "、".join(
             f"{i.get('name')}({i.get('code')}) {float(i.get('pct_chg') or 0):+.2f}%"
@@ -639,7 +659,7 @@ def _build_theme_momentum_body(alerts: list, slot: str) -> str:
 
 
 def send_theme_momentum_alert(slot: str = "morning", notify: bool = True) -> Dict[str, Any]:
-    """Push early theme momentum alerts for formal watchlist themes."""
+    """Push observation-only theme momentum from watchlist or the live market universe."""
     engine = get_db_engine()
     if not engine:
         return {"bark": False, "count": 0, "reason": "db_unavailable"}
@@ -653,8 +673,7 @@ def send_theme_momentum_alert(slot: str = "morning", notify: bool = True) -> Dic
     except Exception as exc:
         logger.error(f"Theme momentum watchlist fetch failed: {exc}")
         return {"bark": False, "count": 0, "reason": "watchlist_fetch_failed", "detail": str(exc)}
-    if items_df.empty:
-        return {"bark": False, "count": 0, "reason": "empty watchlist"}
+    universe_mode = items_df.empty
 
     try:
         from core.data import get_market_snapshot, is_snapshot_stale, get_stale_cache, format_freshness
@@ -667,38 +686,94 @@ def send_theme_momentum_alert(slot: str = "morning", notify: bool = True) -> Dic
         return {"bark": False, "count": 0, "reason": "live_snapshot_unavailable", "detail": str(exc)}
 
     items = []
-    for _, row in items_df.iterrows():
-        code = str(row["code"]).zfill(6)
-        snap = snapshot_map.get(code)
-        if not snap:
-            continue
-        item = dict(row)
-        item["code"] = code
-        item["current_price"] = round(float(snap.get("price") or 0), 2)
-        item["pct_chg"] = round(float(snap.get("pct_chg") or 0), 2)
-        item["turnover"] = round(float(snap.get("turnover") or 0), 2)
-        item["amount"] = float(snap.get("amount") or 0)
-        item["limit_up"] = float(snap.get("limit_up") or 0)
-        items.append(item)
+    if universe_mode:
+        from core.db import get_stock_basic_map
+        basic_map = get_stock_basic_map()
+        for _, snap in snapshot.iterrows():
+            code = str(snap.get("code") or "").zfill(6)
+            name = str(snap.get("name") or "")
+            raw_industry = snap.get("industry")
+            industry = "" if pd.isna(raw_industry) else str(raw_industry).strip()
+            if not industry:
+                industry = str((basic_map.get(code) or {}).get("industry") or "").strip()
+            if (
+                not code.startswith(("60", "00", "30", "688"))
+                or "ST" in name.upper() or "退" in name
+                or not industry
+            ):
+                continue
+            items.append({
+                "code": code,
+                "name": name,
+                "industry": industry,
+                "theme": industry,
+                "current_price": round(float(snap.get("price") or 0), 2),
+                "pct_chg": round(float(snap.get("pct_chg") or 0), 2),
+                "turnover": round(float(snap.get("turnover") or 0), 2),
+                "amount": float(snap.get("amount") or 0),
+                "limit_up": float(snap.get("limit_up") or 0),
+                "trade_eligible": False,
+                "trade_bucket": "OBSERVE",
+            })
+    else:
+        for _, row in items_df.iterrows():
+            code = str(row["code"]).zfill(6)
+            snap = snapshot_map.get(code)
+            if not snap:
+                continue
+            item = dict(row)
+            item["code"] = code
+            item["current_price"] = round(float(snap.get("price") or 0), 2)
+            item["pct_chg"] = round(float(snap.get("pct_chg") or 0), 2)
+            item["turnover"] = round(float(snap.get("turnover") or 0), 2)
+            item["amount"] = float(snap.get("amount") or 0)
+            item["limit_up"] = float(snap.get("limit_up") or 0)
+            items.append(item)
 
+    try:
+        shadow_payload = discover_theme_leadership(engine, snapshot, observed_at=datetime.now())
+    except Exception as exc:
+        logger.warning(f"Theme leadership shadow skipped without affecting momentum alert: {exc}")
+        shadow_payload = {"items": [], "count": 0, "technical_seed_count": 0}
+    shadow_items = shadow_payload["items"]
     alert_payload = _build_theme_momentum_alert(items)
     alerts = alert_payload["alerts"]
-    if not alerts:
-        return {"bark": False, "count": 0, "reason": "no_theme_momentum"}
+    if not alerts and not shadow_items:
+        return {
+            "bark": False, "count": 0, "reason": "no_theme_momentum",
+            "source": "market_snapshot" if universe_mode else "watchlist",
+            "theme_leadership_count": 0,
+            "technical_seed_count": shadow_payload["technical_seed_count"],
+        }
 
     today = datetime.now().strftime("%Y-%m-%d")
     theme_names = ",".join(alert["theme"] for alert in alerts)
-    dedupe_key = f"{today}:{theme_names}"
+    shadow_names = ",".join(f"{item['code']}:{item['state']}" for item in shadow_items)
+    dedupe_key = f"{today}:{theme_names}:{shadow_names}"
+    total_count = len(alerts) + len(shadow_items)
     if notify and _THEME_MOMENTUM_PUSHED.get(dedupe_key):
-        return {"bark": False, "count": len(alerts), "reason": "deduped"}
+        return {
+            "bark": False, "count": total_count, "reason": "deduped",
+            "theme_leadership_count": len(shadow_items),
+        }
 
-    body = _build_theme_momentum_body(alerts, slot)
+    sections = []
+    if alerts:
+        sections.append(_build_theme_momentum_body(alerts, slot))
+    if shadow_items:
+        sections.append(build_theme_leadership_body(shadow_items, slot))
+    body = "\n\n".join(sections)
     try:
         body = body + "\n" + format_freshness(get_stale_cache("market_snapshot"))
     except Exception:
         pass
     if not notify:
-        return {"bark": False, "count": len(alerts), "body": body, "notification": False}
+        return {
+            "bark": False, "count": total_count, "body": body, "notification": False,
+            "source": "market_snapshot" if universe_mode else "watchlist",
+            "theme_leadership_count": len(shadow_items),
+            "technical_seed_count": shadow_payload["technical_seed_count"],
+        }
 
     title = f"Alpha Vision 题材异动预警 {today}"
     try:
@@ -709,13 +784,30 @@ def send_theme_momentum_alert(slot: str = "morning", notify: bool = True) -> Dic
             group="AlphaVision_Theme",
             url="http://localhost:3000",
         ))
-        sent = bool(result)
+        sent = bool(result.get("bark"))
         if sent:
             _THEME_MOMENTUM_PUSHED[dedupe_key] = datetime.now()
-        return {"bark": sent, "count": len(alerts), "body": body}
+        return {
+            "bark": sent, "count": total_count, "body": body,
+            "source": "market_snapshot" if universe_mode else "watchlist",
+            "theme_leadership_count": len(shadow_items),
+            "technical_seed_count": shadow_payload["technical_seed_count"],
+        }
     except Exception as exc:
         logger.error(f"Theme momentum Bark push failed: {exc}")
-        return {"bark": False, "count": len(alerts), "body": body, "detail": str(exc)}
+        return {
+            "bark": False, "count": total_count, "body": body, "detail": str(exc),
+            "theme_leadership_count": len(shadow_items),
+        }
+
+
+@router.get("/theme-leadership/review")
+def get_theme_leadership_review(days: int = 120) -> Dict[str, Any]:
+    """Review forward returns of observation-only theme-leadership signals."""
+    engine = get_db_engine()
+    if not engine:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return load_theme_leadership_review(engine, days=days)
 
 
 def send_watchlist_status_report(slot: str, notify: bool = True) -> Dict[str, Any]:
@@ -759,9 +851,9 @@ def send_watchlist_status_report(slot: str, notify: bool = True) -> Dict[str, An
             loop = None
         if loop and loop.is_running():
             loop.create_task(notifier.send(title, body, channels=["bark"]))
-            return {"bark": True, "count": len(items), "body": body}
+            return {"bark": False, "pending": True, "count": len(items), "body": body}
         result = asyncio.run(notifier.send(title, body, channels=["bark"]))
-        return {"bark": bool(result), "count": len(items), "body": body}
+        return {"bark": bool(result.get("bark")), "count": len(items), "body": body}
     except Exception as exc:
         logger.error(f"Watchlist status notification error: {exc}")
         return {"bark": False, "count": len(items), "body": body, "detail": str(exc)}
@@ -776,6 +868,11 @@ def list_watchlist(status: str = "WATCHING") -> Dict[str, Any]:
     try:
         if status == "ALL":
             df = pd.read_sql(text("SELECT * FROM watchlist ORDER BY updated_at DESC, created_at DESC"), engine)
+        elif status == "ACTIVE":
+            df = pd.read_sql(
+                text("SELECT * FROM watchlist WHERE status IN ('WATCHING', 'TRIGGERED') ORDER BY updated_at DESC, created_at DESC"),
+                engine,
+            )
         else:
             df = pd.read_sql(
                 text("SELECT * FROM watchlist WHERE status = :status ORDER BY updated_at DESC, created_at DESC"),

@@ -88,6 +88,16 @@ def test_sop_detail_fields_in_persistence_whitelist():
         "sop_quality_score", "sop_subgrade",
         "stock_rank_in_sector",  # P0 个股板块内排名
         "limit_up_unsealed",     # #13 涨停开板标记
+        "tv_match",              # 新策略收盘严格双命中复核
+        "tv_ma_signal",
+        "tv_zp_signal",
+        "a_eod_controlled_trial",
+        "a_eod_policy_version",
+        "a_eod_trial_checks",
+        "a_eod_entry_extension_pct",
+        "a_eod_trade_cautions",
+        "a_eod_portfolio_cap_pct",
+        "a_eod_max_positions",
     ]
     missing = [f for f in required if f not in PRICE_ACTION_DETAIL_KEYS]
     assert not missing, f"以下字段未在持久化白名单（无法复盘SOP判定）: {missing}"

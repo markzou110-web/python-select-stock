@@ -67,9 +67,17 @@ def _json_safe(value: Any) -> Any:
 
 
 PRICE_ACTION_DETAIL_KEYS = [
+    "tv_match", "tv_ma_signal", "tv_zp_signal",
+    "signal_sources", "tv_execution_policy_version", "tv_execution_tier",
+    "tv_execution_tier_label", "tv_execution_risk_unit", "tv_execution_auto",
+    "tv_same_day_dual", "trade_exit_policy",
+    "bark_selection_source_label", "bark_scan_strategy_label",
+    "pct_5d",
     "price_action_score", "price_action_regime", "price_action_signal", "price_action_pattern",
     "price_action_entry_quality", "price_action_summary", "price_action_risks",
     "pa_market_cycle", "pa_range_location", "pa_entry_price", "pa_stop_price",
+    "pa_close_guard_price", "pa_hard_stop_price", "pa_invalidation_basis",
+    "pa_invalidation_rule",
     "pa_target_price", "pa_risk_reward", "pa_actual_space_rr", "pa_target_basis",
     "pa_structure_score", "pa_execution_score", "pa_risk_score", "pa_tags", "pa_pullback_legs",
     "pa_pullback_structure", "pa_pullback_validity", "pa_pullback_status",
@@ -81,7 +89,10 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_position_strategy", "pa_weekly_context", "pa_multi_timeframe_score",
     "pa_multi_timeframe_note", "pa_current_week_complete",
     "price_action_version", "target_model_version", "score_model_version",
-    "pa_volume_pattern", "pa_volume_confirmed",
+    "pa_volume_pattern", "pa_volume_confirmed", "pa_volume_confirmation_state",
+    "pa_volume_confirmation_final", "pa_close_confirmation_phase", "pa_close_confirmation_as_of",
+    "pa_close_time_eligible", "pa_confirmation_state", "pa_execution_stage",
+    "pa_execution_stage_label", "pa_signal_date",
     "pa_volume_ratio", "pa_volume_ratio_percentile", "pa_breakout_volume_threshold",
     "pa_confirmation_volume_threshold",
     "pa_volume_risk", "pa_failed_second_entry", "pa_second_entry_risk",
@@ -92,7 +103,11 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_eight_rule_risk_delta",
     "pa_trade_plan", "trade_eligible", "trade_bucket", "trade_blockers",
     "final_trade_score", "trade_timeframe", "exit_hint",
-    "market_regime",
+    "a_eod_controlled_trial", "a_eod_policy_version", "a_eod_trial_checks",
+    "a_eod_entry_extension_pct", "a_eod_trade_cautions",
+    "a_eod_portfolio_cap_pct", "a_eod_max_positions",
+    "market_regime", "effective_market_regime",
+    "market_segment", "market_segment_stage", "market_segment_label", "market_segment_breadth",
     "sop_grade", "sop_action", "sop_risks", "sop_vetoes", "sop_checks", "sop_bonuses",
     "sop_quality_score", "sop_subgrade",
     "sector_momentum_score", "sector_breadth",
@@ -107,6 +122,9 @@ PRICE_ACTION_DETAIL_KEYS = [
     "event_post_limit_state", "event_alert_tier", "event_health_scope",
     "trade_blocker_groups",
     "execution_rr", "execution_plan_state", "distance_to_trade",
+    "execution_plan_frozen", "frozen_plan_date", "frozen_plan_expiry_date",
+    "frozen_plan_valid_sessions", "active_confirmation_price", "active_stop_price",
+    "active_close_guard_price", "active_target_price", "active_execution_plan_source",
     "sector_watch_only", "sector_watch_reason",
     "market_sentiment_stage", "market_sentiment_label", "market_sentiment_score",
     "market_sentiment_reason", "market_cycle_metrics", "market_sentiment_model_version",
@@ -121,12 +139,28 @@ PRICE_ACTION_DETAIL_KEYS = [
     "decision_lifecycle_state", "decision_lifecycle_action",
     "confirmation_event_state", "confirmation_event_reason",
     "early_value_transition_state",
+    "bottom_discovery_watch_only", "bottom_discovery_stage", "bottom_discovery_action",
+    "bottom_discovery_metrics", "bottom_discovery_transition_state",
     "evidence_id", "evidence_grade", "evidence_status", "evidence_summary",
     "evidence_reason_codes", "evidence_gate_mode", "evidence_pipeline_stage",
     "evidence_bundle", "decision_memo",
+    "selection_health", "execution_health", "strategy_health_control_cohort",
+    "confirmation_reachability", "confirmation_limit_price", "confirmation_reachability_reason",
+    "execution_review_state", "strong_exception_shadow", "strong_exception_shadow_reason",
+    "strong_exception_shadow_entry",
+    "sop_base_grade", "sop_quality_gap_to_a", "sop_grade_reason",
+    "sop_grade_transition_reasons", "sop_quality_dimensions",
+    "sop_a_grade_eligible", "sop_a_grade_gate_reasons", "sop_grade_policy_version",
     "execution_plan_frozen", "frozen_plan_date", "frozen_confirmation_price",
-    "frozen_stop_price", "frozen_target_price", "generated_confirmation_price",
-    "generated_stop_price", "display_trade_score",
+    "frozen_stop_price", "frozen_close_guard_price", "frozen_target_price", "generated_confirmation_price",
+    "generated_stop_price", "active_execution_plan_source", "active_confirmation_price",
+    "active_stop_price", "active_close_guard_price", "active_target_price", "pa_setup_confirmed",
+    "pa_plan_triggered", "pa_close_confirmed", "pa_confirmation_state",
+    "pa_close_confirmation_as_of", "pa_close_confirmation_phase", "pa_close_time_eligible",
+    "display_trade_score", "display_signal_score",
+    "display_quality_score", "display_opportunity_score", "display_rank_score",
+    "score_display_scale",
+    "result_group", "data_mode", "as_of",
     "frozen_entry_extension_pct", "frozen_confirmation_triggered",
 ]
 
@@ -225,6 +259,16 @@ def init_db(engine=None):
                 VALUES ('2026-07-12-execution-ops-v1', CURRENT_TIMESTAMP, 'execution evidence, event, notification and ops fields')
                 ON CONFLICT(version) DO NOTHING
             """))
+            conn.execute(text("""
+                INSERT INTO schema_migrations(version, applied_at, description)
+                VALUES ('2026-07-13-intraday-signal-snapshots-v1', CURRENT_TIMESTAMP, 'append-only point-in-time signal snapshots')
+                ON CONFLICT(version) DO NOTHING
+            """))
+            conn.execute(text("""
+                INSERT INTO schema_migrations(version, applied_at, description)
+                VALUES ('2026-07-16-notification-snapshot-resilience-v1', CURRENT_TIMESTAMP, 'durable notification outbox and quote-bearing point-in-time snapshots')
+                ON CONFLICT(version) DO NOTHING
+            """))
             conn.commit()
             # 性能索引
             try:
@@ -232,6 +276,8 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_code ON daily_k(code);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_code_date ON daily_k(code, date);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_date ON scan_history(date);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_intraday_signal_snapshots_date ON intraday_signal_snapshots(signal_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_intraday_signal_snapshots_code_date ON intraday_signal_snapshots(code, signal_date DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_status ON paper_trading(status);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stock_basic_industry ON stock_basic(industry);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_daily_k_date_code ON daily_k(date, code);"))
@@ -247,6 +293,7 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lifecycle_events_code_type ON lifecycle_events(code, event_type, event_time DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_task_run_audits_started ON task_run_audits(started_at DESC);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notification_audits_sent ON notification_audits(sent_at DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notification_outbox_due ON notification_outbox(status, next_retry_at);"))
                 logger.info("Database and performance indexes verified via ORM.")
             except Exception as e:
                 logger.debug(f"Index creation skipped: {e}")
@@ -276,6 +323,28 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"scan audit metadata migration skipped: {e}")
 
+            # Additive only: old snapshot rows remain readable and simply have NULL quotes.
+            try:
+                quote_columns = {
+                    "price": "FLOAT", "open": "FLOAT", "high": "FLOAT", "low": "FLOAT",
+                    "pct_chg": "FLOAT", "vol": "FLOAT", "amount": "FLOAT",
+                    "limit_up": "FLOAT", "limit_down": "FLOAT",
+                }
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(point_in_time_stock_snapshots)"))}
+                    for column_name, definition in quote_columns.items():
+                        if column_name not in existing:
+                            conn.execute(text(f"ALTER TABLE point_in_time_stock_snapshots ADD COLUMN {column_name} {definition}"))
+                else:
+                    clauses = ", ".join(
+                        f"ADD COLUMN IF NOT EXISTS {name} {definition}"
+                        for name, definition in quote_columns.items()
+                    )
+                    conn.execute(text(f"ALTER TABLE point_in_time_stock_snapshots {clauses}"))
+                logger.info("Migration: point-in-time snapshot quote columns ensured.")
+            except Exception as e:
+                logger.debug(f"point-in-time snapshot quote migration skipped: {e}")
+
             # --- Migration: add trade_mode column if missing ---
             try:
                 conn.execute(text("""
@@ -300,6 +369,31 @@ def init_db(engine=None):
                 logger.info("Migration: paper trading entry metadata columns ensured.")
             except Exception as e:
                 logger.debug(f"paper trading entry metadata migration skipped: {e}")
+
+            # Additive only: preserves all existing positions and leaves legacy rows nullable.
+            try:
+                execution_state_columns = {
+                    "signal_sources": "VARCHAR(20)",
+                    "execution_tier": "VARCHAR(5)",
+                    "risk_unit": "FLOAT",
+                    "source_upgraded_at": "TIMESTAMP",
+                    "pending_exit_reason": "TEXT",
+                    "pending_exit_signal_date": "DATE",
+                }
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(paper_trading)"))}
+                    for column_name, definition in execution_state_columns.items():
+                        if column_name not in existing:
+                            conn.execute(text(f"ALTER TABLE paper_trading ADD COLUMN {column_name} {definition}"))
+                else:
+                    clauses = ", ".join(
+                        f"ADD COLUMN IF NOT EXISTS {name} {definition}"
+                        for name, definition in execution_state_columns.items()
+                    )
+                    conn.execute(text(f"ALTER TABLE paper_trading {clauses}"))
+                logger.info("Migration: TV execution state columns ensured.")
+            except Exception as e:
+                logger.debug(f"TV execution state migration skipped: {e}")
 
             # --- Migration: stock theme and rise logic ---
             try:
@@ -437,6 +531,48 @@ def init_db(engine=None):
                 logger.info("Migration: SOP grade snapshot columns ensured.")
             except Exception as e:
                 logger.debug(f"SOP grade snapshot migration skipped: {e}")
+
+            # --- Migration: stable scan result grouping ---
+            try:
+                has_grouping_source_columns = True
+                if engine.dialect.name == "sqlite":
+                    existing_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(scan_history)"))}
+                    has_grouping_source_columns = {"sop_checks", "sop_bonuses"}.issubset(existing_columns)
+                    if "result_group" not in existing_columns:
+                        conn.execute(text("ALTER TABLE scan_history ADD COLUMN result_group VARCHAR(30)"))
+                else:
+                    conn.execute(text("""
+                        ALTER TABLE scan_history
+                        ADD COLUMN IF NOT EXISTS result_group VARCHAR(30)
+                    """))
+                if has_grouping_source_columns:
+                    conn.execute(text("""
+                        UPDATE scan_history
+                        SET result_group = CASE
+                            WHEN COALESCE(CAST(sop_checks AS TEXT), '') LIKE '%复活%'
+                              OR COALESCE(CAST(sop_bonuses AS TEXT), '') LIKE '%历史信号复活%'
+                                THEN 'HISTORICAL_REVIVAL'
+                            WHEN COALESCE(CAST(sop_checks AS TEXT), '') LIKE '%强趋势加速%'
+                              OR COALESCE(CAST(sop_bonuses AS TEXT), '') LIKE '%涨停/大阳加速观察%'
+                                THEN 'MOMENTUM_WATCH'
+                            ELSE 'FORMAL'
+                        END
+                        WHERE result_group IS NULL
+                    """))
+                else:
+                    conn.execute(text("""
+                        UPDATE scan_history SET result_group = 'FORMAL'
+                        WHERE result_group IS NULL
+                    """))
+                if engine.dialect.name == "postgresql":
+                    conn.execute(text("""
+                        ALTER TABLE scan_history
+                        ALTER COLUMN result_group SET DEFAULT 'FORMAL',
+                        ALTER COLUMN result_group SET NOT NULL
+                    """))
+                logger.info("Migration: scan result grouping ensured.")
+            except Exception as e:
+                logger.debug(f"scan result grouping migration skipped: {e}")
 
             # --- Migration: lossless scan signal identity and data-date semantics ---
             try:
@@ -745,6 +881,15 @@ def save_point_in_time_snapshot(
             "turnover": None if pd.isna(item.get("turnover")) else float(item.get("turnover")),
             "mkt_cap": None if pd.isna(item.get("mkt_cap")) else float(item.get("mkt_cap")),
             "source": item.get("source") or data_mode,
+            "price": None if pd.isna(item.get("price")) else float(item.get("price")),
+            "open": None if pd.isna(item.get("open")) else float(item.get("open")),
+            "high": None if pd.isna(item.get("high")) else float(item.get("high")),
+            "low": None if pd.isna(item.get("low")) else float(item.get("low")),
+            "pct_chg": None if pd.isna(item.get("pct_chg")) else float(item.get("pct_chg")),
+            "vol": None if pd.isna(item.get("vol")) else float(item.get("vol")),
+            "amount": None if pd.isna(item.get("amount")) else float(item.get("amount")),
+            "limit_up": None if pd.isna(item.get("limit_up")) else float(item.get("limit_up")),
+            "limit_down": None if pd.isna(item.get("limit_down")) else float(item.get("limit_down")),
             "created_at": datetime.now(),
         })
     if not rows:
@@ -752,14 +897,19 @@ def save_point_in_time_snapshot(
     statement = text("""
         INSERT INTO point_in_time_stock_snapshots
             (dataset_version, as_of, data_mode, code, name, industry, is_st_or_delist,
-             turnover, mkt_cap, source, created_at)
+             turnover, mkt_cap, source, price, open, high, low, pct_chg, vol,
+             amount, limit_up, limit_down, created_at)
         VALUES
             (:dataset_version, :as_of, :data_mode, :code, :name, :industry, :is_st_or_delist,
-             :turnover, :mkt_cap, :source, :created_at)
+             :turnover, :mkt_cap, :source, :price, :open, :high, :low, :pct_chg, :vol,
+             :amount, :limit_up, :limit_down, :created_at)
         ON CONFLICT(dataset_version, code) DO UPDATE SET
             name=EXCLUDED.name, industry=EXCLUDED.industry,
             is_st_or_delist=EXCLUDED.is_st_or_delist, turnover=EXCLUDED.turnover,
-            mkt_cap=EXCLUDED.mkt_cap, source=EXCLUDED.source
+            mkt_cap=EXCLUDED.mkt_cap, source=EXCLUDED.source,
+            price=EXCLUDED.price, open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
+            pct_chg=EXCLUDED.pct_chg, vol=EXCLUDED.vol, amount=EXCLUDED.amount,
+            limit_up=EXCLUDED.limit_up, limit_down=EXCLUDED.limit_down
     """)
     try:
         with engine.begin() as conn:
@@ -768,6 +918,45 @@ def save_point_in_time_snapshot(
     except Exception as exc:
         logger.error(f"Failed to save point-in-time snapshot: {exc}")
         return 0
+
+
+def load_recent_point_in_time_snapshot(max_age_minutes: float = 5, engine=None) -> pd.DataFrame:
+    """Load the latest complete, same-day live snapshot for cross-worker failover."""
+    engine = engine or get_db_engine()
+    if engine is None:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            latest = conn.execute(text("""
+                SELECT dataset_version, MAX(as_of) AS as_of, MAX(source) AS source, COUNT(*) AS row_count
+                FROM point_in_time_stock_snapshots
+                WHERE data_mode = 'LIVE_SNAPSHOT' AND price IS NOT NULL AND pct_chg IS NOT NULL
+                GROUP BY dataset_version
+                ORDER BY MAX(as_of) DESC
+                LIMIT 1
+            """)).mappings().first()
+            if not latest or int(latest["row_count"] or 0) < 4000:
+                return pd.DataFrame()
+            as_of = pd.to_datetime(latest["as_of"]).to_pydatetime()
+            now = datetime.now()
+            if as_of.date() != now.date() or (now - as_of).total_seconds() > max_age_minutes * 60:
+                return pd.DataFrame()
+            snapshot = pd.read_sql(text("""
+                SELECT code, name, industry, price, open, high, low, pct_chg, vol,
+                       amount, turnover, mkt_cap, limit_up, limit_down
+                FROM point_in_time_stock_snapshots
+                WHERE dataset_version = :dataset_version
+                ORDER BY code
+            """), conn, params={"dataset_version": latest["dataset_version"]})
+        snapshot.attrs = {
+            "fetched_at": as_of,
+            "data_date": as_of.strftime("%Y-%m-%d"),
+            "source": f"持久化短时快照·{latest['source'] or '未知源'}",
+        }
+        return snapshot
+    except Exception as exc:
+        logger.warning(f"Recent point-in-time snapshot unavailable: {exc}")
+        return pd.DataFrame()
 
 
 def save_event_catalyst(event: Dict[str, Any], engine=None) -> bool:
@@ -1326,6 +1515,11 @@ def save_scan_results(
                     "resonance": r.get('共振', '独苗'),
                     "shadow_ratio": float(r.get('影线比', 0)),
                     "strategy_type": r.get('strategy_type', 'squeeze'),
+                    "result_group": r.get('result_group') or (
+                        'HISTORICAL_REVIVAL' if r.get('revival_watch_only')
+                        else 'MOMENTUM_WATCH' if r.get('momentum_acceleration_watch_only')
+                        else 'FORMAL'
+                    ),
                     "roe": float(r.get('ROE', 0)) if r.get('ROE') is not None else None,
                     "net_profit_yoy": float(r.get('净利YOY', 0)) if r.get('净利YOY') is not None else None,
                     "price_action_score": float(r.get('price_action_score', 0)) if r.get('price_action_score') is not None else None,
@@ -1355,11 +1549,11 @@ def save_scan_results(
             if rows:
                 conn.execute(text('''
                     INSERT INTO scan_history (
-                        code, name, date, data_date, scanned_at, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, roe, net_profit_yoy,
+                        code, name, date, data_date, scanned_at, price, pct, score, rsi, dif, bb, glue, industry, win_rate, signal_count, north_money, resonance, shadow_ratio, strategy_type, result_group, roe, net_profit_yoy,
                         price_action_score, price_action_regime, price_action_signal, price_action_pattern, price_action_entry_quality, price_action_summary, pa_entry_price, pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action, pa_trade_setup, pa_risk_pct,
                         sop_grade, sop_quality_score, sop_subgrade, sop_vetoes, sop_checks, sop_bonuses, sop_risks, price_action_detail
                     ) VALUES (
-                        :code, :name, :date, :data_date, :scanned_at, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :roe, :net_profit_yoy,
+                        :code, :name, :date, :data_date, :scanned_at, :price, :pct, :score, :rsi, :dif, :bb, :glue, :industry, :win_rate, :signal_count, :north_money, :resonance, :shadow_ratio, :strategy_type, :result_group, :roe, :net_profit_yoy,
                         :price_action_score, :price_action_regime, :price_action_signal, :price_action_pattern, :price_action_entry_quality, :price_action_summary, :pa_entry_price, :pa_stop_price, :pa_target_price, :pa_risk_reward, :pa_trade_action, :pa_trade_setup, :pa_risk_pct,
                         :sop_grade, :sop_quality_score, :sop_subgrade, CAST(:sop_vetoes AS JSONB), CAST(:sop_checks AS JSONB), CAST(:sop_bonuses AS JSONB), CAST(:sop_risks AS JSONB), CAST(:price_action_detail AS JSONB)
                     ) ON CONFLICT (code, data_date, strategy_type) DO UPDATE SET
@@ -1379,6 +1573,7 @@ def save_scan_results(
                         resonance = EXCLUDED.resonance,
                         shadow_ratio = EXCLUDED.shadow_ratio,
                         strategy_type = EXCLUDED.strategy_type,
+                        result_group = EXCLUDED.result_group,
                         roe = EXCLUDED.roe,
                         net_profit_yoy = EXCLUDED.net_profit_yoy,
                         price_action_score = EXCLUDED.price_action_score,
@@ -1457,6 +1652,7 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
             "resonance": "共振",
             "shadow_ratio": "影线比",
             "strategy_type": "strategy_type",
+            "result_group": "result_group",
             "roe": "ROE",
             "net_profit_yoy": "净利YOY",
             "price_action_score": "price_action_score",

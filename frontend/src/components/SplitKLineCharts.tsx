@@ -102,7 +102,6 @@ function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: st
 function getSignalMarkerTone(marker: any) {
     const text = String(marker?.text || '');
     if (text.includes('Bark')) return { badge: 'Bark', label: '推荐日', color: '#0ea5e9' };
-    if (text.includes('冲高回落')) return { badge: '警', label: '冲高回落', color: '#f59e0b' };
     if (text.toLowerCase().includes('long')) return { badge: 'B', label: 'long', color: '#22c55e' };
     if (text.toLowerCase().includes('short')) return { badge: 'S', label: 'short', color: '#ef4444' };
     if (text.includes('共振')) return { badge: 'B', label: '共振', color: '#ef4444' };
@@ -261,31 +260,6 @@ function buildRiskPriceLines(riskLevels: any, paperLines?: { price: number; labe
     return lines;
 }
 
-function buildPullbackWarningMarkers(candles: any[]) {
-    const recent = candles.slice(-80);
-    const markers: any[] = [];
-    recent.forEach((candle, index) => {
-        const range = candle.high - candle.low;
-        if (range <= 0) return;
-        const upperShadow = candle.high - Math.max(candle.open, candle.close);
-        const shadowRatio = upperShadow / range;
-        const closePosition = (candle.close - candle.low) / range;
-        const prev = recent[index - 1];
-        const wasStrong = prev ? candle.high >= prev.high * 1.03 : candle.high >= candle.open * 1.04;
-        if (wasStrong && shadowRatio >= 0.45 && closePosition <= 0.55) {
-            markers.push({
-                time: candle.time,
-                position: 'aboveBar',
-                color: '#f59e0b',
-                shape: 'circle',
-                text: '冲高回落',
-                source: 'warning',
-            });
-        }
-    });
-    return markers;
-}
-
 function SummaryBox({
     title,
     body,
@@ -376,7 +350,6 @@ export default function SplitKLineCharts({
             ...(markers || []),
             ...overlayMarkers,
             ...(overlayMarkers.length === 0 ? buildSignalMarkers(buySignals, sellSignals) : []),
-            ...buildPullbackWarningMarkers(sortedCandles),
         ];
         if (buyDate && sortedCandles.some((c) => c.time === buyDate)) {
             all.push({
@@ -400,7 +373,12 @@ export default function SplitKLineCharts({
         }
         const seen = new Set<string>();
         return all
-            .filter((marker) => marker?.time && !String(marker.text || '').startsWith('PA'))
+            .filter((marker) => (
+                marker?.time
+                && marker?.source !== 'eight_rule'
+                && !String(marker.text || marker.label || '').includes('冲高回落')
+                && !String(marker.text || '').startsWith('PA')
+            ))
             .sort((a, b) => String(a.time).localeCompare(String(b.time)))
             .filter((marker) => {
                 const key = `${marker.time}-${marker.position}-${marker.text}`;
@@ -411,7 +389,12 @@ export default function SplitKLineCharts({
     }, [markers, buySignals, sellSignals, strategySignalSets, buyDate, barkDate, sortedCandles]);
     const priceActionMarkers = useMemo(() => {
         return (markers || [])
-            .filter((marker) => marker?.time && String(marker.text || '').startsWith('PA'))
+            .filter((marker) => (
+                marker?.time
+                && marker?.source !== 'eight_rule'
+                && !String(marker.text || marker.label || '').includes('冲高回落')
+                && String(marker.text || '').startsWith('PA')
+            ))
             .sort((a, b) => String(a.time).localeCompare(String(b.time)));
     }, [markers]);
 

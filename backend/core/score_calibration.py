@@ -2,22 +2,21 @@ from collections import defaultdict
 from typing import Any, Dict, List
 import math
 
+from core.risk_constants import (
+    A_MINUS_TRIAL_MAX_DAILY_RISE_PCT,
+    SOP_A_GRADE_MAX_5D_GAIN_PCT,
+)
 
-# 综合评分权重（求和=1.0）。历史胜率（historical_win_rate）专项 0.10，
-# 让历史回测胜率高的标的在排序中获得加权优势，而非仅作二元 SOP 勾选。
-# 便于调参：调整后请确保五项权重之和仍为 1.0。
-# 修复 L-决策2: 板块影响双重计算。trade_opportunity 内部已含 sector_score(权重0.2×0.25=0.05)，
-# 外部又加 sector_alignment(0.12)，总板块影响=0.17(17%)过高。
-# 将 sector_alignment 从 0.12 降至 0.07，总板块影响=0.07+0.05=0.12(合理)，
-# 释放的 0.05 转给 price_action(0.18→0.23)以加强个股技术面权重。
-# 改动 A5：W_HISTORICAL_WIN_RATE 0.10→0.05（与 scanner 层 0.18 权重双重计入，
-# 实际权重远超 0.28），释放给 W_TRADE_OPPORTUNITY(0.25→0.30)，后者信息密度更高
-# （含市场+板块+资金+风险综合判断）。
-W_STRATEGY_PERCENTILE = 0.35
-W_PRICE_ACTION = 0.23
-W_SECTOR_ALIGNMENT = 0.07
-W_TRADE_OPPORTUNITY = 0.30
+
+# execution-first-v2：近期校准显示原始策略分和机会分存在排序倒挂，
+# 因此只把它们作为辅助项，排序主要依赖价格行为与板块联动。
+# 该分数只改变候选排序，不放宽任何交易许可门禁。
+W_STRATEGY_PERCENTILE = 0.15
+W_PRICE_ACTION = 0.50
+W_SECTOR_ALIGNMENT = 0.20
+W_TRADE_OPPORTUNITY = 0.10
 W_HISTORICAL_WIN_RATE = 0.05
+MAX_EXTENSION_PENALTY = 15.0
 
 
 def _clamp(value: Any, default: float = 0.0) -> float:
@@ -25,6 +24,24 @@ def _clamp(value: Any, default: float = 0.0) -> float:
         return max(0.0, min(100.0, float(value)))
     except (TypeError, ValueError):
         return default
+
+
+def apply_score_display_contract(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add bounded presentation scores without changing any internal score or ranking."""
+    def display(value: Any) -> float | None:
+        return round(_clamp(value), 1) if value not in (None, "") else None
+
+    for row in results:
+        signal_score = row.get("calibrated_score")
+        if signal_score in (None, ""):
+            signal_score = row.get("Score")
+        row["display_signal_score"] = display(signal_score)
+        row["display_quality_score"] = display(row.get("sop_quality_score"))
+        row["display_opportunity_score"] = display(row.get("trade_opportunity_score"))
+        row["display_rank_score"] = display(row.get("final_rank_score"))
+        row["display_trade_score"] = display(row.get("final_trade_score"))
+        row["score_display_scale"] = "0-100"
+    return results
 
 
 def _percentile_scores(values: List[float]) -> List[float]:
@@ -119,20 +136,34 @@ def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 "trade_opportunity": _clamp(row.get("trade_opportunity_score"), 50),
                 "historical_win_rate": historical_win_rate,
             }
-            calibrated = round(
+            pct_5d = _clamp(row.get("pct_5d"), 0)
+            daily_rise = _clamp(row.get("涨幅%") or row.get("pct_chg"), 0)
+            extension_penalty = min(
+                MAX_EXTENSION_PENALTY,
+                max(0.0, pct_5d - SOP_A_GRADE_MAX_5D_GAIN_PCT) * 1.5
+                + (8.0 if daily_rise > A_MINUS_TRIAL_MAX_DAILY_RISE_PCT else 0.0),
+            )
+            components["extension_penalty"] = round(extension_penalty, 1)
+            base_calibrated = (
                 components["strategy_percentile"] * W_STRATEGY_PERCENTILE
                 + components["price_action"] * W_PRICE_ACTION
                 + components["sector_alignment"] * W_SECTOR_ALIGNMENT
                 + components["trade_opportunity"] * W_TRADE_OPPORTUNITY
-                + components["historical_win_rate"] * W_HISTORICAL_WIN_RATE,
-                1,
+                + components["historical_win_rate"] * W_HISTORICAL_WIN_RATE
             )
+            calibrated = round(max(0.0, base_calibrated - extension_penalty), 1)
+            ranking_delta = round(calibrated - raw_score, 1)
             row["raw_score"] = round(raw_score, 2)
             row["calibrated_score"] = calibrated
             row["score_components"] = components
+            row["score_model_version"] = "execution-first-v2"
+            row["score_ranking_delta"] = ranking_delta
             row["win_probability"] = probability
             row["p_win"] = round(probability["p_win"] * 100, 1)
             row["Score"] = calibrated
+            for rank_field in ("final_rank_score", "final_trade_score"):
+                if row.get(rank_field) is not None:
+                    row[rank_field] = round(float(row[rank_field]) + ranking_delta, 2)
 
             missing = []
             if not row.get("strategy_type"):

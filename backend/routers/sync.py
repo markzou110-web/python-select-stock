@@ -11,6 +11,21 @@ from core.db import get_db_engine, init_db
 router = APIRouter(prefix="/api/sync", tags=["sync"])
 
 
+def _load_local_sync_codes(engine) -> list[str]:
+    """Use the persisted A-share universe so network discovery cannot block sync."""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT code FROM stock_basic ORDER BY code")).fetchall()
+        if not rows:
+            rows = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
+    return [
+        str(row[0]).zfill(6)
+        for row in rows
+        if str(row[0]).startswith(("60", "688", "00", "30"))
+    ]
+
+
 def background_sync_task():
     """Background task to sync stock data."""
     global sync_progress
@@ -27,7 +42,6 @@ def background_sync_task():
     try:
         from core.multi_source_sync import MultiSourceSync, SYNC_MAX_WORKERS
         from core.db import get_db_engine, init_db
-        from sqlalchemy import text
 
         engine = get_db_engine()
         if not engine:
@@ -39,6 +53,10 @@ def background_sync_task():
         with sync_progress_lock:
             sync_progress["status_text"] = "正在初始化多数据源同步..."
 
+        # 股票池首先来自本地数据库。同步按钮的职责是更新行情，不应因为
+        # 外部“股票列表”接口不可用而阻塞在 total=0。
+        all_codes = _load_local_sync_codes(engine)
+
         syncer = MultiSourceSync()
 
         logger.info("Checking data source status...")
@@ -47,29 +65,23 @@ def background_sync_task():
         logger.info(f"Available data sources: {available_count}/{len(report)}")
 
         with sync_progress_lock:
-            sync_progress["status_text"] = "正在获取最新股票基础列表..."
+            sync_progress["status_text"] = "正在准备本地股票列表..."
 
-        logger.info("Fetching fresh stock list from data sources...")
-        fresh_list = syncer.get_stock_list()
-        if fresh_list is not None and not fresh_list.empty:
-            from core.db import save_stock_basic
-            save_stock_basic(fresh_list, engine)
-            all_codes = fresh_list['code'].tolist()
-            logger.info(f"Updated stock_basic with {len(fresh_list)} records from cloud.")
-
-            with sync_progress_lock:
-                sync_progress["status_text"] = "正在补充行业/板块映射..."
-            logger.info("Filling missing sector information from industry boards...")
-            get_sector_map()
+        if all_codes:
+            logger.info(f"Using persisted stock list with {len(all_codes)} records.")
         else:
-            logger.warning("Cloud fetch failed, using DB fallback for code list.")
-            with engine.connect() as conn:
-                all_codes_result = conn.execute(text("SELECT code FROM stock_basic ORDER BY code")).fetchall()
-                if not all_codes_result:
-                    all_codes_result = conn.execute(text("SELECT DISTINCT code FROM daily_k ORDER BY code")).fetchall()
-                all_codes = [row[0] for row in all_codes_result]
+            logger.warning("Local stock list is empty, trying cloud discovery.")
+            fresh_list = syncer.get_stock_list()
+            if fresh_list is not None and not fresh_list.empty:
+                from core.db import save_stock_basic
+                save_stock_basic(fresh_list, engine)
+                all_codes = fresh_list['code'].tolist()
+                logger.info(f"Updated stock_basic with {len(fresh_list)} records from cloud.")
 
-            all_codes = [c for c in all_codes if str(c).startswith(('60', '688', '00', '30'))]
+                with sync_progress_lock:
+                    sync_progress["status_text"] = "正在补充行业/板块映射..."
+                logger.info("Filling missing sector information from industry boards...")
+                get_sector_map()
 
         if not all_codes:
             logger.error("No stocks found in database or network list")

@@ -21,6 +21,7 @@ from core.point_in_time_warehouse import build_point_in_time_coverage
 from core.strategy_governance import list_strategy_states, transition_strategy
 from core.operational_metrics import build_operational_metrics, render_prometheus_metrics
 from core.lookahead_audit import audit_causal_consistency
+from core.signal_performance import build_signal_performance_report
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -103,6 +104,15 @@ def get_point_in_time_coverage():
 @router.get("/operational-metrics")
 def get_operational_metrics():
     return build_operational_metrics(get_db_engine())
+
+
+@router.post("/notification-outbox/retry-dead")
+def retry_dead_notifications(limit: int = 20):
+    """Requeue failed deliveries without exposing their payloads or credentials."""
+    from core.audit_log import requeue_dead_notifications
+
+    bounded_limit = min(max(int(limit), 1), 100)
+    return {"requeued": requeue_dead_notifications(bounded_limit), "limit": bounded_limit}
 
 
 @router.get("/operational-metrics/prometheus", response_class=Response)
@@ -286,6 +296,12 @@ def get_evidence_quality(limit: int = 500):
         "pipeline_stages": stages,
         "domains": domains,
     }
+
+
+@router.get("/signal-performance")
+def get_signal_performance(days: int = 120):
+    """Return point-in-time discovery, execution timing and gate attribution metrics."""
+    return build_signal_performance_report(get_db_engine(), days=days)
 
 
 @router.get("/failure-samples")

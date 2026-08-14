@@ -256,7 +256,9 @@ def evaluate_portfolio_risk_budget(
         ).fillna(0).sum())
     except Exception:
         existing_capital = 0.0
-    new_capital = float(new_trade.get("capital_used") or new_trade.get("position_pct", 0) * float(new_trade.get("entry_price", 0) or 0) / 100 or 0)
+    position_pct = float(new_trade.get("position_pct") or 0)
+    entry_price = float(new_trade.get("entry_price") or new_trade.get("price") or 0)
+    new_capital = float(new_trade.get("capital_used") or position_pct * entry_price / 100 or 0)
     total_capital = existing_capital + new_capital
     virtual_cap = float(limits.get("virtual_total_capital", 1000000))
     capital_pct = total_capital / virtual_cap * 100 if virtual_cap > 0 else 0

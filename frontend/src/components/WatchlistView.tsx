@@ -46,7 +46,7 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
     const [loading, setLoading] = useState(true);
     const [checking, setChecking] = useState(false);
     const [notice, setNotice] = useState<string>('');
-    const [status, setStatus] = useState<'WATCHING' | 'ALL'>('WATCHING');
+    const [status, setStatus] = useState<'ACTIVE' | 'ALL'>('ACTIVE');
     const [transferringId, setTransferringId] = useState<number | null>(null);
     const [viewPrefs, setViewPrefs] = useState(readWatchlistViewPrefs);
     const themeStateFilter = viewPrefs.themeStateFilter;
@@ -99,6 +99,11 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                 trade_mode: 'SIMULATED',
                 entry_source: 'watchlist_current_price',
                 entry_signal_date: item.latest_date,
+                signal_sources: Array.isArray(item.signal_sources)
+                    ? item.signal_sources
+                    : typeof item.signal_sources === 'string'
+                        ? item.signal_sources.split('+').filter((source: string) => source === 'ma' || source === 'zp')
+                        : undefined,
                 entry_reason_snapshot: `${item.reason || '观察池转入'} / ${item.pa_trade_action || 'WATCH'} / 观察价 ${item.watch_price}`,
                 pa_trade_action: item.pa_trade_action,
                 pa_trade_setup: item.pa_trade_setup,
@@ -112,12 +117,16 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                 }
                 return;
             }
-            if (res.data?.status !== 'success') {
+            if (!['success', 'upgraded'].includes(res.data?.status)) {
                 setNotice(res.data?.detail || '转入拟合实盘失败');
                 return;
             }
             await api.post(`/api/watchlist/archive/${item.id}`);
-            setNotice(`${item.name} 已转入拟合实盘，观察记录已归档`);
+            setNotice(
+                res.data.status === 'upgraded'
+                    ? `${item.name} 已升级现有持仓信号，观察记录已归档`
+                    : `${item.name} 已转入拟合实盘，观察记录已归档`,
+            );
             await fetchItems();
         } catch (err: any) {
             console.error("Transfer watchlist to paper error:", err);
@@ -172,9 +181,20 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                     <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">Candidates before position entry</p>
                 </div>
                 <div className="flex items-center gap-2">
-                    <button onClick={() => setStatus(status === 'WATCHING' ? 'ALL' : 'WATCHING')} className="px-4 py-2 rounded-xl bg-white border border-slate-100 text-slate-600 text-xs font-black">
-                        {status === 'WATCHING' ? '仅观察中' : '全部记录'}
-                    </button>
+                    <div className="flex rounded-xl border border-slate-100 bg-white p-1">
+                        <button
+                            onClick={() => setStatus('ACTIVE')}
+                            className={cn("rounded-lg px-3 py-1.5 text-xs font-black", status === 'ACTIVE' ? "bg-indigo-50 text-indigo-700" : "text-slate-400")}
+                        >
+                            有效观察
+                        </button>
+                        <button
+                            onClick={() => setStatus('ALL')}
+                            className={cn("rounded-lg px-3 py-1.5 text-xs font-black", status === 'ALL' ? "bg-indigo-50 text-indigo-700" : "text-slate-400")}
+                        >
+                            全部记录
+                        </button>
+                    </div>
                     <button onClick={checkTriggers} disabled={checking} className="px-4 py-2 rounded-xl bg-amber-50 text-amber-700 text-xs font-black flex items-center gap-2 disabled:opacity-60">
                         {checking ? <Loader2 size={14} className="animate-spin" /> : <BellRing size={14} />}
                         检查触发
@@ -260,6 +280,12 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                                             >
                                                 <p className="font-black text-slate-800 hover:text-indigo-600 transition-colors">{item.name}</p>
                                                 <p className="text-[10px] font-mono font-bold text-slate-400">{item.code} · {item.industry}</p>
+                                                <span className={cn(
+                                                    "mt-1 inline-flex rounded-full px-2 py-0.5 text-[10px] font-black",
+                                                    item.status === 'TRIGGERED' ? "bg-amber-50 text-amber-700" : "bg-sky-50 text-sky-700"
+                                                )}>
+                                                    {item.status === 'TRIGGERED' ? '已触发' : item.status === 'WATCHING' ? '观察中' : watchStatusLabel(item.status)}
+                                                </span>
                                             </button>
                                         </div>
                                     </td>
@@ -375,6 +401,14 @@ function decisionLabel(decision?: string) {
         KEEP_WATCH: '继续观察',
     };
     return labels[decision || ''] || '继续观察';
+}
+
+function watchStatusLabel(status?: string) {
+    const labels: Record<string, string> = {
+        ARCHIVED: '已归档',
+        INVALIDATED: '已失效',
+    };
+    return labels[status || ''] || status || '未知状态';
 }
 
 function themeTrackingTone(state?: string) {

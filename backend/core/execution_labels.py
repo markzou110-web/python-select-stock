@@ -4,7 +4,7 @@ from typing import Any, Dict
 import pandas as pd
 
 
-EXECUTION_MODEL_VERSION = "a-share-next-open-v2"
+EXECUTION_MODEL_VERSION = "a-share-confirmation-trigger-v3"
 
 
 def daily_limit_pct(code: str, *, is_st: bool = False, limit_pct_override: float | None = None) -> float:
@@ -34,6 +34,7 @@ def evaluate_execution_path(
     take_profit_pct: float | None = None,
     max_hold_days: int = 10,
     max_open_gap_pct: float = 3.0,
+    planned_entry_price: float | None = None,
     slippage_bps: float = 5.0,
     commission_rate: float = 0.00025,
     stamp_tax_rate: float = 0.0005,
@@ -45,10 +46,11 @@ def evaluate_execution_path(
     commission_min: float = 5.0,
     volume_in_lots: bool = False,
 ) -> Dict[str, Any]:
-    """Label one signal using next-open entry and conservative OHLC ordering.
+    """Label one signal using a T+1 entry plan and conservative OHLC ordering.
 
-    The first future bar is the intended entry day. A limit-up/high-gap entry is
-    marked unfilled. When stop and target are both touched on one bar, stop wins.
+    The first future bar is the only valid entry day. Entry failures are mature
+    once that bar exists; filled trades still need the full evaluation horizon.
+    When stop and target are both touched on one bar, stop wins.
     """
     empty = {
         "mature": False, "filled": False, "return_pct": None, "mfe_pct": None,
@@ -61,20 +63,47 @@ def evaluate_execution_path(
         return {**empty, "reason": "未来行情字段不完整"}
 
     bars = future_bars.head(max(1, int(max_hold_days))).reset_index(drop=True)
-    if len(bars) < max_hold_days:
-        return {**empty, "reason": "持有期未成熟"}
-    entry_raw = float(bars.loc[0, "开盘"])
-    if entry_raw <= 0:
+    first_open = float(bars.loc[0, "开盘"])
+    if first_open <= 0:
         return {**empty, "mature": True, "reason": "入场价无效"}
-    open_gap = (entry_raw / signal_close - 1) * 100
+    open_gap = (first_open / signal_close - 1) * 100
     limit_pct = daily_limit_pct(code, is_st=is_st, limit_pct_override=limit_pct_override)
     first_close = float(bars.loc[0, "收盘"])
-    intraday_move = abs((first_close / entry_raw - 1) * 100)
+    intraday_move = abs((first_close / first_open - 1) * 100)
     if abs(open_gap) >= max(adjustment_gap_pct, limit_pct + 2) and intraday_move <= 8:
         return {**empty, "mature": True, "reason": "疑似复权断点", "open_gap_pct": round(open_gap, 2)}
     if open_gap >= limit_pct - 0.2:
         return {**empty, "mature": True, "reason": "涨停或近涨停无法成交", "open_gap_pct": round(open_gap, 2)}
-    if open_gap > max_open_gap_pct:
+    planned_entry = float(planned_entry_price or 0)
+    entry_extension_pct = None
+    if planned_entry > 0:
+        if first_open > planned_entry:
+            entry_extension_pct = (first_open / planned_entry - 1) * 100
+            if entry_extension_pct > max_open_gap_pct:
+                return {
+                    **empty,
+                    "mature": True,
+                    "reason": "开盘超过确认价偏离上限",
+                    "open_gap_pct": round(open_gap, 2),
+                    "entry_extension_pct": round(entry_extension_pct, 2),
+                    "entry_trigger_price": round(planned_entry, 4),
+                }
+            entry_raw = first_open
+        else:
+            first_high = float(bars.loc[0, "最高"])
+            if first_high < planned_entry:
+                return {
+                    **empty,
+                    "mature": True,
+                    "reason": "确认价未触及",
+                    "open_gap_pct": round(open_gap, 2),
+                    "entry_trigger_price": round(planned_entry, 4),
+                }
+            entry_raw = planned_entry
+            entry_extension_pct = 0.0
+    else:
+        entry_raw = first_open
+    if planned_entry <= 0 and open_gap > max_open_gap_pct:
         return {**empty, "mature": True, "reason": "高开超过入场上限", "open_gap_pct": round(open_gap, 2)}
 
     entry = entry_raw * (1 + max(0.0, slippage_bps) / 10000)
@@ -95,6 +124,8 @@ def evaluate_execution_path(
                     "open_gap_pct": round(open_gap, 2),
                     "volume_participation_pct": round(participation_pct, 4) if participation_pct is not None else None,
                 }
+    if len(bars) < max_hold_days:
+        return {**empty, "reason": "持有期未成熟"}
     stop = entry_raw * (1 + stop_loss_pct / 100)
     target = entry_raw * (1 + take_profit_pct / 100) if take_profit_pct is not None else None
     max_high = entry_raw
@@ -137,6 +168,8 @@ def evaluate_execution_path(
         "exit_reason": exit_reason,
         "exit_day": exit_day,
         "open_gap_pct": round(open_gap, 2),
+        "entry_extension_pct": round(entry_extension_pct, 2) if entry_extension_pct is not None else None,
+        "entry_trigger_price": round(planned_entry, 4) if planned_entry > 0 else None,
         "shares": shares,
         "fees": round(fees, 2) if fees is not None else None,
         "volume_participation_pct": round(participation_pct, 4) if participation_pct is not None else None,
@@ -163,6 +196,16 @@ def build_executable_labels(signals: pd.DataFrame, daily_k: pd.DataFrame, **para
         name = str(signal.get("name") or "")
         st_value = signal.get("is_st_or_delist")
         is_st = (pd.notna(st_value) and bool(st_value)) or "ST" in name.upper()
-        label = evaluate_execution_path(code, float(signal["signal_close"]), future, is_st=is_st, **params)
+        call_params = dict(params)
+        if "planned_entry_price" not in call_params:
+            planned_entry = signal.get("planned_entry_price")
+            if planned_entry is None or pd.isna(planned_entry):
+                planned_entry = signal.get("confirmation_price")
+            try:
+                if planned_entry is not None and not pd.isna(planned_entry) and float(planned_entry) > 0:
+                    call_params["planned_entry_price"] = float(planned_entry)
+            except (TypeError, ValueError):
+                pass
+        label = evaluate_execution_path(code, float(signal["signal_close"]), future, is_st=is_st, **call_params)
         output.append({**signal.to_dict(), **{f"exec_{key}": value for key, value in label.items()}})
     return pd.DataFrame(output)

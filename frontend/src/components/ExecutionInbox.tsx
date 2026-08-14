@@ -123,6 +123,7 @@ export default function ExecutionInbox() {
                     <div>
                         <h2 className="text-xl font-black text-slate-900">执行收件箱</h2>
                         <p className="text-xs font-medium text-slate-500">只处理Bark明确标记“可交易”的指令</p>
+                        <p className="mt-1 text-[10px] font-bold text-slate-400">实际成交后填写股数和均价，系统才会计入真实操作胜率</p>
                     </div>
                 </div>
                 <button onClick={load} disabled={loading} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-700">

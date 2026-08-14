@@ -44,15 +44,51 @@ def create_bark_execution_intents(stocks: Iterable[Dict[str, Any]], engine, issu
                 continue
             identity = f"bark:{now.date()}:{code}:{strategy}"
             intent_id = f"int_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex[:20]}"
+            position_plan = stock.get("position_plan") or detail.get("position_plan") or {}
+            if not isinstance(position_plan, dict):
+                position_plan = {}
             snapshot = {
                 "grade": stock.get("sop_grade"), "score": stock.get("Score") or stock.get("score"),
+                "a_minus_trial": bool(stock.get("a_minus_trial")),
+                "a_minus_trial_grade": stock.get("a_minus_trial_grade"),
+                "a_minus_trial_policy_version": stock.get("a_minus_trial_policy_version"),
+                "a_minus_trial_health": stock.get("a_minus_trial_health"),
+                "a_minus_portfolio_cap_pct": stock.get("a_minus_portfolio_cap_pct"),
+                "a_eod_controlled_trial": bool(stock.get("a_eod_controlled_trial")),
+                "a_eod_policy_version": stock.get("a_eod_policy_version"),
+                "a_eod_trade_cautions": stock.get("a_eod_trade_cautions") or [],
+                "a_eod_portfolio_cap_pct": stock.get("a_eod_portfolio_cap_pct"),
+                "a_eod_max_positions": stock.get("a_eod_max_positions"),
+                "a_eod_t1_plan": bool(stock.get("a_eod_t1_plan")),
+                "a_eod_t1_confirmed": bool(stock.get("a_eod_t1_confirmed")),
+                "a_eod_t1_policy_version": stock.get("a_eod_t1_policy_version"),
+                "a_eod_t1_frozen_entry_price": stock.get("a_eod_t1_frozen_entry_price"),
+                "a_eod_t1_frozen_stop_price": stock.get("a_eod_t1_frozen_stop_price"),
+                "a_eod_t1_frozen_target_price": stock.get("a_eod_t1_frozen_target_price"),
+                "a_eod_t1_entry_extension_pct": stock.get("a_eod_t1_entry_extension_pct"),
+                "a_eod_t1_portfolio_cap_pct": stock.get("a_eod_t1_portfolio_cap_pct"),
+                "a_eod_t1_max_positions": stock.get("a_eod_t1_max_positions"),
                 "trade_opportunity_score": stock.get("trade_opportunity_score"),
+                "pa_execution_policy_version": stock.get("pa_execution_policy_version"),
+                "pa_execution_tier": stock.get("pa_execution_tier"),
+                "pa_execution_tier_label": stock.get("pa_execution_tier_label"),
+                "signal_sources": stock.get("signal_sources") or detail.get("signal_sources") or [],
+                "tv_execution_policy_version": stock.get("tv_execution_policy_version") or detail.get("tv_execution_policy_version"),
+                "tv_execution_tier": stock.get("tv_execution_tier") or detail.get("tv_execution_tier"),
+                "tv_execution_risk_unit": stock.get("tv_execution_risk_unit") or detail.get("tv_execution_risk_unit"),
                 "entry_condition": stock.get("pa_entry_condition") or detail.get("pa_entry_condition"),
                 "blockers": stock.get("trade_blockers") or detail.get("trade_blockers") or [],
+                "market_regime": stock.get("market_regime") or detail.get("market_regime"),
+                "market_sentiment_stage": stock.get("market_sentiment_stage") or detail.get("market_sentiment_stage"),
+                "sector_phase": stock.get("sector_phase") or detail.get("sector_phase"),
+                "sector_mainline": stock.get("sector_mainline") or detail.get("sector_mainline"),
                 "evidence_id": stock.get("evidence_id") or detail.get("evidence_id"),
                 "evidence_grade": stock.get("evidence_grade") or detail.get("evidence_grade"),
                 "evidence_status": stock.get("evidence_status") or detail.get("evidence_status"),
                 "evidence_reason_codes": stock.get("evidence_reason_codes") or detail.get("evidence_reason_codes") or [],
+                "signal_price": _number(stock.get("现价") or stock.get("price")),
+                "position_plan": position_plan,
+                "execution_instruction": stock.get("execution_instruction") or detail.get("execution_instruction"),
             }
             params = {
                 "id": intent_id, "signal_date": now.date(), "issued_at": now,
@@ -61,7 +97,11 @@ def create_bark_execution_intents(stocks: Iterable[Dict[str, Any]], engine, issu
                 "entry": _number(stock.get("pa_entry_price") or detail.get("pa_entry_price")),
                 "stop": _number(stock.get("pa_stop_price") or detail.get("pa_stop_price")),
                 "target": _number(stock.get("pa_target_price") or detail.get("pa_target_price")),
-                "position": _number(stock.get("suggested_position_pct") or stock.get("position_pct")),
+                "position": _number(
+                    stock.get("suggested_position_pct")
+                    or stock.get("position_pct")
+                    or position_plan.get("initial_position_pct")
+                ),
                 "snapshot": json.dumps(snapshot, ensure_ascii=False, default=str), "updated_at": now,
             }
             inserted = conn.execute(text(f"""

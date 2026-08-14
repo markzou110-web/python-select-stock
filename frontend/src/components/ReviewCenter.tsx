@@ -61,6 +61,13 @@ type CalibrationRow = {
     signals?: number;
     mature_5d?: number;
     metrics?: Record<string, LayerMetric>;
+    excursion_5d?: {
+        samples?: number;
+        avg_mfe?: number | null;
+        avg_mae?: number | null;
+        mfe_ge_5_rate?: number | null;
+        mae_le_minus_4_rate?: number | null;
+    };
 };
 
 type CalibrationPayload = {
@@ -73,6 +80,33 @@ type CalibrationPayload = {
     };
     by_confirmation_event?: CalibrationRow[];
     by_early_value_transition?: CalibrationRow[];
+    bottom_discovery_analysis?: {
+        status?: string;
+        min_mature_b1_samples?: number;
+        by_stage?: CalibrationRow[];
+        conversion?: {
+            b0_unique_stocks?: number;
+            converted_to_b1?: number;
+            conversion_rate?: number | null;
+            median_wait_calendar_days?: number | null;
+        };
+        formal_confirmation?: {
+            window_calendar_days?: number;
+            b1_unique_stocks?: number;
+            mature_b1_followups?: number;
+            confirmed_stocks?: number;
+            confirmation_rate?: number | null;
+            median_wait_calendar_days?: number | null;
+            within_10_days?: number;
+        };
+        strict_strategy_lead?: {
+            window_calendar_days?: number;
+            mature_b1_followups?: number;
+            matched_stocks?: number;
+            match_rate?: number | null;
+            median_lead_calendar_days?: number | null;
+        };
+    };
     blocker_analysis?: {
         summary?: { review_rules?: number; valid_filters?: number };
         items?: Array<{
@@ -221,6 +255,46 @@ type ResearchContext = {
     analysis_framework?: string[];
 };
 
+type SignalMetric = {
+    signals?: number;
+    avg_return?: number;
+    win_rate?: number;
+};
+
+type SignalPerformanceCohort = {
+    cohort?: string;
+    alert_to_close?: SignalMetric;
+    ret_5d?: SignalMetric;
+};
+
+type SignalPerformanceItem = {
+    signal_id?: string;
+    code?: string;
+    name?: string;
+    grade?: string;
+    sop_base_grade?: string;
+    sop_quality_score?: number;
+    display_quality_score?: number;
+    sop_quality_gap_to_a?: number;
+    sop_grade_reason?: string;
+};
+
+type SignalPerformancePayload = {
+    status?: string;
+    note?: string;
+    summary?: Record<string, number>;
+    validation?: Record<string, {
+        status?: string;
+        mature_5d?: number;
+        triggered_samples?: number;
+        required?: number;
+    }>;
+    strong_stock_coverage?: Record<string, number>;
+    gate_attribution?: Record<string, number>;
+    cohorts?: SignalPerformanceCohort[];
+    items?: SignalPerformanceItem[];
+};
+
 export default function ReviewCenter() {
     const [data, setData] = useState<any>(null);
     const [profitability, setProfitability] = useState<ProfitabilityPayload | null>(null);
@@ -229,6 +303,7 @@ export default function ReviewCenter() {
     const [dailyReport, setDailyReport] = useState<DailyStrategyReport | null>(null);
     const [calibration, setCalibration] = useState<CalibrationPayload | null>(null);
     const [executionReplay, setExecutionReplay] = useState<any>(null);
+    const [signalPerformance, setSignalPerformance] = useState<SignalPerformancePayload | null>(null);
     const [researchContext, setResearchContext] = useState<ResearchContext | null>(null);
     const [followup, setFollowup] = useState<any>(null);
     const [loading, setLoading] = useState(true);
@@ -249,6 +324,7 @@ export default function ReviewCenter() {
                 api.get(`/api/review/strategy-calibration-report?days=${days}`),
                 api.get('/api/review/research-context'),
                 api.get(`/api/review/execution-policy-replay?days=${days}`),
+                api.get(`/api/system/signal-performance?days=${days}`),
             ]);
             const value = (index: number) => results[index].status === 'fulfilled' ? (results[index] as PromiseFulfilledResult<any>).value.data : null;
             if (value(0)) setData(value(0));
@@ -259,6 +335,7 @@ export default function ReviewCenter() {
             if (value(5)) setCalibration(value(5));
             if (value(6)) setResearchContext(value(6));
             if (value(7)) setExecutionReplay(value(7));
+            if (value(8)) setSignalPerformance(value(8));
         } finally {
             setLoading(false);
         }
@@ -346,6 +423,8 @@ export default function ReviewCenter() {
             <CalibrationCard data={calibration} />
 
             <ExecutionReplayCard data={executionReplay} />
+
+            <SignalPerformanceCard data={signalPerformance} />
 
             <RecommendationOutcomeLoopCard data={recommendationLoop} />
 
@@ -863,6 +942,7 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
     const confirmationRows = (data?.by_confirmation_event || []).filter(row => row.value !== 'UNKNOWN');
     const earlyRows = (data?.by_early_value_transition || []).filter(row => row.value !== 'UNKNOWN');
     const reviewRules = (data?.blocker_analysis?.items || []).filter(row => row.recommendation === 'REVIEW_RULE');
+    const bottom = data?.bottom_discovery_analysis;
     const sampleText = Object.entries(monotonicity.samples || {}).map(([grade, count]) => `${grade}:${count}`).join(' / ');
     return (
         <div className="glass-card p-6">
@@ -877,9 +957,10 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
                     <MiniStat label="待复核规则" value={`${data?.blocker_analysis?.summary?.review_rules || 0}`} />
                 </div>
             </div>
-            <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-3">
+            <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-4">
                 <CalibrationRows title="确认事件" rows={confirmationRows} empty="新事件尚未形成成熟样本" />
                 <CalibrationRows title="early_value 转化" rows={earlyRows} empty="早期策略尚未形成可验证转化" />
+                <BottomDiscoveryCalibration data={bottom} />
                 <div className="rounded-md border border-slate-100 bg-white/70 p-3">
                     <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">Blocker 复核</div>
                     <div className="mt-2 space-y-2">
@@ -900,6 +981,53 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
             </div>
             <div className="mt-3 text-[10px] font-bold text-slate-400">Grade成熟样本：{sampleText || '暂无'}；{monotonicity.reason || '等待样本成熟'}</div>
             <MeasurementContractLine contract={data?.measurement_contract} />
+        </div>
+    );
+}
+
+function BottomDiscoveryCalibration({ data }: { data?: CalibrationPayload['bottom_discovery_analysis'] }) {
+    const conversion = data?.conversion || {};
+    const confirmation = data?.formal_confirmation || {};
+    const strictLead = data?.strict_strategy_lead || {};
+    const rows = data?.by_stage || [];
+    return (
+        <div className="rounded-md border border-slate-100 bg-white/70 p-3">
+            <div className="flex items-center justify-between gap-2">
+                <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">底部起涨验证</div>
+                <span className={cn(
+                    "rounded-full px-2 py-0.5 text-[9px] font-black",
+                    data?.status === 'VALIDATED' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+                )}>{data?.status || 'INSUFFICIENT_DATA'}</span>
+            </div>
+            <div className="mt-2 space-y-2">
+                {rows.map(row => (
+                    <div key={row.value} className="border-b border-slate-50 pb-2 last:border-b-0">
+                        <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs font-black text-slate-700">{row.value}</p>
+                            <p className="text-[10px] font-bold text-slate-500">5日 {formatLayerMetric(row.metrics?.['5d'])}</p>
+                        </div>
+                        <p className="mt-0.5 text-[10px] font-bold text-slate-400">
+                            成熟 {row.mature_5d || 0}/{row.signals || 0} · MFE {formatSignedPct(row.excursion_5d?.avg_mfe)} · MAE {formatSignedPct(row.excursion_5d?.avg_mae)}
+                        </p>
+                    </div>
+                ))}
+                {!rows.length && <p className="text-xs font-bold text-slate-400">等待 B0/B1 信号形成成熟样本</p>}
+            </div>
+            <p className="mt-2 text-[10px] font-bold text-slate-400">
+                B0→B1 {conversion.converted_to_b1 || 0}/{conversion.b0_unique_stocks || 0}
+                {conversion.conversion_rate != null ? `（${conversion.conversion_rate}%）` : ''}
+                {conversion.median_wait_calendar_days != null ? ` · 中位${conversion.median_wait_calendar_days}天` : ''}
+            </p>
+            <p className="mt-1 text-[10px] font-bold text-slate-400">
+                B1→可交易 {confirmation.confirmed_stocks || 0}/{confirmation.mature_b1_followups || 0}个成熟窗口
+                {confirmation.confirmation_rate != null ? `（${confirmation.confirmation_rate}%）` : ''}
+                {confirmation.median_wait_calendar_days != null ? ` · 中位${confirmation.median_wait_calendar_days}天` : ''}
+            </p>
+            <p className="mt-1 text-[10px] font-bold text-slate-400">
+                领先严格策略 {strictLead.matched_stocks || 0}只
+                {strictLead.match_rate != null ? `（覆盖${strictLead.match_rate}%）` : ''}
+                {strictLead.median_lead_calendar_days != null ? ` · 中位${strictLead.median_lead_calendar_days}天` : ''}
+            </p>
         </div>
     );
 }
@@ -933,6 +1061,116 @@ function MeasurementContractLine({ contract }: { contract?: MeasurementContract 
     );
 }
 
+function SignalPerformanceCard({ data }: { data: SignalPerformancePayload | null }) {
+    if (!data) return null;
+    const summary = data.summary || {};
+    const coverage = data.strong_stock_coverage || {};
+    const attribution = data.gate_attribution || {};
+    const validation = data.validation || {};
+    const cohort = (name: string) => (data.cohorts || []).find((item) => item.cohort === name) || {};
+    const selection = cohort('selection');
+    const execution = cohort('execution');
+    const blocked = cohort('blocked');
+    const shadow = cohort('strong_exception_shadow');
+    const ratingExplanations = (data.items || []).filter((item) => item.sop_grade_reason).slice(-3).reverse();
+    const returnText = (value?: SignalMetric) => {
+        if (!value?.signals) return '样本未成熟';
+        const average = value.avg_return ?? 0;
+        return `${average >= 0 ? '+' : ''}${average}% / 胜率${value.win_rate ?? 0}%`;
+    };
+    const cohortCards: Array<[string, SignalPerformanceCohort]> = [
+        ['选股候选', selection], ['Bark可交易', execution],
+        ['门禁拦截', blocked], ['强势例外SHADOW', shadow],
+    ];
+    return (
+        <div className="glass-card p-5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                    <h3 className="font-black text-slate-800">盘中信号点时表现</h3>
+                    <p className="mt-1 text-xs font-bold text-slate-400">选股、提醒时机、确认触发和门禁反事实分开统计</p>
+                </div>
+                <span className={cn(
+                    "rounded-full px-2.5 py-1 text-[10px] font-black",
+                    data.status === 'VALIDATED' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+                )}>{data.status || 'INSUFFICIENT_DATA'}</span>
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-5">
+                <MiniStat label="不可变快照" value={`${summary.snapshot_events || 0}`} />
+                <MiniStat label="去重候选" value={`${summary.unique_daily_candidates || 0}`} />
+                <MiniStat label="可交易样本" value={`${summary.tradable_candidates || 0}`} />
+                <MiniStat label="强势例外影子" value={`${summary.strong_exception_shadow || 0}`} />
+                <MiniStat label="5日成熟" value={`${summary.mature_5d || 0}`} />
+            </div>
+            <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+                {[
+                    ['选股有效性', validation.selection, 'mature_5d'],
+                    ['可交易判断', validation.execution, 'mature_5d'],
+                    ['确认触发', validation.confirmation, 'triggered_samples'],
+                ].map(([label, item, countKey]) => {
+                    const state = item as { status?: string; mature_5d?: number; triggered_samples?: number; required?: number } | undefined;
+                    const count = state?.[countKey as 'mature_5d' | 'triggered_samples'] || 0;
+                    const valid = state?.status === 'VALIDATED';
+                    return (
+                        <div key={label as string} className="rounded-xl border border-slate-100 bg-white p-3">
+                            <div className="flex items-center justify-between gap-2">
+                                <span className="text-xs font-black text-slate-700">{label as string}</span>
+                                <span className={cn(
+                                    "rounded-full px-2 py-0.5 text-[10px] font-black",
+                                    valid ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+                                )}>{valid ? '样本已成熟' : '样本不足'}</span>
+                            </div>
+                            <div className="mt-1 text-[11px] font-bold text-slate-400">{count}/{state?.required || 30}</div>
+                        </div>
+                    );
+                })}
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {cohortCards.map(([label, item]) => (
+                    <div key={label} className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                        <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">{label}</div>
+                        <div className="mt-2 text-sm font-black text-slate-700">提醒→收盘 {returnText(item.alert_to_close)}</div>
+                        <div className="mt-1 text-xs font-bold text-slate-500">5日 {returnText(item.ret_5d)}</div>
+                    </div>
+                ))}
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                <div className="rounded-xl border border-slate-100 bg-white p-3 text-xs font-bold text-slate-600">
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">强股覆盖</div>
+                    <div className="grid grid-cols-3 gap-2">
+                        <span>Top20 {coverage.top20_hits || 0}（{coverage.top20_coverage_pct || 0}%）</span>
+                        <span>Top50 {coverage.top50_hits || 0}（{coverage.top50_coverage_pct || 0}%）</span>
+                        <span>Top100 {coverage.top100_hits || 0}（{coverage.top100_coverage_pct || 0}%）</span>
+                    </div>
+                </div>
+                <div className="rounded-xl border border-slate-100 bg-white p-3 text-xs font-bold text-slate-600">
+                    <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">门禁归因</div>
+                    <div className="grid grid-cols-2 gap-2">
+                        <span>避免亏损 {attribution.RISK_GATE_SAVED_LOSS || 0}</span>
+                        <span>漏掉赢家 {attribution.RISK_GATE_MISSED_WINNER || 0}</span>
+                        <span>确认触发 {attribution.CONFIRMATION_TRIGGERED || 0}</span>
+                        <span>结果未成熟 {attribution.NO_5D_OUTCOME || 0}</span>
+                    </div>
+                </div>
+            </div>
+            {ratingExplanations.length > 0 && (
+                <div className="mt-4 rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">最近评级解释</div>
+                    <div className="mt-2 space-y-2">
+                        {ratingExplanations.map((item) => (
+                            <div key={item.signal_id || `${item.code}-${item.grade}`} className="text-xs font-bold text-slate-600">
+                                <span className="font-black text-slate-800">{item.name || item.code}：</span>
+                                基础{item.sop_base_grade || item.grade || '--'}→最终{item.grade || '--'}；质量分{Math.max(0, Math.min(100, item.display_quality_score ?? item.sop_quality_score ?? 0)).toFixed(1)}/100；{item.sop_grade_reason}
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+            {data.note && <p className="mt-3 text-xs font-bold text-slate-400">{data.note}</p>}
+        </div>
+    );
+}
+
+
 function ExecutionReplayCard({ data }: { data: any }) {
     if (!data) return null;
     const statusTone = data.verdict === 'SUPPORTED' ? 'text-emerald-600' : data.verdict === 'NOT_SUPPORTED' ? 'text-rose-600' : 'text-amber-600';
@@ -940,6 +1178,9 @@ function ExecutionReplayCard({ data }: { data: any }) {
     const evidence = data.evidence_quality || {};
     const grades = evidence.grade_distribution || {};
     const attribution = evidence.attribution || {};
+    const operation = data.operation_advice_validation || {};
+    const barkEvidence = operation.actual_bark_evidence || {};
+    const actualFillEvidence = barkEvidence.actual_fill_evidence || {};
     return (
         <div className="glass-card p-5">
             <div className="flex items-center justify-between mb-4">
@@ -950,6 +1191,26 @@ function ExecutionReplayCard({ data }: { data: any }) {
                 <span className={cn("text-sm font-black", statusTone)}>{data.verdict || 'UNKNOWN'}</span>
             </div>
             <p className="text-xs font-bold text-slate-600 mb-4">{data.verdict_reason || '暂无验证结论'}</p>
+            <div className={cn(
+                "mb-4 rounded-xl border p-3",
+                barkEvidence.status === 'VALIDATED' ? 'border-emerald-100 bg-emerald-50/60' : 'border-amber-100 bg-amber-50/60'
+            )}>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                        <div className="text-xs font-black text-slate-800">真实 Bark 指令证据</div>
+                        <div className="mt-1 text-[10px] font-bold text-slate-500">研究候选与已发送“可交易”指令分开验收</div>
+                    </div>
+                    <span className="text-[10px] font-black text-amber-700">{barkEvidence.status || 'INSUFFICIENT_DATA'}</span>
+                </div>
+                <div className="mt-3 grid grid-cols-2 gap-2 lg:grid-cols-5">
+                    <MiniStat label="生成可交易" value={`${barkEvidence.tradable_instructions || 0}`} />
+                    <MiniStat label="已发送审计" value={`${barkEvidence.audited_delivered_instructions || 0}`} hot={(barkEvidence.audited_delivered_instructions || 0) > 0} />
+                    <MiniStat label="记录真实成交" value={`${actualFillEvidence.fills || 0}`} hot={(actualFillEvidence.fills || 0) > 0} />
+                    <MiniStat label="真实成交成熟" value={`${actualFillEvidence.mature || 0}`} />
+                    <MiniStat label="验收门槛" value={`${barkEvidence.required || 30}`} />
+                </div>
+                <p className="mt-2 text-[10px] font-bold text-slate-500">{barkEvidence.note || '等待真实指令样本积累'}</p>
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
                 {policies.map((item: any) => (
                     <div key={item.policy} className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">

@@ -16,6 +16,8 @@ from core.data import (
     get_cached_data,
     get_stale_cache,
     set_cached_data,
+    snapshot_data_date,
+    snapshot_matches_date,
 )
 from core.db import get_db_engine, get_scan_dates, get_scan_history_by_date
 from core.sector_strength import build_sector_strength, build_sector_leaders, build_sector_history_context, classify_sector_role
@@ -59,7 +61,13 @@ def _get_local_market_snapshot(engine) -> pd.DataFrame:
     latest["pct_chg"] = latest["pct_chg"].fillna(0).round(2)
     latest["price"] = latest["close"]
     latest["turnover"] = 0
-    return latest[["code", "name", "price", "high", "low", "pct_chg", "vol", "turnover"]]
+    snapshot = latest[["code", "name", "price", "high", "low", "pct_chg", "vol", "turnover"]]
+    snapshot.attrs = {
+        "data_date": str(latest["date"].max())[:10],
+        "fetched_at": datetime.now(),
+        "source": "local_daily_k",
+    }
+    return snapshot
 
 
 def fetch_mine_sweeper_data() -> Dict[str, List[str]]:
@@ -156,25 +164,25 @@ def get_sector_strength(limit: int = 20, force: bool = False):
     try:
         safe_limit = max(1, min(limit, 100))
         cache_key = f"sector_strength:{safe_limit}"
+        expected_date = datetime.now().strftime("%Y-%m-%d")
         if not force:
             cached = get_cached_data(cache_key, 300)
-            if cached:
+            if cached and cached.get("data_date") == expected_date:
                 return {**cached, "cache_hit": True}
             stale = get_stale_cache(cache_key)
-            if stale:
+            if stale and stale.get("data_date") == expected_date:
                 return {**stale, "cache_hit": True, "cache_stale": True}
 
         engine = get_db_engine()
         if force:
-            snapshot = get_market_snapshot()
+            snapshot = get_market_snapshot(force_refresh=True)
             sector_trends = get_sector_trends()
         else:
-            snapshot = get_cached_data("market_snapshot", 300)
-            if snapshot is None:
-                snapshot = get_stale_cache("market_snapshot")
-            if snapshot is None:
+            snapshot = get_market_snapshot()
+            if not snapshot_matches_date(snapshot, expected_date):
                 snapshot = _get_local_market_snapshot(engine)
             sector_trends = get_cached_data("sector_trends", 600) or get_stale_cache("sector_trends") or {}
+        data_date = snapshot_data_date(snapshot)
         sector_map = get_sector_map()
         history_context = build_sector_history_context(engine, sector_map)
         strength = build_sector_strength(snapshot, sector_map, sector_trends, history_context)
@@ -230,6 +238,7 @@ def get_sector_strength(limit: int = 20, force: bool = False):
         )[:safe_limit]
         payload = {
             "items": items,
+            "data_date": data_date,
             "updated_at": datetime.now().isoformat(),
             "cache_hit": False,
             "cache_ttl_sec": 300,
@@ -296,6 +305,13 @@ def get_market_regime(strategy_type: str = "squeeze"):
 def get_market_sentiment():
     """获取市场情绪数据：涨跌停家数，连板高度"""
     try:
+        engine = get_db_engine()
+        snapshot = get_market_snapshot()
+        snapshot_source = str((getattr(snapshot, "attrs", {}) or {}).get("source") or "live")
+        if snapshot is None or snapshot.empty:
+            snapshot = _get_local_market_snapshot(engine)
+            snapshot_source = "local_daily_k"
+
         from core.data import get_tool_trade_date_hist
         trade_dates = get_tool_trade_date_hist()
         trade_dates['trade_date'] = pd.to_datetime(trade_dates['trade_date'])
@@ -306,6 +322,11 @@ def get_market_sentiment():
             return {"error": "No trade dates found"}
         
         latest_date = past_dates.iloc[-1]['trade_date']
+        quote_date = snapshot_data_date(snapshot)
+        if quote_date:
+            quote_timestamp = pd.to_datetime(quote_date, errors="coerce")
+            if pd.notna(quote_timestamp) and quote_timestamp <= today:
+                latest_date = quote_timestamp
         date_str = latest_date.strftime("%Y%m%d")
 
         # 涨停池
@@ -336,15 +357,6 @@ def get_market_sentiment():
         from core.data import get_market_regime as get_market_regime_data
         from core.decision_layer import build_market_decision_context, load_market_cycle_history
 
-        engine = get_db_engine()
-        snapshot = get_market_snapshot()
-        snapshot_source = "live"
-        if snapshot is None or snapshot.empty:
-            snapshot = get_stale_cache("market_snapshot")
-            snapshot_source = "stale_cache"
-        if snapshot is None or snapshot.empty:
-            snapshot = _get_local_market_snapshot(engine)
-            snapshot_source = "local_daily_k"
         decision = build_market_decision_context(
             snapshot,
             get_market_regime_data(),

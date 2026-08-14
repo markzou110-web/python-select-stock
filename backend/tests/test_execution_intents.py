@@ -50,6 +50,107 @@ def test_only_delivered_tradable_candidate_creates_idempotent_intent():
     assert snapshot["evidence_grade"] == "A"
 
 
+def test_intent_persists_risk_normalized_position_plan_when_legacy_field_is_missing():
+    engine = _engine()
+    stock = _stock()
+    stock.pop("suggested_position_pct")
+    stock["现价"] = 10.1
+    stock["position_plan"] = {
+        "initial_position_pct": 4.5,
+        "max_position_pct": 4.5,
+        "risk_budget_pct": 1.0,
+    }
+    stock["execution_instruction"] = "站稳10.00后执行4.5%，跌破9.10退出"
+
+    intent_id = create_bark_execution_intents(
+        [stock], engine, issued_at=datetime(2026, 7, 10, 14, 20),
+    )[0]
+    detail = get_execution_intent(engine, intent_id)
+    snapshot = json.loads(detail["intent"]["signal_snapshot"])
+
+    assert detail["intent"]["planned_position_pct"] == 4.5
+    assert snapshot["signal_price"] == 10.1
+    assert snapshot["position_plan"]["risk_budget_pct"] == 1.0
+    assert "4.5%" in snapshot["execution_instruction"]
+
+
+def test_intent_persists_a_minus_trial_policy_for_health_loop():
+    engine = _engine()
+    stock = _stock()
+    stock.update({
+        "sop_grade": "B",
+        "a_minus_trial": True,
+        "a_minus_trial_grade": "A-",
+        "a_minus_trial_policy_version": "a-minus-controlled-trial-v1",
+        "position_plan": {"initial_position_pct": 5, "max_position_pct": 5},
+    })
+
+    intent_id = create_bark_execution_intents(
+        [stock], engine, issued_at=datetime(2026, 7, 10, 14, 20),
+    )[0]
+    snapshot = json.loads(get_execution_intent(engine, intent_id)["intent"]["signal_snapshot"])
+
+    assert snapshot["grade"] == "B"
+    assert snapshot["a_minus_trial"] is True
+    assert snapshot["a_minus_trial_grade"] == "A-"
+    assert snapshot["a_minus_trial_policy_version"] == "a-minus-controlled-trial-v1"
+
+
+def test_intent_persists_a_eod_controlled_policy_and_limits():
+    engine = _engine()
+    stock = _stock()
+    stock.update({
+        "sop_grade": "B",
+        "a_eod_controlled_trial": True,
+        "a_eod_policy_version": "a-eod-controlled-trial-v1",
+        "a_eod_trade_cautions": ["周线中性，降级观察"],
+        "a_eod_portfolio_cap_pct": 15,
+        "a_eod_max_positions": 3,
+        "position_plan": {"initial_position_pct": 5, "max_position_pct": 5},
+    })
+
+    intent_id = create_bark_execution_intents(
+        [stock], engine, issued_at=datetime(2026, 8, 6, 14, 30),
+    )[0]
+    snapshot = json.loads(get_execution_intent(engine, intent_id)["intent"]["signal_snapshot"])
+
+    assert snapshot["a_eod_controlled_trial"] is True
+    assert snapshot["a_eod_policy_version"] == "a-eod-controlled-trial-v1"
+    assert snapshot["a_eod_trade_cautions"] == ["周线中性，降级观察"]
+    assert snapshot["a_eod_portfolio_cap_pct"] == 15
+    assert snapshot["a_eod_max_positions"] == 3
+
+
+def test_intent_persists_a_eod_t1_confirmation_policy():
+    engine = _engine()
+    stock = _stock()
+    stock.update({
+        "a_eod_t1_confirmed": True,
+        "a_eod_t1_policy_version": "a-eod-t1-confirmation-v1",
+        "a_eod_t1_frozen_entry_price": 9.9,
+        "a_eod_t1_entry_extension_pct": 1.01,
+        "a_eod_t1_portfolio_cap_pct": 6,
+        "a_eod_t1_max_positions": 3,
+        "pa_execution_policy_version": "pa-execution-tier-v1",
+        "pa_execution_tier": "T1_CONFIRM",
+        "pa_execution_tier_label": "次日确认",
+        "position_plan": {"initial_position_pct": 2, "max_position_pct": 2},
+    })
+
+    intent_id = create_bark_execution_intents(
+        [stock], engine, issued_at=datetime(2026, 8, 7, 10, 30),
+    )[0]
+    snapshot = json.loads(get_execution_intent(engine, intent_id)["intent"]["signal_snapshot"])
+
+    assert snapshot["a_eod_t1_confirmed"] is True
+    assert snapshot["a_eod_t1_policy_version"] == "a-eod-t1-confirmation-v1"
+    assert snapshot["a_eod_t1_frozen_entry_price"] == 9.9
+    assert snapshot["a_eod_t1_portfolio_cap_pct"] == 6
+    assert snapshot["a_eod_t1_max_positions"] == 3
+    assert snapshot["pa_execution_policy_version"] == "pa-execution-tier-v1"
+    assert snapshot["pa_execution_tier"] == "T1_CONFIRM"
+
+
 def test_intent_lifecycle_records_timeline_and_slippage():
     engine = _engine()
     intent_id = create_bark_execution_intents([_stock()], engine, issued_at=datetime(2026, 7, 10, 14, 20))[0]

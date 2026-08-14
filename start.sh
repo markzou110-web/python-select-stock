@@ -10,6 +10,34 @@ export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
 
+check_pid_file_not_running() {
+    local pid_file="$1"
+    local label="$2"
+    local expected="$3"
+    [ -f "$pid_file" ] || return 0
+
+    local pid command
+    pid=$(tr -cd '0-9' < "$pid_file")
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    if [ -n "$pid" ] && [[ "$command" == *"$expected"* ]]; then
+        echo "❌ $label 已在运行 (PID: $pid)"
+        return 1
+    fi
+    return 0
+}
+
+SERVICES_ALREADY_RUNNING=0
+check_pid_file_not_running ".backend_pid" "后端" "api.py" || SERVICES_ALREADY_RUNNING=1
+check_pid_file_not_running ".celery_realtime_pid" "Celery 实时队列" "celery" || SERVICES_ALREADY_RUNNING=1
+check_pid_file_not_running ".celery_scan_pid" "Celery 扫描队列" "celery" || SERVICES_ALREADY_RUNNING=1
+check_pid_file_not_running ".celery_maintenance_pid" "Celery 维护队列" "celery" || SERVICES_ALREADY_RUNNING=1
+check_pid_file_not_running ".celery_beat_pid" "Celery 调度器" "celery" || SERVICES_ALREADY_RUNNING=1
+check_pid_file_not_running ".frontend_pid" "前端" "next" || SERVICES_ALREADY_RUNNING=1
+if [ "$SERVICES_ALREADY_RUNNING" -ne 0 ]; then
+    echo "请先运行 ./stop.sh，再重新执行 ./start.sh。"
+    exit 1
+fi
+
 echo "============================================================"
 echo " Alpha Vision 启动"
 echo "============================================================"
@@ -76,13 +104,19 @@ fi
 
 # 检查 Redis 状态
 echo "检查 Redis 连接状态..."
-if nc -z localhost 6379 2>/dev/null || ping -c 1 localhost &> /dev/null; then
-    echo "启动 Celery Worker (任务队列)..."
-    python3 -m celery -A core.celery_app.celery_app worker -B --loglevel=info > celery.log 2>&1 &
-    CELERY_PID=$!
-    echo "Celery PID: $CELERY_PID"
+if command -v redis-cli &> /dev/null && redis-cli ping 2>/dev/null | grep -q PONG; then
+    echo "启动 Celery 实时、扫描、维护队列及独立调度器..."
+    python3 -m celery -A core.celery_app.celery_app worker -Q realtime -n realtime@%h --loglevel=info > celery-realtime.log 2>&1 &
+    CELERY_REALTIME_PID=$!
+    python3 -m celery -A core.celery_app.celery_app worker -Q scan -n scan@%h --loglevel=info > celery-scan.log 2>&1 &
+    CELERY_SCAN_PID=$!
+    python3 -m celery -A core.celery_app.celery_app worker -Q maintenance,celery -n maintenance@%h --loglevel=info > celery-maintenance.log 2>&1 &
+    CELERY_MAINTENANCE_PID=$!
+    python3 -m celery -A core.celery_app.celery_app beat --loglevel=info > celery-beat.log 2>&1 &
+    CELERY_BEAT_PID=$!
+    echo "Celery PIDs: realtime=$CELERY_REALTIME_PID scan=$CELERY_SCAN_PID maintenance=$CELERY_MAINTENANCE_PID beat=$CELERY_BEAT_PID"
 else
-    echo "⚠️ 警告: Redis 可能未运行或无法连接。请运行 docker-compose up -d redis 否则扫描功能可能卡住！"
+    echo "⚠️ 警告: Redis 未通过 PING 检查，不启动 Celery，避免任务进入不可用状态。"
 fi
 
 # 启动后端
@@ -91,8 +125,33 @@ python3 api.py &
 BACKEND_PID=$!
 echo "后端 PID: $BACKEND_PID"
 
-# 等待后端启动
-sleep 3
+# 后端完成数据库、交易日历等初始化后再启动前端，避免前端首屏请求产生批量 Network Error。
+BACKEND_HEALTH_URL="http://127.0.0.1:8000/api/health"
+BACKEND_HEALTH_TIMEOUT_SECONDS=60
+BACKEND_READY=0
+echo "等待后端健康检查..."
+for ((attempt=1; attempt<=BACKEND_HEALTH_TIMEOUT_SECONDS; attempt++)); do
+    if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+        echo "❌ 后端进程已退出，停止启动前端"
+        break
+    fi
+    if curl -fsS --max-time 2 "$BACKEND_HEALTH_URL" >/dev/null 2>&1; then
+        BACKEND_READY=1
+        echo "后端健康检查: OK ($BACKEND_HEALTH_URL)"
+        break
+    fi
+    sleep 1
+done
+
+if [ "$BACKEND_READY" -ne 1 ]; then
+    echo "❌ 后端在 ${BACKEND_HEALTH_TIMEOUT_SECONDS} 秒内未就绪，停止本次启动"
+    kill -TERM "$BACKEND_PID" 2>/dev/null || true
+    [ -n "$CELERY_REALTIME_PID" ] && kill -TERM "$CELERY_REALTIME_PID" 2>/dev/null || true
+    [ -n "$CELERY_SCAN_PID" ] && kill -TERM "$CELERY_SCAN_PID" 2>/dev/null || true
+    [ -n "$CELERY_MAINTENANCE_PID" ] && kill -TERM "$CELERY_MAINTENANCE_PID" 2>/dev/null || true
+    [ -n "$CELERY_BEAT_PID" ] && kill -TERM "$CELERY_BEAT_PID" 2>/dev/null || true
+    exit 1
+fi
 
 # 启动前端
 echo ""
@@ -127,8 +186,11 @@ cd "$PROJECT_DIR"
 echo "$BACKEND_PID" > .backend_pid
 echo "$FRONTEND_PID" > .frontend_pid
 echo "http://localhost:3000" > .frontend_url
-if [ ! -z "$CELERY_PID" ]; then
-    echo "$CELERY_PID" > .celery_pid
+if [ ! -z "$CELERY_REALTIME_PID" ]; then
+    echo "$CELERY_REALTIME_PID" > .celery_realtime_pid
+    echo "$CELERY_SCAN_PID" > .celery_scan_pid
+    echo "$CELERY_MAINTENANCE_PID" > .celery_maintenance_pid
+    echo "$CELERY_BEAT_PID" > .celery_beat_pid
 fi
 
 echo ""

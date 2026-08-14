@@ -247,15 +247,69 @@ def get_stale_cache(key: str) -> Optional[Any]:
             return CACHE[key][0]
         return None
 
+
+def snapshot_data_date(snapshot: Any) -> Optional[str]:
+    """Return the explicit quote date carried by a market snapshot."""
+    attrs = getattr(snapshot, "attrs", {}) or {}
+    value = attrs.get("data_date")
+    if value:
+        return str(value)[:10]
+    fetched_at = attrs.get("fetched_at")
+    if isinstance(fetched_at, datetime):
+        return fetched_at.strftime("%Y-%m-%d")
+    return None
+
+
+def snapshot_matches_date(snapshot: Any, expected_date: str) -> bool:
+    """Reject cross-day quote reuse when a caller requires one trading date."""
+    if snapshot is None or (hasattr(snapshot, "empty") and snapshot.empty):
+        return False
+    return snapshot_data_date(snapshot) == str(expected_date)[:10]
+
+
+def _expected_snapshot_date(now: Optional[datetime] = None) -> str:
+    now = now or datetime.now()
+    try:
+        from core.trading_calendar import is_a_share_trading_day
+        if is_a_share_trading_day(now):
+            return now.strftime("%Y-%m-%d")
+        dates = get_tool_trade_date_hist()
+        parsed = pd.to_datetime(dates.get("trade_date"), errors="coerce").dropna()
+        parsed = parsed[parsed <= now]
+        if not parsed.empty:
+            return parsed.max().strftime("%Y-%m-%d")
+    except Exception as exc:
+        logger.debug(f"Expected snapshot date fallback failed: {exc}")
+    return now.strftime("%Y-%m-%d")
+
+
+def _infer_snapshot_data_date(snapshot: pd.DataFrame, fetched_at: datetime) -> str:
+    if "quote_time" in snapshot.columns:
+        values = snapshot["quote_time"].dropna().astype(str).str.extract(r"(\d{4})[-/]?(\d{2})[-/]?(\d{2})")
+        values = values.dropna()
+        if not values.empty:
+            dates = values.agg("-".join, axis=1)
+            if not dates.empty:
+                return str(dates.mode().iloc[0])
+    return _expected_snapshot_date(fetched_at)
+
 def get_market_snapshot(force_refresh: bool = False) -> pd.DataFrame:
     """获取全市场实时快照 (v6.0 - 引入 resilient_fetch 多源容灾弹性重构)"""
     # P0：在 get_cached_data 调用前先持有 stale 引用。因为 get_cached_data 命中过期条目时
     # 会 del CACHE[key]，导致后续 get_stale_cache 取不到全失败兜底用的旧快照。
     # 提前持有引用可避免这个时序问题，且对新启动（无缓存）场景无副作用。
+    expected_date = _expected_snapshot_date()
     stale_fallback = get_stale_cache('market_snapshot')
+    if stale_fallback is not None and not snapshot_matches_date(stale_fallback, expected_date):
+        logger.warning(
+            "Ignoring cross-day stale market snapshot: expected=%s actual=%s",
+            expected_date,
+            snapshot_data_date(stale_fallback) or "unknown",
+        )
+        stale_fallback = None
     # 增加 60 秒的高速缓存，防止双策略或并发扫描时频繁高负荷请求
     cached = None if force_refresh else get_cached_data('market_snapshot', 60)
-    if cached is not None:
+    if cached is not None and snapshot_matches_date(cached, expected_date):
         logger.info("Using cached market snapshot data.")
         return cached
 
@@ -339,9 +393,15 @@ def get_market_snapshot(force_refresh: bool = False) -> pd.DataFrame:
                 for code, quote in quotes.items():
                     mcap_yi = quote.get("mcap_yi")
                     float_mcap_yi = quote.get("float_mcap_yi")
+                    # get_stock_basic_map() 的正式契约是 {code: industry}；测试和
+                    # 少量旧调用也可能传入字典值，兼容两者但不改变返回结构。
+                    basic = basic_map.get(code)
+                    industry = basic.get("industry") if isinstance(basic, dict) else basic
                     results.append({
                         'code': code,
                         'name': quote.get("name", ""),
+                        'industry': industry,
+                        'quote_time': quote.get("quote_time") or "",
                         'price': quote.get("price") or None,
                         'open': quote.get("open") or None,
                         'high': quote.get("high") or quote.get("price") or None,
@@ -438,19 +498,37 @@ def get_market_snapshot(force_refresh: bool = False) -> pd.DataFrame:
 
         # P1：在 DataFrame 上挂行情元数据，供 Bark 推送生成"⏱️ 行情 HH:MM · 源"标注。
         # 沿用 scanner.py:1246 已有的 df.attrs['data_date'] 范式（pandas 2.2.2 支持）。
-        df.attrs = {'fetched_at': datetime.now(), 'source': _last_snapshot_source}
+        fetched_at = datetime.now()
+        df.attrs = {
+            'fetched_at': fetched_at,
+            'data_date': _infer_snapshot_data_date(df, fetched_at),
+            'source': _last_snapshot_source,
+        }
 
         # 存入缓存
         set_cached_data('market_snapshot', df)
         return df
 
-    # P0：所有实时源失败时，退回函数开头持有的过期快照（stale），而非空 DF。
-    # 用 stale_fallback（函数开头已持有），因为此时 get_cached_data 可能已删除过期 key。
-    # 不刷新缓存时间戳，保持其"过期"属性；attrs.source 标记为过期，供 P1 加 ⚠️。
+    # Celery workers do not share memory. Reuse only a complete same-day snapshot
+    # persisted by another scan before accepting an older in-process stale cache.
+    try:
+        from core.db import load_recent_point_in_time_snapshot
+        persisted = load_recent_point_in_time_snapshot(max_age_minutes=FRESHNESS_WARN_THRESHOLD_MIN)
+        if persisted is not None and snapshot_matches_date(persisted, expected_date):
+            logger.warning("All real-time sources failed. Using recent persisted cross-worker snapshot.")
+            set_cached_data('market_snapshot', persisted)
+            return persisted
+    except Exception as exc:
+        logger.warning(f"Persisted market snapshot fallback unavailable: {exc}")
+
     if stale_fallback is not None and not stale_fallback.empty:
         logger.warning("All real-time sources failed. Falling back to stale snapshot (may lag minutes).")
-        stale_fallback.attrs = {'fetched_at': getattr(stale_fallback, 'attrs', {}).get('fetched_at'),
-                                'source': STALE_SNAPSHOT_WARN}
+        stale_attrs = getattr(stale_fallback, 'attrs', {}) or {}
+        stale_fallback.attrs = {
+            'fetched_at': stale_attrs.get('fetched_at'),
+            'data_date': stale_attrs.get('data_date') or expected_date,
+            'source': STALE_SNAPSHOT_WARN,
+        }
         return stale_fallback
 
     logger.error("All real-time snapshot sources failed and no stale cache available.")
@@ -948,6 +1026,9 @@ def get_index_hist(code: str) -> pd.DataFrame:
     cached = get_cached_data(cache_key, 86400)
     if cached is not None:
         return cached
+    unavailable_cache_key = f'{cache_key}_unavailable'
+    if get_cached_data(unavailable_cache_key, 60) is not None:
+        return pd.DataFrame()
 
     def _min_valid_index_close(index_code: str) -> float:
         return {
@@ -975,10 +1056,14 @@ def get_index_hist(code: str) -> pd.DataFrame:
         from sqlalchemy import text
         engine = get_db_engine()
         if engine:
-            # 只取真正的指数代码（上证指数 sh000001、沪深300 000300），
-            # 不再用个股 000001 冒充指数
-            index_code = code if code in ("000001", "000300", "399006") else None
-            if index_code:
+            # 指数使用带市场前缀的独立代码，彻底避开 000001（平安银行）
+            # 与 000001（上证指数）的六位代码冲突。
+            local_index_code = {
+                "000001": "sh000001",
+                "000300": "sh000300",
+                "399006": "sz399006",
+            }.get(code)
+            if local_index_code:
                 query = text("""
                     SELECT date as "日期", close as "收盘", open as "开盘",
                            high as "最高", low as "最低", vol as "成交量"
@@ -987,25 +1072,30 @@ def get_index_hist(code: str) -> pd.DataFrame:
                     ORDER BY date DESC LIMIT 500
                 """)
                 with engine.connect() as conn:
-                    df_local = pd.read_sql(query, conn, params={"code": index_code})
+                    df_local = pd.read_sql(query, conn, params={"code": local_index_code})
                     df_local = df_local.sort_values("日期").reset_index(drop=True)
                     if not df_local.empty:
                         # 关键修复：指数 6 位代码会与个股代码冲突。
                         # 例如 000001 在指数语境是上证，在个股语境是平安银行。
                         # 用合理点位下限识别污染数据，绝不把个股当指数。
                         latest_close = float(df_local["收盘"].iloc[-1])
-                        min_close = _min_valid_index_close(index_code)
+                        min_close = _min_valid_index_close(code)
                         if latest_close < min_close:
                             logger.warning(
-                                f"Local index fallback for {index_code} is suspicious "
+                                f"Local index fallback for {local_index_code} is suspicious "
                                 f"(close={latest_close:.2f}, expected >= {min_close:.0f}). "
                                 "Refusing to use it as benchmark; returning empty."
                             )
                         else:
-                            logger.info(f"Loaded index {index_code} from local database as fallback (rows: {len(df_local)})")
+                            logger.info(
+                                f"Loaded index {local_index_code} from local database "
+                                f"as fallback (rows: {len(df_local)})"
+                            )
                             return df_local
-            logger.warning(f"Index {code} not in known index codes or no local data, returning empty (no stock-substitute fallback)")
-            return pd.DataFrame()
+            logger.warning(
+                f"Index {code} has no independent local data; trying final fallback "
+                "(stock-substitute disabled)"
+            )
     except Exception as e:
         logger.warning(f"Fallback loading 000001 from local database failed: {e}")
 
@@ -1034,7 +1124,10 @@ def get_index_hist(code: str) -> pd.DataFrame:
         logger.warning(f"akshare fallback for {code} timed out or failed after 5s.")
     except Exception as e:
         logger.debug(f"Error fetching index hist for {code}: {e}")
-        
+
+    # K-line calculation can request the same benchmark more than once. Cache a
+    # failed lookup briefly so one provider outage does not multiply 5s waits.
+    set_cached_data(unavailable_cache_key, True)
     return pd.DataFrame()
 
 def get_tool_trade_date_hist() -> pd.DataFrame:

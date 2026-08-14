@@ -4,7 +4,30 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.score_calibration import calibrate_scan_scores
+from core.score_calibration import apply_score_display_contract, calibrate_scan_scores
+
+
+def test_display_scores_are_bounded_without_changing_internal_scores():
+    row = {
+        "Score": 132.02,
+        "calibrated_score": 108,
+        "sop_quality_score": 104.5,
+        "trade_opportunity_score": -3,
+        "final_rank_score": 145,
+        "final_trade_score": 121,
+    }
+
+    apply_score_display_contract([row])
+
+    assert row["Score"] == 132.02
+    assert row["final_rank_score"] == 145
+    assert row["final_trade_score"] == 121
+    assert row["display_signal_score"] == 100
+    assert row["display_quality_score"] == 100
+    assert row["display_opportunity_score"] == 0
+    assert row["display_rank_score"] == 100
+    assert row["display_trade_score"] == 100
+    assert row["score_display_scale"] == "0-100"
 
 
 def test_calibrated_score_includes_win_rate():
@@ -75,11 +98,48 @@ def test_weights_sum_to_one():
 # 改动 A5：权重调参（胜率双重计入 + 小样本折扣）
 # ---------------------------------------------------------------------------
 
-def test_win_rate_weight_reduced_in_calibration():
-    """A5：W_HISTORICAL_WIN_RATE 从 0.10 降到 0.05（避免与 scanner 层双重计入）。"""
-    from core.score_calibration import W_HISTORICAL_WIN_RATE, W_TRADE_OPPORTUNITY
+def test_execution_first_calibration_weights():
+    from core.score_calibration import (
+        W_HISTORICAL_WIN_RATE,
+        W_PRICE_ACTION,
+        W_SECTOR_ALIGNMENT,
+        W_STRATEGY_PERCENTILE,
+        W_TRADE_OPPORTUNITY,
+    )
     assert W_HISTORICAL_WIN_RATE == 0.05, "A5: calibration 历史胜率权重应降至0.05"
-    assert W_TRADE_OPPORTUNITY == 0.30, "A5: trade_opportunity 权重应升至0.30"
+    assert W_STRATEGY_PERCENTILE == 0.15
+    assert W_PRICE_ACTION == 0.50
+    assert W_SECTOR_ALIGNMENT == 0.20
+    assert W_TRADE_OPPORTUNITY == 0.10
+
+
+def test_execution_first_score_penalizes_extension_and_updates_ranking():
+    base = {
+        "strategy_type": "tv_dual_strict",
+        "Score": 80,
+        "pa_structure_score": 75,
+        "pa_execution_score": 75,
+        "pa_risk_score": 75,
+        "sector_alignment_score": 80,
+        "trade_opportunity_score": 70,
+        "历史胜率": "55%",
+        "pa_trade_action": "READY",
+        "trade_bucket": "OBSERVE",
+        "market_regime": "OFFENSIVE",
+        "final_rank_score": 90,
+        "final_trade_score": 92,
+    }
+    controlled = {**base, "pct_5d": 6, "涨幅%": 3}
+    extended = {**base, "代码": "000002", "pct_5d": 18, "涨幅%": 8}
+
+    calibrate_scan_scores([controlled, extended])
+
+    assert controlled["calibrated_score"] > extended["calibrated_score"]
+    assert extended["score_components"]["extension_penalty"] == 15.0
+    assert controlled["score_model_version"] == "execution-first-v2"
+    assert controlled["final_rank_score"] == round(
+        90 + controlled["score_ranking_delta"], 2,
+    )
 
 
 def test_small_sample_win_rate_discount():

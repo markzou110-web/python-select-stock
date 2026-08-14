@@ -48,10 +48,12 @@ MIN_REQUIRED_TRADING_DAYS = 950
 # 平均返回 990~996 天，足以覆盖 950 天阈值，确保回填后稳定收敛。
 HISTORY_LOOKBACK_CALENDAR_DAYS = 1500
 
-# 批量同步并发度。DB 连接池上限为 30（pool_size=10 + max_overflow=20），
-# 24 个 worker 既能充分并行又留有余量；akshare 调用为 I/O bound，GIL 不阻塞。
-# 如遇数据源限流，可下调此值。
-SYNC_MAX_WORKERS = 24
+# 批量同步并发度。外部免费行情源对突发并发较敏感，10 个 worker 在保持
+# 同步吞吐的同时，减少 RemoteDisconnected 与限流。
+SYNC_MAX_WORKERS = 10
+
+# 所有数据源健康检查共用一个总时限，不能让单个外部接口阻塞同步初始化。
+DATA_SOURCE_HEALTH_TIMEOUT = 5.0
 
 # 单只股票同步的总超时（秒），防止个别源卡死拖垮整批同步。
 SYNC_SINGLE_STOCK_TIMEOUT = 30
@@ -720,12 +722,43 @@ class DataSourceManager:
         # 按优先级排序
         self.sources.sort(key=lambda x: x.priority)
 
-    def _check_all_sources(self):
-        """检查所有数据源状态"""
+    def _check_all_sources(self, timeout: float = DATA_SOURCE_HEALTH_TIMEOUT):
+        """并行检查数据源，整个初始化最多等待 ``timeout`` 秒。"""
         logger.info("检查数据源状态...")
-        for source in self.sources:
-            status = source.check_status()
-            logger.info(f"  {source.name}: {status.value}")
+
+        def check(source: DataSource) -> None:
+            try:
+                source.check_status()
+            except Exception as exc:
+                source.status = DataSourceStatus.UNAVAILABLE
+                source.last_error = str(exc)[:100]
+                source.last_check_time = datetime.now()
+
+        threads = [
+            threading.Thread(
+                target=check,
+                args=(source,),
+                daemon=True,
+                name=f"source-health-{source.name}",
+            )
+            for source in self.sources
+        ]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        checked_at = datetime.now()
+        for source, thread in zip(self.sources, threads):
+            if thread.is_alive():
+                source.status = DataSourceStatus.UNAVAILABLE
+                source.last_error = f"Health check timeout after {timeout:g}s"
+                source.last_check_time = checked_at
+                logger.warning(f"  {source.name}: health check timeout, skipped")
+                continue
+            logger.info(f"  {source.name}: {source.status.value}")
 
     def get_available_source(self) -> Optional[DataSource]:
         """
@@ -856,7 +889,12 @@ class MultiSourceSync:
                 logger.warning(f"数据源 {source.name} 获取股票列表失败: {e}")
         return None
 
-    def sync_single_stock(self, code: str, max_retries: int = 3) -> Dict[str, Any]:
+    def sync_single_stock(
+        self,
+        code: str,
+        max_retries: int = 3,
+        timeout: float = SYNC_SINGLE_STOCK_TIMEOUT,
+    ) -> Dict[str, Any]:
         """
         同步单只股票，自动切换数据源。
 
@@ -870,23 +908,41 @@ class MultiSourceSync:
         Returns:
             同步结果字典
         """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+        result_box: List[Dict[str, Any]] = []
+        error_box: List[Exception] = []
+        completed = threading.Event()
 
-        # 复用一个单线程池执行，避免为每只股票新建线程的开销；超时后线程仍会
-        # 在后台跑完（无法强制中断 Python 线程），但结果被丢弃，不阻塞批次。
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._sync_single_stock_impl, code, max_retries)
+        def run() -> None:
             try:
-                return future.result(timeout=SYNC_SINGLE_STOCK_TIMEOUT)
-            except FuturesTimeoutError:
-                logger.warning(f"同步 {code} 超时（>{SYNC_SINGLE_STOCK_TIMEOUT}s），跳过")
-                return {
-                    "code": code,
-                    "success": False,
-                    "source": None,
-                    "records": 0,
-                    "message": f"同步超时（>{SYNC_SINGLE_STOCK_TIMEOUT}s）",
-                }
+                result_box.append(self._sync_single_stock_impl(code, max_retries))
+            except Exception as exc:
+                error_box.append(exc)
+            finally:
+                completed.set()
+
+        # daemon 线程允许调用方在超时后立即返回；不能再使用 ThreadPoolExecutor
+        # 的上下文管理器，因为 shutdown(wait=True) 会把“30 秒超时”重新等回来。
+        # ponytail: 最多 10 个外层 worker 限制遗留线程规模；若数据源长期无
+        # socket 超时，再升级为可终止的子进程隔离。
+        threading.Thread(target=run, daemon=True, name=f"sync-{code}").start()
+        if not completed.wait(max(float(timeout), 0.0)):
+            logger.warning(f"同步 {code} 超时（>{timeout:g}s），跳过")
+            return {
+                "code": code,
+                "success": False,
+                "source": None,
+                "records": 0,
+                "message": f"同步超时（>{timeout:g}s）",
+            }
+        if error_box:
+            return {
+                "code": code,
+                "success": False,
+                "source": None,
+                "records": 0,
+                "message": f"同步异常: {error_box[0]}",
+            }
+        return result_box[0]
 
     def _sync_single_stock_impl(self, code: str, max_retries: int = 3) -> Dict[str, Any]:
         """sync_single_stock 的实际实现（无超时保护）。"""

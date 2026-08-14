@@ -6,10 +6,10 @@ export interface ScanResult {
     名称: string;
     行业: string;
     现价: number;
-    '涨幅%': number;
+    '涨幅%'?: number;
     Score: number;
-    RSI: number;
-    DIF: number;
+    RSI?: number;
+    DIF?: number;
     BB: number;
     粘合度: number;
     历史胜率: string;
@@ -20,14 +20,24 @@ export interface ScanResult {
     tv_ma_signal?: string;
     tv_zp_signal?: string;
     tv_match?: string;
+    signal_sources?: Array<'ma' | 'zp'>;
+    tv_execution_tier?: 'A' | 'B' | 'C';
+    tv_execution_risk_unit?: number;
     early_watch_only?: boolean;
     early_watch_reason?: string;
     early_watch_quality_ok?: boolean;
     early_watch_quality_reasons?: string[];
     momentum_watch_only?: boolean;
     momentum_watch_reason?: string;
+    momentum_acceleration_watch_only?: boolean;
+    revival_watch_only?: boolean;
+    result_group?: 'FORMAL' | 'HISTORICAL_REVIVAL' | 'MOMENTUM_WATCH';
     sector_watch_only?: boolean;
     sector_watch_reason?: string;
+    bottom_discovery_watch_only?: boolean;
+    bottom_discovery_stage?: 'B0_BASE' | 'B1_REVERSAL' | string;
+    bottom_discovery_action?: string;
+    bottom_discovery_metrics?: Record<string, number | boolean>;
     影线比?: number;
     strategy_type?: string;
     warnings?: string[];
@@ -43,6 +53,12 @@ export interface ScanResult {
     sop_bonuses?: string[];
     sop_risks?: string[];
     sop_quality_score?: number;
+    display_signal_score?: number;
+    display_quality_score?: number;
+    display_opportunity_score?: number;
+    display_rank_score?: number;
+    display_trade_score?: number;
+    score_display_scale?: '0-100' | string;
     sop_subgrade?: string;
     entry_price?: number;
     stop_price?: number;
@@ -56,6 +72,9 @@ export interface ScanResult {
     mkt_cap_yi?: number;
     date?: string;
     日期?: string;
+    data_date?: string;
+    data_mode?: 'LIVE_SNAPSHOT' | 'LOCAL_DB' | string;
+    as_of?: string;
     sector_trend?: string;
     sector_pct?: number;
     sector_momentum_score?: number;
@@ -89,6 +108,7 @@ export interface ScanResult {
         initial_position_pct: number;
         max_position_pct: number;
         portfolio_position_cap_pct: number;
+        tv_execution_risk_unit?: number;
     };
     decision_score_components?: Record<string, number>;
     price_action_score?: number;
@@ -102,6 +122,13 @@ export interface ScanResult {
     pa_range_location?: string;
     pa_entry_price?: number;
     pa_stop_price?: number;
+    pa_close_guard_price?: number;
+    pa_hard_stop_price?: number;
+    pa_invalidation_basis?: string;
+    pa_invalidation_rule?: string;
+    pa_close_confirmation_as_of?: string;
+    pa_close_confirmation_phase?: 'INTRADAY_PROVISIONAL' | 'LATE_SESSION' | 'AFTER_CLOSE' | 'LEGACY_UNKNOWN';
+    pa_close_time_eligible?: boolean;
     pa_target_price?: number;
     pa_risk_reward?: number;
     pa_tags?: string[];
@@ -163,6 +190,14 @@ export interface ScanResult {
         note: string;
     } | null;
     pa_trade_action?: 'READY' | 'WATCH' | 'WAIT' | 'AVOID' | string;
+    pa_execution_stage?: 'OBSERVATION_ONLY' | 'BLOCKED' | 'INTRADAY_PREVIEW' | 'SETUP_READY' | 'EOD_CONFIRMED' | 'NEXT_SESSION_REVIEW' | 'NEXT_SESSION_EXECUTABLE' | 'WAITING_SETUP' | string;
+    pa_execution_stage_label?: string;
+    pa_signal_date?: string;
+    pa_volume_confirmation_state?: 'PROVISIONAL' | 'CONFIRMED' | 'NOT_CONFIRMED' | string;
+    frozen_plan_date?: string;
+    frozen_plan_expiry_date?: string;
+    active_confirmation_price?: number;
+    active_stop_price?: number;
     pa_trade_setup?: string;
     pa_risk_pct?: number;
     pa_trade_plan?: {
@@ -174,6 +209,9 @@ export interface ScanResult {
         invalidation: string;
         risk_pct: number;
         risk_reward: number;
+        close_guard_price?: number;
+        hard_stop_price?: number;
+        invalidation_basis?: string;
         position_hint: string;
         checklist: string[];
         management: string[];
@@ -192,7 +230,7 @@ export interface BacktestStats {
 }
 
 export interface ScanParams {
-    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp';
+    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp';
     pine_min_signals: number;
     min_data_days: number;
     threshold: number;
@@ -220,8 +258,126 @@ export interface ScanProgress {
     message?: string;
 }
 
+export interface ScanCompletionSummary {
+    taskId: string | null;
+    strategyType: ScanParams['strategy_type'];
+    strategyLabel: string;
+    count: number;
+    revivalCount: number;
+    momentumCount: number;
+    excludedCount: number;
+    completedAt: string;
+    dataDate: string | null;
+    dataMode: string | null;
+    asOf: string | null;
+}
+
+export type ScanResultGroupKey = 'formal' | 'revival' | 'momentum';
+
+export interface ScanResultGroups {
+    formal: ScanResult[];
+    revival: ScanResult[];
+    momentum: ScanResult[];
+}
+
+const SCAN_STRATEGY_LABELS: Record<ScanParams['strategy_type'], string> = {
+    tv_dual_strict: 'TV+ 强确认精选',
+    tv_dual: 'TV 宽松观察池',
+    early_value: 'A- 早期性价比',
+    bottom_discovery: 'B0 底部起涨发现',
+    sector_watch: '板块观察',
+    squeeze: '均线粘合',
+    pine: 'Pine 多指标',
+    both: '双重共振',
+    consensus: '放量突破',
+    tv_zp: 'TV-ZP',
+};
+
+let resultRequestGeneration = 0;
+
+function filterStrategyResults(rawResults: unknown, strategyType: ScanParams['strategy_type']): ScanResult[] {
+    const received = Array.isArray(rawResults) ? rawResults : [];
+    const seenCodes = new Set<string>();
+    return received.filter((item): item is ScanResult => {
+        if (!item || typeof item !== 'object') return false;
+        const candidate = item as Partial<ScanResult>;
+        if (candidate.strategy_type !== strategyType || !candidate.代码) return false;
+        const code = String(candidate.代码).padStart(6, '0');
+        if (seenCodes.has(code)) return false;
+        seenCodes.add(code);
+        return true;
+    });
+}
+
+function groupStrategyResults(rawResults: unknown, strategyType: ScanParams['strategy_type']): ScanResultGroups {
+    const matched = filterStrategyResults(rawResults, strategyType);
+    return matched.reduce<ScanResultGroups>((groups, candidate) => {
+        if (candidate.result_group === 'FORMAL') {
+            groups.formal.push(candidate);
+            return groups;
+        }
+        if (candidate.result_group === 'HISTORICAL_REVIVAL') {
+            groups.revival.push(candidate);
+            return groups;
+        }
+        if (candidate.result_group === 'MOMENTUM_WATCH') {
+            groups.momentum.push(candidate);
+            return groups;
+        }
+        const checks = candidate.sop_checks || [];
+        const bonuses = candidate.sop_bonuses || [];
+        const isRevival = candidate.revival_watch_only
+            || checks.some(item => item.includes('复活'))
+            || bonuses.some(item => item.includes('历史信号复活'));
+        const isMomentum = candidate.momentum_acceleration_watch_only
+            || checks.some(item => item.includes('强趋势加速'))
+            || bonuses.some(item => item.includes('涨停/大阳加速观察'));
+        if (isRevival) {
+            groups.revival.push(candidate);
+        } else if (isMomentum) {
+            groups.momentum.push(candidate);
+        } else {
+            groups.formal.push(candidate);
+        }
+        return groups;
+    }, { formal: [], revival: [], momentum: [] });
+}
+
+function buildScanCompletion(
+    rawResults: unknown,
+    strategyType: ScanParams['strategy_type'],
+    taskId: string | null,
+    scanMeta?: { data_date?: string; data_mode?: string; as_of?: string },
+): { results: ScanResult[]; groups: ScanResultGroups; summary: ScanCompletionSummary } {
+    const received = Array.isArray(rawResults) ? rawResults : [];
+    const groups = groupStrategyResults(received, strategyType);
+    const matchedCount = groups.formal.length + groups.revival.length + groups.momentum.length;
+    const metadata = [...groups.formal, ...groups.revival, ...groups.momentum][0];
+
+    return {
+        results: groups.formal,
+        groups,
+        summary: {
+            taskId,
+            strategyType,
+            strategyLabel: SCAN_STRATEGY_LABELS[strategyType],
+            count: groups.formal.length,
+            revivalCount: groups.revival.length,
+            momentumCount: groups.momentum.length,
+            excludedCount: received.length - matchedCount,
+            completedAt: new Date().toISOString(),
+            dataDate: scanMeta?.data_date || metadata?.data_date || metadata?.date || metadata?.日期 || null,
+            dataMode: scanMeta?.data_mode || metadata?.data_mode || null,
+            asOf: scanMeta?.as_of || metadata?.as_of || null,
+        },
+    };
+}
+
 interface ScanStore {
     results: ScanResult[];
+    resultGroups: ScanResultGroups;
+    activeResultGroup: ScanResultGroupKey;
+    resultStrategyType: ScanParams['strategy_type'] | null;
     isScanning: boolean;
     selectedStock: ScanResult | null;
     params: ScanParams;
@@ -229,10 +385,12 @@ interface ScanStore {
     selectedDate: string;
     availableDates: Array<{ date: string; stock_count: number }>;
     scanProgress: ScanProgress | null;
+    lastScanSummary: ScanCompletionSummary | null;
     viewMode: 'list' | 'grid' | 'history';
     isFilterOpen: boolean;
 
     setResults: (results: ScanResult[]) => void;
+    setActiveResultGroup: (group: ScanResultGroupKey) => void;
     setIsScanning: (v: boolean) => void;
     setSelectedStock: (stock: ScanResult | null) => void;
     setParams: (params: ScanParams) => void;
@@ -270,6 +428,9 @@ const DEFAULT_PARAMS: ScanParams = {
 
 export const useScanStore = create<ScanStore>((set, get) => ({
     results: [],
+    resultGroups: { formal: [], revival: [], momentum: [] },
+    activeResultGroup: 'formal',
+    resultStrategyType: null,
     isScanning: false,
     selectedStock: null,
     params: DEFAULT_PARAMS,
@@ -277,10 +438,16 @@ export const useScanStore = create<ScanStore>((set, get) => ({
     selectedDate: '',
     availableDates: [],
     scanProgress: null,
+    lastScanSummary: null,
     viewMode: 'list',
     isFilterOpen: false,
 
     setResults: (results) => set({ results }),
+    setActiveResultGroup: (activeResultGroup) => set(state => ({
+        activeResultGroup,
+        results: state.resultGroups[activeResultGroup],
+        selectedStock: null,
+    })),
     setIsScanning: (isScanning) => set({ isScanning }),
     setSelectedStock: (selectedStock) => set({ selectedStock }),
     setParams: (params) => set({ params }),
@@ -289,12 +456,26 @@ export const useScanStore = create<ScanStore>((set, get) => ({
     setSelectedDate: (selectedDate) => set({ selectedDate }),
 
     startScan: async () => {
+        if (get().isScanning) return;
+        const requestGeneration = ++resultRequestGeneration;
         let ws: WebSocket | null = null;
-        set({ isScanning: true, results: [], scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: "正在向后台提交扫描任务..." } });
+        const requestedParams = get().params;
+        const requestedStrategy = requestedParams.strategy_type;
+        const strategyLabel = SCAN_STRATEGY_LABELS[requestedStrategy];
+        set({
+            isScanning: true,
+            results: [],
+            resultGroups: { formal: [], revival: [], momentum: [] },
+            activeResultGroup: 'formal',
+            resultStrategyType: requestedStrategy,
+            selectedStock: null,
+            lastScanSummary: null,
+            scanProgress: { current: 0, total: 100, matches: 0, elapsed: 0, message: `正在提交${strategyLabel}扫描任务...` },
+        });
         const startTime = Date.now();
 
         try {
-            const cleanParams: Partial<ScanParams> = { ...get().params };
+            const cleanParams: Partial<ScanParams> = { ...requestedParams };
             Object.keys(cleanParams).forEach(key => {
                 const paramKey = key as keyof ScanParams;
                 const val = cleanParams[paramKey];
@@ -302,15 +483,19 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                     delete cleanParams[paramKey];
                 }
             });
+            if (!cleanParams.data_date?.trim()) {
+                delete cleanParams.data_date;
+            }
 
             ws = connectScanWebSocket((msg) => {
+                if (requestGeneration !== resultRequestGeneration) return;
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
                 if (msg.type === 'scan_start') {
                     set({ scanProgress: { current: 0, total: 100, matches: 0, elapsed, message: msg.message } });
                 } else if (msg.type === 'scan_progress') {
                     set({ scanProgress: { current: msg.current, total: msg.total, matches: 0, elapsed, message: msg.message } });
                 } else if (msg.type === 'scan_end') {
-                    set({ scanProgress: { current: 100, total: 100, matches: msg.matches, elapsed, message: msg.message } });
+                    set({ scanProgress: { current: 100, total: 100, matches: 0, elapsed, message: `正在核对${strategyLabel}正式入选结果...` } });
                 }
             });
 
@@ -323,8 +508,20 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 // Poll for status
                 return new Promise<void>((resolve) => {
                     const pollInterval = setInterval(async () => {
+                        if (requestGeneration !== resultRequestGeneration) {
+                            clearInterval(pollInterval);
+                            if (ws) { try { ws.close(); } catch {} }
+                            resolve();
+                            return;
+                        }
                         try {
                             const statusRes = await api.get(`/api/scan/status/${taskId}`);
+                            if (requestGeneration !== resultRequestGeneration) {
+                                clearInterval(pollInterval);
+                                if (ws) { try { ws.close(); } catch {} }
+                                resolve();
+                                return;
+                            }
                             consecutivePollFailures = 0;
                             const state = statusRes.data.status;
                             
@@ -332,9 +529,24 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                                 clearInterval(pollInterval);
                                 // Allow progress animation to complete
                                 setTimeout(() => {
+                                    if (requestGeneration !== resultRequestGeneration) {
+                                        if (ws) { try { ws.close(); } catch {} }
+                                        resolve();
+                                        return;
+                                    }
+                                    const completion = buildScanCompletion(
+                                        statusRes.data.results,
+                                        requestedStrategy,
+                                        taskId,
+                                        statusRes.data.scan_meta,
+                                    );
                                     set({
-                                        results: statusRes.data.results || [],
-                                        selectedDate: new Date().toISOString().split('T')[0],
+                                        results: completion.results,
+                                        resultGroups: completion.groups,
+                                        activeResultGroup: 'formal',
+                                        resultStrategyType: requestedStrategy,
+                                        lastScanSummary: completion.summary,
+                                        selectedDate: completion.summary.dataDate || '',
                                         isScanning: false,
                                         scanProgress: null,
                                     });
@@ -352,6 +564,12 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                             }
                             // PENDING or STARTED: just wait
                         } catch (err) {
+                            if (requestGeneration !== resultRequestGeneration) {
+                                clearInterval(pollInterval);
+                                if (ws) { try { ws.close(); } catch {} }
+                                resolve();
+                                return;
+                            }
                             consecutivePollFailures += 1;
                             const elapsed = Math.floor((Date.now() - startTime) / 1000);
                             set({
@@ -377,9 +595,24 @@ export const useScanStore = create<ScanStore>((set, get) => ({
             } else {
                 // Fallback for sync return if celery was disabled temporarily
                 setTimeout(() => {
+                    if (requestGeneration !== resultRequestGeneration) {
+                        if (ws) { try { ws.close(); } catch {} }
+                        return;
+                    }
+                    const rawResults = submitRes.data.results || submitRes.data || [];
+                    const completion = buildScanCompletion(
+                        rawResults,
+                        requestedStrategy,
+                        null,
+                        submitRes.data.scan_meta,
+                    );
                     set({
-                        results: submitRes.data.results || submitRes.data || [],
-                        selectedDate: new Date().toISOString().split('T')[0],
+                        results: completion.results,
+                        resultGroups: completion.groups,
+                        activeResultGroup: 'formal',
+                        resultStrategyType: requestedStrategy,
+                        lastScanSummary: completion.summary,
+                        selectedDate: completion.summary.dataDate || '',
                         isScanning: false,
                         scanProgress: null,
                     });
@@ -388,6 +621,10 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 }, 1000);
             }
         } catch (e: unknown) {
+            if (requestGeneration !== resultRequestGeneration) {
+                if (ws) { try { ws.close(); } catch {} }
+                return;
+            }
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             console.error("Scan Error Detail:", e);
             const scanError = e as {
@@ -414,33 +651,61 @@ export const useScanStore = create<ScanStore>((set, get) => ({
     },
 
     loadHistory: async (date: string) => {
-        set({ selectedDate: date, isScanning: true });
+        if (get().isScanning) return;
+        const requestGeneration = ++resultRequestGeneration;
+        const strategyType = get().params.strategy_type;
+        set({ selectedDate: date, isScanning: true, lastScanSummary: null });
         if (!date) {
             set({ isScanning: false });
             return;
         }
         try {
             const res = await api.get(`/api/scan/history?date=${date}`);
-            set({ results: res.data });
+            if (
+                requestGeneration === resultRequestGeneration
+                && get().selectedDate === date
+                && get().params.strategy_type === strategyType
+            ) {
+                const groups = groupStrategyResults(res.data, strategyType);
+                set({ results: groups.formal, resultGroups: groups, activeResultGroup: 'formal', resultStrategyType: strategyType });
+            }
         } catch (e) {
             console.error("Failed to load history", e);
         } finally {
-            set({ isScanning: false });
+            if (requestGeneration === resultRequestGeneration) set({ isScanning: false });
         }
     },
 
     fetchHistory: async () => {
+        const requestGeneration = ++resultRequestGeneration;
+        const strategyType = get().params.strategy_type;
         try {
             const dateRes = await api.get('/api/scan/dates');
             const dates = dateRes.data;
             set({ historyDates: dates });
 
             // If we have history and no current results, load latest
-            if (dates.length > 0 && get().results.length === 0) {
+            if (
+                requestGeneration === resultRequestGeneration
+                && get().params.strategy_type === strategyType
+                && dates.length > 0
+                && get().results.length === 0
+                && !get().isScanning
+                && !get().lastScanSummary
+            ) {
                 const latestDate = dates[0];
                 set({ selectedDate: latestDate });
                 const res = await api.get(`/api/scan/history?date=${latestDate}`);
-                set({ results: res.data });
+                if (
+                    requestGeneration === resultRequestGeneration
+                    && get().selectedDate === latestDate
+                    && get().params.strategy_type === strategyType
+                    && !get().isScanning
+                    && !get().lastScanSummary
+                ) {
+                    const groups = groupStrategyResults(res.data, strategyType);
+                    set({ results: groups.formal, resultGroups: groups, activeResultGroup: 'formal', resultStrategyType: strategyType });
+                }
             }
         } catch (e) {
             console.error("Failed to fetch history", e);

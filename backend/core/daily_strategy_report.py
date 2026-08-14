@@ -17,6 +17,27 @@ def _rank_score(stock: Dict[str, Any]) -> float:
     return _as_float(stock.get("final_trade_score") or stock.get("calibrated_score") or stock.get("Score") or stock.get("score"))
 
 
+def _display_score(stock: Dict[str, Any]) -> float:
+    value = None
+    for key in ("display_opportunity_score", "trade_opportunity_score"):
+        if stock.get(key) is not None:
+            value = stock.get(key)
+            break
+    value = _as_float(_rank_score(stock) if value is None else value)
+    return max(0.0, min(100.0, value))
+
+
+def _action_label(stock: Dict[str, Any]) -> str:
+    bucket = _bucket(stock)
+    if bool(stock.get("trade_eligible")) and bucket == "TRADE":
+        return stock.get("execution_instruction") or stock.get("trade_opportunity_label") or "小仓复核"
+    if bucket == "EARLY" or stock.get("early_trade_candidate"):
+        return "提前复核（非正式买点）"
+    if bucket == "BLOCK":
+        return "禁止新增仓位"
+    return "仅观察"
+
+
 def _stock_digest(stock: Dict[str, Any]) -> Dict[str, Any]:
     blockers = stock.get("trade_blockers") or []
     if isinstance(blockers, str):
@@ -27,8 +48,8 @@ def _stock_digest(stock: Dict[str, Any]) -> Dict[str, Any]:
         "industry": stock.get("行业") or stock.get("industry") or "",
         "grade": stock.get("early_trade_grade") or stock.get("sop_grade") or "?",
         "bucket": _bucket(stock),
-        "score": round(_rank_score(stock), 2),
-        "action": stock.get("trade_opportunity_label") or stock.get("execution_instruction") or "",
+        "score": round(_display_score(stock), 2),
+        "action": _action_label(stock),
         "blockers": blockers[:2],
     }
 
@@ -49,7 +70,10 @@ def build_daily_strategy_report(
     strategy_counts = Counter(str(stock.get("strategy_type") or "UNKNOWN") for stock in results)
     industry_counts = Counter(str(stock.get("行业") or stock.get("industry") or "UNKNOWN") for stock in results)
 
-    trade = [stock for stock in results if _bucket(stock) == "TRADE" or stock.get("trade_eligible") is True]
+    trade = [
+        stock for stock in results
+        if _bucket(stock) == "TRADE" and stock.get("trade_eligible") is True
+    ]
     early = [stock for stock in results if _bucket(stock) == "EARLY" or stock.get("early_trade_candidate")]
     observe = [stock for stock in results if _bucket(stock) == "OBSERVE"]
     block = [stock for stock in results if _bucket(stock) == "BLOCK"]

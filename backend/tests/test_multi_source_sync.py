@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from core.multi_source_sync import (
+    DATA_SOURCE_HEALTH_TIMEOUT,
     MIN_REQUIRED_TRADING_DAYS,
     HISTORY_LOOKBACK_CALENDAR_DAYS,
     needs_history_backfill,
@@ -19,6 +20,43 @@ from core.multi_source_sync import (
     TencentDataSource,
     BaoStockDataSource,
 )
+
+
+def test_source_health_checks_have_one_global_timeout():
+    """One hanging provider must not block synchronization initialization."""
+    manager = DataSourceManager.__new__(DataSourceManager)
+
+    class HangingSource:
+        def __init__(self, name):
+            self.name = name
+            self.priority = 0
+            self.status = None
+            self.last_error = None
+            self.last_check_time = None
+
+        def check_status(self):
+            time.sleep(0.5)
+
+    manager.sources = [HangingSource("slow-a"), HangingSource("slow-b")]
+    started = time.monotonic()
+
+    manager._check_all_sources(timeout=0.02)
+
+    assert time.monotonic() - started < 0.2
+    assert all("timeout" in source.last_error.lower() for source in manager.sources)
+
+
+def test_sync_single_stock_timeout_does_not_wait_for_worker_shutdown(monkeypatch):
+    """The public timeout must return even while the provider thread is still stuck."""
+    syncer = _make_syncer([], engine=MagicMock())
+    monkeypatch.setattr(syncer, "_sync_single_stock_impl", lambda *_args, **_kwargs: time.sleep(0.5))
+    started = time.monotonic()
+
+    result = syncer.sync_single_stock("603259", timeout=0.02)
+
+    assert time.monotonic() - started < 0.2
+    assert result["success"] is False
+    assert "超时" in result["message"]
 
 
 def test_needs_history_backfill_uses_trading_day_threshold():
@@ -41,6 +79,8 @@ def test_sync_constants_raised_for_deeper_history():
     assert HISTORY_LOOKBACK_CALENDAR_DAYS == 1500
     # 关键不变式：阈值必须低于数据源的实际返回上限
     assert MIN_REQUIRED_TRADING_DAYS < 996
+    assert 0 < DATA_SOURCE_HEALTH_TIMEOUT <= 5
+    assert SYNC_MAX_WORKERS <= 12
 
 
 # ---------------------------------------------------------------------------

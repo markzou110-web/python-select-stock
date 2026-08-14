@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Literal
+from typing import List, Optional, Literal
 
 
 class PaperTradeCreate(BaseModel):
@@ -23,6 +23,7 @@ class PaperTradeCreate(BaseModel):
     entry_source: Optional[str] = None
     entry_signal_date: Optional[str] = None
     entry_reason_snapshot: Optional[str] = None
+    signal_sources: Optional[List[Literal["ma", "zp"]]] = None
     pa_trade_action: Optional[str] = None
     pa_trade_setup: Optional[str] = None
     pa_entry_condition: Optional[str] = None

@@ -5,7 +5,12 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.decision_layer import apply_decision_layer, build_market_decision_context
+from core.decision_layer import (
+    apply_decision_layer,
+    apply_growth_segment_context,
+    build_growth_segment_context,
+    build_market_decision_context,
+)
 from core.sector_strength import classify_mainline_sector
 
 
@@ -95,6 +100,82 @@ def test_decision_layer_creates_opportunity_position_and_state():
     assert "9.80" in result["execution_instruction"]
 
 
+def test_tv_execution_risk_unit_scales_position_plan():
+    a_tier = _stock(tv_execution_tier="A", tv_execution_risk_unit=1.0)
+    b_tier = _stock(code="000002", tv_execution_tier="B", tv_execution_risk_unit=0.6)
+
+    apply_decision_layer(
+        [a_tier, b_tier],
+        _snapshot([6, 5, 4, 3, 2, 1, -1]),
+        {"status": "OFFENSIVE"},
+    )
+
+    assert b_tier["position_plan"]["initial_position_pct"] == round(
+        a_tier["position_plan"]["initial_position_pct"] * 0.6, 1,
+    )
+    assert b_tier["position_plan"]["max_position_pct"] == round(
+        a_tier["position_plan"]["max_position_pct"] * 0.6, 1,
+    )
+    assert b_tier["position_plan"]["tv_execution_risk_unit"] == 0.6
+
+
+def test_a_minus_trial_position_is_capped_at_five_percent():
+    stocks = [_stock(a_minus_trial=True, a_minus_trial_grade="A-")]
+
+    apply_decision_layer(stocks, _snapshot([8, 7, 6, 5, 4, 3, 2, 1]), {"status": "OFFENSIVE"})
+
+    result = stocks[0]
+    assert result["trade_eligible"] is True
+    assert result["position_plan"]["initial_position_pct"] <= 5
+    assert result["position_plan"]["max_position_pct"] <= 5
+    assert result["position_plan"]["a_minus_portfolio_cap_pct"] == 10
+    assert result["a_minus_portfolio_cap_pct"] == 10
+    assert "A-受控试仓" in result["execution_instruction"]
+
+
+def test_a_eod_trial_position_is_capped_at_five_and_portfolio_fifteen_percent():
+    stocks = [_stock(
+        a_eod_controlled_trial=True,
+        a_eod_policy_version="a-eod-controlled-trial-v1",
+        trade_execution_policy="A_EOD_CONTROLLED_TRIAL",
+    )]
+
+    apply_decision_layer(stocks, _snapshot([8, 7, 6, 5, 4, 3, 2, 1]), {"status": "OFFENSIVE"})
+
+    result = stocks[0]
+    assert result["trade_eligible"] is True
+    assert result["position_plan"]["initial_position_pct"] <= 5
+    assert result["position_plan"]["max_position_pct"] <= 5
+    assert result["position_plan"]["portfolio_position_cap_pct"] <= 15
+    assert result["position_plan"]["a_eod_max_positions"] == 3
+    assert result["a_eod_portfolio_cap_pct"] == 15
+    assert "A-EOD受控小仓" in result["execution_instruction"]
+
+
+def test_bottom_discovery_is_not_judged_by_strict_strategy_opportunity_gate():
+    bottom = _stock(
+        strategy_type="bottom_discovery",
+        bottom_discovery_watch_only=True,
+        trade_bucket="OBSERVE",
+        trade_eligible=False,
+        Score=20,
+        final_trade_score=20,
+        sector_momentum_score=20,
+        sector_alignment_score=20,
+        pa_risk_reward=0,
+        money_flow={},
+    )
+
+    apply_decision_layer(
+        [bottom], _snapshot([4, 3, 2, 1, -1]), {"status": "DEFENSIVE"},
+    )
+
+    assert bottom["trade_opportunity_score"] < 60
+    assert bottom["opportunity_gate_applicable"] is False
+    assert bottom["position_plan"]["initial_position_pct"] == 0
+    assert not any("综合机会分<60" in item for item in bottom.get("trade_blockers", []))
+
+
 def test_single_hot_day_after_weak_period_is_repair_not_climax():
     history = [
         {"date": "2026-06-10", "advance_ratio": 28},
@@ -110,6 +191,64 @@ def test_single_hot_day_after_weak_period_is_repair_not_climax():
 
     assert context["market_sentiment_stage"] == "REPAIR"
     assert context["market_cycle_metrics"]["breadth_trend"] > 40
+
+
+def test_v_reversal_after_weak_period_is_observation_only_strong_repair():
+    history = [
+        {"date": "2026-07-09", "advance_ratio": 38, "strong_ratio": 3},
+        {"date": "2026-07-10", "advance_ratio": 42, "strong_ratio": 4},
+        {"date": "2026-07-13", "advance_ratio": 25, "strong_ratio": 2},
+    ]
+
+    context = build_market_decision_context(
+        _snapshot([10, 9, 8, 7, 6, 5, 4, 3, 2, -1]),
+        {"status": "CRITICAL"},
+        history,
+    )
+
+    assert context["market_sentiment_stage"] == "V_REPAIR"
+    assert context["market_sentiment_label"] == "强修复"
+    assert context["portfolio_position_cap_pct"] == 30
+    assert "追涨加速票" in context["market_forbidden_actions"]
+
+
+def test_growth_board_structural_repair_is_detected_inside_critical_market():
+    snapshot = pd.DataFrame({
+        "code": [f"300{i:03d}" for i in range(100)] + [f"600{i:03d}" for i in range(100)],
+        "pct_chg": [6.0] * 20 + [2.0] * 60 + [-1.0] * 20 + [0.5] * 100,
+    })
+
+    segments = build_growth_segment_context(snapshot, {"status": "CRITICAL"})
+
+    assert segments["创业板"]["stage"] == "STRUCTURAL_REPAIR"
+    assert segments["创业板"]["advance_ratio"] == 80.0
+    assert segments["创业板"]["strong_ratio"] == 20.0
+
+
+def test_growth_board_repair_only_relaxes_segment_regime_not_trade_permission():
+    snapshot = pd.DataFrame({
+        "code": [f"300{i:03d}" for i in range(100)],
+        "pct_chg": [6.0] * 20 + [2.0] * 60 + [-1.0] * 20,
+    })
+    rows = [{"代码": "300001", "trade_eligible": False, "trade_bucket": "OBSERVE"}]
+
+    apply_growth_segment_context(rows, snapshot, {"status": "CRITICAL"})
+
+    assert rows[0]["market_segment_stage"] == "STRUCTURAL_REPAIR"
+    assert rows[0]["effective_market_regime"] == "DEFENSIVE"
+    assert rows[0]["trade_eligible"] is False
+    assert rows[0]["trade_bucket"] == "OBSERVE"
+
+
+def test_growth_board_repair_requires_broad_participation():
+    snapshot = pd.DataFrame({
+        "code": [f"300{i:03d}" for i in range(100)],
+        "pct_chg": [8.0] * 10 + [1.0] * 50 + [-1.0] * 40,
+    })
+
+    segments = build_growth_segment_context(snapshot, {"status": "CRITICAL"})
+
+    assert segments["创业板"]["stage"] == "NEUTRAL"
 
 
 def test_sustained_hot_market_can_enter_climax():
@@ -161,6 +300,28 @@ def test_persistent_weak_market_is_ice_not_one_day_panic():
 
     assert context["market_sentiment_stage"] == "ICE"
     assert context["portfolio_position_cap_pct"] == 15
+
+
+def test_limit_down_wave_cannot_rebound_to_repair_on_breadth_boundary():
+    history = [
+        {"date": "2026-07-15", "advance_ratio": 18.0},
+        {"date": "2026-07-16", "advance_ratio": 19.0},
+        {"date": "2026-07-17", "advance_ratio": 18.8},
+    ]
+    snapshot = _snapshot([1.0] * 318 + [-1.0] * 471 + [-10.0] * 211)
+
+    context = build_market_decision_context(
+        snapshot,
+        {"status": "CRITICAL", "limit_down_count": 211},
+        history,
+        data_date="2026-07-20",
+    )
+
+    assert context["market_breadth"]["advance_ratio"] == 31.8
+    assert context["market_breadth"]["limit_down_count"] == 211
+    assert context["market_sentiment_stage"] == "ICE"
+    assert context["portfolio_position_cap_pct"] == 15
+    assert context["market_sentiment_model_version"] == "cycle-v3"
 
 
 def test_retreat_overrides_trade_permission():

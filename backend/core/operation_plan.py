@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from core.risk_constants import (
     FIRST_PROFIT_TAKE_MARK, FIRST_PROFIT_TAKE_PCT,
+    SIGNAL_REVERSE_REGIMES,
     STRONG_PROFIT_TAKE_PCT, STRONG_SECTOR_PHASES, STRONG_CLOSE_POSITION_THRESHOLD,
 )
 
@@ -31,6 +32,8 @@ def build_position_decision_snapshot(
     already_reduced: bool = False,
     sector_phase: str = "",
     close_position: float = 0.0,
+    pa_regime: str = "",
+    signal_reverse_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Build the authoritative position action shared by UI, alerts, and wind control.
 
@@ -40,6 +43,10 @@ def build_position_decision_snapshot(
     改动 B3：新增 sector_phase/close_position 参数。当板块处于主升早期且个股收盘
     强势时，首笔止盈线从 +8% 上抬到 +12%（STRONG_PROFIT_TAKE_PCT），避免机械减半
     砍掉主升浪牛股的进攻性。
+
+    混合退出策略：signal_reverse_enabled 开启时，若 price_action_regime 判定为
+    空头趋势/向下破位（pa_regime in SIGNAL_REVERSE_REGIMES），则清仓退出。放在
+    +8% 减仓之后，确保先锁部分利润再清剩余。
     """
     now = now or datetime.now()
     current = safe_num(current_price)
@@ -133,6 +140,12 @@ def build_position_decision_snapshot(
             action = "CLOSE"
             trigger = f"现价 {current:.2f} 跌破执行止损线 {active_stop:.2f}"
         confidence = 0.92
+    elif signal_reverse_enabled and pa_regime in SIGNAL_REVERSE_REGIMES:
+        # 混合退出：价格行为趋势反转 → 清仓剩余仓位。
+        # 优先级低于止损/止盈/减仓（先保命再谈趋势），放在 active_stop 之后。
+        action = "CLOSE"
+        trigger = f"趋势反转：价格行为判定为「{pa_regime}」，清仓退出"
+        confidence = 0.88
     elif safe_num(plan.get("add_trigger_price")) > 0 and current >= safe_num(plan.get("add_trigger_price")):
         action = "ADD_REVIEW"
         threshold = safe_num(plan.get("add_trigger_price"))

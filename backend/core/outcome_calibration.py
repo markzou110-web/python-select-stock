@@ -6,8 +6,19 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from core.risk_constants import (
+    SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT,
+    SOP_A_GRADE_MAX_5D_GAIN_PCT,
+    SOP_A_GRADE_MIN_MATURE_SAMPLES,
+    SOP_A_GRADE_MIN_PRICE_ACTION_SCORE,
+    SOP_A_GRADE_MIN_SCORE,
+    SOP_A_GRADE_POLICY_VERSION,
+    SOP_A_GRADE_STRATEGIES,
+)
+
 
 HORIZONS = (1, 3, 5, 10)
+BOTTOM_FOLLOWUP_WINDOW_DAYS = 30
 
 
 def _as_list(value: Any) -> List[str]:
@@ -64,6 +75,9 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
                    COALESCE(json_extract(price_action_detail, '$.trade_eligible'), 0) AS trade_eligible,
                    COALESCE(json_extract(price_action_detail, '$.market_regime'), 'UNKNOWN') AS market_regime,
                    COALESCE(json_extract(price_action_detail, '$.score_model_version'), 'legacy') AS score_model_version,
+                   COALESCE(json_extract(price_action_detail, '$.sop_grade_policy_version'), 'legacy') AS sop_grade_policy_version,
+                   CAST(json_extract(price_action_detail, '$.price_action_score') AS REAL) AS price_action_score,
+                   CAST(json_extract(price_action_detail, '$.pct_5d') AS REAL) AS pct_5d,
                    sop_vetoes, price_action_detail, scanned_at
             FROM ranked_signals WHERE row_num = 1
         )
@@ -71,7 +85,13 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 0) AS close_1d,
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 2) AS close_3d,
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 4) AS close_5d,
-               (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 9) AS close_10d
+               (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 9) AS close_10d,
+               (SELECT MAX(d.high) FROM daily_k d
+                WHERE d.code=s.code AND d.date>s.signal_date
+                  AND d.date <= (SELECT d5.date FROM daily_k d5 WHERE d5.code=s.code AND d5.date>s.signal_date ORDER BY d5.date LIMIT 1 OFFSET 4)) AS high_5d,
+               (SELECT MIN(d.low) FROM daily_k d
+                WHERE d.code=s.code AND d.date>s.signal_date
+                  AND d.date <= (SELECT d5.date FROM daily_k d5 WHERE d5.code=s.code AND d5.date>s.signal_date ORDER BY d5.date LIMIT 1 OFFSET 4)) AS low_5d
         FROM signals s JOIN daily_k d0 ON d0.code=s.code AND d0.date=s.signal_date
         """
     else:
@@ -93,6 +113,9 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
                 COALESCE((s.price_action_detail->>'trade_eligible')::boolean, false) AS trade_eligible,
                 COALESCE(s.price_action_detail->>'market_regime', 'UNKNOWN') AS market_regime,
                 COALESCE(s.price_action_detail->>'score_model_version', 'legacy') AS score_model_version,
+                COALESCE(s.price_action_detail->>'sop_grade_policy_version', 'legacy') AS sop_grade_policy_version,
+                COALESCE(s.price_action_score, NULLIF(s.price_action_detail->>'price_action_score', '')::float) AS price_action_score,
+                NULLIF(s.price_action_detail->>'pct_5d', '')::float AS pct_5d,
                 s.sop_vetoes,
                 s.price_action_detail,
                 s.scanned_at
@@ -111,7 +134,13 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
             h1.close AS close_1d,
             h3.close AS close_3d,
             h5.close AS close_5d,
-            h10.close AS close_10d
+            h10.close AS close_10d,
+            (SELECT MAX(d.high) FROM daily_k d
+             WHERE d.code=s.code AND d.date>s.signal_date
+               AND d.date <= (SELECT d5.date FROM daily_k d5 WHERE d5.code=s.code AND d5.date>s.signal_date ORDER BY d5.date OFFSET 4 LIMIT 1)) AS high_5d,
+            (SELECT MIN(d.low) FROM daily_k d
+             WHERE d.code=s.code AND d.date>s.signal_date
+               AND d.date <= (SELECT d5.date FROM daily_k d5 WHERE d5.code=s.code AND d5.date>s.signal_date ORDER BY d5.date OFFSET 4 LIMIT 1)) AS low_5d
         FROM signals s
         JOIN daily_k d0 ON d0.code = s.code AND d0.date = s.signal_date
         LEFT JOIN LATERAL (
@@ -143,23 +172,42 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
     for horizon in HORIZONS:
         future_close = pd.to_numeric(df[f"close_{horizon}d"], errors="coerce")
         df[f"ret_{horizon}d"] = (future_close - signal_close) / signal_close * 100
+    mature_5d = pd.to_numeric(df["close_5d"], errors="coerce").notna()
+    df["mfe_5d"] = ((pd.to_numeric(df["high_5d"], errors="coerce") - signal_close) / signal_close * 100).where(mature_5d)
+    df["mae_5d"] = ((pd.to_numeric(df["low_5d"], errors="coerce") - signal_close) / signal_close * 100).where(mature_5d)
 
     blockers: List[List[str]] = []
+    extracted = {
+        key: [] for key in (
+            "grade_stage", "decision_lifecycle_state", "confirmation_event_state",
+            "early_value_transition_state", "sector_phase", "bottom_discovery_stage",
+        )
+    }
+    research_eligible: List[bool] = []
+    opportunity_scores: List[Any] = []
     for _, row in df.iterrows():
         detail = _detail_dict(row.get("price_action_detail"))
-        for key in (
-            "grade_stage", "decision_lifecycle_state", "confirmation_event_state",
-            "early_value_transition_state", "sector_phase", "research_eligible",
-            "trade_opportunity_score",
-        ):
-            value = detail.get(key)
-            df.loc[row.name, key] = "UNKNOWN" if value is None else value
+        for key in extracted:
+            extracted[key].append(detail.get(key) or "UNKNOWN")
+        research_value = detail.get("research_eligible")
+        research_eligible.append(
+            research_value is True
+            or research_value == 1
+            or str(research_value).strip().lower() == "true"
+        )
+        opportunity_scores.append(detail.get("trade_opportunity_score"))
         values: Iterable[str] = (
             _as_list(detail.get("trade_blockers"))
             + _as_list(row.get("sop_vetoes"))
             + _as_list(detail.get("sop_vetoes"))
         )
         blockers.append(list(dict.fromkeys(item for item in values if item)))
+    for key, values in extracted.items():
+        df[key] = values
+    df["research_eligible"] = pd.Series(research_eligible, index=df.index, dtype=bool)
+    df["trade_opportunity_score"] = pd.to_numeric(
+        pd.Series(opportunity_scores, index=df.index), errors="coerce"
+    )
     df["blockers"] = blockers
     return df
 
@@ -248,6 +296,77 @@ def _metric_summary(values: pd.Series) -> Dict[str, Any]:
     }
 
 
+def build_a_grade_policy_report(
+    df: pd.DataFrame,
+    min_samples: int = SOP_A_GRADE_MIN_MATURE_SAMPLES,
+) -> Dict[str, Any]:
+    """Compare persisted A grades with the current strategy-calibrated A gate."""
+    min_samples = max(1, int(min_samples))
+
+    def summarize(group: pd.DataFrame) -> Dict[str, Any]:
+        ret_5d = group.get("ret_5d", pd.Series(index=group.index, dtype=float))
+        return {
+            "signals": int(len(group)),
+            "mature_5d": int(pd.to_numeric(ret_5d, errors="coerce").notna().sum()),
+            "metrics": {
+                f"{horizon}d": _metric_summary(group.get(f"ret_{horizon}d", pd.Series(dtype=float)))
+                for horizon in HORIZONS
+            },
+        }
+
+    if df.empty:
+        empty = summarize(pd.DataFrame())
+        return {
+            "status": "INSUFFICIENT_DATA",
+            "policy_version": SOP_A_GRADE_POLICY_VERSION,
+            "min_mature_samples": min_samples,
+            "baseline": empty,
+            "proposed": empty,
+        }
+
+    grades = df.get("sop_grade", pd.Series("UNKNOWN", index=df.index)).astype(str)
+    strategies = df.get("strategy_type", pd.Series("", index=df.index)).astype(str)
+    scores = pd.to_numeric(df.get("sop_quality_score", pd.Series(index=df.index, dtype=float)), errors="coerce")
+    pa_scores = pd.to_numeric(df.get("price_action_score", pd.Series(index=df.index, dtype=float)), errors="coerce")
+    pct_5d = pd.to_numeric(df.get("pct_5d", pd.Series(index=df.index, dtype=float)), errors="coerce")
+    vetoes = df.get("sop_vetoes", pd.Series([[] for _ in range(len(df))], index=df.index)).apply(_as_list)
+    baseline = df[grades.eq("A")]
+    proposed = df[
+        strategies.isin(SOP_A_GRADE_STRATEGIES)
+        & scores.ge(SOP_A_GRADE_MIN_SCORE)
+        & pa_scores.ge(SOP_A_GRADE_MIN_PRICE_ACTION_SCORE)
+        & pct_5d.le(SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT)
+        & vetoes.apply(lambda items: not items)
+    ]
+    proposed_summary = summarize(proposed)
+    metrics_5d = proposed_summary["metrics"]["5d"]
+    if proposed_summary["mature_5d"] < min_samples:
+        status = "INSUFFICIENT_DATA"
+    elif (
+        metrics_5d["win_rate"] >= 55
+        and (metrics_5d["avg_return"] or 0) >= 1.5
+        and (metrics_5d["profit_factor"] or 0) >= 1.5
+    ):
+        status = "VALIDATED"
+    else:
+        status = "NOT_SUPPORTED"
+    return {
+        "status": status,
+        "policy_version": SOP_A_GRADE_POLICY_VERSION,
+        "min_mature_samples": min_samples,
+        "selection_rule": (
+            f"strategy_type in {list(SOP_A_GRADE_STRATEGIES)}, "
+            f"sop_quality_score>={SOP_A_GRADE_MIN_SCORE:g}, "
+            f"price_action_score>={SOP_A_GRADE_MIN_PRICE_ACTION_SCORE:g}, "
+            f"pct_5d<={SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT:g}, sop_vetoes=[]"
+        ),
+        "validation_targets": {"win_rate_5d": 55, "avg_return_5d": 1.5, "profit_factor_5d": 1.5},
+        "baseline": summarize(baseline),
+        "proposed": proposed_summary,
+        "measurement_note": "按信号日收盘到未来交易日收盘衡量结构质量；不等同于可成交收益。",
+    }
+
+
 def _group_rows(df: pd.DataFrame, column: str) -> List[Dict[str, Any]]:
     if column not in df.columns or df.empty:
         return []
@@ -269,6 +388,131 @@ def _group_rows(df: pd.DataFrame, column: str) -> List[Dict[str, Any]]:
         reverse=True,
     )
     return rows
+
+
+def build_bottom_discovery_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[str, Any]:
+    """Evaluate observation-only B0/B1 signals without treating them as executions."""
+    min_samples = max(1, int(min_samples))
+    if df.empty or "strategy_type" not in df.columns:
+        bottom = pd.DataFrame()
+    else:
+        bottom = df[df["strategy_type"].astype(str).eq("bottom_discovery")].copy()
+
+    stage_rows = _group_rows(bottom, "bottom_discovery_stage")
+    for row in stage_rows:
+        stage = bottom[bottom["bottom_discovery_stage"].fillna("UNKNOWN").astype(str).eq(row["value"])]
+        mfe = pd.to_numeric(stage.get("mfe_5d", pd.Series(dtype=float)), errors="coerce").dropna()
+        mae = pd.to_numeric(stage.get("mae_5d", pd.Series(dtype=float)), errors="coerce").dropna()
+        row["excursion_5d"] = {
+            "samples": int(min(len(mfe), len(mae))),
+            "avg_mfe": round(float(mfe.mean()), 2) if not mfe.empty else None,
+            "avg_mae": round(float(mae.mean()), 2) if not mae.empty else None,
+            "mfe_ge_5_rate": round(float(mfe.ge(5).mean() * 100), 1) if not mfe.empty else None,
+            "mae_le_minus_4_rate": round(float(mae.le(-4).mean() * 100), 1) if not mae.empty else None,
+        }
+
+    conversions = []
+    if not bottom.empty and "bottom_discovery_stage" in bottom.columns:
+        dated = bottom.assign(_signal_date=pd.to_datetime(bottom["signal_date"], errors="coerce")).dropna(subset=["_signal_date"])
+        for code, group in dated.groupby(dated["code"].astype(str)):
+            b0_dates = group.loc[group["bottom_discovery_stage"].eq("B0_BASE"), "_signal_date"]
+            b1_dates = group.loc[group["bottom_discovery_stage"].eq("B1_REVERSAL"), "_signal_date"]
+            if b0_dates.empty:
+                continue
+            first_b0 = b0_dates.min()
+            later_b1 = b1_dates[b1_dates > first_b0]
+            conversions.append({
+                "code": code,
+                "converted": not later_b1.empty,
+                "wait_days": int((later_b1.min() - first_b0).days) if not later_b1.empty else None,
+            })
+    converted = [item for item in conversions if item["converted"]]
+    wait_days = pd.Series([item["wait_days"] for item in converted], dtype=float)
+
+    confirmation_window_days = BOTTOM_FOLLOWUP_WINDOW_DAYS
+    confirmation_rows = []
+    strict_rows = []
+    b1_events = pd.DataFrame()
+    b1_total = 0
+    if not bottom.empty and "bottom_discovery_stage" in bottom.columns and "signal_date" in df.columns:
+        events = df.copy()
+        signal_time = pd.to_datetime(events["signal_date"], errors="coerce", utc=True)
+        scanned_time = pd.to_datetime(
+            events.get("scanned_at", pd.Series(index=events.index, dtype=object)), errors="coerce", utc=True,
+        )
+        events["_event_time"] = scanned_time.fillna(signal_time)
+        events = events.dropna(subset=["_event_time"])
+        b1_events = events[
+            events["strategy_type"].astype(str).eq("bottom_discovery")
+            & events.get("bottom_discovery_stage", pd.Series(index=events.index, dtype=object)).eq("B1_REVERSAL")
+        ].sort_values("_event_time").drop_duplicates(subset=["code"], keep="first")
+        b1_total = int(len(b1_events))
+        evaluation_time = events["_event_time"].max()
+        b1_events = b1_events[
+            b1_events["_event_time"].le(evaluation_time - pd.Timedelta(days=confirmation_window_days))
+        ]
+        eligible = events.get("trade_eligible", pd.Series(False, index=events.index)).fillna(False).astype(bool)
+        trade_bucket = events.get("trade_bucket", pd.Series("", index=events.index)).fillna("").astype(str).str.upper()
+        strategy = events["strategy_type"].fillna("").astype(str)
+        for _, b1 in b1_events.iterrows():
+            deadline = b1["_event_time"] + pd.Timedelta(days=confirmation_window_days)
+            later = events[
+                events["code"].astype(str).eq(str(b1["code"]))
+                & events["_event_time"].gt(b1["_event_time"])
+                & events["_event_time"].le(deadline)
+            ].sort_values("_event_time")
+            formal = later[
+                eligible.reindex(later.index).fillna(False)
+                & trade_bucket.reindex(later.index).eq("TRADE")
+                & ~strategy.reindex(later.index).eq("bottom_discovery")
+            ]
+            strict = later[strategy.reindex(later.index).eq("tv_dual_strict")]
+            if not formal.empty:
+                first = formal.iloc[0]
+                confirmation_rows.append({
+                    "wait_days": float((first["_event_time"] - b1["_event_time"]).total_seconds() / 86400),
+                    "strategy_type": str(first["strategy_type"]),
+                })
+            if not strict.empty:
+                first = strict.iloc[0]
+                strict_rows.append(float((first["_event_time"] - b1["_event_time"]).total_seconds() / 86400))
+
+    b1_count = int(len(b1_events))
+    confirmation_waits = pd.Series([row["wait_days"] for row in confirmation_rows], dtype=float)
+    strict_waits = pd.Series(strict_rows, dtype=float)
+    confirmed_by_strategy = pd.Series([row["strategy_type"] for row in confirmation_rows], dtype=str).value_counts().to_dict()
+    mature_by_stage = {row["value"]: row["mature_5d"] for row in stage_rows}
+    validated = mature_by_stage.get("B1_REVERSAL", 0) >= min_samples
+    return {
+        "status": "VALIDATED" if validated else "INSUFFICIENT_DATA",
+        "min_mature_b1_samples": min_samples,
+        "signals": int(len(bottom)),
+        "by_stage": stage_rows,
+        "conversion": {
+            "b0_unique_stocks": len(conversions),
+            "converted_to_b1": len(converted),
+            "conversion_rate": round(len(converted) / len(conversions) * 100, 1) if conversions else None,
+            "median_wait_calendar_days": round(float(wait_days.median()), 1) if not wait_days.empty else None,
+        },
+        "formal_confirmation": {
+            "window_calendar_days": confirmation_window_days,
+            "b1_unique_stocks": b1_total,
+            "mature_b1_followups": b1_count,
+            "confirmed_stocks": len(confirmation_rows),
+            "confirmation_rate": round(len(confirmation_rows) / b1_count * 100, 1) if b1_count else None,
+            "median_wait_calendar_days": round(float(confirmation_waits.median()), 1) if not confirmation_waits.empty else None,
+            "within_10_days": int(confirmation_waits.le(10).sum()),
+            "confirmed_by_strategy": confirmed_by_strategy,
+        },
+        "strict_strategy_lead": {
+            "window_calendar_days": confirmation_window_days,
+            "mature_b1_followups": b1_count,
+            "matched_stocks": len(strict_rows),
+            "match_rate": round(len(strict_rows) / b1_count * 100, 1) if b1_count else None,
+            "median_lead_calendar_days": round(float(strict_waits.median()), 1) if not strict_waits.empty else None,
+        },
+        "measurement_note": "MFE/MAE使用信号后5个交易日最高/最低价；事件漏斗只向前关联30个自然日内的后续信号，不代表可交易收益。",
+    }
 
 
 def _grade_monotonicity(by_grade: List[Dict[str, Any]], min_samples: int) -> Dict[str, Any]:
@@ -306,11 +550,14 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
             "by_trade_bucket": [],
             "by_market_regime": [],
             "by_score_model_version": [],
+            "by_sop_grade_policy_version": [],
             "by_grade_stage": [],
             "by_lifecycle_state": [],
             "by_confirmation_event": [],
             "by_early_value_transition": [],
+            "bottom_discovery_analysis": build_bottom_discovery_report(pd.DataFrame(), min_samples),
             "grade_monotonicity": _grade_monotonicity([], min_samples),
+            "a_grade_policy": build_a_grade_policy_report(pd.DataFrame(), min_samples),
         }
 
     horizons = {f"{horizon}d": _metric_summary(df[f"ret_{horizon}d"]) for horizon in HORIZONS}
@@ -331,11 +578,14 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
         "by_trade_bucket": _group_rows(df, "trade_bucket"),
         "by_market_regime": _group_rows(df, "market_regime"),
         "by_score_model_version": _group_rows(df, "score_model_version"),
+        "by_sop_grade_policy_version": _group_rows(df, "sop_grade_policy_version"),
         "by_grade_stage": _group_rows(df, "grade_stage"),
         "by_lifecycle_state": _group_rows(df, "decision_lifecycle_state"),
         "by_confirmation_event": _group_rows(df, "confirmation_event_state"),
         "by_early_value_transition": _group_rows(df, "early_value_transition_state"),
+        "bottom_discovery_analysis": build_bottom_discovery_report(df, min_samples),
         "grade_monotonicity": _grade_monotonicity(by_grade, min_samples),
+        "a_grade_policy": build_a_grade_policy_report(df, min_samples),
     }
     if "exec_return_pct" in df.columns:
         filled = df["exec_filled"].fillna(False).astype(bool) if "exec_filled" in df.columns else pd.Series(False, index=df.index)

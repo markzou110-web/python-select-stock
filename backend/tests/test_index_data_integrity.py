@@ -43,6 +43,7 @@ def test_local_bank_stock_not_used_as_index(monkeypatch):
 
     # 强制走本地兜底路径：禁用在线 Sina/Eastmoney/akshare 接口
     monkeypatch.setattr(data_mod, "_fetch_index_hist_sina", lambda code: pd.DataFrame())
+    monkeypatch.setattr(data_mod.ak, "index_zh_a_hist", lambda **_kwargs: pd.DataFrame())
     # data.py 内部用 `from core.db import get_db_engine`，patch 源模块的引用
     monkeypatch.setattr(db_mod, "get_db_engine", lambda: fake_engine)
     monkeypatch.setattr(data_mod, "get_db_engine", lambda: fake_engine)
@@ -55,8 +56,8 @@ def test_local_bank_stock_not_used_as_index(monkeypatch):
     assert result is None or result.empty, "银行股(收盘<100)不应被当作上证指数返回"
 
 
-def test_real_index_data_used_when_close_above_1000(monkeypatch):
-    """daily_k 里 000001 收盘 > 1000（真指数）→ 本地兜底应正常返回。"""
+def test_prefixed_local_index_data_is_used(monkeypatch):
+    """独立代码 sh000001 的本地指数数据应作为上证指数兜底。"""
     import core.data as data_mod
     import core.db as db_mod
 
@@ -67,7 +68,7 @@ def test_real_index_data_used_when_close_above_1000(monkeypatch):
     for i in range(100):
         d = today - timedelta(days=99 - i)
         rows.append({
-            "code": "000001", "date": d, "open": 4000.0, "high": 4100.0,
+            "code": "sh000001", "date": d, "open": 4000.0, "high": 4100.0,
             "low": 3950.0, "close": 4000.0 + i * 2, "vol": 100000.0,
         })
     with engine.begin() as conn:
@@ -75,6 +76,7 @@ def test_real_index_data_used_when_close_above_1000(monkeypatch):
                              VALUES (:code, :date, :open, :high, :low, :close, :vol)"""), rows)
 
     monkeypatch.setattr(data_mod, "_fetch_index_hist_sina", lambda code: pd.DataFrame())
+    monkeypatch.setattr(data_mod.ak, "index_zh_a_hist", lambda **_kwargs: pd.DataFrame())
     monkeypatch.setattr(db_mod, "get_db_engine", lambda: engine)
     monkeypatch.setattr(data_mod, "get_db_engine", lambda: engine)
     monkeypatch.setattr(data_mod, "get_cached_data", lambda key, ttl: None)
@@ -104,6 +106,7 @@ def test_local_chinext_stock_not_used_as_chinext_index(monkeypatch):
                              VALUES (:code, :date, :open, :high, :low, :close, :vol)"""), rows)
 
     monkeypatch.setattr(data_mod, "_fetch_index_hist_sina", lambda code: pd.DataFrame())
+    monkeypatch.setattr(data_mod.ak, "index_zh_a_hist", lambda **_kwargs: pd.DataFrame())
     monkeypatch.setattr(db_mod, "get_db_engine", lambda: engine)
     monkeypatch.setattr(data_mod, "get_db_engine", lambda: engine)
     monkeypatch.setattr(data_mod, "get_cached_data", lambda key, ttl: None)
@@ -112,3 +115,29 @@ def test_local_chinext_stock_not_used_as_chinext_index(monkeypatch):
     result = data_mod.get_index_hist("399006")
 
     assert result is None or result.empty
+
+
+def test_unavailable_index_source_is_short_cached(monkeypatch):
+    """同一页面重复计算指标时，不应连续等待同一个已超时的指数源。"""
+    import core.data as data_mod
+    import core.db as db_mod
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    cache = {}
+    calls = []
+
+    def fetch(_code):
+        calls.append(_code)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(data_mod, "_fetch_index_hist_sina", fetch)
+    monkeypatch.setattr(data_mod.ak, "index_zh_a_hist", lambda **_kwargs: pd.DataFrame())
+    monkeypatch.setattr(db_mod, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(data_mod, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(data_mod, "get_cached_data", lambda key, _ttl: cache.get(key))
+    monkeypatch.setattr(data_mod, "set_cached_data", lambda key, value: cache.__setitem__(key, value))
+
+    assert data_mod.get_index_hist("000001").empty
+    assert data_mod.get_index_hist("000001").empty
+    assert calls == ["000001"]

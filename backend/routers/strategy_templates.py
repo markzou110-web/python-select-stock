@@ -7,12 +7,13 @@ import json
 from core.db import get_db_engine
 from core.logging_config import logger
 from core.pro_workflow import recommend_strategy_template
+from core.risk_constants import BACKTEST_STOP_LOSS_PCT, PRIMARY_TV_STRATEGY
 
 router = APIRouter(prefix="/api/strategy-templates", tags=["strategy-templates"])
 
 
 DEFAULT_TEMPLATE_PARAMS = {
-    "strategy_type": "tv_dual_strict",
+    "strategy_type": PRIMARY_TV_STRATEGY,
     "pine_min_signals": 3,
     "min_data_days": 120,
     "threshold": 0.12,
@@ -29,7 +30,7 @@ DEFAULT_TEMPLATE_PARAMS = {
     "use_rs_filter": False,
     "local_only": True,
     "data_date": "",
-    "stop_loss_pct": -8,
+    "stop_loss_pct": BACKTEST_STOP_LOSS_PCT,
 }
 
 
@@ -58,10 +59,10 @@ def _ensure_seed_templates(engine) -> None:
             return
         seeds = [
             {
-                "name": "TV双策略强共振",
-                "strategy_type": "tv_dual_strict",
+                "name": "TV均线或ZP策略",
+                "strategy_type": PRIMARY_TV_STRATEGY,
                 "params": DEFAULT_TEMPLATE_PARAMS,
-                "description": "尾盘买入候选：最近窗口内均线B共振和 TV-ZP long 同时出现。",
+                "description": "尾盘买入候选：均线B或 TV-ZP long 任一有效信号出现。",
                 "is_default": 1,
             },
             {

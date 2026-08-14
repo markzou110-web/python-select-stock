@@ -11,36 +11,36 @@ interface Sector {
 
 export default function SectorGrid({ sectors }: { sectors: Sector[] }) {
     return (
-        <div className="space-y-2">
+        <section className="space-y-3" aria-labelledby="leading-sectors-heading">
             <div className="flex items-center justify-between">
-                <h3 className="text-sm font-black text-slate-900 flex items-center gap-2">
-                    <Flame size={16} className="text-rose-600" />
+                <h2 id="leading-sectors-heading" className="flex items-center gap-2 text-base font-bold text-slate-900">
+                    <Flame size={17} className="text-rose-700" aria-hidden="true" />
                     今日领涨板块
-                </h3>
-                <button className="text-xs font-black text-blue-700 hover:underline">查看全部</button>
+                </h2>
+                <span className="text-xs text-slate-500">按今日涨幅排序</span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-2.5">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
                 {sectors.length > 0 ? sectors.map((sector, i) => (
-                    <div key={i} className="glass-card p-3 group flex flex-col justify-between h-20 relative overflow-hidden transition-colors duration-150 hover:border-blue-200">
+                    <article key={`${sector.name}-${i}`} className="glass-card group flex min-h-24 flex-col justify-between overflow-hidden p-4 transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-lg">
                         <div>
-                            <p className="metric-label mb-1">{sector.name}</p>
+                            <p className="metric-label mb-1.5">{sector.name}</p>
                             <div className="flex items-baseline gap-2">
-                                <span className="text-lg font-black font-mono text-rose-600">+{sector.pct.toFixed(2)}%</span>
+                                <span className="font-mono text-xl font-bold tabular-nums text-rose-700">+{sector.pct.toFixed(2)}%</span>
                             </div>
                         </div>
 
-                        <div className="flex items-center gap-1.5 mt-1">
-                            <TrendingUp size={12} className="text-slate-300" />
-                            <span className="text-[10px] font-bold text-slate-400">领涨: <span className="text-slate-600">{sector.lead}</span></span>
+                        <div className="mt-2 flex items-center gap-1.5">
+                            <TrendingUp size={13} className="text-slate-400" aria-hidden="true" />
+                            <span className="truncate text-xs text-slate-500">领涨 <span className="font-medium text-slate-700">{sector.lead}</span></span>
                         </div>
-                    </div>
+                    </article>
                 )) : (
                     Array(5).fill(0).map((_, i) => (
-                        <div key={i} className="glass-card p-4 h-20 animate-pulse bg-slate-50" />
+                        <div key={i} className="glass-card h-24 animate-pulse bg-slate-50 p-4" aria-hidden="true" />
                     ))
                 )}
             </div>
-        </div>
+        </section>
     );
 }

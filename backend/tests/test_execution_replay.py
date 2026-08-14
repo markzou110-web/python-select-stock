@@ -6,12 +6,17 @@ from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.execution_replay import build_execution_replay_report, run_historical_execution_replay
+from core.execution_replay import (
+    build_bark_instruction_evidence,
+    build_execution_replay_report,
+    build_operation_advice_validation,
+    run_historical_execution_replay,
+)
 
 
 def _candidate(code: str, blockers_ready: bool = True):
     detail = {
-        "research_eligible": True,
+        "research_eligible": True, "sop_quality_score": 65,
         "raw_score": 90,
         "trade_opportunity_score": 75,
         "market_sentiment_stage": "REPAIR",
@@ -25,6 +30,10 @@ def _candidate(code: str, blockers_ready: bool = True):
         "pa_close_position": 0.8,
         "pa_upper_shadow_pct": 1,
         "pa_pullback_status": "CONFIRMED",
+        "execution_plan_frozen": True,
+        "frozen_plan_date": "2026-01-02",
+        "frozen_confirmation_price": 9.9,
+        "frozen_stop_price": 9.0,
         "pct_5d": 5,
         "mkt_cap_yi": 100,
         "evidence_grade": "A",
@@ -104,6 +113,122 @@ def test_historical_replay_supports_sqlite_end_to_end():
     report = run_historical_execution_replay(engine, days=30)
     assert report["summary"]["point_in_time_candidates"] == 1
     assert report["days"] == 30
+    assert report["operation_advice_validation"]["production_logic_changed"] is False
+
+
+def test_operation_advice_validation_never_changes_selection_when_data_is_insufficient():
+    report = build_operation_advice_validation(pd.DataFrame(), pd.DataFrame())
+
+    assert report["verdict"] == "INSUFFICIENT_DATA"
+    assert report["production_logic_changed"] is False
+
+
+def test_bark_instruction_evidence_excludes_observe_events_and_flags_missing_intent_audit():
+    events = pd.DataFrame([
+        {
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 15:00:00",
+            "source": "bark", "code": "000001", "name": "测试",
+            "strategy_type": "tv_dual_strict", "signal_close": 10.0,
+            "trade_bucket": "TRADE", "trade_eligible": 1,
+        },
+        {
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 15:00:00",
+            "source": "bark", "code": "000002", "name": "观察",
+            "strategy_type": "tv_dual_strict", "signal_close": 10.0,
+            "trade_bucket": "OBSERVE", "trade_eligible": 0,
+        },
+        {
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 15:05:00",
+            "source": "bark_next_day", "code": "000001", "name": "测试",
+            "strategy_type": "tv_dual_strict", "signal_close": 10.0,
+            "trade_bucket": "TRADE", "trade_eligible": 1,
+        },
+    ])
+    daily = pd.DataFrame([
+        {
+            "code": "000001", "日期": f"2026-01-{day:02d}",
+            "开盘": price, "最高": price + 0.2, "最低": price - 0.2,
+            "收盘": price, "成交量": 100000,
+        }
+        for day, price in zip(range(6, 11), (10.1, 10.2, 10.3, 10.4, 10.5))
+    ])
+
+    report = build_bark_instruction_evidence(
+        events, daily, {"issued": 0, "states": {}, "items": []},
+    )
+
+    assert report["persisted_candidates"] == 3
+    assert report["tradable_instructions"] == 1
+    assert report["audited_delivered_instructions"] == 0
+    assert report["filled"] == 0
+    assert report["generated_instruction_shadow"]["filled"] == 1
+    assert report["audit_gap"] is True
+    assert report["status"] == "INSUFFICIENT_DATA"
+
+    audited = build_bark_instruction_evidence(events, daily, {
+        "issued": 1, "states": {"ISSUED": 1},
+        "items": [{
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 15:00:00",
+            "source": "bark", "code": "000001", "name": "测试",
+            "strategy_type": "tv_dual_strict", "instruction": "可交易", "state": "ISSUED",
+            "signal_close": 10.0, "pa_entry_price": 10.0, "pa_stop_price": 9.0,
+        }],
+    })
+    assert audited["audited_delivered_instructions"] == 1
+    assert audited["filled"] == 1
+    assert audited["audit_gap"] is False
+
+    next_day_only = build_bark_instruction_evidence(pd.DataFrame(), daily, {
+        "issued": 1, "states": {"ISSUED": 1}, "items": [{
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 10:30:00",
+            "source": "bark", "code": "000001", "name": "测试",
+            "strategy_type": "tv_dual_strict", "instruction": "可交易", "state": "ISSUED",
+            "signal_close": 10.0, "pa_entry_price": 10.0, "pa_stop_price": 9.0,
+        }],
+    })
+    assert next_day_only["tradable_instructions"] == 0
+    assert next_day_only["audited_delivered_instructions"] == 1
+    assert next_day_only["filled"] == 1
+
+    missing_price_audit = build_bark_instruction_evidence(pd.DataFrame(), daily, {
+        "issued": 1, "states": {"ISSUED": 1}, "items": [{
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 10:30:00",
+            "source": "bark", "code": "000002", "name": "缺计划价",
+            "strategy_type": "tv_dual_strict", "instruction": "可交易", "state": "ISSUED",
+            "signal_close": None, "pa_entry_price": None, "pa_stop_price": 9.0,
+        }],
+    })
+    assert missing_price_audit["audited_delivered_instructions"] == 1
+    assert missing_price_audit["missing_planned_entry"] == 1
+    assert missing_price_audit["filled"] == 0
+
+    actual_fill = build_bark_instruction_evidence(pd.DataFrame(), daily, {
+        "issued": 1, "states": {"FILLED": 1}, "items": [{
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 10:30:00",
+            "source": "bark", "code": "000001", "name": "真实成交",
+            "strategy_type": "tv_dual_strict", "instruction": "可交易", "state": "FILLED",
+            "signal_close": 10.0, "pa_entry_price": 10.0, "pa_stop_price": 9.0,
+            "actual_price": 10.0, "filled_shares": 100,
+        }],
+    })
+    assert actual_fill["actual_fill_evidence"]["fills"] == 1
+    assert actual_fill["actual_fill_evidence"]["mature"] == 1
+    assert actual_fill["actual_fill_evidence"]["metrics"]["avg_return"] > 0
+    assert actual_fill["actual_fill_evidence"]["verdict"] == "INSUFFICIENT_DATA"
+
+    adjustment_daily = daily.copy()
+    adjustment_daily.loc[:, ["开盘", "最高", "最低", "收盘"]] = [30.0, 30.2, 29.8, 30.0]
+    adjustment_gap = build_bark_instruction_evidence(pd.DataFrame(), adjustment_daily, {
+        "issued": 1, "states": {"FILLED": 1}, "items": [{
+            "signal_date": "2026-01-05", "event_time": "2026-01-05 10:30:00",
+            "source": "bark", "code": "000001", "name": "复权断点",
+            "strategy_type": "tv_dual_strict", "instruction": "可交易", "state": "FILLED",
+            "signal_close": 10.0, "pa_entry_price": 10.0, "pa_stop_price": 9.0,
+            "actual_price": 10.0, "filled_shares": 100,
+        }],
+    })
+    assert adjustment_gap["actual_fill_evidence"]["mature"] == 0
+    assert adjustment_gap["actual_fill_evidence"]["excluded_adjustment_gaps"] == 1
 
 
 def test_evidence_shadow_reports_missed_winner_without_changing_current():
@@ -123,3 +248,28 @@ def test_evidence_shadow_reports_missed_winner_without_changing_current():
     assert current["selected"] == 1
     assert evidence["selected"] == 0
     assert report["evidence_quality"]["attribution"]["RISK_GATE_MISSED_WINNER"] == 1
+
+
+def test_persistent_b_shadow_requires_repeated_point_in_time_pushes_and_never_changes_current():
+    first = _candidate("000004")
+    second = _candidate("000004")
+    for item, signal_date in ((first, "2026-01-05"), (second, "2026-01-06")):
+        item["signal_date"] = signal_date
+        item["sop_grade"] = "B"
+        item["pct"] = 4.0
+        # Keep this cohort outside the independent A-EOD production route;
+        # this test isolates repeated-push shadow semantics only.
+        item["price_action_score"] = 55
+    outcomes = pd.DataFrame([{
+        "code": "000004", "signal_date": "2026-01-06", "strategy_type": "tv_dual_strict",
+        "ret_5d": 3.0,
+    }])
+
+    report = build_execution_replay_report(pd.DataFrame([first, second]), outcomes)
+    persistent = next(item for item in report["policies"] if item["policy"] == "persistent_b_shadow")
+    current = next(item for item in report["policies"] if item["policy"] == "current_policy")
+
+    assert persistent["selected"] == 1
+    assert current["selected"] == 0
+    assert report["persistent_b_shadow"]["strict_b_candidates"] == 2
+    assert report["persistent_b_shadow"]["failed_checks"]["repeated_push"] == 1

@@ -66,6 +66,11 @@ def test_send_theme_momentum_alert_can_render_without_notifying(monkeypatch):
 
     monkeypatch.setattr(watchlist, "get_db_engine", lambda: object())
     monkeypatch.setattr(watchlist.pd, "read_sql", lambda *args, **kwargs: watch_df)
+    monkeypatch.setattr(
+        watchlist,
+        "discover_theme_leadership",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("shadow unavailable")),
+    )
 
     import core.data as data
     monkeypatch.setattr(data, "get_market_snapshot", lambda: snapshot)
@@ -78,6 +83,56 @@ def test_send_theme_momentum_alert_can_render_without_notifying(monkeypatch):
     assert result["notification"] is False
     assert result["count"] == 1
     assert "双环传动" in result["body"]
+    assert "不是买入指令" in result["body"]
+
+
+def test_theme_momentum_falls_back_to_full_market_as_observation_only(monkeypatch):
+    snapshot = pd.DataFrame([
+        {"code": "002001", "name": "元件一", "industry": "元器件", "price": 10, "pct_chg": 9.9, "turnover": 8, "limit_up": 10.01},
+        {"code": "002002", "name": "元件二", "industry": "元器件", "price": 12, "pct_chg": 7.5, "turnover": 6, "limit_up": 13},
+        {"code": "300003", "name": "元件三", "industry": "元器件", "price": 15, "pct_chg": 5.2, "turnover": 5, "limit_up": 18},
+    ])
+    monkeypatch.setattr(watchlist, "get_db_engine", lambda: object())
+    monkeypatch.setattr(watchlist.pd, "read_sql", lambda *args, **kwargs: pd.DataFrame())
+
+    import core.data as data
+    monkeypatch.setattr(data, "get_market_snapshot", lambda: snapshot)
+    monkeypatch.setattr(data, "is_snapshot_stale", lambda _snapshot: False)
+    monkeypatch.setattr(data, "get_stale_cache", lambda _key: snapshot)
+    monkeypatch.setattr(data, "format_freshness", lambda _snapshot: "行情：实时")
+
+    result = watchlist.send_theme_momentum_alert(slot="13:10", notify=False)
+
+    assert result["source"] == "market_snapshot"
+    assert result["count"] == 1
+    assert "元器件" in result["body"]
+    assert "不是买入指令" in result["body"]
+
+
+def test_theme_momentum_detects_industry_breadth_with_local_industry_mapping(monkeypatch):
+    rows = []
+    basic_map = {}
+    for index in range(10):
+        code = f"600{index:03d}"
+        pct = [9.8, 6.2, 2.8, 2.5, 2.3, 2.0, 1.8, 1.4, 0.9, -0.2][index]
+        rows.append({"code": code, "name": f"影视{index}", "price": 10 + index, "pct_chg": pct})
+        basic_map[code] = {"name": f"影视{index}", "industry": "影视院线"}
+    snapshot = pd.DataFrame(rows)
+    monkeypatch.setattr(watchlist, "get_db_engine", lambda: object())
+    monkeypatch.setattr(watchlist.pd, "read_sql", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr("core.db.get_stock_basic_map", lambda: basic_map)
+
+    import core.data as data
+    monkeypatch.setattr(data, "get_market_snapshot", lambda: snapshot)
+    monkeypatch.setattr(data, "is_snapshot_stale", lambda _snapshot: False)
+    monkeypatch.setattr(data, "get_stale_cache", lambda _key: snapshot)
+    monkeypatch.setattr(data, "format_freshness", lambda _snapshot: "行情：实时")
+
+    result = watchlist.send_theme_momentum_alert(slot="14:00", notify=False)
+
+    assert result["count"] == 1
+    assert "影视院线" in result["body"]
+    assert "上涨占比 90.0%" in result["body"]
     assert "不是买入指令" in result["body"]
 
 
@@ -345,6 +400,24 @@ def test_send_watchlist_status_report_combines_watching_and_triggered(monkeypatc
     assert result["count"] == 2
     assert "士兰微" in result["body"]
     assert "工业富联" in result["body"]
+
+
+def test_send_watchlist_status_report_does_not_treat_failed_dict_as_success(monkeypatch):
+    monkeypatch.setattr(
+        watchlist, "list_watchlist",
+        lambda status="WATCHING": {"items": [{"code": "601138", "name": "工业富联"}]} if status == "WATCHING" else {"items": []},
+    )
+    monkeypatch.setattr(watchlist, "_refresh_items_with_snapshot", lambda items, require_live_snapshot=False: items)
+
+    async def fake_send(*args, **kwargs):
+        return {"bark": False}
+
+    monkeypatch.setattr(watchlist.notifier, "send", fake_send)
+
+    result = watchlist.send_watchlist_status_report("morning")
+
+    assert result["bark"] is False
+    assert result["count"] == 1
 
 
 def test_send_watchlist_status_report_can_render_without_notifying(monkeypatch):

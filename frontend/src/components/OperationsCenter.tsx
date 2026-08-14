@@ -80,6 +80,10 @@ interface OpsSummary {
     scan_quality: {
         total_scans: number;
         success_rate: number;
+        completion_rate: number;
+        research_only_rate: number;
+        failure_rate: number;
+        status_distribution: Record<string, number>;
         avg_duration_sec: number;
         avg_candidates: number;
         avg_results: number;
@@ -206,7 +210,7 @@ export default function OperationsCenter() {
 
             <div className="grid grid-cols-1 lg:grid-cols-4 gap-3">
                 <MetricCard icon={<Database size={18} />} label="可用数据源" value={`${dataSources?.available_count || 0}/${dataSources?.total_count || 0}`} tone={dataSources?.status} />
-                <MetricCard icon={<Activity size={18} />} label="扫描成功率" value={`${summary?.scan_quality.success_rate ?? 0}%`} tone={(summary?.scan_quality.success_rate ?? 0) >= 80 ? 'ok' : 'warn'} />
+                <MetricCard icon={<Activity size={18} />} label="扫描完成率" value={`${summary?.scan_quality.completion_rate ?? summary?.scan_quality.success_rate ?? 0}%`} tone={(summary?.scan_quality.completion_rate ?? summary?.scan_quality.success_rate ?? 0) >= 80 ? 'ok' : 'warn'} />
                 <MetricCard icon={<Layers3 size={18} />} label="研究样本" value={research?.summary.total_signals ?? 0} />
                 <MetricCard icon={<AlertTriangle size={18} />} label="最近入选 / 候选" value={`${latestAudit?.result_count ?? '--'} / ${latestAudit?.candidate_count ?? '--'}`} />
             </div>
@@ -214,8 +218,9 @@ export default function OperationsCenter() {
             <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
                 <section className="glass-card p-5 space-y-4">
                     <SectionTitle icon={<BarChart3 size={18} />} title="扫描质量" subtitle="最近审计任务的稳定性和产出密度" />
-                    <div className="grid grid-cols-3 gap-2">
+                    <div className="grid grid-cols-4 gap-2">
                         <TinyStat label="任务数" value={summary?.scan_quality.total_scans ?? 0} />
+                        <TinyStat label="研究模式" value={summary?.scan_quality.status_distribution?.RESEARCH_ONLY ?? 0} />
                         <TinyStat label="均候选" value={summary?.scan_quality.avg_candidates ?? 0} />
                         <TinyStat label="均入选" value={summary?.scan_quality.avg_results ?? 0} />
                     </div>
@@ -227,7 +232,7 @@ export default function OperationsCenter() {
                         <div className="mt-2 h-2 rounded-full bg-white overflow-hidden">
                             <div
                                 className="h-full rounded-full bg-blue-600"
-                                style={{ width: `${Math.min((summary?.scan_quality.success_rate ?? 0), 100)}%` }}
+                                style={{ width: `${Math.min((summary?.scan_quality.completion_rate ?? summary?.scan_quality.success_rate ?? 0), 100)}%` }}
                             />
                         </div>
                     </div>

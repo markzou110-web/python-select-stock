@@ -489,6 +489,30 @@ def test_watchlist_persists_theme_and_rise_logic(monkeypatch):
     assert payload["items"][0]["rise_logic"] == "银行板块放量走强"
 
 
+def test_watchlist_active_includes_watching_and_triggered_only(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO watchlist (
+                code, name, source, strategy_type, watch_price, status
+            )
+            VALUES
+                ('000001', '观察中股票', 'manual', 'squeeze', 10, 'WATCHING'),
+                ('000002', '已触发股票', 'manual', 'squeeze', 10, 'TRIGGERED'),
+                ('000003', '已归档股票', 'manual', 'squeeze', 10, 'ARCHIVED'),
+                ('000004', '已失效股票', 'manual', 'squeeze', 10, 'INVALIDATED')
+        """))
+
+    monkeypatch.setattr(watchlist, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(watchlist, "_latest_prices", lambda *_: {})
+
+    payload = watchlist.list_watchlist(status="ACTIVE")
+
+    assert {item["status"] for item in payload["items"]} == {"WATCHING", "TRIGGERED"}
+    assert payload["stats"]["total"] == 2
+
+
 def test_watchlist_decision_waits_for_price_trigger_when_setup_is_ready():
     item = {
         "target_hit": False,
