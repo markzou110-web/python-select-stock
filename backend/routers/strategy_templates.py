@@ -6,7 +6,7 @@ import json
 
 from core.db import get_db_engine
 from core.logging_config import logger
-from core.pro_workflow import recommend_strategy_template
+from core.pro_workflow import build_live_strategy_recommendation
 from core.risk_constants import BACKTEST_STOP_LOSS_PCT, PRIMARY_TV_STRATEGY
 
 router = APIRouter(prefix="/api/strategy-templates", tags=["strategy-templates"])
@@ -118,15 +118,16 @@ def list_strategy_templates() -> Dict[str, Any]:
 @router.get("/recommendation")
 def get_strategy_template_recommendation(
     market_regime: str = "UNKNOWN",
-    risk_status: str = "ok",
-    recent_win_rate: float = 0,
+    risk_status: str | None = None,
+    recent_win_rate: float | None = None,
 ) -> Dict[str, Any]:
     return {
         "status": "success",
-        "recommendation": recommend_strategy_template(
+        "recommendation": build_live_strategy_recommendation(
+            get_db_engine(),
             market_regime=market_regime,
             risk_status=risk_status,
-            recent_win_rate=float(recent_win_rate or 0),
+            recent_win_rate=recent_win_rate,
         ),
     }
 

@@ -88,6 +88,8 @@ def _candidate_action_label(stock: Dict[str, Any]) -> str:
 def _candidate_push_bucket(stock: Dict[str, Any]) -> str:
     if stock.get("event_alert_tier") == "STRONG_WATCH":
         return "强势异动"
+    if stock.get("sequoia_research_shadow_only"):
+        return "SHADOW研究观察"
     if stock.get("tv_reversal_watch_only"):
         return "强势异动"
     if stock.get('sector_watch_only'):
@@ -170,6 +172,8 @@ def _candidate_brief_action(stock: Dict[str, Any]) -> str:
         return "可小仓复核"
     if stock.get("bottom_discovery_watch_only"):
         return "起涨预警" if stock.get("bottom_discovery_stage") == "B1_REVERSAL" else "底部观察"
+    if stock.get("sequoia_research_shadow_only"):
+        return "SHADOW研究观察"
     if stock.get("tv_reversal_watch_only"):
         return "强修复观察"
     if stock.get("pa_execution_stage") == "INTRADAY_PREVIEW":
@@ -202,6 +206,8 @@ def _candidate_grade_label(stock: Dict[str, Any]) -> str:
         return explicit
     if stock.get("bottom_discovery_watch_only"):
         return "B1止跌转强" if stock.get("bottom_discovery_stage") == "B1_REVERSAL" else "B0底部候选"
+    if stock.get("sequoia_research_shadow_only"):
+        return "SHADOW研究形态"
     if stock.get("tv_reversal_watch_only"):
         return "M级强修复"
     if stock.get("pa_execution_tier") == "PULLBACK_WATCH":
@@ -609,6 +615,7 @@ def _select_after_close_watchlist(
             )
             and stock.get('trade_bucket') != 'BLOCK'
             and not stock.get('sector_watch_only')
+            and not stock.get('sequoia_research_shadow_only')
             and not (
                 str(stock.get('strategy_type') or '') == 'tv_dual'
                 and str(stock.get('代码') or stock.get('code') or '') in strict_codes
@@ -636,6 +643,7 @@ def _is_a_eod_t1_plan_candidate(stock: Dict[str, Any]) -> bool:
         stock.get('sector_watch_only')
         or stock.get('tv_reversal_watch_only')
         or stock.get('bottom_discovery_watch_only')
+        or stock.get('sequoia_research_shadow_only')
         or str(stock.get('strategy_type') or '') not in SOP_A_GRADE_STRATEGIES
     ):
         return False

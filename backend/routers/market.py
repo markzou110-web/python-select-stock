@@ -1,5 +1,5 @@
-from fastapi import APIRouter
-from typing import Dict, Any, List
+from fastapi import APIRouter, HTTPException, Query
+from typing import Dict, Any, List, Literal
 from datetime import datetime, timedelta
 import time
 import akshare as ak
@@ -285,6 +285,33 @@ def get_research_radar(limit: int = 10, force_refresh: bool = False):
         limit=limit,
         force_refresh=force_refresh,
     )
+
+
+@router.get("/market/hot-stocks")
+def get_hot_stocks(
+    period: Literal["hour", "day"] = "hour",
+    limit: int = Query(default=30, ge=1, le=100),
+    force_refresh: bool = False,
+):
+    """获取市场热度榜；小时榜为人气飙升口径，日榜为综合人气口径。"""
+    from core.hot_stocks import get_hot_stock_ranking
+
+    return get_hot_stock_ranking(period=period, limit=limit, force=force_refresh)
+
+
+@router.get("/market/hot-stocks/{code}/chart")
+def get_hot_stock_chart_data(
+    code: str,
+    period: Literal["minute", "day"] = "minute",
+    force_refresh: bool = False,
+):
+    """获取热度榜个股的最新分时或日 K 数据。"""
+    from core.hot_stocks import get_hot_stock_chart
+
+    try:
+        return get_hot_stock_chart(code=code, period=period, force=force_refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/market/regime")

@@ -440,6 +440,29 @@ def test_gate_mask_applies_only_declared_kline_gates():
     assert _gate_mask(frame, gate).tolist() == [True, False, False]
 
 
+def test_gate_mask_can_exclude_unstable_trend_paths():
+    frame = pd.DataFrame(
+        {
+            "pa_action": ["READY", "READY", "READY"],
+            "pa_score": [65, 65, 65],
+            "pct_5d": [5, 5, 5],
+            "raw_score": [90, 90, 90],
+            "market_offensive": [True, True, True],
+            "pa_trend_path_quality": ["SMOOTH_TREND", "DISCRETE_JUMP", "MIXED_PATH"],
+            "pa_extreme_trend": [False, False, True],
+        }
+    )
+    gate = GateSpec(
+        "path_quality",
+        min_pa_score=60,
+        require_non_avoid=True,
+        exclude_discrete_jump=True,
+        exclude_extreme_trend=True,
+    )
+
+    assert _gate_mask(frame, gate).tolist() == [True, False, False]
+
+
 def test_summarize_gate_uses_filled_execution_returns():
     frame = pd.DataFrame(
         {

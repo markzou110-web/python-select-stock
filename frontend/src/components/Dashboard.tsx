@@ -24,6 +24,7 @@ import BacktestLab from '@/components/BacktestLab';
 import StockDetailPage from '@/components/StockDetailPage';
 import SectorRadarView from '@/components/SectorRadarView';
 import ResearchRadarView from '@/components/ResearchRadarView';
+import HotStocksView from '@/components/HotStocksView';
 import ExecutionInbox from '@/components/ExecutionInbox';
 import { Download, LayoutGrid, List, Search, Zap, Calendar } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -190,6 +191,15 @@ export default function Dashboard() {
                                 <ErrorBoundary fallbackTitle="板块雷达加载异常">
                                     <SectorRadarView />
                                 </ErrorBoundary>
+                            ) : activeView === 'hot-stocks' ? (
+                                <ErrorBoundary fallbackTitle="热股排行加载异常">
+                                    <HotStocksView
+                                        onOpenStock={(stock) => {
+                                            setSelectedStock(null);
+                                            setSearchDetailStock(stock);
+                                        }}
+                                    />
+                                </ErrorBoundary>
                             ) : activeView === 'research-radar' ? (
                                 <ErrorBoundary fallbackTitle="资讯雷达加载异常">
                                     <ResearchRadarView
@@ -275,6 +285,8 @@ export default function Dashboard() {
                                             <p className="mt-1 text-xs font-semibold opacity-80">
                                                 {lastScanSummary.strategyType === 'tv_dual' || lastScanSummary.strategyType === 'tv_dual_strict'
                                                     ? `当前信号 ${lastScanSummary.count} 只 · 历史复活 ${lastScanSummary.revivalCount} 只 · 动量观察 ${lastScanSummary.momentumCount} 只`
+                                                    : ['high_tight_flag', 'turtle_breakout', 'limit_up_shakeout'].includes(lastScanSummary.strategyType)
+                                                        ? `SHADOW研究命中 ${lastScanSummary.count} 只，不进入交易或Bark操作推送`
                                                     : `正式入选 ${lastScanSummary.count} 只`}
                                                 {lastScanSummary.excludedCount > 0
                                                     ? `，已排除 ${lastScanSummary.excludedCount} 条其他策略或观察池结果。`

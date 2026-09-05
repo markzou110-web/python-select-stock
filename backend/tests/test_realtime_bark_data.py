@@ -375,6 +375,42 @@ def test_realtime_alert_task_rejects_stale_snapshot(monkeypatch):
     assert tasks.check_realtime_alerts() == "Failed to fetch fresh snapshot"
 
 
+def test_realtime_alert_state_persists_and_rearms_after_recovery(monkeypatch):
+    from datetime import datetime, timedelta
+    from core import tasks
+
+    settings = {}
+    monkeypatch.setattr(tasks, "get_setting", lambda key, default=None: settings.get(key, default))
+    monkeypatch.setattr(
+        tasks,
+        "save_setting",
+        lambda key, value: settings.update({key: value}) or True,
+    )
+    tasks._ALERT_DEDUPE_CACHE.clear()
+    first = datetime(2026, 9, 4, 9, 35)
+
+    assert tasks._should_push_alert(
+        "600075", "触及执行风控价 ¥4.81（固定保护）", first, level="critical"
+    ) is True
+
+    # 模拟工作进程重启、价格线轻微变化以及超过旧的30分钟冷却时间。
+    tasks._ALERT_DEDUPE_CACHE.clear()
+    assert tasks._should_push_alert(
+        "600075",
+        "触及执行风控价 ¥4.82（固定保护）",
+        first + timedelta(hours=2),
+        level="critical",
+    ) is False
+
+    tasks._mark_alert_recovered("600075", first + timedelta(hours=3))
+    assert tasks._should_push_alert(
+        "600075",
+        "触及执行风控价 ¥4.83（固定保护）",
+        first + timedelta(hours=4),
+        level="critical",
+    ) is True
+
+
 def test_wind_control_rejects_stale_snapshot(monkeypatch):
     from datetime import datetime, timedelta
     from routers import paper_trade

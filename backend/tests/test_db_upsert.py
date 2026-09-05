@@ -101,3 +101,21 @@ def test_sop_detail_fields_in_persistence_whitelist():
     ]
     missing = [f for f in required if f not in PRICE_ACTION_DETAIL_KEYS]
     assert not missing, f"以下字段未在持久化白名单（无法复盘SOP判定）: {missing}"
+
+
+def test_trend_path_research_fields_in_persistence_whitelist():
+    from core.db import PRICE_ACTION_DETAIL_KEYS
+
+    required = {
+        "pa_trend_path_quality",
+        "pa_information_discreteness",
+        "pa_trend_efficiency",
+        "pa_top_day_contribution",
+        "pa_trend_net_return",
+        "pa_nonlinear_trend_strength",
+        "pa_trend_extension_atr",
+        "pa_extreme_trend",
+        "pa_path_research_score_delta",
+    }
+
+    assert required.issubset(PRICE_ACTION_DETAIL_KEYS)

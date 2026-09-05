@@ -371,6 +371,18 @@ export default function ResultsTable({
                                     )}
                                 </div>
                             )}
+                            {res.sequoia_research_shadow_only && (
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                    <span className="rounded border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[8px] font-black text-violet-700">
+                                        SHADOW研究 · 不可交易
+                                    </span>
+                                    {res.rps_120 != null && (
+                                        <span className="rounded border border-sky-100 bg-sky-50 px-1.5 py-0.5 text-[8px] font-black text-sky-700">
+                                            RPS120 {res.rps_120.toFixed(0)}
+                                        </span>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     </div>
                 </td>
@@ -728,8 +740,9 @@ export default function ResultsTable({
                                                         <BrooksInfo label="趋势破坏" value={res.pa_trend_damage || '--'} note="EMA/短线结构破坏" tone={res.pa_trend_damage && res.pa_trend_damage !== '无' ? "rose" : "slate"} />
                                                         <BrooksInfo label="通道状态" value={res.pa_channel_state || '--'} note="延续、过冲或假破" />
                                                     </div>
-                                                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-2 text-xs">
                                                         <BrooksInfo label="多周期" value={res.pa_weekly_context || '--'} note={res.pa_multi_timeframe_score != null ? `${res.pa_multi_timeframe_score > 0 ? '+' : ''}${res.pa_multi_timeframe_score}分` : '周线确认'} tone={(res.pa_multi_timeframe_score || 0) < 0 ? "rose" : "slate"} />
+                                                        <BrooksInfo label="缩量回踩" value={res.pa_volume_pullback_label || '--'} note={res.pa_volume_pullback_support_price ? `${res.pa_volume_pullback_confirmation_label || '等待右侧确认'} · 支撑 ¥${res.pa_volume_pullback_support_price} · 执行分 ${res.pa_volume_pullback_score_delta && res.pa_volume_pullback_score_delta > 0 ? '+' : ''}${res.pa_volume_pullback_score_delta || 0}` : '需先出现真实放量突破'} tone={res.pa_volume_pullback_status === 'CONFIRMED' ? "emerald" : res.pa_volume_pullback_status === 'INVALIDATED' ? "rose" : "slate"} />
                                                         <BrooksInfo label="量能行为" value={res.pa_volume_pattern || '--'} note={res.pa_volume_confirmed ? '量能确认' : (res.pa_volume_risk || '等待确认')} tone={res.pa_volume_confirmed ? "emerald" : "slate"} />
                                                         <BrooksInfo label="缺口行为" value={res.pa_gap_type || '--'} note={res.pa_gap_risk != null ? `风险 ${res.pa_gap_risk}%` : '无明显缺口'} tone={(res.pa_gap_risk || 0) >= 70 ? "rose" : "slate"} />
                                                         <BrooksInfo label="趋势阶段" value={res.pa_trend_phase || '--'} note={res.pa_trend_phase_action || '等待结构确认'} />

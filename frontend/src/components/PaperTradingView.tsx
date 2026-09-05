@@ -70,6 +70,15 @@ interface ModeStats {
     avg_pl_pct: number;
     total_pl_pct: number;
     avg_hold_days: number;
+    max_drawdown?: number;
+    profit_factor?: number;
+    best_trade?: { name: string; pl_pct: number } | null;
+    worst_trade?: { name: string; pl_pct: number } | null;
+    sector_distribution?: { name: string; value: number; count: number }[];
+    risk_metrics?: Stats['risk_metrics'];
+    monte_carlo?: Stats['monte_carlo'];
+    rolling_performance?: Stats['rolling_performance'];
+    pnl_attribution?: Stats['pnl_attribution'];
 }
 
 interface Stats {
@@ -115,7 +124,7 @@ export default function PaperTradingView() {
     const [closePrice, setClosePrice] = useState('');
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [detailStock, setDetailStock] = useState<{ code: string; name: string } | null>(null);
-    const [tradeMode, setTradeMode] = useState<'ALL' | 'SIMULATED' | 'REAL'>('ALL');
+    const [tradeMode, setTradeMode] = useState<'ALL' | 'SIMULATED' | 'REAL'>('REAL');
     const [statsByMode, setStatsByMode] = useState<{ SIMULATED: ModeStats; REAL: ModeStats }>({
         SIMULATED: { total: 0, wins: 0, losses: 0, win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0 },
         REAL: { total: 0, wins: 0, losses: 0, win_rate: 0, avg_pl_pct: 0, total_pl_pct: 0, avg_hold_days: 0 }
@@ -216,13 +225,8 @@ export default function PaperTradingView() {
         const ms = statsByMode[tradeMode];
         return {
             ...stats,
+            ...ms,
             total_trades: ms.total,
-            wins: ms.wins,
-            losses: ms.losses,
-            win_rate: ms.win_rate,
-            avg_pl_pct: ms.avg_pl_pct,
-            total_pl_pct: ms.total_pl_pct,
-            avg_hold_days: ms.avg_hold_days,
         };
     }, [tradeMode, stats, statsByMode]);
 
@@ -335,49 +339,49 @@ export default function PaperTradingView() {
             </div>
 
             {/* Sharpe / Expectancy Cards */}
-            {stats.risk_metrics && (
+            {activeStats.risk_metrics && (
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                     <div className={cn(
                         "glass-card px-5 py-4 flex items-center justify-between",
-                        stats.risk_metrics.sharpe_ratio >= 1.5 ? "ring-1 ring-rose-200" :
-                        stats.risk_metrics.sharpe_ratio >= 0.5 ? "ring-1 ring-amber-200" : ""
+                        activeStats.risk_metrics.sharpe_ratio >= 1.5 ? "ring-1 ring-rose-200" :
+                        activeStats.risk_metrics.sharpe_ratio >= 0.5 ? "ring-1 ring-amber-200" : ""
                     )}>
                         <div>
                             <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">夏普比率</p>
                             <p className={cn(
                                 "text-xl font-black mt-0.5",
-                                stats.risk_metrics.sharpe_ratio >= 1.5 ? "text-rose-600" :
-                                stats.risk_metrics.sharpe_ratio >= 0.5 ? "text-amber-600" : "text-slate-500"
-                            )}>{stats.risk_metrics.sharpe_ratio}</p>
+                                activeStats.risk_metrics.sharpe_ratio >= 1.5 ? "text-rose-600" :
+                                activeStats.risk_metrics.sharpe_ratio >= 0.5 ? "text-amber-600" : "text-slate-500"
+                            )}>{activeStats.risk_metrics.sharpe_ratio}</p>
                         </div>
                         <div className={cn(
                             "text-[9px] font-black px-2 py-1 rounded-lg",
-                            stats.risk_metrics.sharpe_ratio >= 1.5 ? "bg-rose-50 text-rose-600" :
-                            stats.risk_metrics.sharpe_ratio >= 0.5 ? "bg-amber-50 text-amber-600" : "bg-slate-100 text-slate-500"
+                            activeStats.risk_metrics.sharpe_ratio >= 1.5 ? "bg-rose-50 text-rose-600" :
+                            activeStats.risk_metrics.sharpe_ratio >= 0.5 ? "bg-amber-50 text-amber-600" : "bg-slate-100 text-slate-500"
                         )}>
-                            {stats.risk_metrics.sharpe_ratio >= 1.5 ? '⭐ 优秀' :
-                             stats.risk_metrics.sharpe_ratio >= 0.5 ? '⚠️ 一般' : '❌ 偏低'}
+                            {activeStats.risk_metrics.sharpe_ratio >= 1.5 ? '⭐ 优秀' :
+                             activeStats.risk_metrics.sharpe_ratio >= 0.5 ? '⚠️ 一般' : '❌ 偏低'}
                         </div>
                     </div>
                     <div className="glass-card px-5 py-4">
                         <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">期望值</p>
                         <p className={cn(
                             "text-xl font-black mt-0.5",
-                            stats.risk_metrics.expectancy > 0 ? "text-rose-600" : "text-emerald-600"
-                        )}>{stats.risk_metrics.expectancy > 0 ? '+' : ''}{stats.risk_metrics.expectancy}%</p>
+                            activeStats.risk_metrics.expectancy > 0 ? "text-rose-600" : "text-emerald-600"
+                        )}>{activeStats.risk_metrics.expectancy > 0 ? '+' : ''}{activeStats.risk_metrics.expectancy}%</p>
                     </div>
                     <div className="glass-card px-5 py-4">
                         <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">平均盈/亏</p>
                         <div className="flex items-center gap-1.5 mt-1">
-                            <span className="text-sm font-black text-rose-500">+{stats.risk_metrics.avg_win}%</span>
+                            <span className="text-sm font-black text-rose-500">+{activeStats.risk_metrics.avg_win}%</span>
                             <span className="text-slate-300">/</span>
-                            <span className="text-sm font-black text-emerald-500">{stats.risk_metrics.avg_loss}%</span>
+                            <span className="text-sm font-black text-emerald-500">{activeStats.risk_metrics.avg_loss}%</span>
                         </div>
                     </div>
                     <div className="glass-card px-5 py-4">
                         <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">最大连亏</p>
                         <p className="text-xl font-black text-slate-700 mt-0.5">
-                            {stats.risk_metrics.max_consecutive_losses}
+                            {activeStats.risk_metrics.max_consecutive_losses}
                             <span className="text-xs font-bold text-slate-400 ml-1">笔</span>
                         </p>
                     </div>
@@ -385,23 +389,23 @@ export default function PaperTradingView() {
             )}
 
             {/* Best / Worst highlight */}
-            {(stats.best_trade || stats.worst_trade) && (
+            {(activeStats.best_trade || activeStats.worst_trade) && (
                 <div className="grid grid-cols-2 gap-4">
-                    {stats.best_trade && (
+                    {activeStats.best_trade && (
                         <div className="flex items-center gap-3 px-5 py-3 bg-rose-50 border border-rose-100 rounded-2xl">
                             <Trophy size={18} className="text-rose-500" />
                             <div>
                                 <p className="text-[10px] font-bold text-rose-400 uppercase tracking-widest">最佳单笔</p>
-                                <p className="text-sm font-black text-rose-700">{stats.best_trade.name} <span className="text-rose-500">+{stats.best_trade.pl_pct}%</span></p>
+                                <p className="text-sm font-black text-rose-700">{activeStats.best_trade.name} <span className="text-rose-500">+{activeStats.best_trade.pl_pct}%</span></p>
                             </div>
                         </div>
                     )}
-                    {stats.worst_trade && stats.worst_trade.pl_pct < 0 && (
+                    {activeStats.worst_trade && activeStats.worst_trade.pl_pct < 0 && (
                         <div className="flex items-center gap-3 px-5 py-3 bg-emerald-50 border border-emerald-100 rounded-2xl">
                             <Skull size={18} className="text-emerald-500" />
                             <div>
                                 <p className="text-[10px] font-bold text-emerald-400 uppercase tracking-widest">最差单笔</p>
-                                <p className="text-sm font-black text-emerald-700">{stats.worst_trade.name} <span className="text-emerald-500">{stats.worst_trade.pl_pct}%</span></p>
+                                <p className="text-sm font-black text-emerald-700">{activeStats.worst_trade.name} <span className="text-emerald-500">{activeStats.worst_trade.pl_pct}%</span></p>
                             </div>
                         </div>
                     )}
@@ -660,9 +664,9 @@ export default function PaperTradingView() {
                         板块胜率分布图
                     </h3>
                     <div className="glass-card p-5 h-[400px]">
-                        {stats.sector_distribution && stats.sector_distribution.length > 0 ? (
+                        {activeStats.sector_distribution && activeStats.sector_distribution.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
-                                <BarChart data={stats.sector_distribution} layout="vertical" margin={{ left: 20 }}>
+                                <BarChart data={activeStats.sector_distribution} layout="vertical" margin={{ left: 20 }}>
                                     <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(0,0,0,0.05)" />
                                     <XAxis type="number" hide />
                                     <YAxis
@@ -686,7 +690,7 @@ export default function PaperTradingView() {
                                         }}
                                     />
                                     <Bar dataKey="value" radius={[0, 8, 8, 0]} barSize={20}>
-                                        {stats.sector_distribution.map((entry, index) => (
+                                        {activeStats.sector_distribution.map((entry, index) => (
                                             <Cell key={`cell-${index}`} fill={entry.value > 50 ? '#6366f1' : '#94a3b8'} fillOpacity={Math.max(entry.value / 100, 0.3)} />
                                         ))}
                                     </Bar>
@@ -698,12 +702,12 @@ export default function PaperTradingView() {
                             </div>
                         )}
                         
-                        {stats.sector_distribution && stats.sector_distribution.length > 0 && (
+                        {activeStats.sector_distribution && activeStats.sector_distribution.length > 0 && (
                             <div className="mt-4 p-4 bg-indigo-50 rounded-md border border-indigo-100 flex gap-3">
                                 <AlertCircle size={16} className="text-indigo-600 shrink-0" />
                                 <p className="text-[10px] text-indigo-700 font-medium leading-relaxed">
-                                    决策建议：您的模拟盈亏显示 <span className="font-black">{stats.sector_distribution[0]?.name}</span> 胜率
-                                    {stats.sector_distribution[0]?.value >= 50
+                                    当前账本显示 <span className="font-black">{activeStats.sector_distribution[0]?.name}</span> 胜率
+                                    {activeStats.sector_distribution[0]?.value >= 50
                                         ? "显著高于其他板块。建议强化该板块权重。"
                                         : "尚未达优势水平，建议持续积累样本。"}
                                 </p>

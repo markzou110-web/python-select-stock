@@ -104,6 +104,10 @@ def test_periodic_slot_runs_formal_tv_scan(monkeypatch):
     calls = []
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
     monkeypatch.setattr(
+        "routers.watchlist.check_watchlist_triggers",
+        lambda notify=True, notify_target_hits=True: {"count": 0},
+    )
+    monkeypatch.setattr(
         "routers.scan.run_market_scan_task",
         lambda **kwargs: calls.append(("scan", kwargs)) or [{"代码": "603259"}],
     )
@@ -131,7 +135,7 @@ def test_noon_periodic_scan_preserves_position_and_watchlist_checks(monkeypatch)
     )
     monkeypatch.setattr(
         "routers.watchlist.check_watchlist_triggers",
-        lambda notify=True: calls.append("watch") or {"count": 2},
+        lambda notify=True, notify_target_hits=True: calls.append(f"watch:{notify}:{notify_target_hits}") or {"count": 2},
     )
     monkeypatch.setattr(
         "routers.watchlist.send_watchlist_status_report",
@@ -142,7 +146,7 @@ def test_noon_periodic_scan_preserves_position_and_watchlist_checks(monkeypatch)
 
     result = tasks.intraday_monitor_checkpoint(slot="strategy_scan_1300")
 
-    assert calls == ["operation", "watch"]
+    assert calls == ["operation", "watch:True:True"]
     assert result["operation_alerts"] == 1
     assert result["watch_alerts"] == 2
     assert result["watch_status_push"] == 0
@@ -151,7 +155,10 @@ def test_noon_periodic_scan_preserves_position_and_watchlist_checks(monkeypatch)
 def test_1430_periodic_scan_preserves_candidate_maintenance(monkeypatch):
     calls = []
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
-    monkeypatch.setattr("routers.watchlist.check_watchlist_triggers", lambda notify=True: {"count": 0})
+    monkeypatch.setattr(
+        "routers.watchlist.check_watchlist_triggers",
+        lambda notify=True, notify_target_hits=True: {"count": 0},
+    )
     monkeypatch.setattr(
         "routers.watchlist.refresh_watchlist_decisions",
         lambda: calls.append("refresh"),

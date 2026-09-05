@@ -15,7 +15,10 @@ from core.db import get_db_engine, validate_stock_code, save_failure_sample, loa
 from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache, is_snapshot_stale
 from core.indicators import calculate_indicators
 from core.price_action import analyze_price_action
-from core.analytics import run_monte_carlo, calculate_rolling_performance, calculate_risk_metrics, calculate_pnl_attribution
+from core.analytics import (
+    calculate_pnl_attribution, calculate_risk_metrics, calculate_rolling_performance,
+    compute_equity_curve_drawdown, compute_profit_factor, run_monte_carlo,
+)
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context, safe_float, track_high_since_entry
 from core.risk_constants import (
     FIXED_STOP_LOSS_PCT, FIXED_STOP_LOSS_RATIO,
@@ -154,15 +157,81 @@ def _upgrade_open_tv_position(
     }
 
 
-def _empty_mode_stats() -> Dict[str, Any]:
+def _empty_mode_stats(scope: str = "UNKNOWN") -> Dict[str, Any]:
     return {
+        "scope": scope,
+        "total_trades": 0,
         "total": 0,
         "wins": 0,
         "losses": 0,
+        "flat": 0,
         "win_rate": 0,
         "avg_pl_pct": 0,
         "total_pl_pct": 0,
         "avg_hold_days": 0,
+        "max_drawdown": 0,
+        "profit_factor": 0,
+        "best_trade": None,
+        "worst_trade": None,
+        "sector_distribution": [],
+        "monte_carlo": None,
+        "rolling_performance": [],
+        "risk_metrics": {"equity_curve": []},
+        "pnl_attribution": {"by_industry": [], "by_strategy": []},
+        "measurement": {"closed_only": True, "default_position_pct": 5.0},
+    }
+
+
+def _build_trade_stats(trades: List[Dict[str, Any]], scope: str) -> Dict[str, Any]:
+    closed = [trade for trade in trades if trade.get("status") == "CLOSED"]
+    if not closed:
+        return _empty_mode_stats(scope)
+    returns = [float(trade.get("pl_pct") or 0) for trade in closed]
+    wins = sum(value > 0 for value in returns)
+    losses = sum(value < 0 for value in returns)
+    sector_stats: Dict[str, Dict[str, int]] = {}
+    for trade in closed:
+        sector = str(trade.get("industry") or "未知")
+        row = sector_stats.setdefault(sector, {"wins": 0, "total": 0})
+        row["total"] += 1
+        row["wins"] += int(float(trade.get("pl_pct") or 0) > 0)
+    sectors = [
+        {"name": name, "value": round(row["wins"] / row["total"] * 100), "count": row["total"]}
+        for name, row in sector_stats.items()
+    ]
+    sectors.sort(key=lambda item: item["value"], reverse=True)
+    best = max(closed, key=lambda trade: float(trade.get("pl_pct") or 0))
+    worst = min(closed, key=lambda trade: float(trade.get("pl_pct") or 0))
+    positioned_returns = []
+    for trade in sorted(closed, key=lambda item: str(item.get("entry_date") or "")):
+        raw_position = trade.get("position_pct")
+        try:
+            position = float(raw_position) if raw_position is not None and not pd.isna(raw_position) else 5.0
+        except (TypeError, ValueError):
+            position = 5.0
+        positioned_returns.append(float(trade.get("pl_pct") or 0) * max(0.0, min(position, 100.0)) / 100)
+    max_drawdown, _ = compute_equity_curve_drawdown(positioned_returns)
+    return {
+        "scope": scope,
+        "total_trades": len(closed),
+        "total": len(closed),
+        "wins": wins,
+        "losses": losses,
+        "flat": len(closed) - wins - losses,
+        "win_rate": round(wins / len(closed) * 100),
+        "avg_pl_pct": round(sum(returns) / len(closed), 2),
+        "total_pl_pct": round(sum(returns), 2),
+        "avg_hold_days": round(sum(float(trade.get("hold_days") or 0) for trade in closed) / len(closed), 1),
+        "max_drawdown": max_drawdown,
+        "profit_factor": compute_profit_factor(returns, cap=9.9),
+        "best_trade": {"name": best.get("name"), "pl_pct": best.get("pl_pct")},
+        "worst_trade": {"name": worst.get("name"), "pl_pct": worst.get("pl_pct")},
+        "sector_distribution": sectors,
+        "monte_carlo": run_monte_carlo(returns, position_pct=5.0),
+        "rolling_performance": calculate_rolling_performance(closed),
+        "risk_metrics": calculate_risk_metrics(closed, default_position_pct=5.0),
+        "pnl_attribution": calculate_pnl_attribution(closed),
+        "measurement": {"closed_only": True, "default_position_pct": 5.0},
     }
 
 
@@ -189,8 +258,8 @@ def _empty_paper_trade_response() -> Dict[str, Any]:
             "pnl_attribution": None,
         },
         "stats_by_mode": {
-            "SIMULATED": _empty_mode_stats(),
-            "REAL": _empty_mode_stats(),
+            "SIMULATED": _empty_mode_stats("SIMULATED"),
+            "REAL": _empty_mode_stats("REAL"),
         },
     }
 
@@ -394,11 +463,72 @@ def _evaluate_time_stop(hold_trading_days: int, pl_pct: float, strategy_type: st
 # 每级每天最多推一次；进程重启后重置（sentinel 是常驻线程，可接受）。
 _tier_alert_sent: Dict[str, str] = {}
 
-# 改动 B2：实盘止损告警升级状态。key=f"{code}:real_stop"，value=当日已推送次数。
-# 首次触发普通推送；后续每次 tick 仍未平仓 → 升级为"未处理·第N次"。
-# 进程重启后重置（同 _tier_alert_sent 模式，sentinel 常驻可接受）。
+# 实盘止损提醒状态。只在状态变化时推送，避免盘中最低价击穿后已经收回，
+# 仍被每个 sentinel tick 重复催促。进程重启后重置（同 _tier_alert_sent）。
 _real_stop_alert_state: Dict[str, int] = {}
 _REAL_STOP_ALERT_DATE: Dict[str, str] = {}  # 记录推送日期，跨日重置
+_REAL_STOP_ALERT_PHASE: Dict[str, str] = {}
+_operation_trigger_state: Dict[str, Dict[str, str]] = {}
+
+
+def _operation_trigger_transition(identity: str, trading_date: str, kind: str) -> bool:
+    """同一持仓的操作区间仅在首次进入或状态改变时通知。"""
+    previous = _operation_trigger_state.get(identity)
+    if not previous or previous.get("date") != trading_date:
+        _operation_trigger_state[identity] = {"date": trading_date, "kind": kind}
+        return kind != "HOLD"
+    if previous.get("kind") == kind:
+        return False
+    _operation_trigger_state[identity] = {"date": trading_date, "kind": kind}
+    return kind != "HOLD"
+
+
+def _real_stop_alert_transition(
+    *,
+    code: str,
+    trading_date: str,
+    current_price: float,
+    stop_price: float,
+    intraday_low: float,
+    now: datetime,
+) -> Dict[str, Any]:
+    """返回本 tick 是否需要发送实盘止损提醒。
+
+    首次观察到击穿会立即提醒；现价收回止损线后保持静默；再次跌破或
+    14:50 后仍在止损线下时各提醒一次。计数表示当日实际推送次数。
+    """
+    alert_key = f"{code}:real_stop"
+    if _REAL_STOP_ALERT_DATE.get(alert_key) != trading_date:
+        _REAL_STOP_ALERT_DATE[alert_key] = trading_date
+        _real_stop_alert_state[alert_key] = 0
+        _REAL_STOP_ALERT_PHASE[alert_key] = "CLEAR"
+
+    count = _real_stop_alert_state.get(alert_key, 0)
+    previous_phase = _REAL_STOP_ALERT_PHASE.get(alert_key, "CLEAR")
+    if stop_price <= 0 or intraday_low > stop_price:
+        _REAL_STOP_ALERT_PHASE[alert_key] = "CLEAR"
+        return {"notify": False, "phase": "CLEAR", "event": None, "count": count}
+
+    below_stop = current_price <= stop_price
+    near_close = (now.hour, now.minute) >= (14, 50)
+    if below_stop and near_close:
+        phase = "CLOSE_CONFIRMED"
+        notify = previous_phase != phase
+        event = "CLOSE_CONFIRMED" if notify else None
+    elif below_stop:
+        phase = "ACTIVE"
+        notify = previous_phase in {"CLEAR", "RECOVERED"}
+        event = ("FIRST_BREACH_ACTIVE" if count == 0 else "REBREAK") if notify else None
+    else:
+        phase = "RECOVERED"
+        notify = previous_phase == "CLEAR" and count == 0
+        event = "FIRST_BREACH_RECOVERED" if notify else None
+
+    _REAL_STOP_ALERT_PHASE[alert_key] = phase
+    if notify:
+        count += 1
+        _real_stop_alert_state[alert_key] = count
+    return {"notify": notify, "phase": phase, "event": event, "count": count}
 
 
 def _tier_early_warning(*, code: str, name: str, trade_mode: str,
@@ -902,6 +1032,8 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             }
 
         alerts: List[Dict[str, Any]] = []
+        notification_alerts: List[Dict[str, Any]] = []
+        operation_date = datetime.now().strftime("%Y-%m-%d")
         price_updates: List[Dict[str, Any]] = []
         for _, row in df.iterrows():
             code = str(row.get("code") or "")
@@ -928,6 +1060,13 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, code), code)
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             trigger = evaluate_operation_trigger(current, plan)
+            should_notify = False
+            if notify:
+                should_notify = _operation_trigger_transition(
+                    f"{int(row['id'])}:{code}",
+                    operation_date,
+                    str(trigger.get("kind") or "HOLD"),
+                )
             if not trigger.get("triggered"):
                 continue
             alert = {
@@ -942,6 +1081,8 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                 "instruction": plan.get("instruction"),
             }
             alerts.append(alert)
+            if should_notify:
+                notification_alerts.append(alert)
 
         if price_updates:
             try:
@@ -957,8 +1098,8 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             except Exception as exc:
                 logger.warning(f"Failed to refresh paper trading live prices: {exc}")
 
-        if alerts and notify:
-            _send_operation_trigger_notification(alerts)
+        if notification_alerts:
+            _send_operation_trigger_notification(notification_alerts)
             try:
                 _ensure_trade_journal_table(engine)
                 with engine.connect() as conn:
@@ -982,7 +1123,7 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                             "stop_price": alert["plan"].get("active_stop_price"),
                             "result_note": alert["instruction"],
                         }
-                        for alert in alerts
+                        for alert in notification_alerts
                     ])
                     conn.commit()
             except Exception as exc:
@@ -992,7 +1133,8 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
             "status": "success",
             "checked": int(len(df)),
             "alerts": alerts,
-            "notification": bool(alerts and notify),
+            "notification": bool(notification_alerts),
+            "notified_count": len(notification_alerts),
         }
     except Exception as exc:
         logger.error(f"Check operation triggers error: {exc}")
@@ -1320,87 +1462,13 @@ def list_paper_trades(refresh: bool = False) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Batch paper trading update failed: {e}")
 
-        # --- 汇总统计 ---
-        # 修复 BUG-B: 统计指标(胜率/盈亏比/回撤)只用 CLOSED（已实现），
-        # 不混入 OPEN（浮亏/浮盈会随盘中波动导致胜率不稳定）。
-        closed_for_stats = [t for t in trades if t.get('status') == 'CLOSED']
-        wins = sum(1 for t in closed_for_stats if t['pl_pct'] > 0)
-        losses = sum(1 for t in closed_for_stats if t['pl_pct'] < 0)
-        flat = sum(1 for t in closed_for_stats if t['pl_pct'] == 0)
-        total = len(closed_for_stats)
-        avg_pl = sum(t['pl_pct'] for t in closed_for_stats) / total if total > 0 else 0
-        avg_hold = sum(t['hold_days'] for t in closed_for_stats) / total if total > 0 else 0
-
-        # 按板块汇总胜率
-        sector_stats = {}
-        for t in trades:
-            ind = t['industry']
-            if ind not in sector_stats:
-                sector_stats[ind] = {"wins": 0, "total": 0}
-            sector_stats[ind]["total"] += 1
-            if t['pl_pct'] > 0:
-                sector_stats[ind]["wins"] += 1
-
-        sector_distribution = [
-            {"name": k, "value": round(v["wins"] / v["total"] * 100) if v["total"] > 0 else 0, "count": v["total"]}
-            for k, v in sector_stats.items()
-        ]
-        sector_distribution.sort(key=lambda x: x["value"], reverse=True)
-
-        # 最大单笔盈利/亏损
-        best = max(trades, key=lambda t: t['pl_pct']) if trades else None
-        worst = min(trades, key=lambda t: t['pl_pct']) if trades else None
-
-        # 改动 #13：最大回撤改为复利权益曲线口径（修复旧实现用 pl_pct 累加和的数学错误）。
-        # 保留本接口的"正值百分比"输出契约。复用 analytics 规范 helper。
-        from core.analytics import compute_equity_curve_drawdown, compute_profit_factor
-        sorted_for_dd = sorted(closed_for_stats, key=lambda x: x['entry_date'])
-        max_drawdown, _curve = compute_equity_curve_drawdown([t['pl_pct'] for t in sorted_for_dd])
-        # 盈亏比：改调规范 helper（毛额口径，cap 9.9 保留本接口契约）
-        profit_factor = compute_profit_factor([t['pl_pct'] for t in closed_for_stats], cap=9.9)
-
-        stats = {
-            "total_trades": total,
-            "wins": wins,
-            "losses": losses,
-            "flat": flat,
-            "win_rate": round(wins / total * 100) if total > 0 else 0,
-            "avg_pl_pct": round(avg_pl, 2),
-            "total_pl_pct": round(sum(t['pl_pct'] for t in trades), 2),
-            "avg_hold_days": round(avg_hold, 1),
-            "max_drawdown": round(max_drawdown, 2),
-            "profit_factor": profit_factor,
-            "best_trade": {"name": best['name'], "pl_pct": best['pl_pct']} if best else None,
-            "worst_trade": {"name": worst['name'], "pl_pct": worst['pl_pct']} if worst else None,
-            "sector_distribution": sector_distribution,
-            "monte_carlo": run_monte_carlo([t['pl_pct'] for t in trades]),
-            "rolling_performance": calculate_rolling_performance(trades),
-            "risk_metrics": calculate_risk_metrics(trades),
-            "pnl_attribution": calculate_pnl_attribution(trades)
-        }
-
-        # --- 按交易模式分组统计 ---
-        def _calc_mode_stats(mode_trades):
-            if not mode_trades:
-                return _empty_mode_stats()
-            m_wins = sum(1 for t in mode_trades if t['pl_pct'] > 0)
-            m_losses = sum(1 for t in mode_trades if t['pl_pct'] < 0)
-            m_total = len(mode_trades)
-            return {
-                "total": m_total,
-                "wins": m_wins,
-                "losses": m_losses,
-                "win_rate": round(m_wins / m_total * 100) if m_total > 0 else 0,
-                "avg_pl_pct": round(sum(t['pl_pct'] for t in mode_trades) / m_total, 2),
-                "total_pl_pct": round(sum(t['pl_pct'] for t in mode_trades), 2),
-                "avg_hold_days": round(sum(t['hold_days'] for t in mode_trades) / m_total, 1)
-            }
-
         sim_trades = [t for t in trades if t.get('trade_mode') == 'SIMULATED']
         real_trades = [t for t in trades if t.get('trade_mode') == 'REAL']
+        stats = _build_trade_stats(trades, scope="ALL_MODES")
+        stats["mixed_mode_warning"] = bool(sim_trades and real_trades)
         stats_by_mode = {
-            "SIMULATED": _calc_mode_stats(sim_trades),
-            "REAL": _calc_mode_stats(real_trades)
+            "SIMULATED": _build_trade_stats(sim_trades, scope="SIMULATED"),
+            "REAL": _build_trade_stats(real_trades, scope="REAL"),
         }
 
         return {"trades": trades, "stats": stats, "stats_by_mode": stats_by_mode}
@@ -1963,25 +2031,52 @@ def run_wind_control() -> Dict[str, Any]:
                     else curr_price
                 )
                 if trade_mode == "REAL":
-                    warned_real_count += 1
-                    # 改动 B2：实盘告警升级。首次普通推送，后续每次 tick（~30分钟）仍未
-                    # 平仓 → 升级为"未处理·第N次"，让上班族意识到紧迫性。
-                    _today_key = close_date_str
-                    _alert_key = f"{code}:real_stop"
-                    # 跨日重置
-                    if _REAL_STOP_ALERT_DATE.get(_alert_key) != _today_key:
-                        _REAL_STOP_ALERT_DATE[_alert_key] = _today_key
-                        _real_stop_alert_state[_alert_key] = 0
-                    _real_stop_alert_state[_alert_key] = _real_stop_alert_state.get(_alert_key, 0) + 1
-                    _alert_n = _real_stop_alert_state[_alert_key]
-                    if _alert_n == 1:
+                    stop_breached_today = _stop_level > 0 and curr_low <= _stop_level
+                    if stop_breached_today:
+                        alert_state = _real_stop_alert_transition(
+                            code=str(code),
+                            trading_date=close_date_str,
+                            current_price=curr_price,
+                            stop_price=_stop_level,
+                            intraday_low=curr_low,
+                            now=now,
+                        )
+                        if not alert_state["notify"]:
+                            continue
+
+                        event = alert_state["event"]
+                        risk_stage = risk_levels.get("risk_stage") or "风险控制"
+                        if event == "FIRST_BREACH_RECOVERED":
+                            reason = (
+                                f"盘中曾击穿止损线 ¥{_stop_level:.2f}（最低 ¥{curr_low:.2f}），"
+                                f"当前 ¥{curr_price:.2f} 已重新站回；等待再次跌破或尾盘确认。"
+                            )
+                            mode_label = "实盘止损·已收回"
+                            action_line = "当前已站回止损线，暂停连续催促；再次跌破或尾盘失守时再提醒。"
+                        elif event == "CLOSE_CONFIRMED":
+                            reason = (
+                                f"尾盘仍失守止损线 ¥{_stop_level:.2f}（当前 ¥{curr_price:.2f}，"
+                                f"最低 ¥{curr_low:.2f}）。{risk_stage}"
+                            )
+                            mode_label = "实盘止损·尾盘确认"
+                            action_line = "尾盘仍未收回止损线，请立即在券商 App 确认是否卖出。"
+                        else:
+                            reason = (
+                                f"当前 ¥{curr_price:.2f} 跌破止损线 ¥{_stop_level:.2f}"
+                                f"（最低 ¥{curr_low:.2f}）。{risk_stage}"
+                            )
+                            if event == "REBREAK":
+                                mode_label = "实盘止损·再次跌破"
+                                action_line = "价格收回后再次跌破，请立即在券商 App 确认是否卖出。"
+                            else:
+                                mode_label = "实盘风控预警"
+                                action_line = "系统不会自动平仓，请立即在券商 App 确认是否卖出。"
+                        alerts.append(f"{row['name']}({code}) {mode_label}: {reason}")
+                    else:
                         alerts.append(f"{row['name']}({code}) 实盘风控预警: {reason}")
                         mode_label = "实盘风控预警"
                         action_line = "系统不会自动平仓，请人工确认是否卖出。"
-                    else:
-                        alerts.append(f"🔴【未处理·第{_alert_n}次】{row['name']}({code}) 实盘止损仍未处理: {reason}")
-                        mode_label = f"实盘风控预警·第{_alert_n}次"
-                        action_line = f"⚠️ 已第{_alert_n}次提醒！请立即在券商App处理，或点击下方链接记录平仓。"
+                    warned_real_count += 1
                 elif should_close:
                     close_updates.append({
                         "p": exec_price,
@@ -2197,9 +2292,19 @@ def get_portfolio_stats() -> Dict[str, Any]:
             trade["pl_pct"] = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
         
         # 2. 计算指标
-        risk_metrics = calculate_risk_metrics(trades)
+        risk_metrics = calculate_risk_metrics(trades, default_position_pct=5.0)
         attribution = calculate_pnl_attribution(trades)
-        rolling_performance = calculate_rolling_performance(trades)
+        rolling_performance = calculate_rolling_performance([t for t in trades if t.get("status") == "CLOSED"])
+        by_mode = {}
+        for mode in ("REAL", "SIMULATED"):
+            mode_trades = [t for t in trades if (t.get("trade_mode") or "SIMULATED") == mode]
+            by_mode[mode] = {
+                "risk_metrics": calculate_risk_metrics(mode_trades, default_position_pct=5.0),
+                "attribution": calculate_pnl_attribution(mode_trades),
+                "rolling_performance": calculate_rolling_performance(
+                    [t for t in mode_trades if t.get("status") == "CLOSED"]
+                ),
+            }
         
         # 3. 补充持仓热力图数据 (按行业)
         # 获取行业分布 (OPEN 持仓)
@@ -2212,12 +2317,21 @@ def get_portfolio_stats() -> Dict[str, Any]:
                     "name": sector,
                     "value": int(count)
                 })
+        for mode in ("REAL", "SIMULATED"):
+            mode_open = open_df[open_df["trade_mode"].fillna("SIMULATED") == mode] if not open_df.empty else open_df
+            by_mode[mode]["sector_distribution"] = [
+                {"name": sector, "value": int(count)}
+                for sector, count in mode_open["industry"].value_counts().items()
+            ] if not mode_open.empty else []
         
         return {
             "risk_metrics": risk_metrics,
             "attribution": attribution,
             "rolling_performance": rolling_performance,
-            "sector_distribution": sector_dist
+            "sector_distribution": sector_dist,
+            "by_mode": by_mode,
+            "mixed_mode_warning": bool(by_mode["REAL"]["risk_metrics"].get("equity_curve") and by_mode["SIMULATED"]["risk_metrics"].get("equity_curve")),
+            "measurement": {"closed_only": True, "default_position_pct": 5.0},
         }
     except Exception as e:
         logger.error(f"Error calculating portfolio stats: {e}")

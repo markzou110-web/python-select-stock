@@ -154,6 +154,9 @@ export default function BacktestLab() {
                             <option value="pine">Pine 多指标</option>
                             <option value="squeeze">均线粘合</option>
                             <option value="consensus">Azul 共识</option>
+                            <option value="high_tight_flag">HTF 高位收敛（SHADOW）</option>
+                            <option value="turtle_breakout">20日新高基准（SHADOW）</option>
+                            <option value="limit_up_shakeout">涨停洗盘观察（SHADOW）</option>
                         </select>
                     </Field>
                     <Field label="回看天数">

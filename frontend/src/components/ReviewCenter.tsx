@@ -71,7 +71,12 @@ type CalibrationRow = {
 };
 
 type CalibrationPayload = {
-    summary?: { signals?: number; mature_5d?: number; mature_10d?: number };
+    summary?: { raw_signals?: number; signals?: number; mature_5d?: number; mature_10d?: number };
+    grade_usage?: {
+        mode?: string;
+        production_effect?: boolean;
+        reason?: string;
+    };
     grade_monotonicity?: {
         status?: string;
         reason?: string;
@@ -944,6 +949,7 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
     const reviewRules = (data?.blocker_analysis?.items || []).filter(row => row.recommendation === 'REVIEW_RULE');
     const bottom = data?.bottom_discovery_analysis;
     const sampleText = Object.entries(monotonicity.samples || {}).map(([grade, count]) => `${grade}:${count}`).join(' / ');
+    const gradeUsage = data?.grade_usage;
     return (
         <div className="glass-card p-6">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
@@ -957,6 +963,11 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
                     <MiniStat label="待复核规则" value={`${data?.blocker_analysis?.summary?.review_rules || 0}`} />
                 </div>
             </div>
+            {gradeUsage?.mode === 'SHADOW_ONLY' && (
+                <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-bold text-amber-800">
+                    评级当前仅作影子描述，不会单独产生可交易资格。{gradeUsage.reason ? ` ${gradeUsage.reason}` : ''}
+                </div>
+            )}
             <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-4">
                 <CalibrationRows title="确认事件" rows={confirmationRows} empty="新事件尚未形成成熟样本" />
                 <CalibrationRows title="early_value 转化" rows={earlyRows} empty="早期策略尚未形成可验证转化" />

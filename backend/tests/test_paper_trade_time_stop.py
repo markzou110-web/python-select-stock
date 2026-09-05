@@ -16,6 +16,8 @@ from routers.paper_trade import (
     _wind_control_decision,
     _tier_early_warning,
     _tier_alert_sent,
+    _real_stop_alert_transition,
+    _operation_trigger_transition,
 )
 from schemas.paper_trade import PaperTradeClose
 
@@ -468,48 +470,155 @@ def test_sentinel_consumes_urgency_from_wind_control_result():
 
 
 # ---------------------------------------------------------------------------
-# 改动 B2：实盘仓位告警升级（首次普通 → 第N次 critical）
+# 实盘止损告警状态机：首次击穿 → 恢复静默 → 再次跌破/尾盘失守再提醒
 # ---------------------------------------------------------------------------
 
 def test_real_stop_alert_escalation_state_exists():
-    """B2：实盘止损告警升级状态 dict 应存在（进程级，跨 tick 累计次数）。"""
-    from routers.paper_trade import _real_stop_alert_state, _REAL_STOP_ALERT_DATE
+    """实盘止损提醒状态应在进程内按交易日保存。"""
+    from routers.paper_trade import (
+        _real_stop_alert_state,
+        _REAL_STOP_ALERT_DATE,
+        _REAL_STOP_ALERT_PHASE,
+    )
     assert isinstance(_real_stop_alert_state, dict)
     assert isinstance(_REAL_STOP_ALERT_DATE, dict)
+    assert isinstance(_REAL_STOP_ALERT_PHASE, dict)
 
 
-def test_real_stop_alert_escalation_logic():
-    """B2：首次告警普通推送，第2次起升级为"未处理·第N次"。
+def test_real_stop_alert_silences_recovered_ticks_and_realerts_on_rebreak():
+    """盘中最低价曾击穿但现价已恢复时，只提醒一次；再次跌破才重发。"""
+    from routers.paper_trade import (
+        _real_stop_alert_state,
+        _REAL_STOP_ALERT_DATE,
+        _REAL_STOP_ALERT_PHASE,
+    )
 
-    ponytail 简化：砍掉了一键平仓端点（过度设计），只保留告警升级。
-    """
-    from routers.paper_trade import _real_stop_alert_state, _REAL_STOP_ALERT_DATE
-
-    # 清空状态模拟首次
     _real_stop_alert_state.clear()
     _REAL_STOP_ALERT_DATE.clear()
+    _REAL_STOP_ALERT_PHASE.clear()
 
-    # 模拟首次触发：code=000001，当天
-    _alert_key = "000001:real_stop"
-    _today = "2026-06-18"
-    _REAL_STOP_ALERT_DATE[_alert_key] = _today
-    _real_stop_alert_state[_alert_key] = 0
-    _real_stop_alert_state[_alert_key] += 1
-    n1 = _real_stop_alert_state[_alert_key]
-    assert n1 == 1, "首次应计数为1（普通推送）"
+    first = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.85,
+        stop_price=4.81,
+        intraday_low=4.80,
+        now=datetime(2026, 9, 4, 9, 35),
+    )
+    repeated_recovered = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.91,
+        stop_price=4.81,
+        intraday_low=4.80,
+        now=datetime(2026, 9, 4, 9, 45),
+    )
+    rebreak = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.80,
+        stop_price=4.81,
+        intraday_low=4.79,
+        now=datetime(2026, 9, 4, 10, 0),
+    )
+    repeated_below = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.79,
+        stop_price=4.81,
+        intraday_low=4.78,
+        now=datetime(2026, 9, 4, 10, 10),
+    )
 
-    # 第2次 tick 仍未平仓 → 升级
-    _real_stop_alert_state[_alert_key] += 1
-    n2 = _real_stop_alert_state[_alert_key]
-    assert n2 == 2, "第2次应计数为2（升级推送）"
-    # 升级标记：n >= 2 时标题应含"未处理·第N次"
-    assert n2 >= 2
+    assert first == {
+        "notify": True,
+        "phase": "RECOVERED",
+        "event": "FIRST_BREACH_RECOVERED",
+        "count": 1,
+    }
+    assert repeated_recovered["notify"] is False
+    assert repeated_recovered["count"] == 1
+    assert rebreak["notify"] is True
+    assert rebreak["event"] == "REBREAK"
+    assert rebreak["count"] == 2
+    assert repeated_below["notify"] is False
+    assert repeated_below["count"] == 2
 
-    # 跨日重置
-    _REAL_STOP_ALERT_DATE[_alert_key] = "2026-06-19"
-    if _REAL_STOP_ALERT_DATE.get(_alert_key) != _today:
-        _real_stop_alert_state[_alert_key] = 0
-    assert _real_stop_alert_state[_alert_key] == 0, "跨日应重置计数"
+
+def test_real_stop_alert_confirms_once_near_close_and_resets_next_day():
+    """14:50 后仍在止损线下只确认一次，下一交易日重新开始计数。"""
+    from routers.paper_trade import (
+        _real_stop_alert_state,
+        _REAL_STOP_ALERT_DATE,
+        _REAL_STOP_ALERT_PHASE,
+    )
+
+    _real_stop_alert_state.clear()
+    _REAL_STOP_ALERT_DATE.clear()
+    _REAL_STOP_ALERT_PHASE.clear()
+
+    intraday = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.80,
+        stop_price=4.81,
+        intraday_low=4.79,
+        now=datetime(2026, 9, 4, 10, 0),
+    )
+    close_confirmed = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.78,
+        stop_price=4.81,
+        intraday_low=4.77,
+        now=datetime(2026, 9, 4, 14, 50),
+    )
+    repeated_close = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-04",
+        current_price=4.77,
+        stop_price=4.81,
+        intraday_low=4.76,
+        now=datetime(2026, 9, 4, 14, 55),
+    )
+    next_day = _real_stop_alert_transition(
+        code="600075",
+        trading_date="2026-09-07",
+        current_price=4.80,
+        stop_price=4.81,
+        intraday_low=4.79,
+        now=datetime(2026, 9, 7, 9, 35),
+    )
+
+    assert intraday["event"] == "FIRST_BREACH_ACTIVE"
+    assert close_confirmed == {
+        "notify": True,
+        "phase": "CLOSE_CONFIRMED",
+        "event": "CLOSE_CONFIRMED",
+        "count": 2,
+    }
+    assert repeated_close["notify"] is False
+    assert repeated_close["count"] == 2
+    assert next_day["notify"] is True
+    assert next_day["event"] == "FIRST_BREACH_ACTIVE"
+    assert next_day["count"] == 1
+
+
+def test_operation_trigger_only_notifies_on_state_change():
+    """同一操作区间保持命中时静默，回到 HOLD 后再次跌破才重发。"""
+    from routers.paper_trade import _operation_trigger_state
+
+    _operation_trigger_state.clear()
+    identity = "1:600075"
+    day = "2026-09-04"
+
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD") is True
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD") is False
+    assert _operation_trigger_transition(identity, day, "HOLD") is False
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD") is True
+    assert _operation_trigger_transition(identity, day, "REDUCE") is True
+    assert _operation_trigger_transition(identity, day, "REDUCE") is False
+    assert _operation_trigger_transition(identity, "2026-09-07", "REDUCE") is True
 
 
 # ── 保本移动止损决策（改动 #14）：operation_plan 对"保本移动"档返回 REDUCE ──

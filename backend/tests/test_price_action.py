@@ -1,6 +1,37 @@
 import pandas as pd
 
-from core.price_action import _evaluate_pullback_validity, analyze_price_action, build_price_action_annotations
+from core.price_action import (
+    _detect_breakout_volume_pullback,
+    _evaluate_pullback_validity,
+    _trend_path_quality,
+    analyze_price_action,
+    build_price_action_annotations,
+)
+
+
+def _breakout_volume_pullback_df(invalidated=False):
+    rows = []
+    dates = pd.bdate_range("2026-01-05", periods=30)
+    for index, date in enumerate(dates[:25]):
+        close = 10 + (index % 4 - 1.5) * 0.03
+        rows.append({
+            "日期": date,
+            "开盘": round(close - 0.02, 2),
+            "最高": round(close + 0.08, 2),
+            "最低": round(close - 0.08, 2),
+            "收盘": round(close, 2),
+            "成交量": 1_000_000,
+        })
+    rows.extend([
+        {"日期": dates[25], "开盘": 10.05, "最高": 10.85, "最低": 10.02, "收盘": 10.75, "成交量": 2_000_000},
+        {"日期": dates[26], "开盘": 10.70, "最高": 10.72, "最低": 10.50, "收盘": 10.55, "成交量": 850_000},
+        {"日期": dates[27], "开盘": 10.55, "最高": 10.58, "最低": 10.34, "收盘": 10.40, "成交量": 700_000},
+        {"日期": dates[28], "开盘": 10.42, "最高": 10.48, "最低": 10.27, "收盘": 10.36, "成交量": 600_000},
+        {"日期": dates[29], "开盘": 10.34, "最高": 10.58, "最低": 10.30, "收盘": 10.52, "成交量": 750_000},
+    ])
+    if invalidated:
+        rows[-1].update({"开盘": 10.10, "最高": 10.12, "最低": 9.35, "收盘": 9.45, "成交量": 2_200_000})
+    return pd.DataFrame(rows)
 
 
 def _ohlc_from_closes(closes):
@@ -45,6 +76,89 @@ def test_price_action_detects_bull_context_and_outputs_risk_levels():
     assert 0 <= result["pa_structure_score"] <= 100
     assert 0 <= result["pa_execution_score"] <= 100
     assert 0 <= result["pa_risk_score"] <= 100
+
+
+def test_breakout_volume_pullback_requires_breakout_volume_depth_and_slow_rhythm():
+    frame = _breakout_volume_pullback_df()
+    result = _detect_breakout_volume_pullback(frame)
+    analysis = analyze_price_action(frame)
+
+    assert result["status"] == "CONFIRMED"
+    assert result["label"] == "缩量回踩企稳"
+    assert result["breakout_date"] == "2026-02-09"
+    assert result["support_price"] > 0
+    assert result["pullback_volume_ratio"] < 1
+    assert result["rhythm_ratio"] < 1
+    assert result["score_delta"] > 0
+    assert result["pullback_sessions"] == 4
+    assert result["confirmation"] in {"REVERSAL_BAR", "MA_SUPPORT", "REBREAK"}
+    assert result["confirmation_date"] == "2026-02-13"
+    assert result["stop_price"] < result["breakout_price"]
+    assert all(check["passed"] for check in result["checks"])
+    assert analysis["pa_volume_pullback_score_delta"] == result["score_delta"]
+    assert "缩量回踩企稳" in analysis["pa_decision_summary"]
+
+
+def test_breakout_volume_pullback_rejects_breakout_without_volume():
+    frame = _breakout_volume_pullback_df()
+    frame.loc[25, "成交量"] = 1_050_000
+
+    result = _detect_breakout_volume_pullback(frame)
+
+    assert result["status"] == "NONE"
+    assert result["score_delta"] == 0
+
+
+def test_breakout_volume_pullback_invalidates_deep_high_volume_selloff():
+    frame = _breakout_volume_pullback_df(invalidated=True)
+    result = _detect_breakout_volume_pullback(frame)
+    analysis = analyze_price_action(frame)
+
+    assert result["status"] == "INVALIDATED"
+    assert result["score_delta"] < 0
+    assert "箱体" in result["reason"] or "放量" in result["reason"]
+    assert analysis["pa_trade_plan"]["action"] == "AVOID"
+
+
+def test_breakout_volume_pullback_expires_without_confirmation_in_five_bars():
+    frame = _breakout_volume_pullback_df()
+    frame.loc[29, ["开盘", "最高", "最低", "收盘", "成交量"]] = [10.36, 10.40, 10.25, 10.30, 650_000]
+    extra = pd.DataFrame([
+        {"日期": pd.Timestamp("2026-02-16"), "开盘": 10.31, "最高": 10.35, "最低": 10.24, "收盘": 10.28, "成交量": 620_000},
+        {"日期": pd.Timestamp("2026-02-17"), "开盘": 10.29, "最高": 10.33, "最低": 10.23, "收盘": 10.26, "成交量": 600_000},
+    ])
+
+    result = _detect_breakout_volume_pullback(pd.concat([frame, extra], ignore_index=True))
+
+    assert result["status"] == "INVALIDATED"
+    assert result["confirmation"] == "NONE"
+    assert "超过5根K线" in result["reason"]
+
+
+def test_late_quiet_bar_cannot_retroactively_validate_weak_pullback():
+    frame = _breakout_volume_pullback_df()
+    frame.loc[[26, 27, 28], "成交量"] = 1_100_000
+    extra = pd.DataFrame([
+        {"日期": pd.Timestamp("2026-02-16"), "开盘": 10.34, "最高": 10.38, "最低": 10.25, "收盘": 10.30, "成交量": 1_100_000},
+        {"日期": pd.Timestamp("2026-02-17"), "开盘": 10.31, "最高": 10.33, "最低": 10.27, "收盘": 10.29, "成交量": 100_000},
+    ])
+
+    result = _detect_breakout_volume_pullback(pd.concat([frame, extra], ignore_index=True))
+
+    assert result["confirmation"] != "NONE"
+    assert result["pullback_avg_volume_ratio"] > 0.9
+    assert result["status"] == "UNQUALIFIED"
+
+
+def test_price_action_annotations_show_breakout_and_pullback_markers():
+    annotations = build_price_action_annotations(_breakout_volume_pullback_df())
+    labels = [marker.get("text") for marker in annotations["markers"]]
+
+    assert "放量突破" in labels
+    assert "回踩企稳" in labels
+    assert annotations["summary"]["pa_volume_pullback_status"] == "CONFIRMED"
+    assert any(line.get("kind") == "pullback_support" for line in annotations["lines"])
+    assert any(line.get("kind") == "pullback_stop" for line in annotations["lines"])
 
 
 def test_price_action_handles_short_data():
@@ -244,9 +358,27 @@ def test_price_action_uses_calendar_weeks_when_dates_are_available():
     result = analyze_price_action(df)
 
     assert result["pa_weekly_context"] != "周线数据不足"
-    assert result["price_action_version"] == "price-action-v4"
+    assert result["price_action_version"] == "price-action-v7"
     assert result["target_model_version"] == "structure-target-v2"
-    assert result["score_model_version"] == "pa-three-score-v1"
+    assert result["score_model_version"] == "pa-three-score-v3-confirmed-pullback"
+    assert result["pa_path_research_score_delta"] == 3
+
+
+def test_trend_path_quality_distinguishes_gradual_trend_from_discrete_jump():
+    smooth = _ohlc_from_closes([10 + i * 0.08 for i in range(50)])
+    discrete_closes = [10 + i * 0.01 for i in range(30)]
+    discrete_closes += [10.30 - i * 0.02 for i in range(19)] + [12.20]
+    discrete = _ohlc_from_closes(discrete_closes)
+
+    smooth_quality = _trend_path_quality(smooth)
+    discrete_quality = _trend_path_quality(discrete)
+
+    assert smooth_quality["quality"] == "SMOOTH_TREND"
+    assert smooth_quality["score_delta"] > 0
+    assert smooth_quality["information_discreteness"] < 0
+    assert discrete_quality["quality"] == "DISCRETE_JUMP"
+    assert discrete_quality["score_delta"] < 0
+    assert discrete_quality["top_day_contribution"] >= 0.65
 
 
 def test_incomplete_calendar_week_is_marked_unconfirmed():

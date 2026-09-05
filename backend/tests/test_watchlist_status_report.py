@@ -538,3 +538,128 @@ def test_confirming_triggered_item_is_not_archived():
     result = watchlist._triggered_archive_decision(item, max_triggered_days=5)
 
     assert result == {"should_archive": False, "reason": ""}
+
+
+def test_check_triggers_notifies_only_new_trigger_or_invalidation(monkeypatch):
+    sent = []
+
+    def fake_list(status="WATCHING"):
+        if status == "WATCHING":
+            return {"items": [{
+                "id": 1, "code": "000001", "name": "新触发",
+                "status": "WATCHING", "target_hit": True, "stop_hit": False,
+                "current_price": 11.0, "watch_price": 10.0,
+                "target_price": 11.0, "stop_price": 9.0, "pl_pct": 10.0,
+            }]}
+        return {"items": [
+            {
+                "id": 2, "code": "000002", "name": "重复触发",
+                "status": "TRIGGERED", "target_hit": True, "stop_hit": False,
+                "current_price": 11.0, "watch_price": 10.0,
+                "target_price": 11.0, "stop_price": 9.0, "pl_pct": 10.0,
+            },
+            {
+                "id": 3, "code": "000003", "name": "触发后失效",
+                "status": "TRIGGERED", "target_hit": False, "stop_hit": True,
+                "current_price": 8.9, "watch_price": 10.0,
+                "target_price": 11.0, "stop_price": 9.0, "pl_pct": -11.0,
+            },
+        ]}
+
+    monkeypatch.setattr(watchlist, "list_watchlist", fake_list)
+    monkeypatch.setattr(
+        watchlist,
+        "_refresh_items_with_snapshot",
+        lambda items, require_live_snapshot=False: items,
+    )
+    monkeypatch.setattr(watchlist, "get_db_engine", lambda: None)
+    monkeypatch.setattr(
+        watchlist,
+        "_send_trigger_notification",
+        lambda alerts: sent.extend(alerts) or {"bark": True},
+    )
+
+    result = watchlist.check_watchlist_triggers(notify=True)
+
+    assert result["count"] == 2
+    assert [item["name"] for item in sent] == ["新触发", "触发后失效"]
+    assert "重复触发" not in [item["name"] for item in result["alerts"]]
+
+
+def test_late_confirmation_pushes_only_actionable_triggered_once(monkeypatch):
+    sent = []
+    updates = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _statement, params):
+            updates.extend(params)
+
+        def commit(self):
+            pass
+
+    class FakeEngine:
+        def connect(self):
+            return FakeConnection()
+
+    monkeypatch.setattr(watchlist, "get_db_engine", lambda: FakeEngine())
+    monkeypatch.setattr(watchlist, "list_watchlist", lambda status="WATCHING": {"items": [
+        {
+            "id": 1, "code": "000001", "name": "可执行",
+            "status": "TRIGGERED", "watch_decision": "TRIGGERED",
+            "pa_trade_action": "READY", "execution_state": "CONFIRM",
+            "current_price": 11.0, "trigger_price": 10.8, "guard_price": 9.8,
+            "market_sentiment_stage": "REPAIR",
+        },
+        {
+            "id": 2, "code": "000002", "name": "已推过",
+            "status": "TRIGGERED", "watch_decision": "CONFIRMED",
+            "last_review_date": datetime.now().strftime("%Y-%m-%d"),
+            "pa_trade_action": "READY", "execution_state": "CONFIRM",
+            "current_price": 12.0, "trigger_price": 11.8, "guard_price": 10.8,
+            "market_sentiment_stage": "REPAIR",
+        },
+        {
+            "id": 3, "code": "000003", "name": "市场退潮",
+            "status": "TRIGGERED", "watch_decision": "TRIGGERED",
+            "pa_trade_action": "READY", "execution_state": "CONFIRM",
+            "current_price": 13.0, "trigger_price": 12.8, "guard_price": 11.8,
+            "market_sentiment_stage": "RETREAT",
+        },
+        {
+            "id": 4, "code": "000004", "name": "昨日确认",
+            "status": "TRIGGERED", "watch_decision": "CONFIRMED",
+            "last_review_date": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"),
+            "pa_trade_action": "READY", "execution_state": "CONFIRM",
+            "current_price": 14.0, "trigger_price": 13.8, "guard_price": 12.8,
+            "market_sentiment_stage": "REPAIR",
+        },
+    ]})
+    monkeypatch.setattr(
+        watchlist,
+        "_refresh_items_with_snapshot",
+        lambda items, require_live_snapshot=False: items,
+    )
+
+    async def fake_send(title, body, channels=None, group=None, url=None):
+        sent.append((title, body, channels, group, url))
+        return {"bark": True}
+
+    monkeypatch.setattr(watchlist.notifier, "send", fake_send)
+    monkeypatch.setattr(watchlist, "record_lifecycle_event", lambda *args, **kwargs: None)
+
+    result = watchlist.send_late_watchlist_confirmations(notify=True)
+
+    assert result["count"] == 2
+    assert result["bark"] is True
+    assert "可执行(000001)" in sent[0][1]
+    assert "已推过" not in sent[0][1]
+    assert "市场退潮" not in sent[0][1]
+    assert "昨日确认(000004)" in sent[0][1]
+    assert [item["id"] for item in updates] == [1, 4]
+    assert all(item["review_date"] == datetime.now().strftime("%Y-%m-%d") for item in updates)

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core.outcome_calibration import (
     build_a_grade_policy_report, build_blocker_report, build_bottom_discovery_report, build_calibration_report, build_execution_cohort_report,
     build_feature_ablation_report, build_opportunity_threshold_report,
-    load_scan_outcomes,
+    load_scan_outcomes, mark_independent_signal_events,
 )
 
 
@@ -86,6 +86,30 @@ def test_grade_monotonicity_passes_with_mature_a_b_c_samples():
 
     assert report["grade_monotonicity"]["status"] == "PASS"
     assert report["grade_monotonicity"]["metric"] == "avg_return_5d"
+
+
+def test_overlapping_daily_signals_count_as_one_independent_event_until_five_day_maturity():
+    df = pd.DataFrame([
+        {"code": "000001", "strategy_type": "tv_dual", "signal_date": "2026-07-01", "maturity_5d_date": "2026-07-08"},
+        {"code": "000001", "strategy_type": "tv_dual", "signal_date": "2026-07-02", "maturity_5d_date": "2026-07-09"},
+        {"code": "000001", "strategy_type": "tv_dual", "signal_date": "2026-07-09", "maturity_5d_date": "2026-07-16"},
+    ])
+
+    marked = mark_independent_signal_events(df)
+
+    assert marked["independent_event"].tolist() == [True, False, True]
+
+
+def test_calibration_uses_independent_events_and_shadows_failed_grade_ordering():
+    df = _sample_frame().head(4).copy()
+    df["independent_event"] = [True, False, True, False]
+
+    report = build_calibration_report(df, min_samples=1)
+
+    assert report["summary"]["raw_signals"] == 4
+    assert report["summary"]["signals"] == 2
+    assert report["grade_usage"]["mode"] == "SHADOW_ONLY"
+    assert report["grade_usage"]["production_effect"] is False
 
 
 def test_a_grade_policy_report_caps_discovery_and_vetoed_candidates():

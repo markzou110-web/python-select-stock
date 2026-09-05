@@ -2,16 +2,24 @@ import os
 import sys
 
 import pandas as pd
+import pytest
 from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.execution_replay import (
+    _soft_blocker_shadow_eligible,
     build_bark_instruction_evidence,
     build_execution_replay_report,
     build_operation_advice_validation,
     run_historical_execution_replay,
 )
+
+
+@pytest.fixture(autouse=True)
+def _validated_grade_mode_for_replay_unit_tests(monkeypatch):
+    from core import scanner
+    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "ACTIVE")
 
 
 def _candidate(code: str, blockers_ready: bool = True):
@@ -81,6 +89,18 @@ def test_replay_reports_negative_hard_only_shadow_without_changing_current_polic
     current = next(item for item in report["policies"] if item["policy"] == "current_policy")
     assert current["selected"] == 0
     assert report["summary"]["point_in_time_candidates"] == 1
+
+
+def test_soft_blocker_shadow_removes_only_reviewed_explanation_rules():
+    soft = {"hard": [], "wait": [], "other": []}
+    hard = {"hard": ["风险收益比不足"], "wait": [], "other": []}
+
+    assert _soft_blocker_shadow_eligible(
+        {"trade_blockers": ["交易计划未确认"], "pa_trade_action": "READY"}, soft, 70,
+    ) is True
+    assert _soft_blocker_shadow_eligible(
+        {"trade_blockers": ["风险收益比不足"], "pa_trade_action": "READY"}, hard, 70,
+    ) is False
 
 
 def test_historical_replay_supports_sqlite_end_to_end():

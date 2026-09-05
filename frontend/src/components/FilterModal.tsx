@@ -298,6 +298,27 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                             onClick={() => setParams({ ...params, strategy_type: "both" })}
                                             icon="🔥"
                                         />
+                                        <StrategyOption
+                                            title="HTF 高位收敛"
+                                            description="强势上涨后高位窄幅缩量；SHADOW研究"
+                                            active={params.strategy_type === "high_tight_flag"}
+                                            onClick={() => setParams({ ...params, strategy_type: "high_tight_flag", min_data_days: 80 })}
+                                            icon="HTF"
+                                        />
+                                        <StrategyOption
+                                            title="20日新高基准"
+                                            description="突破前20日高点并通过流动性过滤；SHADOW研究"
+                                            active={params.strategy_type === "turtle_breakout"}
+                                            onClick={() => setParams({ ...params, strategy_type: "turtle_breakout", min_data_days: 80 })}
+                                            icon="T20"
+                                        />
+                                        <StrategyOption
+                                            title="涨停后洗盘"
+                                            description="前日封板、放量换手且支撑未破；SHADOW研究"
+                                            active={params.strategy_type === "limit_up_shakeout"}
+                                            onClick={() => setParams({ ...params, strategy_type: "limit_up_shakeout", min_data_days: 80 })}
+                                            icon="ZT"
+                                        />
                                     </div>
                                 </details>
                             </div>

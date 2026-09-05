@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from core.risk_constants import PRIMARY_TV_STRATEGY
 
@@ -22,25 +22,52 @@ def classify_strategy_health(metrics: Dict[str, Any]) -> Dict[str, Any]:
 def recommend_strategy_template(
     market_regime: str = "UNKNOWN",
     risk_status: str = "ok",
-    recent_win_rate: float = 0,
-    strategy_health: Dict[str, Any] | None = None,
+    recent_win_rate: Optional[float] = None,
+    strategy_health: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Choose a scan template profile for the next run based on regime and recent quality."""
     regime = (market_regime or "UNKNOWN").upper()
-    health_status = (strategy_health or {}).get("status")
+    health_map = strategy_health or {}
+    primary_health = health_map.get(PRIMARY_TV_STRATEGY) or {}
+    recent_weak = recent_win_rate is not None and float(recent_win_rate) < 45
     defensive = (
         risk_status in {"warning", "error"}
-        or recent_win_rate < 45
+        or recent_weak
         or regime in {"DEFENSIVE", "CRITICAL"}
-        or health_status in {"DOWNWEIGHT", "PAUSED"}
+        or primary_health.get("status") in {"DOWNWEIGHT", "PAUSED"}
     )
 
+    def choose_strategy(preferred: List[str]) -> tuple[str, Dict[str, Any]]:
+        if not health_map:
+            return preferred[0], {}
+        ranked = []
+        status_rank = {"ACTIVE": 0, "DOWNWEIGHT": 1, "OBSERVE": 2}
+        for preference, strategy in enumerate(preferred):
+            metrics = health_map.get(strategy)
+            if not metrics or metrics.get("status") == "PAUSED":
+                continue
+            ranked.append((
+                status_rank.get(str(metrics.get("status") or "OBSERVE"), 2),
+                -float(metrics.get("expected_return") or 0),
+                preference,
+                strategy,
+                metrics,
+            ))
+        if ranked:
+            _, _, _, strategy, metrics = min(ranked)
+            return strategy, metrics
+        for strategy in preferred:
+            if strategy not in health_map:
+                return strategy, {}
+        return preferred[0], health_map.get(preferred[0]) or {}
+
     if defensive:
+        strategy, selected_health = choose_strategy(["pine", "tv_zp", "consensus", PRIMARY_TV_STRATEGY])
         return {
             "profile": "防守精选",
-            "strategy_type": "pine",
+            "strategy_type": strategy,
             "params": {
-                "strategy_type": "pine",
+                "strategy_type": strategy,
                 "pine_min_signals": 4,
                 "vol_multiplier": 1.8,
                 "rsi_min": 58,
@@ -48,16 +75,19 @@ def recommend_strategy_template(
                 "use_weekly": True,
                 "max_open_gap_pct": 2.0,
             },
-            "reason": (strategy_health or {}).get("reason") or "市场或组合风险偏高，优先减少信号数量并提高右侧确认要求",
-            "strategy_health": strategy_health or {},
+            "reason": selected_health.get("reason") or "市场或组合风险偏高，优先减少信号数量并提高右侧确认要求",
+            "strategy_health": selected_health,
         }
 
-    if regime in {"BULL", "RISK_ON", "CONFIRM"} or recent_win_rate >= 55:
+    if regime in {"BULL", "RISK_ON", "CONFIRM"} or (
+        recent_win_rate is not None and float(recent_win_rate) >= 55
+    ):
+        strategy, selected_health = choose_strategy([PRIMARY_TV_STRATEGY, "tv_zp", "consensus", "pine"])
         return {
             "profile": "进攻共振",
-            "strategy_type": PRIMARY_TV_STRATEGY,
+            "strategy_type": strategy,
             "params": {
-                "strategy_type": PRIMARY_TV_STRATEGY,
+                "strategy_type": strategy,
                 "pine_min_signals": 3,
                 "vol_multiplier": 1.5,
                 "rsi_min": 55,
@@ -66,14 +96,15 @@ def recommend_strategy_template(
                 "max_open_gap_pct": 3.0,
             },
             "reason": "近期验证质量较好，可保持共振策略并允许正常触发频率",
-            "strategy_health": strategy_health or {},
+            "strategy_health": selected_health,
         }
 
+    strategy, selected_health = choose_strategy(["consensus", "tv_zp", PRIMARY_TV_STRATEGY, "pine"])
     return {
         "profile": "均衡观察",
-        "strategy_type": "consensus",
+        "strategy_type": strategy,
         "params": {
-            "strategy_type": "consensus",
+            "strategy_type": strategy,
             "vol_multiplier": 1.6,
             "rsi_min": 55,
             "turnover_min": 3.5,
@@ -81,8 +112,33 @@ def recommend_strategy_template(
             "max_open_gap_pct": 2.5,
         },
         "reason": "市场状态不明朗，使用均衡参数等待板块和量能进一步确认",
-        "strategy_health": strategy_health or {},
+        "strategy_health": selected_health,
     }
+
+
+def build_live_strategy_recommendation(
+    engine,
+    market_regime: str = "UNKNOWN",
+    risk_status: Optional[str] = None,
+    recent_win_rate: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build a recommendation from current market, portfolio and strategy evidence."""
+    from core.data import get_market_regime
+    from core.portfolio_risk import build_portfolio_exposure
+    from core.strategy_health import build_strategy_health
+
+    regime = market_regime
+    if not regime or str(regime).upper() == "UNKNOWN":
+        regime = (get_market_regime() or {}).get("status", "UNKNOWN")
+    exposure_status = risk_status or build_portfolio_exposure(engine).get("status", "ok")
+    health_report = build_strategy_health(engine)
+    health_map = (health_report.get("selection") or {}).get("strategies") or {}
+    return recommend_strategy_template(
+        market_regime=str(regime or "UNKNOWN"),
+        risk_status=str(exposure_status or "ok"),
+        recent_win_rate=recent_win_rate,
+        strategy_health=health_map,
+    )
 
 
 def build_alert_priority(level: str, pl_pct: float, reasons: List[str]) -> Dict[str, Any]:

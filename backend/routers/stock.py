@@ -6,8 +6,9 @@ Extracted from api.py.
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from datetime import date, datetime, timedelta
+from typing import Annotated, Literal
 import json
 import math
 import akshare as ak
@@ -31,6 +32,25 @@ from core.models import ResearchThesis
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
 
+class SerenityResearchSnapshot(BaseModel):
+    """Point-in-time supply-chain thesis that never grants trade permission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    framework_version: Literal["serenity-choke-v1"] = "serenity-choke-v1"
+    sector_cycle: Literal[
+        "DEMAND_BOOM", "TECH_TRANSITION", "SUPPLY_CONSTRAINED", "UNKNOWN"
+    ] = "UNKNOWN"
+    supply_chain_path: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        default_factory=list, max_length=20,
+    )
+    bottleneck_node: str = Field(min_length=1, max_length=200)
+    bottleneck_reason: str = Field(default="", max_length=2000)
+    authenticity: Literal["UNVERIFIED", "PARTIAL", "VERIFIED"] = "UNVERIFIED"
+    evidence_urls: list[HttpUrl] = Field(default_factory=list, max_length=20)
+    observed_at: datetime | None = None
+
+
 class ResearchThesisCreate(BaseModel):
     title: str = Field(default="研究论点", max_length=200)
     thesis_text: str = Field(min_length=1, max_length=5000)
@@ -40,6 +60,7 @@ class ResearchThesisCreate(BaseModel):
     invalidation_condition: str = Field(default="", max_length=1000)
     strategy_type: str | None = Field(default=None, max_length=30)
     signal_id: int | None = None
+    serenity_snapshot: SerenityResearchSnapshot | None = None
 
 
 def _json_safe_response(value):
@@ -174,6 +195,16 @@ def create_research_thesis(code: str, payload: ResearchThesisCreate):
     if engine is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
     cached_research = get_cached_stock_research_signals(code) or {}
+    source_snapshot = _json_safe_response(cached_research)
+    if payload.serenity_snapshot:
+        serenity_snapshot = payload.serenity_snapshot.model_dump(mode="json")
+        serenity_snapshot.update({
+            "mode": "SHADOW",
+            "score_effect": 0,
+            "trade_eligible": False,
+        })
+        source_snapshot = dict(source_snapshot) if isinstance(source_snapshot, dict) else {}
+        source_snapshot["serenity"] = serenity_snapshot
     thesis = ResearchThesis(
         code=code,
         title=payload.title.strip() or "研究论点",
@@ -183,7 +214,7 @@ def create_research_thesis(code: str, payload: ResearchThesisCreate):
         risks=payload.risks[:20],
         confirmation_condition=payload.confirmation_condition.strip() or None,
         invalidation_condition=payload.invalidation_condition.strip() or None,
-        source_snapshot=_json_safe_response(cached_research),
+        source_snapshot=source_snapshot,
         strategy_type=payload.strategy_type,
         signal_id=payload.signal_id,
         status="ACTIVE",
@@ -207,13 +238,25 @@ def list_research_theses(code: str, limit: int = 20):
         rows = conn.execute(text("""
             SELECT id, code, title, thesis_date, thesis_text, catalysts, risks,
                    confirmation_condition, invalidation_condition, strategy_type,
-                   signal_id, status, created_at
+                   signal_id, status, source_snapshot, created_at
             FROM research_theses
             WHERE code = :code
             ORDER BY thesis_date DESC, created_at DESC
             LIMIT :limit
         """), {"code": code, "limit": safe_limit}).mappings().all()
-    items = [_json_safe_response(dict(row)) for row in rows]
+    items = []
+    for row in rows:
+        item = dict(row)
+        source_snapshot = item.pop("source_snapshot", None) or {}
+        if isinstance(source_snapshot, str):
+            try:
+                source_snapshot = json.loads(source_snapshot)
+            except json.JSONDecodeError:
+                source_snapshot = {}
+        item["serenity_snapshot"] = (
+            source_snapshot.get("serenity") if isinstance(source_snapshot, dict) else None
+        )
+        items.append(_json_safe_response(item))
     return {"items": items, "count": len(items)}
 
 

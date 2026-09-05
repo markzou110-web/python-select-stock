@@ -127,6 +127,41 @@ interface StockResearchData {
     };
 }
 
+type SerenityCycle = 'DEMAND_BOOM' | 'TECH_TRANSITION' | 'SUPPLY_CONSTRAINED' | 'UNKNOWN';
+
+interface SerenityResearchSnapshot {
+    framework_version: 'serenity-choke-v1';
+    sector_cycle: SerenityCycle;
+    supply_chain_path: string[];
+    bottleneck_node: string;
+    bottleneck_reason: string;
+    authenticity: 'UNVERIFIED' | 'PARTIAL' | 'VERIFIED';
+    evidence_urls: string[];
+    observed_at?: string | null;
+    mode: 'SHADOW';
+    score_effect: 0;
+    trade_eligible: false;
+}
+
+interface ResearchThesisItem {
+    id: number;
+    title: string;
+    thesis_date: string;
+    thesis_text: string;
+    confirmation_condition?: string | null;
+    invalidation_condition?: string | null;
+    strategy_type?: string | null;
+    status: string;
+    serenity_snapshot?: SerenityResearchSnapshot | null;
+}
+
+const serenityCycleLabels: Record<SerenityCycle, string> = {
+    DEMAND_BOOM: '需求爆发',
+    TECH_TRANSITION: '技术跃迁',
+    SUPPLY_CONSTRAINED: '供给受限',
+    UNKNOWN: '待判断',
+};
+
 export default function StockDetailPage({ code, name, onBack }: StockDetailPageProps) {
     const [data, setData] = useState<FullAnalysisData | null>(null);
     const [loading, setLoading] = useState(true);
@@ -1136,10 +1171,17 @@ function ResearchFlagList({ title, items, tone }: { title: string; items: string
 }
 
 function ResearchThesisPanel({ code, strategyType, research }: { code: string; strategyType: string; research: StockResearchData | null }) {
-    const [items, setItems] = useState<any[]>([]);
+    const [items, setItems] = useState<ResearchThesisItem[]>([]);
     const [open, setOpen] = useState(false);
+    const [serenityMode, setSerenityMode] = useState(false);
     const [saving, setSaving] = useState(false);
-    const [draft, setDraft] = useState({ thesis: '', confirmation: '', invalidation: '' });
+    const [draft, setDraft] = useState({
+        thesis: '', confirmation: '', invalidation: '',
+        sectorCycle: 'UNKNOWN' as SerenityCycle,
+        supplyChain: '', bottleneckNode: '', bottleneckReason: '',
+        authenticity: 'UNVERIFIED' as SerenityResearchSnapshot['authenticity'],
+        evidenceUrls: '',
+    });
 
     const load = useCallback(async () => {
         try {
@@ -1153,19 +1195,42 @@ function ResearchThesisPanel({ code, strategyType, research }: { code: string; s
     useEffect(() => { load(); }, [load]);
 
     const save = async () => {
-        if (!draft.thesis.trim()) return;
+        if (!draft.thesis.trim() || (serenityMode && !draft.bottleneckNode.trim())) return;
         setSaving(true);
         try {
             await api.post(`/api/stock/${code}/research-theses`, {
-                title: `研究论点 ${new Date().toISOString().slice(0, 10)}`,
+                title: `${serenityMode ? 'Serenity 卡脖子研究' : '研究论点'} ${new Date().toISOString().slice(0, 10)}`,
                 thesis_text: draft.thesis,
                 confirmation_condition: draft.confirmation,
                 invalidation_condition: draft.invalidation,
                 catalysts: research?.summary?.opportunity_flags || [],
                 risks: research?.summary?.risk_flags || [],
                 strategy_type: strategyType,
+                ...(serenityMode ? {
+                    serenity_snapshot: {
+                        framework_version: 'serenity-choke-v1',
+                        sector_cycle: draft.sectorCycle,
+                        supply_chain_path: draft.supplyChain
+                            .split(/\s*(?:→|>|\n)\s*/)
+                            .map(item => item.trim())
+                            .filter(Boolean),
+                        bottleneck_node: draft.bottleneckNode.trim(),
+                        bottleneck_reason: draft.bottleneckReason.trim(),
+                        authenticity: draft.authenticity,
+                        evidence_urls: draft.evidenceUrls
+                            .split(/[\n,]/)
+                            .map(item => item.trim())
+                            .filter(Boolean),
+                        observed_at: new Date().toISOString(),
+                    },
+                } : {}),
             });
-            setDraft({ thesis: '', confirmation: '', invalidation: '' });
+            setDraft({
+                thesis: '', confirmation: '', invalidation: '', sectorCycle: 'UNKNOWN',
+                supplyChain: '', bottleneckNode: '', bottleneckReason: '',
+                authenticity: 'UNVERIFIED', evidenceUrls: '',
+            });
+            setSerenityMode(false);
             setOpen(false);
             await load();
         } finally {
@@ -1178,7 +1243,7 @@ function ResearchThesisPanel({ code, strategyType, research }: { code: string; s
             <div className="flex items-start justify-between gap-3">
                 <div>
                     <div className="flex items-center gap-2"><BookOpen size={16} className="text-indigo-600" /><h4 className="text-xs font-black uppercase tracking-widest text-slate-400">研究论点快照</h4></div>
-                    <p className="mt-1 text-xs font-semibold text-slate-500">保存当时的判断、确认条件、失效条件和当前研究证据</p>
+                    <p className="mt-1 text-xs font-semibold text-slate-500">保存当时的判断与证据；Serenity 只进入影子研究，不改变交易许可</p>
                 </div>
                 <button type="button" onClick={() => setOpen(value => !value)} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-600 hover:text-indigo-600">
                     {open ? '取消' : '新建论点'}
@@ -1187,10 +1252,35 @@ function ResearchThesisPanel({ code, strategyType, research }: { code: string; s
 
             {open && (
                 <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3">
+                    <button
+                        type="button"
+                        aria-pressed={serenityMode}
+                        onClick={() => setSerenityMode(value => !value)}
+                        className={cn(
+                            "rounded-md border px-3 py-2 text-sm font-black lg:col-span-3",
+                            serenityMode ? "border-violet-300 bg-violet-50 text-violet-700" : "border-slate-200 bg-white text-slate-600"
+                        )}
+                    >
+                        {serenityMode ? 'Serenity 影子研究已开启' : '启用 Serenity 产业链瓶颈研究'}
+                    </button>
+                    {serenityMode && (
+                        <div className="grid grid-cols-1 gap-3 rounded-lg border border-violet-100 bg-violet-50/50 p-3 lg:col-span-3 lg:grid-cols-3">
+                            <select value={draft.sectorCycle} onChange={event => setDraft({ ...draft, sectorCycle: event.target.value as SerenityCycle })} className="rounded-md border border-violet-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-violet-400">
+                                {Object.entries(serenityCycleLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                            </select>
+                            <input value={draft.bottleneckNode} onChange={event => setDraft({ ...draft, bottleneckNode: event.target.value })} placeholder="瓶颈节点（必填）" className="rounded-md border border-violet-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-violet-400" />
+                            <select value={draft.authenticity} onChange={event => setDraft({ ...draft, authenticity: event.target.value as SerenityResearchSnapshot['authenticity'] })} className="rounded-md border border-violet-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-violet-400">
+                                <option value="UNVERIFIED">未验证</option><option value="PARTIAL">部分验证</option><option value="VERIFIED">已验证</option>
+                            </select>
+                            <input value={draft.supplyChain} onChange={event => setDraft({ ...draft, supplyChain: event.target.value })} placeholder="供应链路径，用 → 分隔" className="rounded-md border border-violet-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-violet-400 lg:col-span-3" />
+                            <textarea value={draft.bottleneckReason} onChange={event => setDraft({ ...draft, bottleneckReason: event.target.value })} placeholder="瓶颈依据：壁垒、扩产周期、自给率、替代性" className="min-h-20 rounded-md border border-violet-200 bg-white p-3 text-sm font-semibold outline-none focus:border-violet-400 lg:col-span-2" />
+                            <textarea value={draft.evidenceUrls} onChange={event => setDraft({ ...draft, evidenceUrls: event.target.value })} placeholder="证据链接，每行一个" className="min-h-20 rounded-md border border-violet-200 bg-white p-3 text-sm font-semibold outline-none focus:border-violet-400" />
+                        </div>
+                    )}
                     <textarea value={draft.thesis} onChange={event => setDraft({ ...draft, thesis: event.target.value })} placeholder="核心研究判断" className="min-h-24 rounded-md border border-slate-200 bg-white p-3 text-sm font-semibold text-slate-700 outline-none focus:border-indigo-400 lg:col-span-3" />
                     <input value={draft.confirmation} onChange={event => setDraft({ ...draft, confirmation: event.target.value })} placeholder="确认条件，例如放量站回确认价" className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-400" />
                     <input value={draft.invalidation} onChange={event => setDraft({ ...draft, invalidation: event.target.value })} placeholder="失效条件，例如跌破结构止损" className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold outline-none focus:border-indigo-400" />
-                    <button type="button" onClick={save} disabled={saving || !draft.thesis.trim()} className="inline-flex items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-black text-white disabled:opacity-50">
+                    <button type="button" onClick={save} disabled={saving || !draft.thesis.trim() || (serenityMode && !draft.bottleneckNode.trim())} className="inline-flex items-center justify-center gap-2 rounded-md bg-indigo-600 px-3 py-2 text-sm font-black text-white disabled:opacity-50">
                         <Save size={14} />{saving ? '保存中' : '保存快照'}
                     </button>
                 </div>
@@ -1199,8 +1289,19 @@ function ResearchThesisPanel({ code, strategyType, research }: { code: string; s
             <div className="mt-4 space-y-2">
                 {items.slice(0, 5).map(item => (
                     <div key={item.id} className="grid grid-cols-1 gap-2 border-t border-slate-100 pt-3 first:border-t-0 first:pt-0 lg:grid-cols-[140px_1fr_1fr]">
-                        <div><p className="text-xs font-black text-slate-700">{item.thesis_date}</p><p className="text-[10px] font-bold text-slate-400">{item.strategy_type || '未关联策略'} · {item.status}</p></div>
-                        <div><p className="text-sm font-black text-slate-800">{item.thesis_text}</p><p className="mt-1 text-[10px] font-bold text-slate-400">确认：{item.confirmation_condition || '未记录'}</p></div>
+                        <div><p className="text-xs font-black text-slate-700">{item.thesis_date}</p><p className="text-[10px] font-bold text-slate-400">{item.strategy_type || '未关联策略'} · {item.status}</p>{item.serenity_snapshot && <span className="mt-1 inline-flex rounded-full bg-violet-100 px-2 py-1 text-[9px] font-black text-violet-700">SERENITY · SHADOW</span>}</div>
+                        <div>
+                            <p className="text-sm font-black text-slate-800">{item.thesis_text}</p>
+                            {item.serenity_snapshot && (
+                                <div className="mt-2 rounded-md border border-violet-100 bg-violet-50 p-2 text-[10px] font-bold text-violet-800">
+                                    <p>{serenityCycleLabels[item.serenity_snapshot.sector_cycle]} · 瓶颈：{item.serenity_snapshot.bottleneck_node} · {item.serenity_snapshot.authenticity}</p>
+                                    {!!item.serenity_snapshot.supply_chain_path.length && <p className="mt-1">{item.serenity_snapshot.supply_chain_path.join(' → ')}</p>}
+                                    {!!item.serenity_snapshot.bottleneck_reason && <p className="mt-1 text-violet-600">{item.serenity_snapshot.bottleneck_reason}</p>}
+                                    {!!item.serenity_snapshot.evidence_urls.length && <div className="mt-1 flex flex-wrap gap-2">{item.serenity_snapshot.evidence_urls.map((url, index) => <a key={`${url}-${index}`} href={url} target="_blank" rel="noreferrer" className="underline">证据 {index + 1}</a>)}</div>}
+                                </div>
+                            )}
+                            <p className="mt-1 text-[10px] font-bold text-slate-400">确认：{item.confirmation_condition || '未记录'}</p>
+                        </div>
                         <p className="text-xs font-bold text-rose-600">失效：{item.invalidation_condition || '未记录'}</p>
                     </div>
                 ))}

@@ -23,6 +23,7 @@ def test_after_close_review_pushes_next_day_watchlist(monkeypatch):
 
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
     monkeypatch.setattr(tasks, "is_a_share_trading_day", lambda now=None: True)
+    monkeypatch.setattr(tasks, "_is_after_close_review_window", lambda now: True)
     monkeypatch.setattr("routers.paper_trade.check_operation_triggers", lambda notify=True, trade_mode="REAL": {"alerts": []})
     monkeypatch.setattr("routers.watchlist.refresh_watchlist_decisions", lambda: None)
     monkeypatch.setattr("routers.watchlist.auto_prune_watchlist", lambda max_watch_days=15: {"updated": 0})
@@ -56,6 +57,18 @@ def test_after_close_review_pushes_next_day_watchlist(monkeypatch):
     assert sent == []
 
 
+def test_after_close_review_skips_stale_night_task(monkeypatch):
+    monkeypatch.setattr(tasks, "_is_after_close_review_window", lambda now: False)
+
+    result = tasks.intraday_monitor_checkpoint(slot="after_close_review")
+
+    assert result == {
+        "status": "skipped",
+        "reason": "stale_after_close_slot",
+        "slot": "after_close_review",
+    }
+
+
 def test_open_risk_keeps_healthy_self_check_and_watchlist_silent(monkeypatch):
     calls = []
 
@@ -82,7 +95,7 @@ def test_morning_confirm_runs_tv_or_scan_and_pushes_results(monkeypatch):
     )
     monkeypatch.setattr(
         "routers.watchlist.check_watchlist_triggers",
-        lambda notify=True: {"count": 0},
+        lambda notify=True, notify_target_hits=True: {"count": 0},
     )
     monkeypatch.setattr(
         "routers.scan.run_market_scan_task",
@@ -120,12 +133,22 @@ def test_morning_confirm_runs_tv_or_scan_and_pushes_results(monkeypatch):
 
 def test_late_decision_keeps_watchlist_conclusion_in_app(monkeypatch):
     calls = []
+    watch_calls = []
 
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
     monkeypatch.setattr("routers.paper_trade.check_operation_triggers", lambda notify=True, trade_mode="REAL": {"alerts": []})
     monkeypatch.setattr("routers.watchlist.refresh_watchlist_decisions", lambda: None)
     monkeypatch.setattr("routers.watchlist.auto_prune_watchlist", lambda max_watch_days=15: {"updated": 0})
-    monkeypatch.setattr("routers.watchlist.check_watchlist_triggers", lambda notify=True: {"count": 0})
+    monkeypatch.setattr(
+        "routers.watchlist.check_watchlist_triggers",
+        lambda notify=True, notify_target_hits=True: watch_calls.append(
+            (notify, notify_target_hits)
+        ) or {"count": 0},
+    )
+    monkeypatch.setattr(
+        "routers.watchlist.send_late_watchlist_confirmations",
+        lambda notify=True: calls.append(("watch_confirm", notify)) or {"bark": True, "count": 1},
+    )
     monkeypatch.setattr(
         "routers.scan.run_market_scan_task",
         lambda **kwargs: calls.append(("scan", kwargs)) or [{
@@ -142,10 +165,12 @@ def test_late_decision_keeps_watchlist_conclusion_in_app(monkeypatch):
 
     assert calls[0][1]["strategy_type"] == "tv_dual"
     assert calls[1][0] == "push"
+    assert calls[2] == ("watch_confirm", True)
+    assert watch_calls == [(True, False)]
     assert result["formal_scan_count"] == 1
     assert result["formal_scan_push"] == 1
     assert result["formal_scan_completed"] == 1
-    assert result["watch_status_push"] == 0
+    assert result["watch_status_push"] == 1
 
 
 def test_candidate_scan_runs_formal_scan_instead_of_only_refreshing_watchlist(monkeypatch):
@@ -233,7 +258,7 @@ def test_noon_workflow_syncs_scans_and_pushes_reports(monkeypatch):
     monkeypatch.setattr("routers.scan.run_market_scan_task", lambda **kwargs: calls.append(("scan", kwargs)) or [{"代码": "603259", "名称": "药明康德", "Score": 88, "data_date": "2026-06-30"}])
     monkeypatch.setattr(tasks, "_send_noon_scan_push", lambda results: calls.append(("scan_push", len(results))) or True)
     monkeypatch.setattr("routers.paper_trade.check_operation_triggers", lambda notify=True, trade_mode="REAL": calls.append(("operation", trade_mode)) or {"alerts": [{"code": "603259"}]})
-    monkeypatch.setattr("routers.watchlist.check_watchlist_triggers", lambda notify=True: calls.append(("watch_trigger", notify)) or {"count": 2})
+    monkeypatch.setattr("routers.watchlist.check_watchlist_triggers", lambda notify=True, notify_target_hits=True: calls.append(("watch_trigger", notify)) or {"count": 2})
 
     result = tasks.noon_sync_scan_review()
 
@@ -245,7 +270,7 @@ def test_noon_workflow_syncs_scans_and_pushes_reports(monkeypatch):
     assert result["watch_status_push"] == 0
     assert calls[0] == ("sync", "午间")
     assert calls[1][0] == "scan"
-    assert ("watch_trigger", False) in calls
+    assert ("watch_trigger", True) in calls
 
 
 def test_noon_sync_only_does_not_scan_or_push(monkeypatch):
@@ -273,7 +298,7 @@ def test_noon_review_continues_when_scan_fails(monkeypatch):
 
     monkeypatch.setattr("routers.scan.run_market_scan_task", fail_scan)
     monkeypatch.setattr("routers.paper_trade.check_operation_triggers", lambda notify=True, trade_mode="REAL": calls.append(("operation", trade_mode)) or {"alerts": [{"code": "603259"}]})
-    monkeypatch.setattr("routers.watchlist.check_watchlist_triggers", lambda notify=True: calls.append(("watch_trigger", notify)) or {"count": 2})
+    monkeypatch.setattr("routers.watchlist.check_watchlist_triggers", lambda notify=True, notify_target_hits=True: calls.append(("watch_trigger", notify)) or {"count": 2})
 
     result = tasks.noon_sync_scan_review(sync_first=False, run_review=True)
 
@@ -285,7 +310,7 @@ def test_noon_review_continues_when_scan_fails(monkeypatch):
     assert "snapshot unavailable" in result["errors"][0]
     assert [call[1]["strategy_type"] for call in calls if call[0] == "scan"] == ["tv_dual"]
     assert ("operation", "REAL") in calls
-    assert ("watch_trigger", False) in calls
+    assert ("watch_trigger", True) in calls
 
 
 def test_noon_workflow_stops_when_sync_did_not_complete(monkeypatch):

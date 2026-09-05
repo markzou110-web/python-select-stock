@@ -1,7 +1,7 @@
 from .celery_app import celery_app
 from .logging_config import logger
 from .notifier import notifier
-from .db import get_db_engine
+from .db import get_db_engine, get_setting, save_setting
 from .task_idempotency import daily_task_slot
 from .data import get_market_snapshot, is_snapshot_stale
 from .indicators import calculate_indicators
@@ -11,11 +11,37 @@ from core.trading_calendar import is_a_share_intraday_session, is_a_share_tradin
 import asyncio
 import json
 import pandas as pd
-from datetime import datetime
+import re
+from datetime import datetime, time as datetime_time
 from sqlalchemy import text
 
 _ALERT_DEDUPE_CACHE = {}
 _ALERT_DEDUPE_SECONDS = 30 * 60
+_ALERT_STATE_KEY_PREFIX = "realtime_exit_alert:"
+_SCHEDULED_SCAN_MAX_DELAY_MINUTES = 15
+_AFTER_CLOSE_REVIEW_END = datetime_time(18, 0)
+
+
+def _scheduled_scan_skip_reason(now: datetime, slot: str) -> str | None:
+    """Reject periodic scan messages that are closed-market or too old to execute."""
+    if not is_a_share_intraday_session(now):
+        return "market_closed"
+    if slot not in {"09:45", "13:15", "13:25"}:
+        return None
+
+    hour, minute = (int(part) for part in slot.split(":"))
+    scheduled_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    delay_minutes = (now - scheduled_at).total_seconds() / 60
+    if delay_minutes < 0 or delay_minutes > _SCHEDULED_SCAN_MAX_DELAY_MINUTES:
+        return "stale_task_slot"
+    return None
+
+
+def _is_after_close_review_window(now: datetime) -> bool:
+    return (
+        is_a_share_trading_day(now)
+        and datetime_time(15, 0) <= now.time() <= _AFTER_CLOSE_REVIEW_END
+    )
 
 
 @celery_app.task(name="tasks.discover_event_catalysts")
@@ -203,14 +229,62 @@ def _alert_action(signal: dict, trade_mode: str, pl_pct: float) -> str:
     return f"建议减仓或收紧风控；{reason}"
 
 
-def _should_push_alert(code: str, reason: str, now: datetime) -> bool:
-    key = f"{code}:{reason}"
+def _alert_event_key(reason: str, level: str) -> str:
+    normalized = re.sub(r"¥\s*\d+(?:\.\d+)?", "¥#", str(reason or ""))
+    normalized = re.sub(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?%", "#%", normalized)
+    return f"{level}:{normalized}"
+
+
+def _load_alert_state(code: str) -> dict:
+    raw = get_setting(f"{_ALERT_STATE_KEY_PREFIX}{code}", "")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _should_push_alert(code: str, reason: str, now: datetime, level: str = "warning") -> bool:
+    event_key = _alert_event_key(reason, level)
+    day = now.strftime("%Y-%m-%d")
+    state = _load_alert_state(code)
+    if state.get("day") == day and state.get("active") is True and state.get("event_key") == event_key:
+        return False
+
+    saved = save_setting(
+        f"{_ALERT_STATE_KEY_PREFIX}{code}",
+        json.dumps({
+            "day": day,
+            "active": True,
+            "event_key": event_key,
+            "updated_at": now.isoformat(timespec="seconds"),
+        }, ensure_ascii=False),
+    )
+    if saved:
+        return True
+
+    # 持久化不可用时退回进程内冷却，避免数据库故障放大成推送风暴。
+    key = f"{code}:{event_key}"
     last_ts = _ALERT_DEDUPE_CACHE.get(key)
     now_ts = now.timestamp()
     if last_ts and now_ts - last_ts < _ALERT_DEDUPE_SECONDS:
         return False
     _ALERT_DEDUPE_CACHE[key] = now_ts
     return True
+
+
+def _mark_alert_recovered(code: str, now: datetime) -> None:
+    state = _load_alert_state(code)
+    if state.get("day") != now.strftime("%Y-%m-%d") or state.get("active") is not True:
+        return
+    state["active"] = False
+    state["updated_at"] = now.isoformat(timespec="seconds")
+    save_setting(
+        f"{_ALERT_STATE_KEY_PREFIX}{code}",
+        json.dumps(state, ensure_ascii=False),
+    )
 
 
 @celery_app.task(name="tasks.check_realtime_alerts")
@@ -290,22 +364,24 @@ def check_realtime_alerts():
                 close_confirmed=now.hour >= 15,
             )
             
-            if signals:
-                # 过滤出需要推送的信号 (warning 和 critical)
-                important_signals = [s for s in signals if s['level'] in ['warning', 'critical']]
-                if important_signals:
-                    sig = important_signals[0]
-                    reason = sig.get('reason', '')
-                    if not _should_push_alert(code, reason, now):
-                        continue
-                    pl_pct = (curr_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
-                    mode_label = "实盘" if trade_mode == "REAL" else "模拟"
-                    action = _alert_action(sig, trade_mode, pl_pct)
-                    alerts_triggered.append(
-                        f"{name}({code}) [{mode_label}] {curr_price:.2f} ({pl_pct:+.2f}%)\n"
-                        f"动作：{action}\n"
-                        f"提示：{sig.get('suggestion', '')}"
-                    )
+            # 过滤出需要推送的信号 (warning 和 critical)
+            important_signals = [s for s in signals if s['level'] in ['warning', 'critical']]
+            if not important_signals:
+                _mark_alert_recovered(code, now)
+                continue
+
+            sig = important_signals[0]
+            reason = sig.get('reason', '')
+            if not _should_push_alert(code, reason, now, level=sig.get('level', 'warning')):
+                continue
+            pl_pct = (curr_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+            mode_label = "实盘" if trade_mode == "REAL" else "模拟"
+            action = _alert_action(sig, trade_mode, pl_pct)
+            alerts_triggered.append(
+                f"{name}({code}) [{mode_label}] {curr_price:.2f} ({pl_pct:+.2f}%)\n"
+                f"动作：{action}\n"
+                f"提示：{sig.get('suggestion', '')}"
+            )
 
         # 5. 发送推送
         if alerts_triggered:
@@ -352,7 +428,14 @@ def check_realtime_alerts():
 def intraday_monitor_checkpoint(slot: str = "price_watch"):
     """Professional intraday workflow checkpoints for real trading operations."""
     now = datetime.now()
-    if not is_a_share_intraday_session(now) and slot not in {"after_close_review"}:
+    if slot == "after_close_review" and not _is_after_close_review_window(now):
+        logger.info("Checkpoint after_close_review skipped: stale task slot.")
+        return {
+            "status": "skipped",
+            "reason": "stale_after_close_slot",
+            "slot": slot,
+        }
+    if slot != "after_close_review" and not is_a_share_intraday_session(now):
         logger.info(f"Checkpoint {slot} skipped: market closed.")
         return "Market closed"
 
@@ -384,6 +467,7 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
             auto_prune_watchlist,
             check_watchlist_triggers,
             refresh_watchlist_decisions,
+            send_late_watchlist_confirmations,
         )
 
         if slot == "open_risk":
@@ -394,9 +478,13 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
             operation = check_operation_triggers(notify=True, trade_mode="REAL")
             summary["operation_alerts"] = len(operation.get("alerts") or [])
 
-        if noon_periodic_scan or candidate_periodic_scan or slot in {"morning_confirm", "candidate_scan", "late_decision"}:
-            watch = check_watchlist_triggers(notify=False)
+        if periodic_strategy_scan or slot in {"morning_confirm", "candidate_scan", "late_decision"}:
+            watch = check_watchlist_triggers(
+                notify=True,
+                notify_target_hits=slot != "late_decision",
+            )
             summary["watch_alerts"] = int(watch.get("count") or 0)
+            summary["watch_status_push"] = int(bool((watch.get("notification") or {}).get("bark")))
 
         if periodic_strategy_scan or slot in {"morning_confirm", "candidate_scan", "late_decision", "late_recovery"}:
             try:
@@ -434,6 +522,13 @@ def intraday_monitor_checkpoint(slot: str = "price_watch"):
             except Exception as scan_exc:
                 logger.error(f"{slot} formal scan error: {scan_exc}")
                 summary["errors"].append(f"formal_scan: {scan_exc}")
+
+        if slot == "late_decision":
+            late_confirmation = send_late_watchlist_confirmations(notify=True)
+            summary["watch_status_push"] = max(
+                summary["watch_status_push"],
+                int(bool(late_confirmation.get("bark"))),
+            )
 
         if candidate_periodic_scan or slot in {"candidate_scan", "after_close_review"}:
             refresh_watchlist_decisions()
@@ -659,8 +754,9 @@ def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
             logger.error(f"Noon operation trigger step error: {operation_exc}")
             summary["errors"].append(f"operation: {operation_exc}")
         try:
-            watch = check_watchlist_triggers(notify=False)
+            watch = check_watchlist_triggers(notify=True)
             summary["watch_alerts"] = int(watch.get("count") or 0)
+            summary["watch_status_push"] = int(bool((watch.get("notification") or {}).get("bark")))
         except Exception as watch_exc:
             logger.error(f"Noon watch trigger step error: {watch_exc}")
             summary["errors"].append(f"watch: {watch_exc}")
@@ -673,11 +769,19 @@ def noon_sync_scan_review(sync_first: bool = True, run_review: bool = True):
 
 
 @celery_app.task(name="tasks.early_value_scan")
+@daily_task_slot("early-value-scan", timeout_minutes=45)
 def early_value_scan():
     """Run the independent early-value watch strategy without changing the main scan."""
     now = datetime.now()
-    if not is_a_share_trading_day(now):
-        return {"status": "skipped", "reason": "non_trading_day", "strategy_type": "early_value"}
+    slot = "13:15"
+    skip_reason = _scheduled_scan_skip_reason(now, slot)
+    if skip_reason:
+        return {
+            "status": "skipped",
+            "reason": skip_reason,
+            "strategy_type": "early_value",
+            "slot": slot,
+        }
     try:
         from routers.scan import run_market_scan_task
 
@@ -698,11 +802,18 @@ def early_value_scan():
 
 
 @celery_app.task(name="tasks.bottom_discovery_scan")
+@daily_task_slot("bottom-discovery-scan", slot_argument="slot", timeout_minutes=45)
 def bottom_discovery_scan(slot: str = "scheduled"):
     """Run the independent bottom-discovery research strategy and push observation-only Bark."""
     now = datetime.now()
-    if not is_a_share_trading_day(now):
-        return {"status": "skipped", "reason": "non_trading_day", "strategy_type": "bottom_discovery"}
+    skip_reason = _scheduled_scan_skip_reason(now, slot)
+    if skip_reason:
+        return {
+            "status": "skipped",
+            "reason": skip_reason,
+            "strategy_type": "bottom_discovery",
+            "slot": slot,
+        }
     try:
         from routers.scan import run_market_scan_task
         from core.sentinel import send_intraday_notification

@@ -486,7 +486,8 @@ def test_portfolio_stats_derives_pl_pct_from_trade_prices(monkeypatch):
     result = paper_trade.get_portfolio_stats()
 
     assert "error" not in result
-    assert result["risk_metrics"]["equity_curve"][-1]["equity"] == 110.0
+    assert result["risk_metrics"]["equity_curve"][-1]["equity"] == 100.5
+    assert result["measurement"]["default_position_pct"] == 5.0
     assert result["attribution"]["by_industry"][0]["total_pnl"] == 10.0
 
 
@@ -532,6 +533,29 @@ def test_paper_list_empty_response_contains_complete_zero_stats(monkeypatch):
     assert result["stats"]["profit_factor"] == 0
     assert result["stats_by_mode"]["SIMULATED"]["avg_hold_days"] == 0
     assert result["stats_by_mode"]["REAL"]["total"] == 0
+    assert result["stats_by_mode"]["REAL"]["risk_metrics"]["equity_curve"] == []
+
+
+def test_paper_stats_separate_real_and_simulated_and_use_closed_trades_only():
+    trades = [
+        {"name": "实盘", "status": "CLOSED", "trade_mode": "REAL", "pl_pct": -10.0,
+         "hold_days": 3, "entry_date": "2026-01-01", "industry": "银行", "position_pct": 5},
+        {"name": "模拟", "status": "CLOSED", "trade_mode": "SIMULATED", "pl_pct": 20.0,
+         "hold_days": 4, "entry_date": "2026-01-02", "industry": "科技", "position_pct": 5},
+        {"name": "未平仓", "status": "OPEN", "trade_mode": "REAL", "pl_pct": 99.0,
+         "hold_days": 1, "entry_date": "2026-01-03", "industry": "银行", "position_pct": 5},
+    ]
+
+    real = paper_trade._build_trade_stats([t for t in trades if t["trade_mode"] == "REAL"], scope="REAL")
+    simulated = paper_trade._build_trade_stats(
+        [t for t in trades if t["trade_mode"] == "SIMULATED"], scope="SIMULATED",
+    )
+
+    assert real["total"] == 1
+    assert real["total_pl_pct"] == -10.0
+    assert real["risk_metrics"]["equity_curve"][-1]["equity"] == 99.5
+    assert simulated["total"] == 1
+    assert simulated["total_pl_pct"] == 20.0
 
 
 def test_paper_list_database_failure_is_explicit(monkeypatch):

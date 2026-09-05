@@ -57,7 +57,10 @@ def compute_win_rate(pl_pcts: Sequence[float], ndigits: int = 1) -> float:
     return round(wins / total * 100.0, ndigits)
 
 
-def run_monte_carlo(returns: List[float], iterations: int = 1000, trade_count: int = 50) -> Dict[str, Any]:
+def run_monte_carlo(
+    returns: List[float], iterations: int = 1000, trade_count: int = 50,
+    position_pct: float = 5.0,
+) -> Dict[str, Any]:
     """
     基于历史收益率进行蒙特卡洛模拟，预测未来组合表现分布。
     """
@@ -65,7 +68,8 @@ def run_monte_carlo(returns: List[float], iterations: int = 1000, trade_count: i
         return {"distribution": [], "p90": 0, "p50": 0, "p10": 0}
     
     # 转换为百分比
-    rets = np.array(returns) / 100.0
+    position_pct = max(0.0, min(float(position_pct), 100.0))
+    rets = np.array(returns) / 100.0 * position_pct / 100.0
     
     simulations = []
     for _ in range(iterations):
@@ -93,7 +97,8 @@ def run_monte_carlo(returns: List[float], iterations: int = 1000, trade_count: i
         "p50": round(float(np.percentile(simulations, 50)), 2),
         "p10": round(float(np.percentile(simulations, 10)), 2),
         "max": round(float(np.max(simulations)), 2),
-        "min": round(float(np.min(simulations)), 2)
+        "min": round(float(np.min(simulations)), 2),
+        "assumptions": {"position_pct": position_pct, "trade_count": trade_count},
     }
 
 def calculate_rolling_performance(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -124,7 +129,9 @@ def calculate_rolling_performance(trades: List[Dict[str, Any]]) -> List[Dict[str
     return rolling_data
 
 
-def calculate_risk_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def calculate_risk_metrics(
+    trades: List[Dict[str, Any]], default_position_pct: float = 100.0,
+) -> Dict[str, Any]:
     """
     计算高级风险指标：夏普比率、卡尔马比率、权益曲线、连续亏损等。
     
@@ -150,7 +157,15 @@ def calculate_risk_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
             "avg_win": 0, "avg_loss": 0, "expectancy": 0
         }
     
-    returns = [t['pl_pct'] / 100 for t in closed]
+    def portfolio_return_pct(trade: Dict[str, Any]) -> float:
+        raw_position = trade.get("position_pct")
+        try:
+            position = float(raw_position) if raw_position is not None and not pd.isna(raw_position) else float(default_position_pct)
+        except (TypeError, ValueError):
+            position = float(default_position_pct)
+        return float(trade['pl_pct']) * max(0.0, min(position, 100.0)) / 100.0
+
+    returns = [portfolio_return_pct(t) / 100 for t in closed]
     
     # --- 夏普比率 (Sharpe Ratio) ---
     # 假设无风险利率 2.5% 年化, 每笔交易约 5 天
@@ -163,13 +178,13 @@ def calculate_risk_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     # --- 权益曲线 (Equity Curve) — 改动 #13：复用规范 helper（复利权益高水位回撤） ---
     sorted_trades = sorted(closed, key=lambda t: t.get('entry_date', ''))
-    trade_pl_pcts = [t['pl_pct'] for t in sorted_trades]
+    trade_pl_pcts = [portfolio_return_pct(t) for t in sorted_trades]
     max_dd, equity_curve_skeleton = compute_equity_curve_drawdown(trade_pl_pcts)
     # 重新附加真实日期到 equity_curve（helper 返回的 date 为占位空串）
     equity_curve = [{"date": "", "equity": 100.0}]
     equity = 100.0
     for t, _skel in zip(sorted_trades, equity_curve_skeleton[1:]):
-        equity *= (1 + t['pl_pct'] / 100)
+        equity *= (1 + portfolio_return_pct(t) / 100)
         equity_curve.append({
             "date": str(t.get('entry_date', ''))[:10],
             "equity": round(equity, 2)
@@ -210,7 +225,9 @@ def calculate_risk_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "max_consecutive_losses": max_consecutive_losses,
         "avg_win": avg_win,
         "avg_loss": avg_loss,
-        "expectancy": expectancy
+        "expectancy": expectancy,
+        "portfolio_return_pct": round(total_return, 2),
+        "assumptions": {"default_position_pct": float(default_position_pct)},
     }
 
 

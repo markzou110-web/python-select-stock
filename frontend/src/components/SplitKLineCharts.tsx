@@ -170,6 +170,12 @@ function buildPriceActionSummary(priceAction: any, priceActionLines?: any[]) {
     const summary = priceAction?.price_action_summary;
     const regime = priceAction?.price_action_regime;
     const quality = priceAction?.price_action_entry_quality;
+    const volumePullbackStatus = String(priceAction?.pa_volume_pullback_status || 'NONE');
+    const volumePullbackLabel = String(priceAction?.pa_volume_pullback_label || '');
+    const volumePullbackConfirmation = String(priceAction?.pa_volume_pullback_confirmation_label || '');
+    const volumePullbackNote = volumePullbackStatus !== 'NONE' && volumePullbackLabel
+        ? `当前突破回踩状态：${volumePullbackLabel}${volumePullbackConfirmation ? `（${volumePullbackConfirmation}）` : ''}。`
+        : '';
 
     if (summary) {
         const action = score != null && score >= 70
@@ -179,7 +185,7 @@ function buildPriceActionSummary(priceAction: any, priceActionLines?: any[]) {
                 : '结构处在可观察区间，适合等待价格靠近入场线或失效线后再做决策。';
         return {
             title: `${regime || '价格行为'}${quality ? ` · ${quality}` : ''}`,
-            body: `${summary} ${action}`,
+            body: `${summary} ${volumePullbackNote} ${action}`,
             tone: score != null && score >= 70 ? 'positive' as const : score != null && score < 55 ? 'risk' as const : 'neutral' as const,
         };
     }
@@ -778,7 +784,7 @@ export default function SplitKLineCharts({
             <div className="min-w-0">
                 <div className="px-4 py-2 border-b border-slate-100 flex items-center justify-between gap-3">
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">价格行为结构</span>
-                    <span className="text-[10px] font-bold text-blue-600">趋势线 / 入场 / 失效</span>
+                    <span className="text-[10px] font-bold text-blue-600">趋势线 / 回踩支撑 / 入场 / 失效</span>
                 </div>
                 <div className="relative w-full" style={{ height }}>
                     <div ref={priceActionRef} className="absolute inset-0" />

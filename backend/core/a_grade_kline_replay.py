@@ -48,6 +48,8 @@ class GateSpec:
     min_raw_score: float = 0.0
     require_non_avoid: bool = False
     require_offensive_market: bool = False
+    exclude_discrete_jump: bool = False
+    exclude_extreme_trend: bool = False
 
 
 # ponytail: this deliberately small ladder is the ceiling against grid-search overfitting.
@@ -67,6 +69,13 @@ GATE_SPECS = (
         max_pct_5d=15,
         require_non_avoid=True,
         require_offensive_market=True,
+    ),
+    GateSpec(
+        "pa_60_path_quality",
+        min_pa_score=60,
+        require_non_avoid=True,
+        exclude_discrete_jump=True,
+        exclude_extreme_trend=True,
     ),
 )
 
@@ -462,6 +471,8 @@ def replay_stock(
                 "pa_structure_score": float(pa.get("pa_structure_score") or 0),
                 "pa_action": str(plan.get("action") or "WAIT"),
                 "pa_setup": str(plan.get("setup") or ""),
+                "pa_trend_path_quality": str(pa.get("pa_trend_path_quality") or "INSUFFICIENT_DATA"),
+                "pa_extreme_trend": bool(pa.get("pa_extreme_trend")),
                 "market_offensive": market_lookup.get(signal_date, False),
                 "exec_mature": bool(execution.get("mature")),
                 "exec_filled": bool(execution.get("filled")),
@@ -506,6 +517,18 @@ def _gate_mask(frame: pd.DataFrame, gate: GateSpec) -> pd.Series:
         mask &= frame["raw_score"].ge(gate.min_raw_score)
     if gate.require_offensive_market:
         mask &= frame["market_offensive"].fillna(False)
+    if gate.exclude_discrete_jump:
+        path_quality = frame.get(
+            "pa_trend_path_quality",
+            pd.Series("INSUFFICIENT_DATA", index=frame.index, dtype="object"),
+        )
+        mask &= path_quality.ne("DISCRETE_JUMP")
+    if gate.exclude_extreme_trend:
+        extreme = frame.get(
+            "pa_extreme_trend",
+            pd.Series(False, index=frame.index, dtype="bool"),
+        )
+        mask &= ~extreme.fillna(False)
     return mask
 
 
@@ -966,9 +989,10 @@ def run_kline_replay(
                 "5bp slippage, A-share fees, -9% stop; "
                 "exit on matching MA +15%/EMA20-break or TV-ZP short marker"
             ),
-            "point_in_time_fields": ["OHLCV", "derived market proxy", "RS", "weekly trend", "price action"],
+            "point_in_time_fields": ["signal-time OHLCV window", "derived market proxy", "RS", "weekly trend", "price action"],
             "excluded_non_point_in_time_fields": ["fundamentals", "historical market cap", "historical ST status"],
             "limitations": [
+                "local daily_k uses qfq prices; later corporate actions can revise historical prices and historical fills are approximate",
                 "current stock_basic industry/name metadata may contain survivorship changes",
                 "signal events are de-duplicated; consecutive daily re-alerts are not independent samples",
                 "each gate allows one position per stock and ignores its own buy markers while that position is open",

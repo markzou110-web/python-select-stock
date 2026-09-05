@@ -14,10 +14,27 @@ import numpy as np
 import pandas as pd
 
 from core.eight_rules import detect_eight_rules
+from core.risk_constants import (
+    PA_VOLUME_BREAKOUT_BUFFER_PCT,
+    PA_VOLUME_BREAKOUT_MIN_BODY_RATIO,
+    PA_VOLUME_BREAKOUT_MIN_CLOSE_POSITION,
+    PA_VOLUME_BREAKOUT_MIN_VOLUME_RATIO,
+    PA_VOLUME_PULLBACK_CONFIRM_MAX_SESSIONS,
+    PA_VOLUME_PULLBACK_CONFIRM_SCORE_DELTA,
+    PA_VOLUME_PULLBACK_FORMING_SCORE_DELTA,
+    PA_VOLUME_PULLBACK_INVALID_SCORE_DELTA,
+    PA_VOLUME_PULLBACK_MAX_AVG_VOLUME_RATIO,
+    PA_VOLUME_PULLBACK_MAX_BREAKOUT_VOLUME_RATIO,
+    PA_VOLUME_PULLBACK_MAX_RHYTHM_RATIO,
+    PA_VOLUME_PULLBACK_MAX_SESSIONS,
+    PA_VOLUME_PULLBACK_RESISTANCE_LOOKBACK,
+    PA_VOLUME_PULLBACK_SUPPORT_TOLERANCE_PCT,
+    PA_VOLUME_PULLBACK_WEAK_SCORE_DELTA,
+)
 
-PRICE_ACTION_VERSION = "price-action-v4"
+PRICE_ACTION_VERSION = "price-action-v7"
 TARGET_MODEL_VERSION = "structure-target-v2"
-SCORE_MODEL_VERSION = "pa-three-score-v1"
+SCORE_MODEL_VERSION = "pa-three-score-v3-confirmed-pullback"
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -135,6 +152,367 @@ def _volume_series(work: pd.DataFrame) -> pd.Series:
         if col in work.columns:
             return pd.to_numeric(work[col], errors="coerce").fillna(0)
     return pd.Series([0] * len(work), index=work.index, dtype=float)
+
+
+def _empty_volume_pullback(reason: str = "近期没有识别到有效放量突破。") -> Dict[str, Any]:
+    return {
+        "status": "NONE",
+        "label": "无缩量回踩结构",
+        "score_delta": 0,
+        "breakout_date": None,
+        "breakout_price": None,
+        "support_price": None,
+        "box_mid_price": None,
+        "depth": "NONE",
+        "depth_label": "不适用",
+        "breakout_volume_ratio": None,
+        "pullback_volume_ratio": None,
+        "pullback_avg_volume_ratio": None,
+        "rhythm_ratio": None,
+        "pullback_sessions": 0,
+        "confirmation": "NONE",
+        "confirmation_label": "等待右侧确认",
+        "confirmation_date": None,
+        "stop_price": None,
+        "checks": [],
+        "reason": reason,
+    }
+
+
+def _detect_breakout_volume_pullback(work: pd.DataFrame) -> Dict[str, Any]:
+    """Detect a point-in-time volume pullback anchored to a real prior breakout."""
+    required = {"开盘", "最高", "最低", "收盘"}
+    minimum = PA_VOLUME_PULLBACK_RESISTANCE_LOOKBACK + 1
+    if work is None or len(work) < minimum or not required.issubset(work.columns):
+        return _empty_volume_pullback("K线样本不足，无法识别突破回踩。")
+
+    frame = work.copy().reset_index(drop=True)
+    for column in required:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["__volume"] = _volume_series(frame)
+    frame = frame.dropna(subset=list(required)).reset_index(drop=True)
+    if len(frame) < minimum or _safe_float(frame["__volume"].max()) <= 0:
+        return _empty_volume_pullback("量能数据不足，无法验证缩量回踩。")
+
+    start = max(
+        PA_VOLUME_PULLBACK_RESISTANCE_LOOKBACK,
+        len(frame) - PA_VOLUME_PULLBACK_MAX_SESSIONS - 1,
+    )
+    breakout_index = None
+    breakout_context: Dict[str, float] = {}
+    for index in range(start, len(frame)):
+        prior = frame.iloc[index - PA_VOLUME_PULLBACK_RESISTANCE_LOOKBACK:index]
+        bar = frame.iloc[index]
+        resistance = _safe_float(prior["最高"].max())
+        box_low = _safe_float(prior["最低"].min())
+        avg_volume = _safe_float(prior["__volume"].mean())
+        bar_range = max(_safe_float(bar["最高"] - bar["最低"]), 0.01)
+        body_ratio = max(0.0, _safe_float(bar["收盘"] - bar["开盘"])) / bar_range
+        close_position = _safe_float((bar["收盘"] - bar["最低"]) / bar_range)
+        volume_ratio = _safe_float(bar["__volume"]) / max(avg_volume, 1.0)
+        closes_above = _safe_float(bar["收盘"]) >= resistance * (1 + PA_VOLUME_BREAKOUT_BUFFER_PCT)
+        if (
+            closes_above
+            and bar["收盘"] > bar["开盘"]
+            and body_ratio >= PA_VOLUME_BREAKOUT_MIN_BODY_RATIO
+            and close_position >= PA_VOLUME_BREAKOUT_MIN_CLOSE_POSITION
+            and volume_ratio >= PA_VOLUME_BREAKOUT_MIN_VOLUME_RATIO
+        ):
+            breakout_index = index
+            breakout_context = {
+                "resistance": resistance,
+                "box_low": box_low,
+                "avg_volume": avg_volume,
+                "volume_ratio": volume_ratio,
+                "body": max(_safe_float(bar["收盘"] - bar["开盘"]), 0.01),
+            }
+
+    if breakout_index is None:
+        return _empty_volume_pullback()
+
+    breakout = frame.iloc[breakout_index]
+    post = frame.iloc[breakout_index + 1:]
+    resistance = breakout_context["resistance"]
+    box_mid = (resistance + breakout_context["box_low"]) / 2
+    breakout_date = (
+        pd.to_datetime(breakout.get("日期"), errors="coerce").strftime("%Y-%m-%d")
+        if "日期" in frame.columns and pd.notna(pd.to_datetime(breakout.get("日期"), errors="coerce"))
+        else str(breakout_index)
+    )
+    base = {
+        "breakout_date": breakout_date,
+        "breakout_price": round(_safe_float(breakout["收盘"]), 2),
+        "support_price": round(resistance, 2),
+        "box_mid_price": round(box_mid, 2),
+        "breakout_volume_ratio": round(breakout_context["volume_ratio"], 2),
+    }
+    if post.empty:
+        return {
+            **_empty_volume_pullback("放量突破已成立，等待回踩验证。"),
+            **base,
+            "status": "BREAKOUT",
+            "label": "放量突破",
+            "checks": [{"key": "breakout", "label": "真实放量突破", "passed": True}],
+        }
+
+    quality_post = post.head(PA_VOLUME_PULLBACK_CONFIRM_MAX_SESSIONS)
+    bearish = quality_post[quality_post["收盘"] < quality_post["开盘"]]
+    has_pullback = bool(
+        not bearish.empty
+        or _safe_float(post["最低"].min()) < _safe_float(breakout["收盘"]) * 0.99
+    )
+    if not has_pullback:
+        return {
+            **_empty_volume_pullback("突破后仍在延续，尚未出现可评估的回踩。"),
+            **base,
+            "status": "WAITING_PULLBACK",
+            "label": "等待缩量回踩",
+            "checks": [{"key": "breakout", "label": "真实放量突破", "passed": True}],
+        }
+
+    # ponytail: freeze quality at the five-bar confirmation window; a later
+    # quiet bar must not retroactively turn a weak pullback into a valid one.
+    pullback_bars = bearish if not bearish.empty else quality_post
+    pullback_volume = _safe_float(pullback_bars["__volume"].mean())
+    breakout_volume = _safe_float(breakout["__volume"])
+    pullback_volume_ratio = pullback_volume / max(breakout_volume, 1.0)
+    pullback_avg_volume_ratio = pullback_volume / max(breakout_context["avg_volume"], 1.0)
+    shrinking = (
+        pullback_volume_ratio <= PA_VOLUME_PULLBACK_MAX_BREAKOUT_VOLUME_RATIO
+        and pullback_avg_volume_ratio <= PA_VOLUME_PULLBACK_MAX_AVG_VOLUME_RATIO
+    )
+
+    previous_close = _safe_float(frame["收盘"].iloc[breakout_index - 1], resistance)
+    breakout_speed = max(
+        (_safe_float(breakout["收盘"]) - previous_close) / max(previous_close, 0.01),
+        PA_VOLUME_BREAKOUT_BUFFER_PCT,
+    )
+    pullback_depth_pct = max(
+        0.0,
+        (_safe_float(breakout["收盘"]) - _safe_float(quality_post["收盘"].min()))
+        / max(_safe_float(breakout["收盘"]), 0.01),
+    )
+    pullback_speed = pullback_depth_pct / max(len(quality_post), 1)
+    rhythm_ratio = pullback_speed / max(breakout_speed, 0.001)
+    largest_bear_body = _safe_float((bearish["开盘"] - bearish["收盘"]).max()) if not bearish.empty else 0.0
+    rhythm_slow = (
+        rhythm_ratio <= PA_VOLUME_PULLBACK_MAX_RHYTHM_RATIO
+        and largest_bear_body <= breakout_context["body"]
+    )
+
+    pullback_low = _safe_float(post["最低"].min())
+    pullback_close = _safe_float(post["收盘"].min())
+    if pullback_low >= resistance:
+        depth, depth_label = "STRONG", "强势回踩"
+    elif pullback_low >= resistance * (1 - PA_VOLUME_PULLBACK_SUPPORT_TOLERANCE_PCT):
+        depth, depth_label = "STANDARD", "标准回踩"
+    elif pullback_close > box_mid:
+        depth, depth_label = "TOLERANCE", "容忍极限"
+    else:
+        depth, depth_label = "INVALID", "跌回箱体深处"
+
+    confirmation = "NONE"
+    confirmation_label = "等待右侧确认"
+    confirmation_date = None
+    pullback_seen = False
+    confirmation_window = post.head(PA_VOLUME_PULLBACK_CONFIRM_MAX_SESSIONS)
+    for post_offset, (row_index, row) in enumerate(confirmation_window.iterrows(), start=1):
+        previous = frame.iloc[row_index - 1]
+        pullback_seen = bool(
+            pullback_seen
+            or row["收盘"] < row["开盘"]
+            or _safe_float(row["最低"]) < _safe_float(breakout["收盘"]) * 0.99
+        )
+        if not pullback_seen:
+            continue
+
+        row_range = max(_safe_float(row["最高"] - row["最低"]), 0.01)
+        row_body = abs(_safe_float(row["收盘"] - row["开盘"]))
+        lower_wick = min(_safe_float(row["开盘"]), _safe_float(row["收盘"])) - _safe_float(row["最低"])
+        close_position = _safe_float((row["收盘"] - row["最低"]) / row_range)
+        bullish_engulfing = bool(
+            row["收盘"] > row["开盘"]
+            and previous["收盘"] < previous["开盘"]
+            and row["开盘"] <= previous["收盘"]
+            and row["收盘"] >= previous["开盘"]
+        )
+        reversal_bar = bool(
+            close_position >= 0.55
+            and (
+                (row["收盘"] > row["开盘"] and row["收盘"] >= previous["收盘"])
+                or bullish_engulfing
+                or lower_wick >= max(row_body * 1.5, row_range * 0.3)
+            )
+        )
+        history = frame.iloc[:row_index + 1]
+        ma10 = _safe_float(history["收盘"].tail(10).mean())
+        ma20 = _safe_float(history["收盘"].tail(20).mean())
+        moving_average_support = bool(
+            row["收盘"] >= previous["收盘"]
+            and any(
+                _safe_float(row["最低"]) <= average * 1.01
+                and _safe_float(row["收盘"]) >= average
+                for average in (ma10, ma20)
+                if average > 0
+            )
+        )
+        earlier_post = post.iloc[:post_offset - 1]
+        rebreak = bool(
+            not earlier_post.empty
+            and row["收盘"] > row["开盘"]
+            and _safe_float(row["收盘"]) > _safe_float(earlier_post["最高"].max())
+        )
+        if rebreak:
+            confirmation, confirmation_label = "REBREAK", "突破回踩小高点"
+        elif reversal_bar:
+            confirmation, confirmation_label = "REVERSAL_BAR", "反转K线企稳"
+        elif moving_average_support:
+            confirmation, confirmation_label = "MA_SUPPORT", "MA10/MA20共振支撑"
+        else:
+            continue
+        confirmation_date = (
+            pd.to_datetime(row.get("日期"), errors="coerce").strftime("%Y-%m-%d")
+            if "日期" in frame.columns and pd.notna(pd.to_datetime(row.get("日期"), errors="coerce"))
+            else str(row_index)
+        )
+        break
+
+    stabilised = confirmation != "NONE"
+    timed_out = len(post) > PA_VOLUME_PULLBACK_CONFIRM_MAX_SESSIONS and not stabilised
+    post_ranges = (post["最高"] - post["最低"]).clip(lower=0.01)
+    bearish_body_ratio = (post["开盘"] - post["收盘"]).clip(lower=0) / post_ranges
+    volume_breakdown = bool((
+        (post["收盘"] < post["开盘"])
+        & (bearish_body_ratio >= PA_VOLUME_BREAKOUT_MIN_BODY_RATIO)
+        & (
+            post["__volume"]
+            >= max(breakout_context["avg_volume"] * 1.3, breakout_volume * 0.9)
+        )
+    ).any())
+    invalidated = depth == "INVALID" or volume_breakdown or timed_out
+
+    checks = [
+        {"key": "breakout", "label": "真实放量突破", "passed": True},
+        {"key": "volume", "label": "回踩成交量收缩", "passed": shrinking},
+        {"key": "rhythm", "label": "下跌节奏慢于突破", "passed": rhythm_slow},
+        {"key": "depth", "label": "未跌回箱体深处", "passed": depth != "INVALID"},
+        {"key": "selling_pressure", "label": "未出现放量长阴", "passed": not volume_breakdown},
+        {"key": "time", "label": "5根K线内完成确认", "passed": not timed_out},
+        {"key": "stabilisation", "label": confirmation_label, "passed": stabilised},
+    ]
+    if invalidated:
+        status, label, score_delta = "INVALIDATED", "缩量回踩失效", PA_VOLUME_PULLBACK_INVALID_SCORE_DELTA
+        if depth == "INVALID":
+            reason = "回踩跌回前期箱体下半区。"
+        elif volume_breakdown:
+            reason = "回踩出现放量长阴，抛压未收敛。"
+        else:
+            reason = "回踩超过5根K线仍未确认，时间过滤失效。"
+    elif shrinking and rhythm_slow and stabilised:
+        status, label, score_delta = "CONFIRMED", "缩量回踩企稳", PA_VOLUME_PULLBACK_CONFIRM_SCORE_DELTA
+        reason = f"放量突破后回踩缩量、节奏放缓，并出现{confirmation_label}。"
+    elif shrinking and rhythm_slow:
+        status, label, score_delta = "PULLBACK", "缩量回踩中", PA_VOLUME_PULLBACK_FORMING_SCORE_DELTA
+        reason = "量价回踩结构有效，但尚未出现明确企稳K线。"
+    else:
+        status, label, score_delta = "UNQUALIFIED", "回踩质量不足", PA_VOLUME_PULLBACK_WEAK_SCORE_DELTA
+        reason = "回踩量能或下跌节奏不符合有效缩量回踩标准。"
+    return {
+        **base,
+        "status": status,
+        "label": label,
+        "score_delta": score_delta,
+        "depth": depth,
+        "depth_label": depth_label,
+        "pullback_volume_ratio": round(pullback_volume_ratio, 2),
+        "pullback_avg_volume_ratio": round(pullback_avg_volume_ratio, 2),
+        "rhythm_ratio": round(rhythm_ratio, 2),
+        "pullback_sessions": len(post),
+        "confirmation": confirmation,
+        "confirmation_label": confirmation_label,
+        "confirmation_date": confirmation_date,
+        "stop_price": round(
+            min(pullback_low, resistance * (1 - PA_VOLUME_PULLBACK_SUPPORT_TOLERANCE_PCT))
+            * (1 - PA_VOLUME_BREAKOUT_BUFFER_PCT),
+            2,
+        ),
+        "checks": checks,
+        "reason": reason,
+    }
+
+
+def _trend_path_quality(work: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
+    """Measure whether a recent trend developed gradually or through a few jumps.
+
+    The information-discreteness measure follows the sign-frequency proxy used
+    in the frog-in-the-pan momentum literature.  All inputs end at the current
+    bar, so the result is safe for point-in-time replay.
+    """
+    if work is None or "收盘" not in work.columns:
+        return {
+            "quality": "INSUFFICIENT_DATA",
+            "information_discreteness": 0.0,
+            "efficiency": 0.0,
+            "top_day_contribution": 0.0,
+            "net_return": 0.0,
+            "nonlinear_strength": 0.0,
+            "score_delta": 0,
+        }
+
+    closes = pd.to_numeric(work["收盘"], errors="coerce").dropna().tail(lookback + 1)
+    if len(closes) < max(10, lookback // 2 + 1):
+        return {
+            "quality": "INSUFFICIENT_DATA",
+            "information_discreteness": 0.0,
+            "efficiency": 0.0,
+            "top_day_contribution": 0.0,
+            "net_return": 0.0,
+            "nonlinear_strength": 0.0,
+            "score_delta": 0,
+        }
+
+    returns = closes.pct_change().dropna()
+    net_return = _safe_float(closes.iloc[-1] / max(closes.iloc[0], 0.01) - 1)
+    direction = 1.0 if net_return > 0 else -1.0 if net_return < 0 else 0.0
+    positive_share = _safe_float((returns > 0).mean())
+    negative_share = _safe_float((returns < 0).mean())
+    information_discreteness = direction * (negative_share - positive_share)
+
+    absolute_path = _safe_float(closes.diff().abs().sum())
+    efficiency = abs(_safe_float(closes.iloc[-1] - closes.iloc[0])) / max(absolute_path, 0.01)
+    positive_returns = returns[returns > 0].sort_values(ascending=False)
+    positive_sum = _safe_float(positive_returns.sum())
+    top_day_contribution = (
+        _safe_float(positive_returns.head(2).sum()) / positive_sum
+        if positive_sum > 0 else 0.0
+    )
+
+    realized_path_vol = _safe_float(returns.std(ddof=0)) * np.sqrt(len(returns))
+    raw_strength = net_return / max(realized_path_vol, 0.01)
+    nonlinear_strength = float(np.tanh(raw_strength))
+
+    quality = "MIXED_PATH"
+    score_delta = 0
+    if net_return <= 0:
+        quality = "NON_POSITIVE_TREND"
+    elif net_return < 0.03:
+        quality = "WEAK_TREND"
+    elif information_discreteness >= 0.10 or top_day_contribution >= 0.65:
+        quality = "DISCRETE_JUMP"
+        score_delta = -10
+    elif information_discreteness <= -0.20 and efficiency >= 0.35 and top_day_contribution <= 0.45:
+        quality = "SMOOTH_TREND"
+        score_delta = 3
+
+    return {
+        "quality": quality,
+        "information_discreteness": round(information_discreteness, 3),
+        "efficiency": round(max(0.0, min(1.0, efficiency)), 3),
+        "top_day_contribution": round(max(0.0, min(1.0, top_day_contribution)), 3),
+        "net_return": round(net_return, 4),
+        "nonlinear_strength": round(max(-1.0, min(1.0, nonlinear_strength)), 3),
+        "score_delta": score_delta,
+    }
 
 
 def _evaluate_pullback_validity(
@@ -302,6 +680,8 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
     mtf_score = int(summary.get("pa_multi_timeframe_score") or 0)
     volume_risk = str(summary.get("pa_volume_risk") or "无")
     pullback_validity = summary.get("pa_pullback_validity") or {}
+    volume_pullback = summary.get("pa_volume_pullback") or {}
+    volume_pullback_status = str(summary.get("pa_volume_pullback_status") or "NONE")
     risks = list(summary.get("price_action_risks") or [])
 
     setup_name = pattern if pattern and pattern != "无明确形态" else signal
@@ -398,6 +778,17 @@ def build_price_action_trade_plan(summary: Dict[str, Any]) -> Dict[str, Any]:
         entry_condition = str(pullback_validity.get("action") or entry_condition)
     elif pullback_validity.get("status") == "CONFIRMED":
         entry_condition = str(pullback_validity.get("action") or entry_condition)
+    if volume_pullback_status == "INVALIDATED":
+        action = "AVOID"
+        action_label = "突破回踩失效"
+        avoid_reasons.append(str(volume_pullback.get("reason") or "突破回踩结构已经失效。"))
+    elif volume_pullback_status == "PULLBACK" and action == "READY":
+        action = "WATCH"
+        action_label = "等待回踩右侧确认"
+        entry_condition = "等待5根K线内出现反转K线、均线支撑或突破回踩小高点。"
+    elif volume_pullback_status == "CONFIRMED":
+        confirmation_label = str(volume_pullback.get("confirmation_label") or "右侧企稳")
+        entry_condition = f"已出现{confirmation_label}；仍需按原策略入场线触发，并执行结构止损。"
 
     checklist = [
         "14:30后确认K线形态仍保持强势",
@@ -486,6 +877,15 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "score_model_version": SCORE_MODEL_VERSION,
         "pa_volume_pattern": "量能不足",
         "pa_volume_confirmed": False,
+        "pa_volume_pullback": _empty_volume_pullback("K线样本不足，无法识别突破回踩。"),
+        "pa_volume_pullback_status": "NONE",
+        "pa_volume_pullback_label": "无缩量回踩结构",
+        "pa_volume_pullback_score_delta": 0,
+        "pa_volume_pullback_breakout_date": None,
+        "pa_volume_pullback_support_price": None,
+        "pa_volume_pullback_confirmation_label": "等待右侧确认",
+        "pa_volume_pullback_confirmation_date": None,
+        "pa_volume_pullback_stop_price": None,
         "pa_volume_ratio": 0,
         "pa_volume_ratio_percentile": 0,
         "pa_breakout_volume_threshold": 0,
@@ -501,6 +901,15 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_trend_phase": "数据不足",
         "pa_trend_phase_action": "等待更多K线",
         "pa_decision_summary": "K线样本不足，暂不识别价格行为结构。",
+        "pa_trend_path_quality": "INSUFFICIENT_DATA",
+        "pa_information_discreteness": 0,
+        "pa_trend_efficiency": 0,
+        "pa_top_day_contribution": 0,
+        "pa_trend_net_return": 0,
+        "pa_nonlinear_trend_strength": 0,
+        "pa_trend_extension_atr": 0,
+        "pa_extreme_trend": False,
+        "pa_path_research_score_delta": 0,
         "pa_eight_rules": [],
         "pa_eight_rule_primary": None,
         "pa_eight_rule_score_delta": 0,
@@ -529,6 +938,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     if "EMA60" not in work.columns:
         work["EMA60"] = work["收盘"].ewm(span=60, adjust=False).mean()
     volumes = _volume_series(work)
+    volume_pullback = _detect_breakout_volume_pullback(work)
 
     recent = work.tail(20).copy()
     last = work.iloc[-1]
@@ -595,6 +1005,20 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     ema20_now = _safe_float(last["EMA20"])
     ema60_now = _safe_float(last["EMA60"])
     ema20_prev = _safe_float(work["EMA20"].iloc[-6]) if len(work) >= 6 else ema20_now
+    trend_path = _trend_path_quality(work)
+    trend_extension_atr = max(
+        0.0,
+        (_safe_float(last["收盘"]) - ema20_now)
+        / max(atr20, _safe_float(last["收盘"]) * 0.005, 0.01),
+    )
+    extreme_trend = bool(
+        trend_path["net_return"] >= 0.12
+        and trend_path["nonlinear_strength"] >= 0.75
+        and trend_extension_atr >= 2.5
+    )
+    path_research_score_delta = int(trend_path["score_delta"])
+    if extreme_trend:
+        path_research_score_delta = min(path_research_score_delta, -5)
     bull_trend_bars = int(((recent["收盘"] > recent["开盘"]) & (body_ratio.tail(20) >= 0.55)).sum())
     bear_trend_bars = int(((recent["收盘"] < recent["开盘"]) & (body_ratio.tail(20) >= 0.55)).sum())
 
@@ -963,6 +1387,21 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         volume_pattern = "缩量上攻"
         volume_risk = "上攻量能不足，突破延续性需要确认。"
 
+    volume_pullback_status = str(volume_pullback.get("status") or "NONE")
+    if volume_pullback_status == "CONFIRMED":
+        volume_pattern = "放量突破后缩量回踩企稳"
+        pattern = "突破缩量回踩"
+        pattern_score = max(pattern_score, 20)
+        tags.extend(["缩量回踩", "回踩企稳"])
+    elif volume_pullback_status == "PULLBACK":
+        volume_pattern = "放量突破后缩量回踩"
+        if pattern in {"无明确形态", "突破回踩"}:
+            pattern = "突破缩量回踩"
+        pattern_score = max(pattern_score, 16)
+        tags.append("缩量回踩")
+    elif volume_pullback_status == "INVALIDATED":
+        volume_risk = str(volume_pullback.get("reason") or "缩量回踩结构失效。")
+
     failure_risk = 20
     if regime == "交易区间" and range_location == "区间上沿":
         failure_risk += 25
@@ -979,6 +1418,8 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     if second_entry_risk >= 70:
         failure_risk += 20
     if volume_risk not in {"无", "量能数据不足"}:
+        failure_risk += 10
+    if volume_pullback_status == "INVALIDATED":
         failure_risk += 10
     failure_risk = int(max(0, min(100, failure_risk)))
 
@@ -1108,7 +1549,6 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         risks.append("多头趋势出现首次破坏，追买需等待二次确认。")
     elif trend_damage == "跌破EMA60":
         risks.append("中期趋势结构被破坏，主动做多应降级。")
-
     channel_state = "无明显通道"
     if micro_channel == "多头微型通道":
         channel_state = "多头微型通道延续"
@@ -1187,6 +1627,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
     execution_score += max(-15, min(15, mtf_score * 0.3))
     execution_score += 15 if pullback_validity["status"] == "CONFIRMED" else 0
     execution_score -= 15 if pullback_validity["status"] == "INVALIDATED" else 0
+    execution_score += int(volume_pullback.get("score_delta") or 0)
     execution_score -= 10 if risk / max(entry_price, 0.01) >= 0.1 else 0
     execution_score = int(max(0, min(100, execution_score)))
     risk_score = int(max(0, min(100, 100 - trap_risk * 0.55 - failure_risk * 0.35 - gap_risk * 0.1)))
@@ -1209,6 +1650,10 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         decision_parts.append(f"{weekly_context}({mtf_score:+d})")
     if volume_pattern != "量能中性":
         decision_parts.append(volume_pattern)
+    if volume_pullback_status not in {"NONE", "WAITING_PULLBACK"}:
+        decision_parts.append(
+            f"突破回踩：{volume_pullback.get('label')}({int(volume_pullback.get('score_delta') or 0):+d})"
+        )
     if trend_phase:
         decision_parts.append(f"阶段：{trend_phase}")
     if failed_breakout_type:
@@ -1277,6 +1722,15 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "score_model_version": SCORE_MODEL_VERSION,
         "pa_volume_pattern": volume_pattern,
         "pa_volume_confirmed": volume_confirmed,
+        "pa_volume_pullback": volume_pullback,
+        "pa_volume_pullback_status": volume_pullback_status,
+        "pa_volume_pullback_label": volume_pullback.get("label"),
+        "pa_volume_pullback_score_delta": int(volume_pullback.get("score_delta") or 0),
+        "pa_volume_pullback_breakout_date": volume_pullback.get("breakout_date"),
+        "pa_volume_pullback_support_price": volume_pullback.get("support_price"),
+        "pa_volume_pullback_confirmation_label": volume_pullback.get("confirmation_label"),
+        "pa_volume_pullback_confirmation_date": volume_pullback.get("confirmation_date"),
+        "pa_volume_pullback_stop_price": volume_pullback.get("stop_price"),
         "pa_volume_ratio": round(volume_ratio, 2),
         "pa_volume_ratio_percentile": volume_ratio_percentile,
         "pa_breakout_volume_threshold": round(breakout_volume_threshold, 2),
@@ -1294,6 +1748,15 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_trend_phase": trend_phase,
         "pa_trend_phase_action": trend_phase_action,
         "pa_decision_summary": decision_summary,
+        "pa_trend_path_quality": trend_path["quality"],
+        "pa_information_discreteness": trend_path["information_discreteness"],
+        "pa_trend_efficiency": trend_path["efficiency"],
+        "pa_top_day_contribution": trend_path["top_day_contribution"],
+        "pa_trend_net_return": trend_path["net_return"],
+        "pa_nonlinear_trend_strength": trend_path["nonlinear_strength"],
+        "pa_trend_extension_atr": round(trend_extension_atr, 2),
+        "pa_extreme_trend": extreme_trend,
+        "pa_path_research_score_delta": path_research_score_delta,
         "pa_eight_rules": eight_rules.get("signals", []),
         "pa_eight_rule_primary": primary_rule,
         "pa_eight_rule_score_delta": int(eight_rules.get("score_delta") or 0),
@@ -1325,6 +1788,7 @@ def build_price_action_annotations(df: pd.DataFrame, lookback: int = 90) -> Dict
     start_idx = max(20, len(work) - lookback)
     markers = []
     seen_dates = set()
+    previous_volume_pullback_status = "NONE"
 
     for idx in range(start_idx, len(work)):
         sub = work.iloc[:idx + 1]
@@ -1334,6 +1798,30 @@ def build_price_action_annotations(df: pd.DataFrame, lookback: int = 90) -> Dict
         score = int(pa.get("price_action_score") or 0)
         eight_rule = pa.get("pa_eight_rule_primary")
         time_str = work["日期"].iloc[idx].strftime("%Y-%m-%d")
+        volume_pullback_status = str(pa.get("pa_volume_pullback_status") or "NONE")
+        if (
+            volume_pullback_status != previous_volume_pullback_status
+            and volume_pullback_status in {"BREAKOUT", "PULLBACK", "CONFIRMED", "INVALIDATED"}
+            and time_str not in seen_dates
+        ):
+            marker_style = {
+                "BREAKOUT": ("belowBar", "#dc2626", "放量突破"),
+                "PULLBACK": ("belowBar", "#0f766e", "缩量回踩"),
+                "CONFIRMED": ("belowBar", "#2563eb", "回踩企稳"),
+                "INVALIDATED": ("aboveBar", "#dc2626", "回踩失效"),
+            }[volume_pullback_status]
+            markers.append({
+                "time": time_str,
+                "position": marker_style[0],
+                "color": marker_style[1],
+                "shape": "square",
+                "size": 0.8,
+                "text": marker_style[2],
+                "label": (pa.get("pa_volume_pullback") or {}).get("reason"),
+                "source": "volume_pullback",
+            })
+            seen_dates.add(time_str)
+        previous_volume_pullback_status = volume_pullback_status
         if eight_rule and int(eight_rule.get("confidence") or 0) >= 75 and time_str not in seen_dates:
             is_risk = eight_rule.get("direction") == "RISK"
             markers.append({
@@ -1419,6 +1907,34 @@ def build_price_action_annotations(df: pd.DataFrame, lookback: int = 90) -> Dict
                 {"time": last_time, "value": summary["pa_stop_price"]},
             ],
         })
+
+    volume_pullback = summary.get("pa_volume_pullback") or {}
+    if volume_pullback.get("support_price") and volume_pullback.get("breakout_date"):
+        last_time = work["日期"].iloc[-1].strftime("%Y-%m-%d")
+        lines.append({
+            "kind": "pullback_support",
+            "label": "突破回踩支撑",
+            "color": "#0f766e",
+            "style": "dashed",
+            "points": [
+                {"time": volume_pullback["breakout_date"], "value": volume_pullback["support_price"]},
+                {"time": last_time, "value": volume_pullback["support_price"]},
+            ],
+        })
+        if (
+            volume_pullback.get("stop_price")
+            and volume_pullback.get("status") != "INVALIDATED"
+        ):
+            lines.append({
+                "kind": "pullback_stop",
+                "label": "回踩失效参考",
+                "color": "#e11d48",
+                "style": "dotted",
+                "points": [
+                    {"time": volume_pullback["breakout_date"], "value": volume_pullback["stop_price"]},
+                    {"time": last_time, "value": volume_pullback["stop_price"]},
+                ],
+            })
 
     eight_markers = [marker for marker in markers if marker.get("source") == "eight_rule"][-6:]
     other_markers = [marker for marker in markers if marker.get("source") != "eight_rule"][-18:]

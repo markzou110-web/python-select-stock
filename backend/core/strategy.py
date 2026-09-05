@@ -13,10 +13,30 @@ from core.risk_constants import (
     ZP_PROFIT_PROTECT_TRIGGER_PCT,
 )
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context
+from core.sequoia_research import (
+    high_tight_flag_signal_mask,
+    limit_up_shakeout_signal_mask,
+    turtle_breakout_signal_mask,
+)
 
 STRATEGY_LOGIC_VERSION = "2026.08-tv-or-tiered-execution-v1"
 BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
 EXIT_RULE_VERSION = "tv-source-aware-next-open-v1"
+RESEARCH_PATTERN_STRATEGIES = {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}
+
+
+def _find_research_pattern_indices(df: pd.DataFrame, strategy_type: str) -> List[int]:
+    if strategy_type == "high_tight_flag":
+        mask = high_tight_flag_signal_mask(df)
+    elif strategy_type == "turtle_breakout":
+        mask = turtle_breakout_signal_mask(df)
+    elif strategy_type == "limit_up_shakeout":
+        code_column = "code" if "code" in df.columns else "代码"
+        code = str(df[code_column].iloc[-1]) if code_column in df.columns and not df.empty else ""
+        mask = limit_up_shakeout_signal_mask(df, code)
+    else:
+        return []
+    return [int(position) for position, matched in enumerate(mask.to_numpy()) if bool(matched)]
 
 
 def classify_tv_execution_tier(
@@ -281,6 +301,8 @@ def _find_all_signal_indices(
             return _find_pine_signal_indices(df, min_signals)
         elif strategy_type == "consensus":
             return _find_consensus_signal_indices(df)
+        elif strategy_type in RESEARCH_PATTERN_STRATEGIES:
+            return _find_research_pattern_indices(df, strategy_type)
         else:
             return _find_squeeze_signal_indices(df, threshold, vol_multiplier, rsi_min)
     except Exception:
@@ -676,6 +698,12 @@ def _get_signal_reason(df: pd.DataFrame, idx: int, strategy_type: str) -> str:
         return "+".join(parts) if parts else "Pine共振"
     elif strategy_type == "consensus":
         return "HH突破+大阳线+放量"
+    elif strategy_type == "high_tight_flag":
+        return "高位窄幅缩量整理（SHADOW，等待突破确认）"
+    elif strategy_type == "turtle_breakout":
+        return "突破前20日高点+成交额过亿+阳线确认（SHADOW）"
+    elif strategy_type == "limit_up_shakeout":
+        return "涨停后放量换手且关键支撑未破（SHADOW，等待再次转强）"
     else:
         parts = ["均线粘合突破"]
         vol_ma = row.get('Vol_MA20', 0)
@@ -760,6 +788,8 @@ def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param
             return _find_pine_signal_indices(df, min_signals)
         elif strategy_type == "consensus":
             return _find_consensus_signal_indices(df)
+        elif strategy_type in RESEARCH_PATTERN_STRATEGIES:
+            return _find_research_pattern_indices(df, strategy_type)
         else:
             # squeeze 策略
             threshold = 0.12
@@ -1216,6 +1246,36 @@ def calculate_historical_win_rate(
         )
 
     except Exception as e:
+        return empty_result
+
+
+def calculate_research_pattern_win_rate(
+    df: pd.DataFrame,
+    strategy_type: str,
+    stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
+):
+    """Backtest a research pattern with the shared next-open/friction engine."""
+    empty_result = _empty_backtest_result()
+    if df is None or df.empty or strategy_type not in RESEARCH_PATTERN_STRATEGIES:
+        return empty_result
+    try:
+        signal_indices = [
+            idx for idx in _find_research_pattern_indices(df, strategy_type)
+            if idx < len(df) - 5
+        ]
+        if not signal_indices:
+            return empty_result
+        return _simulate_backtest(
+            close_vals=df['收盘'].values,
+            high_vals=df['最高'].values,
+            low_vals=df['最低'].values,
+            signal_indices=signal_indices,
+            stop_loss_pct=stop_loss_pct,
+            atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
+            vol_vals=df['成交量'].values if '成交量' in df.columns else None,
+            open_vals=df['开盘'].values if '开盘' in df.columns else None,
+        )
+    except Exception:
         return empty_result
 
 

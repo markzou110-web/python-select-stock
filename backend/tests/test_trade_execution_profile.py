@@ -3,6 +3,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -22,6 +23,13 @@ from core.scanner import (
     _trade_setup_quality,
     single_stock_task,
 )
+
+
+@pytest.fixture(autouse=True)
+def _validated_grade_mode_for_non_calibration_tests(monkeypatch):
+    """Keep existing execution-profile tests focused on their own gate."""
+    from core import scanner
+    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "ACTIVE")
 
 
 def test_confirmation_tolerance_accepts_one_tick_rounding_gap():
@@ -1223,11 +1231,23 @@ def test_single_stock_task_rejects_abnormal_price_jump():
 
 # ── 调整3：实盘信号门槛（仅 A 级 + 多重共振可交易）──
 
-def test_a_grade_with_resonance_is_trade_eligible():
-    """A 级 + 🔥核心热点 → trade_eligible=True（严格门槛下仍可交易）。"""
+def test_a_grade_with_resonance_stays_shadow_while_grade_calibration_is_invalid(monkeypatch):
+    """评级校准未通过时，A 级本身不能新增实盘资格。"""
+    from core import scanner
+    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "SHADOW_ONLY")
     results = [_base_candidate()]  # base 已含 共振=🔥核心热点
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
     assert results[0]["sop_grade"] == "A"
+    assert results[0]["trade_eligible"] is False
+    assert results[0]["grade_execution_mode"] == "SHADOW_ONLY"
+    assert results[0]["grade_execution_shadow_eligible"] is True
+
+
+def test_a_grade_formal_route_can_be_reenabled_only_after_validation(monkeypatch):
+    from core import scanner
+    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "ACTIVE")
+    results = [_base_candidate()]
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
     assert results[0]["trade_eligible"] is True
     assert results[0]["trade_bucket"] == "TRADE"
 

@@ -14,11 +14,13 @@ from core.risk_constants import (
     SOP_A_GRADE_MIN_SCORE,
     SOP_A_GRADE_POLICY_VERSION,
     SOP_A_GRADE_STRATEGIES,
+    SOP_GRADE_EXECUTION_MODE,
 )
 
 
 HORIZONS = (1, 3, 5, 10)
 BOTTOM_FOLLOWUP_WINDOW_DAYS = 30
+INDEPENDENT_EVENT_RULE = "同代码同策略在前一事件5个交易日成熟前的重复信号只计一次"
 
 
 def _as_list(value: Any) -> List[str]:
@@ -53,6 +55,44 @@ def _detail_dict(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def mark_independent_signal_events(df: pd.DataFrame) -> pd.DataFrame:
+    """Mark non-overlapping code/strategy events using the exact 5-day maturity date."""
+    marked = df.copy()
+    marked["independent_event"] = False
+    if marked.empty:
+        return marked
+    if "maturity_5d_date" not in marked.columns:
+        marked["independent_event"] = True
+        return marked
+
+    signal_dates = pd.to_datetime(marked.get("signal_date"), errors="coerce")
+    maturity_dates = pd.to_datetime(marked["maturity_5d_date"], errors="coerce")
+    strategies = marked.get("strategy_type", pd.Series("UNKNOWN", index=marked.index)).fillna("UNKNOWN").astype(str)
+    codes = marked.get("code", pd.Series("UNKNOWN", index=marked.index)).fillna("UNKNOWN").astype(str)
+    ordered = marked.assign(_signal_date=signal_dates, _maturity_5d_date=maturity_dates)
+    ordered = ordered.assign(_code=codes, _strategy=strategies).sort_values("_signal_date")
+    selected: List[Any] = []
+    for _, group in ordered.groupby(["_code", "_strategy"], sort=False):
+        blocked_until = pd.NaT
+        for idx, row in group.iterrows():
+            signal_date = row["_signal_date"]
+            if pd.isna(signal_date):
+                continue
+            if pd.isna(blocked_until) or signal_date > blocked_until:
+                selected.append(idx)
+                blocked_until = row["_maturity_5d_date"]
+                if pd.isna(blocked_until):
+                    blocked_until = signal_date
+    marked.loc[selected, "independent_event"] = True
+    return marked
+
+
+def _independent_event_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if "independent_event" not in df.columns:
+        return df
+    return df[df["independent_event"].fillna(False).astype(bool)].copy()
+
+
 def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
     """Load one point-in-time scan signal and future trading-day closes."""
     days = max(1, min(int(days), 3650))
@@ -85,6 +125,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 0) AS close_1d,
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 2) AS close_3d,
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 4) AS close_5d,
+               (SELECT date FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 4) AS maturity_5d_date,
                (SELECT close FROM daily_k d WHERE d.code=s.code AND d.date>s.signal_date ORDER BY d.date LIMIT 1 OFFSET 9) AS close_10d,
                (SELECT MAX(d.high) FROM daily_k d
                 WHERE d.code=s.code AND d.date>s.signal_date
@@ -134,6 +175,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
             h1.close AS close_1d,
             h3.close AS close_3d,
             h5.close AS close_5d,
+            h5.date AS maturity_5d_date,
             h10.close AS close_10d,
             (SELECT MAX(d.high) FROM daily_k d
              WHERE d.code=s.code AND d.date>s.signal_date
@@ -154,7 +196,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
             ORDER BY d.date ASC OFFSET 2 LIMIT 1
         ) h3 ON true
         LEFT JOIN LATERAL (
-            SELECT close FROM daily_k d
+            SELECT date, close FROM daily_k d
             WHERE d.code = s.code AND d.date > s.signal_date
             ORDER BY d.date ASC OFFSET 4 LIMIT 1
         ) h5 ON true
@@ -209,13 +251,14 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
         pd.Series(opportunity_scores, index=df.index), errors="coerce"
     )
     df["blockers"] = blockers
-    return df
+    return mark_independent_signal_events(df)
 
 
 def build_execution_cohort_report(df: pd.DataFrame) -> Dict[str, Any]:
     """Compare research, blocked, and executable cohorts on the same future-return basis."""
     if df.empty:
         return {"cohorts": [], "primary_horizon": "5d", "notes": ["暂无成熟扫描样本"]}
+    df = _independent_event_frame(df)
     research = df.get("research_eligible", pd.Series(False, index=df.index)).fillna(False).astype(bool)
     executable = (
         df.get("trade_eligible", pd.Series(False, index=df.index)).fillna(False).astype(bool)
@@ -253,6 +296,7 @@ def build_opportunity_threshold_report(
     """Report threshold sensitivity without changing the production threshold."""
     if df.empty or "trade_opportunity_score" not in df.columns:
         return {"thresholds": [], "production_threshold": 60, "status": "INSUFFICIENT"}
+    df = _independent_event_frame(df)
     research = df.get("research_eligible", pd.Series(False, index=df.index)).fillna(False).astype(bool)
     scores = pd.to_numeric(df["trade_opportunity_score"], errors="coerce")
     rows = []
@@ -394,9 +438,10 @@ def build_bottom_discovery_report(df: pd.DataFrame, min_samples: int = 30) -> Di
     """Evaluate observation-only B0/B1 signals without treating them as executions."""
     min_samples = max(1, int(min_samples))
     if df.empty or "strategy_type" not in df.columns:
-        bottom = pd.DataFrame()
+        raw_bottom = pd.DataFrame()
     else:
-        bottom = df[df["strategy_type"].astype(str).eq("bottom_discovery")].copy()
+        raw_bottom = df[df["strategy_type"].astype(str).eq("bottom_discovery")].copy()
+    bottom = _independent_event_frame(raw_bottom)
 
     stage_rows = _group_rows(bottom, "bottom_discovery_stage")
     for row in stage_rows:
@@ -412,8 +457,8 @@ def build_bottom_discovery_report(df: pd.DataFrame, min_samples: int = 30) -> Di
         }
 
     conversions = []
-    if not bottom.empty and "bottom_discovery_stage" in bottom.columns:
-        dated = bottom.assign(_signal_date=pd.to_datetime(bottom["signal_date"], errors="coerce")).dropna(subset=["_signal_date"])
+    if not raw_bottom.empty and "bottom_discovery_stage" in raw_bottom.columns:
+        dated = raw_bottom.assign(_signal_date=pd.to_datetime(raw_bottom["signal_date"], errors="coerce")).dropna(subset=["_signal_date"])
         for code, group in dated.groupby(dated["code"].astype(str)):
             b0_dates = group.loc[group["bottom_discovery_stage"].eq("B0_BASE"), "_signal_date"]
             b1_dates = group.loc[group["bottom_discovery_stage"].eq("B1_REVERSAL"), "_signal_date"]
@@ -487,6 +532,7 @@ def build_bottom_discovery_report(df: pd.DataFrame, min_samples: int = 30) -> Di
         "status": "VALIDATED" if validated else "INSUFFICIENT_DATA",
         "min_mature_b1_samples": min_samples,
         "signals": int(len(bottom)),
+        "raw_signals": int(len(raw_bottom)),
         "by_stage": stage_rows,
         "conversion": {
             "b0_unique_stocks": len(conversions),
@@ -543,7 +589,7 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
     min_samples = max(1, int(min_samples))
     if df.empty:
         return {
-            "summary": {"signals": 0, "mature_5d": 0, "mature_10d": 0},
+            "summary": {"raw_signals": 0, "signals": 0, "mature_5d": 0, "mature_10d": 0},
             "horizons": {f"{horizon}d": _metric_summary(pd.Series(dtype=float)) for horizon in HORIZONS},
             "by_strategy": [],
             "by_grade": [],
@@ -558,19 +604,28 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
             "bottom_discovery_analysis": build_bottom_discovery_report(pd.DataFrame(), min_samples),
             "grade_monotonicity": _grade_monotonicity([], min_samples),
             "a_grade_policy": build_a_grade_policy_report(pd.DataFrame(), min_samples),
+            "grade_usage": {"mode": "SHADOW_ONLY", "production_effect": False, "reason": "暂无可校准样本"},
         }
 
+    raw_df = df
+    df = _independent_event_frame(df)
     horizons = {f"{horizon}d": _metric_summary(df[f"ret_{horizon}d"]) for horizon in HORIZONS}
     by_grade = _group_rows(df, "sop_grade")
-    signal_dates = pd.to_datetime(df.get("signal_date"), errors="coerce")
+    signal_dates = pd.to_datetime(raw_df.get("signal_date"), errors="coerce")
+    grade_monotonicity = _grade_monotonicity(by_grade, min_samples)
+    a_grade_policy = build_a_grade_policy_report(df, min_samples)
+    grade_validated = grade_monotonicity["status"] == "PASS" and a_grade_policy["status"] == "VALIDATED"
+    grade_active = SOP_GRADE_EXECUTION_MODE == "ACTIVE" and grade_validated
     report = {
         "summary": {
+            "raw_signals": int(len(raw_df)),
             "signals": int(len(df)),
             "mature_5d": horizons["5d"]["signals"],
             "mature_10d": horizons["10d"]["signals"],
             "latest_signal_date": str(signal_dates.max().date()) if signal_dates.notna().any() else None,
             "price_basis": "daily_k_signal_close",
             "maturity_rule": "未来第N个交易日收盘存在时才计入N日样本",
+            "event_dedup_rule": INDEPENDENT_EVENT_RULE,
         },
         "horizons": horizons,
         "by_strategy": _group_rows(df, "strategy_type"),
@@ -583,9 +638,16 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
         "by_lifecycle_state": _group_rows(df, "decision_lifecycle_state"),
         "by_confirmation_event": _group_rows(df, "confirmation_event_state"),
         "by_early_value_transition": _group_rows(df, "early_value_transition_state"),
-        "bottom_discovery_analysis": build_bottom_discovery_report(df, min_samples),
-        "grade_monotonicity": _grade_monotonicity(by_grade, min_samples),
-        "a_grade_policy": build_a_grade_policy_report(df, min_samples),
+        "bottom_discovery_analysis": build_bottom_discovery_report(raw_df, min_samples),
+        "grade_monotonicity": grade_monotonicity,
+        "a_grade_policy": a_grade_policy,
+        "grade_usage": {
+            "mode": "ACTIVE" if grade_active else "SHADOW_ONLY",
+            "production_effect": grade_active,
+            "reason": "评级顺序与A级政策均通过成熟样本验证" if grade_active else "评级只作结构描述，不作为新增可交易资格证据",
+            "configured_mode": SOP_GRADE_EXECUTION_MODE,
+            "validation_passed": grade_validated,
+        },
     }
     if "exec_return_pct" in df.columns:
         filled = df["exec_filled"].fillna(False).astype(bool) if "exec_filled" in df.columns else pd.Series(False, index=df.index)
@@ -602,7 +664,7 @@ def build_blocker_report(df: pd.DataFrame, min_samples: int = 10) -> Dict[str, A
     if df.empty or "blockers" not in df.columns:
         return {"summary": {"blockers": 0, "mature_5d": 0}, "items": []}
 
-    normalized = df.copy()
+    normalized = _independent_event_frame(df).copy()
     normalized["blockers"] = normalized["blockers"].apply(_as_list)
     all_blockers = sorted({item for values in normalized["blockers"] for item in values})
     control_columns = [
@@ -696,6 +758,7 @@ def build_feature_ablation_report(
     min_samples: int = 30,
 ) -> Dict[str, Any]:
     """Report marginal rank association; causal promotion still requires rolling OOS."""
+    df = _independent_event_frame(df)
     if outcome not in df.columns:
         return {"outcome": outcome, "samples": 0, "items": []}
     items = []

@@ -19,6 +19,7 @@ import {
     BarChart3,
     Newspaper,
     Inbox,
+    Flame,
     X
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -152,6 +153,12 @@ export default function Sidebar({
                         label="板块雷达"
                         active={activeView === 'sector-radar'}
                         onClick={() => navigate('sector-radar')}
+                    />
+                    <NavItem
+                        icon={<Flame size={20} />}
+                        label="热股排行"
+                        active={activeView === 'hot-stocks'}
+                        onClick={() => navigate('hot-stocks')}
                     />
                     <NavItem
                         icon={<Newspaper size={20} />}

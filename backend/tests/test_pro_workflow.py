@@ -8,7 +8,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.models import Base
 from core.portfolio_risk import build_portfolio_exposure
-from core.pro_workflow import build_alert_priority, build_premarket_checklist, recommend_strategy_template
+from core.pro_workflow import (
+    build_alert_priority,
+    build_live_strategy_recommendation,
+    build_premarket_checklist,
+    recommend_strategy_template,
+)
 
 
 def test_recommend_strategy_template_turns_defensive_on_weak_quality():
@@ -17,6 +22,75 @@ def test_recommend_strategy_template_turns_defensive_on_weak_quality():
     assert result["profile"] == "防守精选"
     assert result["params"]["pine_min_signals"] == 4
     assert result["params"]["max_open_gap_pct"] == 2.0
+
+
+def test_recommend_strategy_template_skips_paused_strategy_when_health_is_available():
+    result = recommend_strategy_template(
+        market_regime="DEFENSIVE",
+        risk_status="warning",
+        recent_win_rate=40,
+        strategy_health={
+            "pine": {"status": "PAUSED", "signals": 100, "expected_return": -1.55},
+            "tv_zp": {"status": "ACTIVE", "signals": 77, "expected_return": 1.26},
+        },
+    )
+
+    assert result["profile"] == "防守精选"
+    assert result["strategy_type"] == "tv_zp"
+    assert result["params"]["strategy_type"] == "tv_zp"
+    assert result["strategy_health"]["status"] == "ACTIVE"
+
+
+def test_strategy_template_route_uses_live_context_by_default(monkeypatch):
+    from routers import strategy_templates
+
+    engine = object()
+    captured = {}
+    monkeypatch.setattr(strategy_templates, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(
+        strategy_templates,
+        "build_live_strategy_recommendation",
+        lambda selected_engine, **kwargs: captured.update({
+            "engine": selected_engine,
+            **kwargs,
+        }) or {"profile": "测试"},
+    )
+
+    result = strategy_templates.get_strategy_template_recommendation()
+
+    assert result["recommendation"] == {"profile": "测试"}
+    assert captured == {
+        "engine": engine,
+        "market_regime": "UNKNOWN",
+        "risk_status": None,
+        "recent_win_rate": None,
+    }
+
+
+def test_live_strategy_recommendation_reads_market_portfolio_and_health(monkeypatch):
+    engine = object()
+    monkeypatch.setattr("core.data.get_market_regime", lambda: {"status": "DEFENSIVE"})
+    monkeypatch.setattr(
+        "core.portfolio_risk.build_portfolio_exposure",
+        lambda selected_engine: {"status": "warning", "engine": selected_engine},
+    )
+    monkeypatch.setattr(
+        "core.strategy_health.build_strategy_health",
+        lambda selected_engine: {
+            "selection": {
+                "strategies": {
+                    "pine": {"status": "PAUSED", "expected_return": -1.55},
+                    "tv_zp": {"status": "ACTIVE", "expected_return": 1.26},
+                }
+            }
+        },
+    )
+
+    result = build_live_strategy_recommendation(engine)
+
+    assert result["profile"] == "防守精选"
+    assert result["strategy_type"] == "tv_zp"
+    assert result["strategy_health"]["status"] == "ACTIVE"
 
 
 def test_build_alert_priority_maps_stop_to_p0():

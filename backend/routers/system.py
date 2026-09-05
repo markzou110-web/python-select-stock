@@ -8,7 +8,7 @@ from core.data_source_quality import build_data_source_quality_report
 from core.data_source_quality import build_local_data_quality_report
 from core.ops_summary import build_ops_summary
 from core.portfolio_risk import build_portfolio_exposure, build_portfolio_stress
-from core.pro_workflow import build_premarket_checklist, recommend_strategy_template
+from core.pro_workflow import build_live_strategy_recommendation, build_premarket_checklist
 from core.research_summary import build_research_summary
 from core.system_health import build_system_health_snapshot
 from core.strategy_health import build_strategy_health
@@ -187,16 +187,17 @@ def get_portfolio_stress(lookback: int = 60):
 
 
 @router.get("/premarket-checklist")
-def get_premarket_checklist(market_regime: str = "UNKNOWN", recent_win_rate: float = 0):
+def get_premarket_checklist(market_regime: str = "UNKNOWN", recent_win_rate: float | None = None):
     """Return the daily pre-market checklist for scan and trading readiness."""
     engine = get_db_engine()
     health = build_system_health_snapshot(engine)
     exposure = build_portfolio_exposure(engine)
     data_quality = build_data_source_quality_report(engine)
-    template = recommend_strategy_template(
+    template = build_live_strategy_recommendation(
+        engine,
         market_regime=market_regime,
         risk_status=exposure.get("status", "ok"),
-        recent_win_rate=float(recent_win_rate or 0),
+        recent_win_rate=recent_win_rate,
     )
     checklist = build_premarket_checklist(health, exposure, data_quality, template)
     return {

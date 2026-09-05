@@ -134,16 +134,19 @@ celery_app.conf.update(
         'early-value-independent-scan-1315': {
             'task': 'tasks.early_value_scan',
             'schedule': crontab(hour=13, minute=15, day_of_week='1-5'),
+            'options': {'expires': 900},
         },
         'bottom-discovery-morning-0945': {
             'task': 'tasks.bottom_discovery_scan',
             'schedule': crontab(hour=9, minute=45, day_of_week='1-5'),
             'kwargs': {'slot': '09:45'},
+            'options': {'expires': 900},
         },
         'bottom-discovery-afternoon-1325': {
             'task': 'tasks.bottom_discovery_scan',
             'schedule': crontab(hour=13, minute=25, day_of_week='1-5'),
             'kwargs': {'slot': '13:25'},
+            'options': {'expires': 900},
         },
         'intraday-late-decision-1450': {
             'task': 'tasks.intraday_monitor_checkpoint',

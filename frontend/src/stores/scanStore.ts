@@ -31,13 +31,21 @@ export interface ScanResult {
     momentum_watch_reason?: string;
     momentum_acceleration_watch_only?: boolean;
     revival_watch_only?: boolean;
-    result_group?: 'FORMAL' | 'HISTORICAL_REVIVAL' | 'MOMENTUM_WATCH';
+    result_group?: 'FORMAL' | 'HISTORICAL_REVIVAL' | 'MOMENTUM_WATCH' | 'SHADOW_RESEARCH';
     sector_watch_only?: boolean;
     sector_watch_reason?: string;
     bottom_discovery_watch_only?: boolean;
     bottom_discovery_stage?: 'B0_BASE' | 'B1_REVERSAL' | string;
     bottom_discovery_action?: string;
     bottom_discovery_metrics?: Record<string, number | boolean>;
+    sequoia_research_shadow_only?: boolean;
+    release_state?: 'SHADOW' | string;
+    shadow_instruction?: string;
+    rps_60?: number;
+    rps_120?: number;
+    rps_250?: number;
+    rps_sector_120?: number;
+    rps_acceleration?: number;
     影线比?: number;
     strategy_type?: string;
     warnings?: string[];
@@ -166,6 +174,14 @@ export interface ScanResult {
     pa_multi_timeframe_note?: string;
     pa_volume_pattern?: string;
     pa_volume_confirmed?: boolean;
+    pa_volume_pullback_status?: 'NONE' | 'BREAKOUT' | 'WAITING_PULLBACK' | 'PULLBACK' | 'CONFIRMED' | 'UNQUALIFIED' | 'INVALIDATED';
+    pa_volume_pullback_label?: string;
+    pa_volume_pullback_score_delta?: number;
+    pa_volume_pullback_breakout_date?: string | null;
+    pa_volume_pullback_support_price?: number | null;
+    pa_volume_pullback_confirmation_label?: string | null;
+    pa_volume_pullback_confirmation_date?: string | null;
+    pa_volume_pullback_stop_price?: number | null;
     pa_volume_risk?: string;
     pa_failed_second_entry?: string | null;
     pa_second_entry_risk?: number;
@@ -230,7 +246,7 @@ export interface BacktestStats {
 }
 
 export interface ScanParams {
-    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp';
+    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp' | 'high_tight_flag' | 'turtle_breakout' | 'limit_up_shakeout';
     pine_min_signals: number;
     min_data_days: number;
     threshold: number;
@@ -291,6 +307,9 @@ const SCAN_STRATEGY_LABELS: Record<ScanParams['strategy_type'], string> = {
     both: '双重共振',
     consensus: '放量突破',
     tv_zp: 'TV-ZP',
+    high_tight_flag: 'HTF 高位收敛（SHADOW）',
+    turtle_breakout: '20日新高基准（SHADOW）',
+    limit_up_shakeout: '涨停洗盘观察（SHADOW）',
 };
 
 let resultRequestGeneration = 0;
@@ -312,7 +331,7 @@ function filterStrategyResults(rawResults: unknown, strategyType: ScanParams['st
 function groupStrategyResults(rawResults: unknown, strategyType: ScanParams['strategy_type']): ScanResultGroups {
     const matched = filterStrategyResults(rawResults, strategyType);
     return matched.reduce<ScanResultGroups>((groups, candidate) => {
-        if (candidate.result_group === 'FORMAL') {
+        if (candidate.result_group === 'FORMAL' || candidate.result_group === 'SHADOW_RESEARCH') {
             groups.formal.push(candidate);
             return groups;
         }

@@ -5,6 +5,7 @@ Decoupled business logic from FastAPI Routers.
 import time
 import os
 import re
+import hashlib
 import pandas as pd
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Any
@@ -31,6 +32,7 @@ from core.indicators import (
 from core.strategy import (
     check_strategy, check_pine_strategy, check_tv_zp_strategy, check_tv_dual_strategy, check_tv_reversal_watch, check_consensus_strategy,
     calculate_historical_win_rate, calculate_pine_win_rate, calculate_tv_zp_win_rate, calculate_tv_dual_win_rate, calculate_consensus_win_rate,
+    calculate_research_pattern_win_rate,
     STRATEGY_LOGIC_VERSION, BACKTEST_ENGINE_VERSION, EXIT_RULE_VERSION
 )
 from core.price_action import analyze_price_action
@@ -55,6 +57,7 @@ from core.risk_constants import (
     SOP_A_GRADE_MIN_PRICE_ACTION_SCORE,
     SOP_A_GRADE_MIN_SCORE,
     SOP_A_GRADE_POLICY_VERSION,
+    SOP_GRADE_EXECUTION_MODE,
     SOP_A_GRADE_STRATEGIES,
     PRIMARY_TV_STRATEGY,
     TV_MA_ONLY_MIN_PA_SCORE,
@@ -83,6 +86,80 @@ FAILURE_VETO_MIN_COUNT = 3
 # 改动 A5：小样本胜率折扣。无 Wilson 下界时对原始胜率打此折扣，
 # 惩罚样本量不足（如样本=3、胜率=100% 的票折扣后=70%，更接近真实置信度）。
 SMALL_SAMPLE_WIN_RATE_DISCOUNT = 0.7
+
+_DYNAMIC_REJECTION_VALUE = re.compile(
+    r"[（(]\s*[-+]?\d+(?:\.\d+)?(?:\s*/\s*\d+(?:\.\d+)?)?\s*(?:%|x|天)?\s*[)）]",
+    re.IGNORECASE,
+)
+_REJECTION_REASON_LIMIT = 50
+_REJECTION_REASON_SAMPLE_LIMIT = 3
+_REJECTION_REASON_CODES = (
+    ("距60日低点涨幅不在", "DISTANCE_FROM_60D_LOW_OUT_OF_RANGE"),
+    ("距20日低点涨幅不在", "DISTANCE_FROM_20D_LOW_OUT_OF_RANGE"),
+    ("底部量能尚未收缩", "BOTTOM_VOLUME_NOT_CONTRACTED"),
+    ("当日量能已过度放大", "CURRENT_VOLUME_OVEREXPANDED"),
+    ("底部波动尚未收敛", "BOTTOM_VOLATILITY_NOT_CONTRACTED"),
+    ("EMA20仍快速下行", "EMA20_FALLING_FAST"),
+    ("量能尚未开始确认", "VOLUME_NOT_CONFIRMED"),
+    ("历史数据不足", "INSUFFICIENT_HISTORY"),
+    ("样本不足", "INSUFFICIENT_SAMPLE"),
+    ("信号不足", "INSUFFICIENT_SIGNALS"),
+    ("扫描异常", "SCAN_EXCEPTION"),
+)
+
+
+def _normalize_rejection_reason(reason: Any) -> tuple[str, str, Optional[str]]:
+    """Return a stable code/label while retaining one raw diagnostic sample."""
+    raw = str(reason or "未知").strip()
+    label = "扫描异常" if raw.startswith("异常:") else _DYNAMIC_REJECTION_VALUE.sub("", raw)
+    label = re.sub(r"\s+", " ", label).strip(" ,，;；") or "未知"
+    code = next(
+        (value for prefix, value in _REJECTION_REASON_CODES if label.startswith(prefix)),
+        None,
+    )
+    if code is None:
+        digest = hashlib.sha1(label.encode("utf-8")).hexdigest()[:10].upper()
+        code = f"REJECT_{digest}"
+    return code, label, raw if raw != label else None
+
+
+def _summarize_rejection_reasons(
+    raw_reasons: Dict[str, int],
+) -> tuple[Dict[str, int], Dict[str, Any]]:
+    """Aggregate dynamic rejection strings and cap persisted audit cardinality."""
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for raw_reason, raw_count in raw_reasons.items():
+        code, label, sample = _normalize_rejection_reason(raw_reason)
+        item = grouped.setdefault(label, {
+            "reason_code": code,
+            "label": label,
+            "count": 0,
+            "samples": [],
+        })
+        item["count"] += int(raw_count or 0)
+        if sample and sample not in item["samples"] and len(item["samples"]) < _REJECTION_REASON_SAMPLE_LIMIT:
+            item["samples"].append(sample)
+
+    ordered = sorted(grouped.values(), key=lambda item: (-item["count"], item["label"]))
+    kept = ordered[:_REJECTION_REASON_LIMIT]
+    overflow = ordered[_REJECTION_REASON_LIMIT:]
+    if overflow:
+        kept.append({
+            "reason_code": "OTHER_REJECTIONS",
+            "label": "其他失败原因",
+            "count": sum(item["count"] for item in overflow),
+            "samples": [],
+        })
+
+    return (
+        {item["label"]: item["count"] for item in kept},
+        {
+            "total_rejections": sum(int(value or 0) for value in raw_reasons.values()),
+            "unique_raw": len(raw_reasons),
+            "unique_normalized": len(grouped),
+            "reasons": kept,
+        },
+    )
 
 # 改动(上班族Bark v2)：破位反抽陷阱多维评分。检测信号前 N 天内单日大跌后，
 # 通过"量能/反抽强度/MA20破位时长/V型未确认"四维评分区分真陷阱与黄金坑洗盘，
@@ -524,6 +601,12 @@ def _discovery_pool_mask(snapshot_df: pd.DataFrame, strategy_type: str) -> tuple
         return pct.between(-3.0, 5.0, inclusive="both"), "EARLY_DISCOVERY"
     if strategy_type == "bottom_discovery":
         return pct.between(-4.0, 4.0, inclusive="both"), "BOTTOM_DISCOVERY"
+    if strategy_type == "high_tight_flag":
+        return pct.between(-3.0, 5.0, inclusive="both"), "HIGH_TIGHT_FLAG_SHADOW"
+    if strategy_type == "limit_up_shakeout":
+        return pct.between(-12.0, 5.0, inclusive="both"), "LIMIT_UP_SHAKEOUT_SHADOW"
+    if strategy_type == "turtle_breakout":
+        return pct.gt(0), "TURTLE_BREAKOUT_SHADOW"
     if strategy_type == "sector_watch":
         return pct.between(-2.0, 8.0, inclusive="both"), "PULLBACK_DISCOVERY"
     return pct > 0, "MOMENTUM_DISCOVERY"
@@ -623,6 +706,9 @@ _OBSERVATION_ONLY_PLAN_FLAGS = (
     "tv_reversal_watch_only",
     "sector_watch_only",
     "early_value_watch_only",
+    "high_tight_flag_watch_only",
+    "turtle_breakout_watch_only",
+    "limit_up_shakeout_watch_only",
 )
 
 
@@ -1369,6 +1455,71 @@ def _check_bottom_discovery_strategy(
     }
 
 
+def _check_sequoia_research_strategy(
+    df: pd.DataFrame,
+    code: str,
+    name: str,
+    strategy_type: str,
+) -> tuple[bool, Dict[str, Any]]:
+    """Evaluate adapted pattern research without granting execution permission."""
+    from core.sequoia_research import (
+        high_tight_flag_signal_mask,
+        limit_up_shakeout_signal_mask,
+        signal_metrics,
+        turtle_breakout_signal_mask,
+    )
+
+    masks = {
+        "high_tight_flag": lambda: high_tight_flag_signal_mask(df),
+        "turtle_breakout": lambda: turtle_breakout_signal_mask(df),
+        "limit_up_shakeout": lambda: limit_up_shakeout_signal_mask(df, code),
+    }
+    if strategy_type not in masks:
+        return False, {"reason": "未知研究策略"}
+    mask = masks[strategy_type]()
+    if mask.empty or not bool(mask.iloc[-1]):
+        return False, {"reason": "未满足研究形态"}
+
+    close = pd.to_numeric(df["收盘"], errors="coerce")
+    open_ = pd.to_numeric(df["开盘"], errors="coerce")
+    current = float(close.iloc[-1])
+    previous = float(close.iloc[-2])
+    daily_pct = (current / previous - 1) * 100 if previous > 0 else 0.0
+    labels = {
+        "high_tight_flag": ("HTF高位收敛", "高位窄幅缩量整理，等待放量突破整理区高点"),
+        "turtle_breakout": ("20日新高突破", "简单突破基准已命中，等待收盘与次日价格确认"),
+        "limit_up_shakeout": ("涨停后洗盘", "放量换手但支撑未破，等待再次转强，禁止直接抄底"),
+    }
+    metric_fields = {
+        "high_tight_flag": "high_tight_flag_metrics",
+        "turtle_breakout": "turtle_breakout_metrics",
+        "limit_up_shakeout": "limit_up_shakeout_metrics",
+    }
+    signal, instruction = labels[strategy_type]
+    score = {"high_tight_flag": 66.0, "turtle_breakout": 70.0, "limit_up_shakeout": 62.0}[strategy_type]
+    flag = f"{strategy_type}_watch_only"
+    return True, {
+        "代码": code,
+        "名称": name,
+        "现价": round(current, 2),
+        "涨幅%": round(daily_pct, 2),
+        "Score": score,
+        "raw_score": score,
+        "strategy_type": strategy_type,
+        "signal": signal,
+        "reason": instruction,
+        "shadow_instruction": instruction,
+        "sequoia_research_shadow_only": True,
+        "release_state": "SHADOW",
+        "trade_eligible": False,
+        "trade_bucket": "SHADOW",
+        flag: True,
+        metric_fields[strategy_type]: signal_metrics(df, strategy_type, code),
+        "current_body_pct": round((current / float(open_.iloc[-1]) - 1) * 100, 2)
+        if float(open_.iloc[-1]) > 0 else None,
+    }
+
+
 def _early_value_sector_started(res: Dict[str, Any], sector_info: Dict[str, Any]) -> bool:
     phase = str(sector_info.get("sector_phase") or "")
     score = _as_float(sector_info.get("sector_momentum_score"))
@@ -1606,6 +1757,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
             blockers.append("MA单信号仅进攻市场允许执行")
     if res.get("bottom_discovery_watch_only"):
         blockers.append("底部起涨发现仅供观察，等待板块、确认价和量能共同确认")
+    if res.get("sequoia_research_shadow_only"):
+        blockers.append("外部策略概念尚未通过滚动样本外验证，仅限SHADOW观察")
     if res.get('sector_trend') == 'DOWN':
         blockers.append("板块下跌")
     if res.get('sector_phase') == 'SECTOR_FADE' and res.get('sector_alignment_score', 0) < 60:
@@ -1816,10 +1969,13 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     # 改动(上班族Bark)：实盘门槛收紧。STRICT_REAL_SIGNAL_GATE=True 时仅 A 级 + 多重共振
     # (🔥核心热点) 判为可交易；B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。
     if STRICT_REAL_SIGNAL_GATE:
-        formal_a_trade = (grade == "A" and not blockers
-                          and strategy_type in CORE_TRADE_STRATEGIES
-                          and res.get('共振') == "🔥 核心热点"
-                          and _trade_quality_confirmed(res, sector_strength, stock_sector_fit))
+        formal_a_structure = (grade == "A" and not blockers
+                              and strategy_type in CORE_TRADE_STRATEGIES
+                              and res.get('共振') == "🔥 核心热点"
+                              and _trade_quality_confirmed(res, sector_strength, stock_sector_fit))
+        res['grade_execution_mode'] = SOP_GRADE_EXECUTION_MODE
+        res['grade_execution_shadow_eligible'] = formal_a_structure
+        formal_a_trade = SOP_GRADE_EXECUTION_MODE == "ACTIVE" and formal_a_structure
         trade_eligible = formal_a_trade or a_minus_trial or a_eod_trial
     else:
         trade_eligible = grade in {"A", "B"} and not blockers and strategy_type in CORE_TRADE_STRATEGIES
@@ -2301,6 +2457,18 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         res['brooks_rank_adjustment'] = brooks_adjustment
         res['final_rank_score'] = round(float(res.get('Score') or 0) + brooks_adjustment, 2)
         res['final_rank_score'] = round(res['final_rank_score'] + min(12, max(0, float(res.get('sector_alignment_score') or 0) - 50) * 0.24), 2)
+        _rps_120 = float(res.get('rps_120') or 0)
+        _rps_sector_120 = float(res.get('rps_sector_120') or 0)
+        _rps_acceleration = float(res.get('rps_acceleration') or 0)
+        if _rps_120 >= 90:
+            res['final_rank_score'] = round(res['final_rank_score'] + 4, 2)
+            bonuses.append("全市场RPS120前10%")
+        if _rps_sector_120 >= 80:
+            res['final_rank_score'] = round(res['final_rank_score'] + 2, 2)
+            bonuses.append("板块内RPS120前20%")
+        if _rps_acceleration >= 5:
+            res['final_rank_score'] = round(res['final_rank_score'] + 1, 2)
+            bonuses.append("RPS短周期加速")
         if res.get('trend_continuation_candidate'):
             res['final_rank_score'] = round(res['final_rank_score'] + 6, 2)
         if _has_pullback_reversal_volume(res):
@@ -2332,7 +2500,11 @@ def _apply_sop_filter(results, market_regime, sector_trends):
         if brooks_adjustment <= -6:
             vetoes.append("Brooks风险偏高")
             res['sop_grade'] = "D" if grade in {"C", "D"} else "C"
-        if res.get('bottom_discovery_watch_only'):
+        if res.get('sequoia_research_shadow_only'):
+            res['sop_grade'] = "D" if vetoes else "C"
+            res['sop_checks'].append("外部研究形态SHADOW")
+            res['sop_bonuses'].append("独立形态研究样本")
+        elif res.get('bottom_discovery_watch_only'):
             res['sop_grade'] = "D" if vetoes else "C"
             stage = str(res.get('bottom_discovery_stage') or "B0_BASE")
             res['sop_checks'].append("B1止跌转强" if stage == "B1_REVERSAL" else "B0底部候选")
@@ -2568,7 +2740,10 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     if min_data_days is None:
         if strategy_type in {"pine", "tv_zp", "tv_dual", "tv_dual_strict"}:
             min_days = 120
-        elif strategy_type in {"early_value", "bottom_discovery"}:
+        elif strategy_type in {
+            "early_value", "bottom_discovery", "high_tight_flag",
+            "turtle_breakout", "limit_up_shakeout",
+        }:
             min_days = 80
         elif strategy_type == "consensus":
             min_days = 130 # 需要 60 周或足够长的日线来模拟
@@ -2709,6 +2884,9 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
             match, stats = _check_bottom_discovery_strategy(
                 df, code, name, price, current_vol=vol, current_open=open_price,
             )
+            return stats
+        elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
+            match, stats = _check_sequoia_research_strategy(df, code, name, strategy_type)
             return stats
         else:
             # 默认均线粘合策略
@@ -3278,10 +3456,12 @@ def perform_market_scan(
                 except Exception as e:
                     fail_reasons[f"异常: {str(e)[:30]}"] = fail_reasons.get(f"异常: {str(e)[:30]}", 0) + 1
 
+            normalized_fail_reasons, fail_reason_details = _summarize_rejection_reasons(fail_reasons)
             logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
-            audit_payload["fail_reasons"] = fail_reasons
-            if fail_reasons:
-                logger.info(f"Rejection Summary: {fail_reasons}")
+            audit_payload["fail_reasons"] = normalized_fail_reasons
+            audit_payload["params_snapshot"]["fail_reason_details"] = fail_reason_details
+            if normalized_fail_reasons:
+                logger.info(f"Rejection Summary: {normalized_fail_reasons}")
 
             # Pine 策略或 同时启用 策略额外统计
             if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
@@ -3297,9 +3477,39 @@ def perform_market_scan(
                     logger.info(f"Pine Strategy Signal Distribution: {pine_stats}")
 
         logger.info(f"Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
+        mark_phase("strategy_evaluation")
 
-        # 排序并取 Top 100
-        results = sorted(results, key=lambda x: x['Score'], reverse=True)[:100]
+        # 排序并取 Top 100；先记录截断压力，供影子排序验证，不改变正式结果。
+        results = sorted(results, key=lambda x: x['Score'], reverse=True)
+        prelimit_count = len(results)
+        audit_payload["params_snapshot"]["prelimit_ranking"] = {
+            "candidate_count": prelimit_count,
+            "limit": 100,
+            "truncated_count": max(0, prelimit_count - 100),
+            "top100_cutline_score": round(float(results[99]['Score']), 2) if prelimit_count >= 100 else None,
+            "top200_cutline_score": round(float(results[199]['Score']), 2) if prelimit_count >= 200 else None,
+        }
+        results = results[:100]
+        if strategy_type == "limit_up_shakeout":
+            from core.limit_up_leadership import load_limit_up_event_map
+            from core.sequoia_research import confirm_limit_up_shakeout_candidates
+
+            signal_date = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
+            prior_event_date = shift_a_share_trading_date(signal_date, -1)
+            before_event_gate = len(results)
+            prior_event_map = load_limit_up_event_map(prior_event_date, engine)
+            results = confirm_limit_up_shakeout_candidates(
+                results,
+                prior_event_map,
+                prior_event_date,
+            )
+            audit_payload["limit_up_shakeout_event_gate"] = {
+                "event_date": prior_event_date,
+                "input_count": before_event_gate,
+                "confirmed_count": len(results),
+                "event_universe_count": len(prior_event_map),
+                "fail_closed": True,
+            }
 
         sector_map = get_sector_map()
         sector_trends = get_sector_trends()
@@ -3385,6 +3595,8 @@ def perform_market_scan(
                 logger.info(f"Added {len(momentum_candidates)} momentum acceleration candidates.")
                 results.extend(momentum_candidates)
 
+        mark_phase("strategy_post_filter")
+
         # 补充增强 data (行业, 胜率) - 并发处理 Top 100 + 板块观察
         logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
 
@@ -3426,6 +3638,12 @@ def perform_market_scan(
                     bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
                 elif strategy_type == "consensus":
                     bt = calculate_consensus_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
+                    bt = calculate_research_pattern_win_rate(
+                        df_labeled,
+                        strategy_type,
+                        stop_loss_pct=sl_pct,
+                    )
                 else:
                     bt = calculate_historical_win_rate(
                         df_labeled,
@@ -3511,6 +3729,7 @@ def perform_market_scan(
         # 使用线程池并发补充 100 只股票
         with ThreadPoolExecutor(max_workers=15) as executor:
             list(executor.map(process_supplement, results))
+        mark_phase("result_supplement")
 
         recent_push_counts = load_recent_push_counts(
             engine,
@@ -3648,6 +3867,19 @@ def perform_market_scan(
                 res['stock_sector_fit_score'],
             )
 
+        # 横截面 RPS 使用最新完整日线截面计算，只参与排序和解释，不授予交易权限。
+        from core.sequoia_research import load_cross_sectional_rps
+        rps_as_of = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
+        rps_map = load_cross_sectional_rps(engine, rps_as_of) if results else {}
+        for res in results:
+            res.update(rps_map.get(str(res.get("代码") or "").zfill(6), {}))
+        audit_payload["rps_factor"] = {
+            "as_of": rps_as_of,
+            "universe_count": len(rps_map),
+            "point_in_time": True,
+            "trade_permission": False,
+        }
+
         # 改动 #17：预查近期失败模式，注入 recent_failure_count 供 _apply_sop_filter 否决
         _inject_failure_pattern(results, engine)
         _inject_breakdown_retracement(results, hist_map)
@@ -3674,6 +3906,7 @@ def perform_market_scan(
         # 成长板块可能先于宽基指数修复；先注入板块级市场状态，再进行 SOP 评分。
         growth_segment_context = apply_growth_segment_context(results, snapshot_df, market_regime)
         market_regime['growth_segments'] = growth_segment_context
+        mark_phase("result_enrichment")
 
         # 应用 SOP 等级评定
         _apply_sop_filter(results, market_regime, sector_trends)
@@ -3711,6 +3944,7 @@ def perform_market_scan(
             row["execution_plan_state"] = build_frozen_plan_state(row)
             row["distance_to_trade"] = build_distance_to_trade(row)
         _apply_research_only_gate(results, audit_payload)
+        mark_phase("decision_pipeline")
         from core.candidate_evidence import apply_candidate_evidence
         from core.stock_research import get_cached_stock_research_signals
 
@@ -3727,6 +3961,7 @@ def perform_market_scan(
             mode=EVIDENCE_GATE_MODE,
             research_lookup=_cached_research,
         )
+        mark_phase("candidate_evidence")
         from core.execution_reachability import apply_execution_reachability
         reachability_summary = apply_execution_reachability(results)
         # Research-only and evidence gates run after the first presentation pass;
@@ -3748,7 +3983,7 @@ def perform_market_scan(
         audit_payload["version_snapshot"]["candidate_evidence"] = "candidate-evidence-v1"
         audit_payload["version_snapshot"]["execution_reachability"] = "execution-reachability-v1"
         audit_payload["params_snapshot"]["execution_reachability"] = reachability_summary
-        mark_phase("candidate_evidence")
+        mark_phase("execution_reachability")
         audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
         audit_payload["version_snapshot"]["strategy_health_control"] = "execution-cohort-circuit-breaker-v2"
         audit_payload["version_snapshot"]["decision_layer"] = (
@@ -3777,7 +4012,7 @@ def perform_market_scan(
         from core.sentinel import sentinel, _select_intraday_push_stocks
         ab_results = [r for r in results if r.get('sop_grade') in ('A', 'B')]
         sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else ab_results[:5]
-        mark_phase("scoring_and_decision")
+        mark_phase("result_ranking")
 
         # --- 持久化保存 ---
         persist_started_at = time.perf_counter()
@@ -3790,6 +4025,8 @@ def perform_market_scan(
                 res['result_group'] = 'HISTORICAL_REVIVAL'
             elif res.get('momentum_acceleration_watch_only'):
                 res['result_group'] = 'MOMENTUM_WATCH'
+            elif res.get('sequoia_research_shadow_only'):
+                res['result_group'] = 'SHADOW_RESEARCH'
             else:
                 res['result_group'] = 'FORMAL'
         save_scan_results(

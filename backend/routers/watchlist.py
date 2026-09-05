@@ -255,9 +255,14 @@ def _send_trigger_notification(alerts) -> Dict[str, bool]:
     for alert in alerts[:8]:
         reasons = "、".join(alert["reasons"])
         instruction = f"\n   └ 指令: {alert.get('instruction')}" if alert.get("instruction") else ""
+        price_plan = (
+            f"\n   └ 确认价: {alert.get('target_price') or '--'} | "
+            f"失效价: {alert.get('stop_price') or '--'}"
+        )
         lines.append(
             f"{alert['name']}({alert['code']}) {reasons}: "
-            f"现价 {alert['current_price']}，观察收益 {alert['pl_pct']}%{instruction}"
+            f"现价 {alert['current_price']}，观察收益 {alert['pl_pct']}%"
+            f"{price_plan}{instruction}"
         )
     if len(alerts) > 8:
         lines.append(f"另有 {len(alerts) - 8} 条触发记录，请打开观察池查看。")
@@ -1094,9 +1099,13 @@ def auto_prune_watchlist(max_watch_days: int = 15, max_triggered_days: int = 5) 
 
 
 @router.post("/check-triggers")
-def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
-    payload = list_watchlist(status="WATCHING")
-    items = _refresh_items_with_snapshot(payload.get("items", []), require_live_snapshot=True)
+def check_watchlist_triggers(
+    notify: bool = True,
+    notify_target_hits: bool = True,
+) -> Dict[str, Any]:
+    watching = list_watchlist(status="WATCHING").get("items", [])
+    triggered = list_watchlist(status="TRIGGERED").get("items", [])
+    items = _refresh_items_with_snapshot(watching + triggered, require_live_snapshot=True)
     if items is None:
         logger.warning("Watchlist trigger Bark skipped: live market snapshot unavailable.")
         return {
@@ -1110,10 +1119,14 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
 
     for item in items:
         reasons = []
-        if item.get("target_hit"):
-            reasons.append("Brooks入场触发" if item.get("pa_trade_action") else "触达目标价")
         if item.get("stop_hit"):
             reasons.append("触发Brooks失效位" if item.get("pa_trade_action") else "触发失效价")
+            event_state = "INVALIDATED"
+        elif item.get("status") == "WATCHING" and item.get("target_hit"):
+            reasons.append("Brooks入场触发" if item.get("pa_trade_action") else "触达目标价")
+            event_state = "TRIGGERED"
+        else:
+            event_state = ""
         if not reasons:
             continue
         alerts.append({
@@ -1128,16 +1141,20 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
             "pl_pct": item.get("pl_pct"),
             "reasons": reasons,
             "instruction": item.get("operation_instruction") or "",
+            "event_state": event_state,
         })
 
-    notification = _send_trigger_notification(alerts) if notify and alerts else {}
+    notification_alerts = alerts
+    if not notify_target_hits:
+        notification_alerts = [item for item in alerts if item["event_state"] == "INVALIDATED"]
+    notification = _send_trigger_notification(notification_alerts) if notify and notification_alerts else {}
     if alerts:
         try:
             engine = get_db_engine()
             if engine:
                 updates = []
                 for alert in alerts:
-                    is_stop = any("失效" in reason for reason in alert.get("reasons", []))
+                    is_stop = alert.get("event_state") == "INVALIDATED"
                     updates.append({
                         "id": alert["id"],
                         "status": "INVALIDATED" if is_stop else "TRIGGERED",
@@ -1161,7 +1178,7 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
                     """), updates)
                     conn.commit()
                 for alert in alerts:
-                    is_stop = any("失效" in reason for reason in alert.get("reasons", []))
+                    is_stop = alert.get("event_state") == "INVALIDATED"
                     record_lifecycle_event(
                         "WATCHLIST_INVALIDATED" if is_stop else "WATCHLIST_TRIGGERED",
                         source="watchlist_trigger",
@@ -1178,6 +1195,118 @@ def check_watchlist_triggers(notify: bool = True) -> Dict[str, Any]:
         "alerts": alerts,
         "notification": notification,
     }
+
+
+def send_late_watchlist_confirmations(notify: bool = True) -> Dict[str, Any]:
+    """Push only newly actionable late-session watchlist transitions."""
+    engine = get_db_engine()
+    if not engine:
+        return {"bark": False, "count": 0, "reason": "database_unavailable"}
+
+    triggered = list_watchlist(status="TRIGGERED").get("items", [])
+    items = _refresh_items_with_snapshot(triggered, require_live_snapshot=True)
+    if items is None:
+        return {"bark": False, "count": 0, "reason": "live_snapshot_unavailable"}
+
+    review_date = datetime.now().strftime("%Y-%m-%d")
+    confirmed = [
+        item for item in items
+        if not (
+            str(item.get("watch_decision") or "").upper() == "CONFIRMED"
+            and str(item.get("last_review_date") or "") == review_date
+        )
+        and str(item.get("pa_trade_action") or "").upper() == "READY"
+        and str(item.get("execution_state") or "").upper() == "CONFIRM"
+        and str(item.get("market_sentiment_stage") or "").upper() != "RETREAT"
+    ]
+    if not confirmed:
+        return {"bark": False, "count": 0, "reason": "no_actionable_confirmation"}
+
+    lines = [
+        "性质：观察池尾盘确认候选，不自动下单。",
+        "纪律：只允许小仓复核；未站稳确认价、跌破失效价或次日明显高开时不追。",
+        "",
+    ]
+    for item in confirmed[:5]:
+        trigger = item.get("trigger_price") or item.get("target_price") or "--"
+        guard = item.get("guard_price") or item.get("stop_price") or "--"
+        lines.extend([
+            f"{item.get('name', '')}({item.get('code', '')}) 现价 {item.get('current_price', '--')}",
+            f"  确认 >{trigger} | 失效 <{guard}",
+            "  操作：可转模拟盘/小仓复核；禁止追高",
+            "",
+        ])
+    if len(confirmed) > 5:
+        lines.append(f"另有 {len(confirmed) - 5} 只，请打开观察池复核。")
+    try:
+        from core.data import get_stale_cache, format_freshness
+        lines.append(format_freshness(get_stale_cache("market_snapshot")))
+    except Exception:
+        pass
+    body = "\n".join(lines).rstrip()
+
+    if not notify:
+        return {"bark": False, "count": len(confirmed), "body": body, "notification": False}
+    try:
+        delivery = asyncio.run(notifier.send(
+            f"Alpha Vision 观察池尾盘确认 {len(confirmed)} 只",
+            body,
+            channels=["bark"],
+            group="AlphaVision_Watchlist",
+            url="http://localhost:3000",
+        ))
+    except Exception as exc:
+        logger.error(f"Late watchlist confirmation notification error: {exc}")
+        return {"bark": False, "count": len(confirmed), "body": body, "detail": str(exc)}
+
+    updates = [
+        {
+            "id": item["id"],
+            "review_date": review_date,
+            "updated_at": datetime.now(),
+        }
+        for item in confirmed
+    ]
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE watchlist
+                SET watch_decision = 'CONFIRMED',
+                    watch_action = '尾盘站稳确认价，可转模拟盘/小仓复核',
+                    last_review_date = :review_date,
+                    logic_status = 'CONFIRMED',
+                    logic_last_review_at = :updated_at,
+                    updated_at = :updated_at
+                WHERE id = :id
+                  AND status = 'TRIGGERED'
+                  AND NOT (
+                      COALESCE(watch_decision, '') = 'CONFIRMED'
+                      AND last_review_date = :review_date
+                  )
+            """), updates)
+            conn.commit()
+        for item in confirmed:
+            record_lifecycle_event(
+                "WATCHLIST_CONFIRMED",
+                source="watchlist_late_confirmation",
+                code=item.get("code"),
+                name=item.get("name"),
+                watchlist_id=item.get("id"),
+                payload={
+                    "current_price": item.get("current_price"),
+                    "trigger_price": item.get("trigger_price") or item.get("target_price"),
+                    "guard_price": item.get("guard_price") or item.get("stop_price"),
+                },
+            )
+    except Exception as exc:
+        logger.error(f"Late watchlist confirmation state update error: {exc}")
+        return {
+            "bark": bool(delivery.get("bark")),
+            "count": len(confirmed),
+            "body": body,
+            "detail": str(exc),
+        }
+    return {"bark": bool(delivery.get("bark")), "count": len(confirmed), "body": body}
 
 
 @router.post("/add")

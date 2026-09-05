@@ -26,12 +26,14 @@ interface PortfolioStats {
     risk_metrics: RiskMetrics;
     attribution: Attribution;
     sector_distribution: { name: string, value: number }[];
+    by_mode?: Record<'REAL' | 'SIMULATED', PortfolioStats>;
 }
 
 const COLORS = ['#6366f1', '#f43f5e', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4'];
 
 const PortfolioDashboard: React.FC = () => {
     const [stats, setStats] = useState<PortfolioStats | null>(null);
+    const [mode, setMode] = useState<'REAL' | 'SIMULATED'>('REAL');
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
@@ -49,12 +51,24 @@ const PortfolioDashboard: React.FC = () => {
     }, []);
 
     if (loading) return <div className="h-64 flex items-center justify-center"><div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600"></div></div>;
-    if (!stats?.risk_metrics?.equity_curve) return <div className="p-8 text-center text-gray-500">暂无组合分析数据，请先进行模拟交易</div>;
+    if (!stats?.risk_metrics?.equity_curve) return <div className="p-8 text-center text-gray-500">暂无组合分析数据，请先记录交易</div>;
 
-    const metrics = stats.risk_metrics;
+    const activeStats = stats.by_mode?.[mode] || stats;
+    const metrics = activeStats.risk_metrics;
 
     return (
         <div className="space-y-6">
+            <div className="flex justify-end gap-2">
+                {(['REAL', 'SIMULATED'] as const).map(item => (
+                    <button
+                        key={item}
+                        onClick={() => setMode(item)}
+                        className={`rounded-full px-4 py-2 text-xs font-bold ${mode === item ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-500'}`}
+                    >
+                        {item === 'REAL' ? '实盘账本' : '模拟账本'}
+                    </button>
+                ))}
+            </div>
             {/* KPI Cards */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div className="bg-white p-4 rounded-xl border border-gray-100 shadow-sm">
@@ -129,11 +143,11 @@ const PortfolioDashboard: React.FC = () => {
                         <PieIcon size={16} /> 当前持仓分布
                     </h4>
                     <div className="h-64">
-                        {stats.sector_distribution.length > 0 ? (
+                        {activeStats.sector_distribution.length > 0 ? (
                             <ResponsiveContainer width="100%" height="100%">
                                 <PieChart>
                                     <Pie
-                                        data={stats.sector_distribution}
+                                        data={activeStats.sector_distribution}
                                         cx="50%"
                                         cy="50%"
                                         innerRadius={60}
@@ -141,7 +155,7 @@ const PortfolioDashboard: React.FC = () => {
                                         paddingAngle={5}
                                         dataKey="value"
                                     >
-                                        {stats.sector_distribution.map((entry, index) => (
+                                        {activeStats.sector_distribution.map((entry, index) => (
                                             <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                                         ))}
                                     </Pie>
@@ -162,13 +176,13 @@ const PortfolioDashboard: React.FC = () => {
                     <h4 className="text-sm font-bold text-gray-800 mb-4">行业收益归因 (PnL %)</h4>
                     <div className="h-64">
                         <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={stats.attribution.by_industry.slice(0, 8)} layout="vertical">
+                            <BarChart data={activeStats.attribution.by_industry.slice(0, 8)} layout="vertical">
                                 <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f8fafc" />
                                 <XAxis type="number" hide />
                                 <YAxis dataKey="name" type="category" width={80} style={{ fontSize: '10px' }} />
                                 <Tooltip />
                                 <Bar dataKey="total_pnl" name="累计收益" radius={[0, 4, 4, 0]}>
-                                    {stats.attribution.by_industry.map((entry, index) => (
+                                    {activeStats.attribution.by_industry.map((entry, index) => (
                                         <Cell key={`cell-${index}`} fill={entry.total_pnl >= 0 ? '#10b981' : '#f43f5e'} />
                                     ))}
                                 </Bar>
@@ -181,13 +195,13 @@ const PortfolioDashboard: React.FC = () => {
                     <h4 className="text-sm font-bold text-gray-800 mb-4">策略类型收益归因 (PnL %)</h4>
                     <div className="h-64">
                         <ResponsiveContainer width="100%" height="100%">
-                            <BarChart data={stats.attribution.by_strategy} layout="vertical">
+                            <BarChart data={activeStats.attribution.by_strategy} layout="vertical">
                                 <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f8fafc" />
                                 <XAxis type="number" hide />
                                 <YAxis dataKey="name" type="category" width={80} style={{ fontSize: '10px' }} />
                                 <Tooltip />
                                 <Bar dataKey="total_pnl" name="累计收益" radius={[0, 4, 4, 0]}>
-                                    {stats.attribution.by_strategy.map((entry, index) => (
+                                    {activeStats.attribution.by_strategy.map((entry, index) => (
                                         <Cell key={`cell-${index}`} fill={entry.total_pnl >= 0 ? '#6366f1' : '#f43f5e'} />
                                     ))}
                                 </Bar>

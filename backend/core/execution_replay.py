@@ -23,6 +23,28 @@ OPERATION_POLICIES = {
     "no_chase": {"max_open_gap_pct": 1.0, "stop_loss_pct": -6.0, "max_hold_days": 3, "avoid_critical": False},
     "defensive_only": {"max_open_gap_pct": 2.0, "stop_loss_pct": -6.0, "max_hold_days": 3, "avoid_critical": True},
 }
+SOFT_SHADOW_BLOCKER_MARKERS = (
+    "交易计划未确认",
+    "普通tv_dual仅用于发现",
+    "历史信号复活仅观察",
+    "量能未确认",
+    "震荡观察胜率偏低",
+    "周线交易区间",
+)
+
+
+def _soft_blocker_shadow_eligible(
+    candidate: Dict[str, Any], blocker_groups: Dict[str, List[str]], opportunity: float,
+) -> bool:
+    """Allow only reviewed explanation blockers in a non-production replay cohort."""
+    blockers = [str(item) for item in candidate.get("trade_blockers") or []]
+    if not blockers or blocker_groups.get("hard"):
+        return False
+    soft_only = all(
+        any(marker in blocker for marker in SOFT_SHADOW_BLOCKER_MARKERS)
+        for blocker in blockers
+    )
+    return soft_only and opportunity >= 65 and str(candidate.get("pa_trade_action") or "").upper() == "READY"
 
 
 def _load_bark_instruction_events(engine, days: int) -> pd.DataFrame:
@@ -127,7 +149,7 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
 
     policy_returns = {
         "current_policy": [], "hard_wait_a_b_shadow": [], "hard_only_a_b_shadow": [],
-        "persistent_b_shadow": [], "evidence_enforced_simulation": [],
+        "soft_blocker_shadow": [], "persistent_b_shadow": [], "evidence_enforced_simulation": [],
     }
     policy_trades = {key: [] for key in policy_returns}
     executable_returns = {key: [] for key in policy_returns}
@@ -177,6 +199,7 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
             "current_policy": current,
             "hard_wait_a_b_shadow": common and not groups["hard"] and not groups["wait"],
             "hard_only_a_b_shadow": common and not groups["hard"],
+            "soft_blocker_shadow": common and _soft_blocker_shadow_eligible(candidate, groups, opportunity),
             "persistent_b_shadow": persistent_shadow["eligible"],
             "evidence_enforced_simulation": current and evidence_grade in {"A", "B"},
         }
@@ -285,6 +308,13 @@ def build_execution_replay_report(candidates: pd.DataFrame, outcomes: pd.DataFra
             "selected": len(policy_returns["persistent_b_shadow"]),
             "failed_checks": persistent_shadow_failures,
             "note": "连续B级只记录反事实结果，不改变Bark不可交易指令",
+        },
+        "soft_blocker_shadow": {
+            "mode": "SHADOW_ONLY",
+            "selected": len(policy_returns["soft_blocker_shadow"]),
+            "reviewed_markers": list(SOFT_SHADOW_BLOCKER_MARKERS),
+            "production_logic_changed": False,
+            "note": "只影子消融已列明的解释型规则；硬风控、未列明等待项和65分机会阈值保持不变。",
         },
         "policies": policies,
         "portfolio_simulations": portfolio_simulations,
