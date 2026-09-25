@@ -1,5 +1,6 @@
 import os
 import sys
+from datetime import datetime
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -323,3 +324,34 @@ def test_market_regime_uses_realtime_index_pct_for_wording(monkeypatch):
     assert regime["indices"]["上证"]["chg_pct"] == 1.16
     assert regime["indices"]["创业"]["close"] == 4216.7
     assert regime["indices"]["创业"]["chg_pct"] == 0.54
+    assert regime["indices"]["创业"]["trend_label"] in {"站上EMA20", "低于EMA20"}
+    assert isinstance(regime["indices"]["创业"]["ema20_gap_pct"], float)
+    assert regime["trend_basis"] == "双指数相对EMA20"
+
+
+def test_market_baseline_label_distinguishes_preopen_intraday_and_close(monkeypatch):
+    monkeypatch.setattr("core.trading_calendar.is_a_share_trading_day", lambda _now: True)
+
+    assert data._market_baseline_label(datetime(2026, 9, 8, 8, 30)) == "上一交易日收盘状态"
+    assert data._market_baseline_label(datetime(2026, 9, 8, 10, 0)) == "盘中趋势参考"
+    assert data._market_baseline_label(datetime(2026, 9, 8, 15, 30)) == "今日收盘状态"
+
+
+def test_market_regime_route_uses_dashboard_market_pulse(monkeypatch):
+    from routers import market
+
+    pulse = {
+        "status": "DEFENSIVE",
+        "desc": "减仓观望：市场进入震荡/分化期",
+        "indices": {"上证": {"trend": "BULL"}, "创业": {"trend": "BEAR"}},
+        "limit_down_count": 2,
+        "trend_basis": "双指数相对EMA20",
+    }
+    monkeypatch.setattr("core.data.get_market_regime", lambda: pulse)
+
+    result = market.get_market_regime("pine")
+
+    assert result["regime"]["regime"] == "volatile"
+    assert result["regime"]["source"] == "market_pulse_dual_index_ema20"
+    assert result["market_pulse"] == pulse
+    assert result["recommended_params"]["pine_min_signals"] == 3

@@ -76,7 +76,6 @@ def load_pending_next_day_reviews(engine, as_of: date | None = None) -> list[Dic
     for row in snapshots:
         raw = dict(row)
         item = {**_json_object(raw.pop("snapshot_payload", None)), **raw}
-        item["sop_grade"] = item.get("grade")
         item["target_price"] = item.get("a_eod_t1_frozen_target_price") or item.get("pa_target_price")
         item["confirmation_price"] = item.get("a_eod_t1_frozen_entry_price") or item.get("confirmation_price")
         item["stop_price"] = item.get("a_eod_t1_frozen_stop_price") or item.get("stop_price")
@@ -298,7 +297,7 @@ def _body(
     icons = {"CONFIRMED_TRADE": "✅", "CONTINUE_WAIT": "⏳", "NOT_CONFIRMED": "⛔", "NOT_RESELECTED": "⛔"}
     for item in items:
         name = item.get("name") or "--"
-        plan_label = "｜A-EOD-T1" if item.get("a_eod_t1_plan") else ""
+        plan_label = "｜尾盘T1" if item.get("a_eod_t1_plan") else ""
         lines.append(f"{icons.get(item['status'], '⛔')} {name}({item['code']}){plan_label}｜指令：{item['instruction']}")
         price_parts = []
         if item.get("current_price"):

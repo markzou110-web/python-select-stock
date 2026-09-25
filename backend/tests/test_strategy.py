@@ -53,7 +53,7 @@ def test_tv_execution_tier_does_not_promote_different_day_window_to_a():
     assert tier["same_day_dual"] is False
 
 
-def test_tv_execution_profile_blocks_zp_only_and_gates_ma_only():
+def test_tv_execution_profile_softens_zp_only_and_gates_ma_only():
     zp_only = {
         "strategy_type": "tv_dual",
         "tv_execution_tier": "C",
@@ -62,7 +62,7 @@ def test_tv_execution_profile_blocks_zp_only_and_gates_ma_only():
         "effective_market_regime": "OFFENSIVE",
     }
     _apply_trade_execution_profile(zp_only)
-    assert "ZP单信号仅研究观察，禁止自动执行" in zp_only["trade_blockers"]
+    assert "ZP单信号仅研究观察，降低仓位优先级" in zp_only["trade_cautions"]
     assert zp_only["trade_eligible"] is False
 
     ma_only = {
@@ -74,7 +74,7 @@ def test_tv_execution_profile_blocks_zp_only_and_gates_ma_only():
     }
     _apply_trade_execution_profile(ma_only)
     assert "MA单信号价格行为分<60，只观察" in ma_only["trade_blockers"]
-    assert "MA单信号仅进攻市场允许执行" in ma_only["trade_blockers"]
+    assert "MA单信号仅进攻市场允许执行" in ma_only["trade_cautions"]
 
 
 def test_source_aware_tv_exit_signals_follow_declared_next_open_rules(monkeypatch):
@@ -146,6 +146,30 @@ def test_zp_profit_protection_requires_fifteen_percent_activation(monkeypatch):
     )
     assert protected[0]["reason"] == "TV-ZP盈利保护触发EMA20破位"
     assert "下一交易日开盘退出" in protected[0]["suggestion"]
+
+
+def test_exit_signal_warns_when_limit_up_next_day_has_no_follow_through():
+    frame = pd.DataFrame({
+        "开盘": [9.9, 10.2, 11.0],
+        "最高": [10.1, 11.0, 11.05],
+        "最低": [9.8, 10.2, 10.7],
+        "收盘": [10.0, 11.0, 10.8],
+        "成交量": [100_000, 300_000, 220_000],
+        "Vol_MA20": [100_000, 100_000, 100_000],
+        "EMA5": [9.9, 10.2, 10.7],
+        "EMA20": [9.8, 10.0, 10.4],
+    })
+
+    alerts = evaluate_exit_signals(
+        frame,
+        entry_price=9.5,
+        high_since_entry=11.05,
+        code="600001",
+        signal_sources=["ma"],
+    )
+
+    assert alerts[0]["reason"] == "涨停次日未能顺势走高"
+    assert "短期仓" in alerts[0]["suggestion"]
 
 
 def test_tv_reversal_watch_requires_raw_long_daily_b_and_missing_weekly(monkeypatch):

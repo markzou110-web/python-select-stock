@@ -4,13 +4,12 @@ from typing import Any
 
 
 def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
-    """Separate structural grade, observation state, and executable action.
+    """Separate observation state and executable action without letter grades.
 
     This is presentation and audit metadata only; it never changes selection,
     score, or trade eligibility rules.
     """
     for row in results:
-        grade = str(row.get("sop_grade") or "UNKNOWN").upper()
         bucket = str(row.get("trade_bucket") or "OBSERVE").upper()
         raw_blockers = row.get("trade_blockers") or []
         if isinstance(raw_blockers, str):
@@ -19,17 +18,17 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
         pullback = str(row.get("pa_pullback_status") or "").upper()
 
         if row.get("a_eod_controlled_trial") and bool(row.get("trade_eligible")) and bucket == "TRADE":
-            stage, label, action = "A-EOD-TRIAL", "A-EOD级受控交易", "可执行"
+            stage, label, action = "EOD-CONTROLLED-TRIAL", "尾盘受控试仓", "可执行"
         elif row.get("a_minus_trial") and bool(row.get("trade_eligible")) and bucket == "TRADE":
-            stage, label, action = "A--TRIAL", "A-级受控试仓", "可执行"
+            stage, label, action = "EARLY-CONTROLLED-TRIAL", "早期受控试仓", "可执行"
         elif bool(row.get("trade_eligible")) and bucket == "TRADE":
-            stage, label, action = f"{grade}-TRADE", f"{grade}级可交易", "可执行"
-        elif grade == "A" and bucket == "EARLY":
-            stage, label, action = "A-EARLY", "A级提前复核", "小仓复核"
-        elif grade == "A":
-            stage, label, action = "A-STRUCTURE", "A级结构", "等待确认"
+            stage, label, action = "TRADE", "可交易候选", "可执行"
+        elif bucket == "EARLY":
+            stage, label, action = "EARLY-REVIEW", "提前复核", "小仓复核"
+        elif bucket == "BLOCK":
+            stage, label, action = "BLOCKED", "禁止交易", "仅复盘"
         else:
-            stage, label, action = f"{grade}-STRUCTURE", f"{grade}级结构", "仅观察"
+            stage, label, action = "OBSERVE", "结构观察", "仅观察"
 
         if row.get("bottom_discovery_watch_only"):
             bottom_stage = str(row.get("bottom_discovery_stage") or "B0_BASE")
@@ -47,8 +46,6 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
             lifecycle, confirmation = "SECTOR_FOUND", "WAIT_SECTOR_CONFIRMATION"
         elif bucket == "EARLY":
             lifecycle, confirmation = "PULLBACK_VALID", "WAIT_PRICE_CONFIRMATION"
-        elif grade == "A":
-            lifecycle, confirmation = "CORE_CANDIDATE", "WAIT_PRICE_CONFIRMATION"
         else:
             lifecycle, confirmation = "WAITING_CONFIRMATION", "NOT_READY"
 
@@ -68,10 +65,10 @@ def apply_decision_semantics(results: list[dict[str, Any]]) -> None:
             bottom_state = str(row.get("bottom_discovery_stage") or "B0_BASE")
 
         row.update({
-            "grade_stage": stage,
-            "grade_label": label,
-            "grade_action": action,
-            "grade_reason": "；".join(blockers[:2]) or "结构评级与执行状态已分离记录",
+            "decision_stage": stage,
+            "decision_label": label,
+            "decision_action": action,
+            "decision_reason": "；".join(blockers[:2]) or "按策略信号与风控状态生成",
             "decision_lifecycle_state": lifecycle,
             "decision_lifecycle_action": action,
             "confirmation_event_state": confirmation,

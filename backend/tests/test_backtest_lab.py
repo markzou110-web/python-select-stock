@@ -4,6 +4,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -45,7 +46,53 @@ def test_single_stock_backtest_returns_trades_and_equity_curve():
     assert result["summary"]["final_equity"] > 100000
     assert result["trades"][0]["entry_date"] == "2025-05-06"
     assert result["trades"][0]["return_pct"] > 0
-    assert len(result["equity_curve"]) == result["summary"]["signal_count"] + 1
+    assert len(result["equity_curve"]) == len(_pine_fixture())
+
+
+def test_daily_equity_includes_temporary_loss_and_recovers_at_exit(monkeypatch):
+    from core import backtest_lab
+
+    df = _pine_fixture()
+    df[["开盘", "最高", "最低", "收盘"]] = 100.0
+    df["ATR"] = 20.0
+    df.loc[126, ["开盘", "最高", "最低", "收盘"]] = [100, 100, 93, 93]
+    df.loc[127, ["开盘", "最高", "最低", "收盘"]] = [93, 105, 93, 105]
+    monkeypatch.setattr(backtest_lab, "_signal_indices", lambda *_a, **_kw: [125])
+
+    result = run_single_stock_backtest(df, params={
+        "max_hold_days": 2, "stop_loss_pct": -8, "slippage_bps": 0,
+        "position_pct": 0.9, "entry_mode": "signal_close",
+    })
+
+    # 900 shares, 22.50 entry commission, 6,300 unrealized loss.
+    curve = result["equity_curve"]
+    assert curve[126]["equity"] == pytest.approx(93677.50)
+    assert result["summary"]["max_drawdown"] == pytest.approx(-6.32)
+    assert result["trades"][0]["return_pct"] > 0
+    assert curve[-1]["equity"] == result["summary"]["final_equity"]
+    assert curve[127]["equity"] == curve[-1]["equity"]
+
+
+def test_daily_equity_marks_only_shares_owned_before_staged_add(monkeypatch):
+    from core import backtest_lab
+
+    df = _pine_fixture()
+    df[["开盘", "最高", "最低", "收盘"]] = 100.0
+    df["ATR"] = 20.0
+    df.loc[126, ["开盘", "最高", "最低", "收盘"]] = [100, 100, 99, 99]
+    df.loc[127:, ["开盘", "最高", "最低", "收盘"]] = 102.0
+    monkeypatch.setattr(backtest_lab, "_signal_indices", lambda *_a, **_kw: [125])
+
+    result = run_single_stock_backtest(df, params={
+        "max_hold_days": 3, "position_mode": "two_stage_50_50",
+        "position_pct": 0.8, "slippage_bps": 0, "entry_mode": "signal_close",
+    })
+
+    trade = result["trades"][0]
+    assert trade["add_shares"] > 0
+    assert result["equity_curve"][126]["equity"] == pytest.approx(99590)
+    assert result["equity_curve"][127]["equity"] == pytest.approx(100782.35)
+    assert result["equity_curve"][-1]["equity"] == result["summary"]["final_equity"]
 
 
 def test_single_stock_backtest_handles_no_signal():
@@ -78,6 +125,26 @@ def test_next_open_backtest_skips_high_open_signal():
     assert result["summary"]["skipped_high_open"] == 1
     assert result["trades"][0]["signal_date"] == "2025-05-19"
     assert result["trades"][0]["entry_date"] == "2025-05-20"
+
+
+def test_next_open_backtest_uses_signal_day_atr(monkeypatch):
+    from core import backtest_lab
+
+    base = _pine_fixture()
+    monkeypatch.setattr(backtest_lab, "_signal_indices", lambda *_a, **_kw: [125])
+    results = []
+    for entry_day_atr in (0.1, 20.0):
+        df = base.copy()
+        df["ATR"] = 20.0
+        df.loc[125, "ATR"] = 20.0
+        df.loc[126, "ATR"] = entry_day_atr
+        result = run_single_stock_backtest(df, params={
+            "entry_mode": "next_open_confirm", "max_hold_days": 2,
+            "max_open_gap_pct": 3, "slippage_bps": 0,
+        })
+        results.append(result["trades"][0]["exit_reason"])
+
+    assert results[0] == results[1]
 
 
 def test_backtest_skips_suspected_adjustment_gap_trade():
@@ -117,6 +184,71 @@ def test_backtest_applies_slippage_position_and_lot_size():
     assert trade["shares"] % 100 == 0
     assert trade["entry_price"] > trade["raw_entry_price"]
     assert trade["exit_price"] < trade["raw_exit_price"]
+
+
+def test_two_stage_position_adds_second_half_only_after_day_one_confirmation(monkeypatch):
+    from core import backtest_lab
+
+    df = _pine_fixture()
+    monkeypatch.setattr(backtest_lab, "_signal_indices", lambda *_args, **_kwargs: [125])
+    result = run_single_stock_backtest(
+        df,
+        strategy_type="pine",
+        params={
+            "max_hold_days": 5,
+            "position_pct": 1.0,
+            "position_mode": "two_stage_50_50",
+        },
+    )
+
+    trade = result["trades"][0]
+    assert trade["add_date"] == str(df.loc[126, "日期"])[:10]
+    assert trade["initial_shares"] > 0
+    assert trade["add_shares"] > 0
+    assert result["summary"]["added_position_count"] == 1
+    assert result["summary"]["position_mode"] == "two_stage_50_50"
+
+
+def test_two_stage_position_does_not_add_when_first_two_closes_are_weak(monkeypatch):
+    from core import backtest_lab
+
+    df = _pine_fixture()
+    monkeypatch.setattr(backtest_lab, "_signal_indices", lambda *_args, **_kwargs: [125])
+    entry = float(df.loc[125, "收盘"])
+    for idx, close in ((126, entry * 0.995), (127, entry * 0.99)):
+        df.loc[idx, ["开盘", "最高", "最低", "收盘"]] = [close, close * 1.01, close * 0.99, close]
+
+    result = run_single_stock_backtest(
+        df,
+        strategy_type="pine",
+        params={"max_hold_days": 5, "position_mode": "two_stage_50_50"},
+    )
+
+    trade = result["trades"][0]
+    assert trade["add_date"] is None
+    assert trade["add_shares"] == 0
+    assert result["summary"]["added_position_count"] == 0
+
+
+def test_half_peak_profit_exit_releases_when_half_of_peak_profit_is_given_back(monkeypatch):
+    from core import backtest_lab
+
+    df = _pine_fixture()
+    monkeypatch.setattr(backtest_lab, "_signal_indices", lambda *_args, **_kwargs: [125])
+    entry = float(df.loc[125, "收盘"])
+    df.loc[126, ["开盘", "最高", "最低", "收盘"]] = [entry * 1.05, entry * 1.16, entry * 1.04, entry * 1.16]
+    df.loc[127, ["开盘", "最高", "最低", "收盘"]] = [entry * 1.09, entry * 1.10, entry * 1.07, entry * 1.075]
+
+    result = run_single_stock_backtest(
+        df,
+        strategy_type="pine",
+        params={"max_hold_days": 5, "profit_exit_mode": "half_peak_giveback"},
+    )
+
+    trade = result["trades"][0]
+    assert trade["exit_date"] == str(df.loc[127, "日期"])[:10]
+    assert trade["exit_reason"] == "峰值利润回撤一半"
+    assert result["summary"]["profit_exit_mode"] == "half_peak_giveback"
 
 
 # ── 改动 #15：基准 alpha / CAGR ──

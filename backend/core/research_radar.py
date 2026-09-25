@@ -139,7 +139,7 @@ def build_candidate_research_radar(engine, limit: int = 10, force_refresh: bool 
             "partial_targets": sum(1 for item in items if item["errors"]),
         },
         "items": items,
-        "policy": "研究证据只展示，不修改策略分、A级或交易资格",
+        "policy": "研究证据只展示，不修改策略分、交易资格或执行门禁",
     }
     set_cached_data(cache_key, payload)
     return payload

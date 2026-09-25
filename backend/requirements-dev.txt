@@ -1,0 +1,4 @@
+# 仅用于运行测试（pytest 不在生产依赖中）
+# 安装：cd backend && source venv_new/bin/activate && pip install -r requirements-dev.txt
+pytest==9.0.3
+httpx==0.28.1

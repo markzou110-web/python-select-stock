@@ -4,8 +4,11 @@ Replaces print() statements with structured logging.
 """
 import logging
 import sys
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from datetime import datetime
+
+
+LOG_RETENTION_DAYS = 14  # 保留最近 14 天日志，超出自动删除
 
 
 class AlphaVisionFormatter(logging.Formatter):
@@ -55,12 +58,15 @@ def setup_logging(name: str = "alphavision") -> logging.Logger:
     console_handler.setFormatter(AlphaVisionFormatter())
     logger.addHandler(console_handler)
 
-    # File handler for persistent logs
+    # File handler with daily rotation (keeps LOG_RETENTION_DAYS days, then deletes)
     log_dir = Path(__file__).parent.parent / "logs"
     log_dir.mkdir(exist_ok=True)
 
-    file_handler = logging.FileHandler(
-        log_dir / f"alphavision_{datetime.now().strftime('%Y%m%d')}.log"
+    file_handler = TimedRotatingFileHandler(
+        log_dir / "alphavision.log",
+        when="midnight",
+        backupCount=LOG_RETENTION_DAYS,
+        encoding="utf-8",
     )
     file_formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"

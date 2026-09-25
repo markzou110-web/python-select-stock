@@ -9,6 +9,11 @@ from typing import Dict, Any
 
 from core.config import config
 from core.db import save_setting, get_setting
+from core.bark_scan_selection import (
+    BARK_SCAN_STRATEGIES,
+    BARK_TV_OBSERVATION_STRATEGY,
+    normalize_bark_scan_strategy,
+)
 from core.sync_scheduler import SYNC_SCHEDULE_DEFAULT
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -35,6 +40,13 @@ def get_settings_api() -> Dict[str, Any]:
     return {
         "configured": config.is_bark_configured(),
         "bark_key": get_setting("bark_key", ""),
+        "bark_scan_strategy": normalize_bark_scan_strategy(
+            get_setting("bark_scan_strategy", BARK_TV_OBSERVATION_STRATEGY)
+        ),
+        "bark_scan_strategy_options": [
+            {"value": value, **details}
+            for value, details in BARK_SCAN_STRATEGIES.items()
+        ],
         "sentinel_schedule_times": get_setting(
             "sentinel_schedule_times", config.SENTINEL_SCHEDULE_TIMES
         ),
@@ -46,6 +58,11 @@ def get_settings_api() -> Dict[str, Any]:
 def save_settings_api(data: dict):
     if "bark_key" in data:
         save_setting("bark_key", data["bark_key"])
+    if "bark_scan_strategy" in data:
+        strategy = str(data["bark_scan_strategy"] or "").strip()
+        if strategy not in BARK_SCAN_STRATEGIES:
+            raise HTTPException(status_code=400, detail="不支持的 Bark 选股策略")
+        save_setting("bark_scan_strategy", strategy)
     if "sentinel_schedule_times" in data:
         # 修复 R3-6: 校验格式，防止垃圾值静默禁用扫描
         validated = _validate_schedule_times(data["sentinel_schedule_times"])

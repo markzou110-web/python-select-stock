@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { X, Check, Zap, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useMarketStore } from '@/stores/marketStore';
-import type { ScanParams } from '@/stores/scanStore';
+import type { ScanParams, ScanStrategyType } from '@/stores/scanStore';
 
 interface FilterModalProps {
     isOpen: boolean;
@@ -16,9 +16,23 @@ interface FilterModalProps {
 }
 
 export default function FilterModal({ isOpen, onClose, params, setParams, onScan, availableDates = [] }: FilterModalProps) {
-    const showSqueezeParams = params.strategy_type === "tv_dual_strict" || params.strategy_type === "tv_dual" || params.strategy_type === "squeeze" || params.strategy_type === "both";
-    const showPineParams = params.strategy_type === "pine" || params.strategy_type === "both";
-    const showConsensusParams = params.strategy_type === "consensus";
+    const selectedStrategies = params.strategy_types?.length ? params.strategy_types : [params.strategy_type];
+    const hasStrategy = (strategy: ScanStrategyType) => selectedStrategies.includes(strategy);
+    const toggleStrategy = (strategy: ScanStrategyType, overrides: Partial<ScanParams> = {}) => {
+        if (hasStrategy(strategy) && selectedStrategies.length === 1) return;
+        const strategyTypes = hasStrategy(strategy)
+            ? selectedStrategies.filter(item => item !== strategy)
+            : [strategy, ...selectedStrategies];
+        setParams({
+            ...params,
+            ...overrides,
+            strategy_type: strategyTypes[0],
+            strategy_types: strategyTypes,
+        });
+    };
+    const showSqueezeParams = ['tv_dual_strict', 'tv_dual', 'squeeze', 'both'].some(item => hasStrategy(item as ScanStrategyType));
+    const showPineParams = ['pine', 'both'].some(item => hasStrategy(item as ScanStrategyType));
+    const showConsensusParams = hasStrategy('consensus');
     const [recommending, setRecommending] = useState(false);
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [highlightedFields, setHighlightedFields] = useState<string[]>([]);
@@ -161,7 +175,7 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                 <div className="flex shrink-0 items-center justify-between px-5 sm:px-8 py-4 sm:py-5 border-b border-slate-100 bg-slate-50/50">
                     <div>
                         <h2 id="filter-dialog-title" className="text-xl font-bold text-slate-900">高级策略筛选</h2>
-                        <p className="mt-0.5 text-sm text-slate-500">选择策略并调整本次扫描参数</p>
+                        <p className="mt-0.5 text-sm text-slate-500">可同时选择多个策略；至少保留一个</p>
                     </div>
                     <div className="flex items-center gap-3">
                         <button 
@@ -184,6 +198,37 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                     <div className="px-5 sm:px-8 py-4 bg-gradient-to-r from-indigo-50 to-purple-50 border-b border-indigo-100">
                         <FilterItem label="🎯 选择选股策略">
                             <div className="space-y-3">
+                                <div className="rounded-2xl border border-indigo-100 bg-white/80 p-3">
+                                    <p className="text-xs font-bold text-slate-700">多策略匹配关系</p>
+                                    <div className="mt-2 grid grid-cols-2 gap-2" role="group" aria-label="多策略匹配关系">
+                                        {([
+                                            { mode: 'any', label: '或 · 任一命中' },
+                                            { mode: 'all', label: '且 · 全部命中' },
+                                        ] as const).map(({ mode, label }) => (
+                                            <button
+                                                key={mode}
+                                                type="button"
+                                                aria-pressed={params.match_mode === mode}
+                                                onClick={() => setParams({ ...params, match_mode: mode })}
+                                                className={cn(
+                                                    'rounded-xl px-3 py-2 text-sm font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600',
+                                                    params.match_mode === mode
+                                                        ? 'bg-indigo-600 text-white'
+                                                        : 'bg-slate-50 text-slate-600 hover:bg-indigo-50',
+                                                )}
+                                            >
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <p className="mt-2 text-xs text-slate-500">
+                                        {selectedStrategies.length < 2
+                                            ? '仅选一个策略时，两种关系结果相同。'
+                                            : params.match_mode === 'all'
+                                                ? '只显示同时命中所有已选策略的股票；不改变各策略的交易规则。'
+                                                : '显示命中任意一个已选策略的股票。'}
+                                    </p>
+                                </div>
                                 <div className="text-xs font-black uppercase tracking-wider text-slate-500">
                                     正式选股与观察
                                 </div>
@@ -191,10 +236,8 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     <StrategyOption
                                         title="宽松观察池"
                                         description="均线B 或 TV-ZP趋势信号，数量更多"
-                                        active={params.strategy_type === "tv_dual"}
-                                        onClick={() => setParams({
-                                            ...params,
-                                            strategy_type: "tv_dual",
+                                        active={hasStrategy("tv_dual")}
+                                        onClick={() => toggleStrategy("tv_dual", {
                                             threshold: 0.15,
                                             vol_multiplier: 1.3,
                                             rsi_min: 52,
@@ -207,10 +250,8 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     <StrategyOption
                                         title="强确认精选"
                                         description="均线B + TV-ZP趋势信号（非五指标），少而精"
-                                        active={params.strategy_type === "tv_dual_strict"}
-                                        onClick={() => setParams({
-                                            ...params,
-                                            strategy_type: "tv_dual_strict",
+                                        active={hasStrategy("tv_dual_strict")}
+                                        onClick={() => toggleStrategy("tv_dual_strict", {
                                             threshold: 0.12,
                                             vol_multiplier: 1.5,
                                             rsi_min: 55,
@@ -223,10 +264,8 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     <StrategyOption
                                         title="放量突破"
                                         description="高低点结构 + 放量大阳线"
-                                        active={params.strategy_type === "consensus"}
-                                        onClick={() => setParams({
-                                            ...params,
-                                            strategy_type: "consensus",
+                                        active={hasStrategy("consensus")}
+                                        onClick={() => toggleStrategy("consensus", {
                                             vol_multiplier: 1.8,
                                         })}
                                         icon="💎"
@@ -234,10 +273,8 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     <StrategyOption
                                         title="早期性价比"
                                         description="20日低点+10%~20%，板块刚启动"
-                                        active={params.strategy_type === "early_value"}
-                                        onClick={() => setParams({
-                                            ...params,
-                                            strategy_type: "early_value",
+                                        active={hasStrategy("early_value")}
+                                        onClick={() => toggleStrategy("early_value", {
                                             threshold: 0.15,
                                             vol_multiplier: 1.05,
                                             rsi_min: 50,
@@ -245,15 +282,13 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                             use_rs_filter: false,
                                             use_weekly: false,
                                         })}
-                                        icon="A-"
+                                        icon="✓"
                                     />
                                     <StrategyOption
                                         title="底部起涨发现"
                                         description="60日低位缩量止跌与首次转强；仅观察"
-                                        active={params.strategy_type === "bottom_discovery"}
-                                        onClick={() => setParams({
-                                            ...params,
-                                            strategy_type: "bottom_discovery",
+                                        active={hasStrategy("bottom_discovery")}
+                                        onClick={() => toggleStrategy("bottom_discovery", {
                                             min_data_days: 80,
                                             threshold: 0.15,
                                             vol_multiplier: 0.5,
@@ -264,6 +299,13 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         })}
                                         icon="B0"
                                     />
+                                    <StrategyOption
+                                        title="周线四形态观察"
+                                        description="已完成周线的四类形态；仅观察，不触发买入"
+                                        active={hasStrategy("weekly_four_patterns")}
+                                        onClick={() => toggleStrategy("weekly_four_patterns")}
+                                        icon="周"
+                                    />
                                 </div>
                                 <details className="rounded-2xl border border-indigo-100 bg-white/60 p-3">
                                     <summary className="cursor-pointer select-none text-xs font-black uppercase tracking-wider text-indigo-600">
@@ -273,50 +315,57 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         <StrategyOption
                                             title="均线粘合（单策略）"
                                             description="仅检查TV均线B信号"
-                                            active={params.strategy_type === "squeeze"}
-                                            onClick={() => setParams({ ...params, strategy_type: "squeeze" })}
+                                            active={hasStrategy("squeeze")}
+                                            onClick={() => toggleStrategy("squeeze")}
                                             icon="📊"
                                         />
                                         <StrategyOption
                                             title="五指标投票共振"
                                             description="RF、ST、RQK、HalfTrend、QQE至少3项"
-                                            active={params.strategy_type === "pine"}
-                                            onClick={() => setParams({ ...params, strategy_type: "pine" })}
+                                            active={hasStrategy("pine")}
+                                            onClick={() => toggleStrategy("pine")}
                                             icon="🚀"
                                         />
                                         <StrategyOption
                                             title="TV-ZP趋势信号"
                                             description="RF主导 + Volume/QQE确认"
-                                            active={params.strategy_type === "tv_zp"}
-                                            onClick={() => setParams({ ...params, strategy_type: "tv_zp" })}
+                                            active={hasStrategy("tv_zp")}
+                                            onClick={() => toggleStrategy("tv_zp")}
                                             icon="ZP"
                                         />
                                         <StrategyOption
                                             title="均线 + 五指标共振"
                                             description="均线粘合 + 五指标投票（不是ZP双确认）"
-                                            active={params.strategy_type === "both"}
-                                            onClick={() => setParams({ ...params, strategy_type: "both" })}
+                                            active={hasStrategy("both")}
+                                            onClick={() => toggleStrategy("both")}
                                             icon="🔥"
+                                        />
+                                        <StrategyOption
+                                            title="H2 二次入场"
+                                            description="多头趋势双腿回调后向上突破；弱H2仅观察"
+                                            active={hasStrategy("h2")}
+                                            onClick={() => toggleStrategy("h2")}
+                                            icon="H2"
                                         />
                                         <StrategyOption
                                             title="HTF 高位收敛"
                                             description="强势上涨后高位窄幅缩量；SHADOW研究"
-                                            active={params.strategy_type === "high_tight_flag"}
-                                            onClick={() => setParams({ ...params, strategy_type: "high_tight_flag", min_data_days: 80 })}
+                                            active={hasStrategy("high_tight_flag")}
+                                            onClick={() => toggleStrategy("high_tight_flag", { min_data_days: 80 })}
                                             icon="HTF"
                                         />
                                         <StrategyOption
                                             title="20日新高基准"
                                             description="突破前20日高点并通过流动性过滤；SHADOW研究"
-                                            active={params.strategy_type === "turtle_breakout"}
-                                            onClick={() => setParams({ ...params, strategy_type: "turtle_breakout", min_data_days: 80 })}
+                                            active={hasStrategy("turtle_breakout")}
+                                            onClick={() => toggleStrategy("turtle_breakout", { min_data_days: 80 })}
                                             icon="T20"
                                         />
                                         <StrategyOption
                                             title="涨停后洗盘"
                                             description="前日封板、放量换手且支撑未破；SHADOW研究"
-                                            active={params.strategy_type === "limit_up_shakeout"}
-                                            onClick={() => setParams({ ...params, strategy_type: "limit_up_shakeout", min_data_days: 80 })}
+                                            active={hasStrategy("limit_up_shakeout")}
+                                            onClick={() => toggleStrategy("limit_up_shakeout", { min_data_days: 80 })}
                                             icon="ZT"
                                         />
                                     </div>

@@ -20,7 +20,8 @@ class ConnectionManager:
             self.pubsub.subscribe('scan_progress')
             self.redis_available = True
         except Exception as e:
-            print(f"Warning: Redis is unavailable. WebSockets cross-process might fail. {e}")
+            from .logging_config import logger
+            logger.warning(f"Redis is unavailable. WebSockets cross-process might fail. {e}")
             self.redis_client = None
             self.pubsub = None
             self.redis_available = False

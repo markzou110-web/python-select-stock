@@ -32,7 +32,6 @@ def classify_post_limit_state(row: Dict[str, Any]) -> str:
     if (
         _num(row.get("limit_up_streak")) > 0
         or bool(row.get("frozen_confirmation_triggered"))
-        or _num(row.get("pct_5d")) >= 15
     ):
         return "WAIT_FIRST_TRADABLE_PULLBACK"
     return "EVENT_DISCOVERY"

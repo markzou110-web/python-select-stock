@@ -98,7 +98,8 @@ def get_market_regime() -> Dict[str, Any]:
     realtime_index_alias = {"上证": "上证", "创业": "创业板"}
     realtime_indices = {}
     states = {}
-    
+    raw_index_frames = {}
+
     try:
         try:
             realtime_indices = get_index_data()
@@ -121,6 +122,7 @@ def get_market_regime() -> Dict[str, Any]:
             df = resilient_fetch([_fetch_sina, _fetch_tx, _fetch_em], timeout=15, label=f"regime_{name}")
             if df is None or df.empty:
                 continue
+            raw_index_frames[name] = df
             
             # 统一列名：新浪源和腾讯源列名是 close，东财源是 收盘
             close_col = 'close' if 'close' in df.columns else '收盘'
@@ -148,6 +150,8 @@ def get_market_regime() -> Dict[str, Any]:
                 "close": round(close, 2),
                 "ema20": round(ema20, 2),
                 "trend": "BULL" if close > ema20 else "BEAR",
+                "trend_label": "站上EMA20" if close > ema20 else "低于EMA20",
+                "ema20_gap_pct": round((close / ema20 - 1) * 100, 2) if ema20 > 0 else None,
                 "chg_pct": chg_pct,
             }
         
@@ -178,16 +182,144 @@ def get_market_regime() -> Dict[str, Any]:
                 status = "DEFENSIVE"
                 desc = f"宽度降级·减仓观望：跌停 {limit_down_count} 家（指数失真，市场宽度恶化）"
 
+        # 周线MACD顶背离（《交易之路》：大小同涨但中期顶背离 → 持有不追）。
+        # 双指数同现顶背离时 OFFENSIVE 降级为 DEFENSIVE（只降不升，数据不足不降）。
+        weekly_macd_divergence = False
+        try:
+            from core.market_regime import (
+                detect_weekly_macd_top_divergence,
+                to_daily_close_series,
+            )
+            divergence_flags = [
+                detect_weekly_macd_top_divergence(to_daily_close_series(raw_index_frames.get(name)))
+                for name in ("上证", "创业")
+            ]
+            weekly_macd_divergence = len(divergence_flags) == 2 and all(divergence_flags)
+            if weekly_macd_divergence and status == "OFFENSIVE":
+                status = "DEFENSIVE"
+                desc = "周线MACD顶背离·持有不追：双指数同现顶背离，减仓观望"
+        except Exception as exc:
+            logger.debug(f"Weekly MACD divergence check skipped (fail-open): {exc}")
+
+        seasonality_note = None
+        try:
+            from core.market_regime import get_seasonality_note
+            seasonality_note = get_seasonality_note()
+        except Exception:
+            pass
+
         return {
             "status": status,
             "desc": desc,
             "indices": states,
             "limit_down_count": limit_down_count,
+            "weekly_macd_divergence": weekly_macd_divergence,
+            "seasonality_note": seasonality_note,
+            "baseline_label": _market_baseline_label(),
+            "trend_basis": "双指数相对EMA20",
             "updated_at": datetime.now().strftime('%H:%M:%S')
         }
     except Exception as e:
         logger.error(f"Error getting market regime: {e}")
         return {"status": "UNKNOWN", "desc": "数据获取失败", "indices": {}, "limit_down_count": None, "updated_at": ""}
+
+
+def get_snapshot_daily_bar(code: str, snapshot: Optional[pd.DataFrame] = None) -> Optional[Dict[str, Any]]:
+    """把全市场实时快照转换为"当日日K"，用于校正 daily_k 中的部分/过期行。
+
+    背景：盘中 12:10 的同步会把半日部分数据写入 daily_k，收盘后的最终化同步
+    若错过（如进程在 18:00 未运行），图表会一直画半日数据而头部实时价已更新。
+    本函数提供权威的当日 OHLCV（收盘后 quote_time 对应的即为终值）。
+    快照缺失/字段无效返回 None（fail-open，不改动任何数据）。
+    """
+    try:
+        frame = snapshot if snapshot is not None else get_market_snapshot()
+        if frame is None or getattr(frame, "empty", True) or "code" not in frame.columns:
+            return None
+        match = frame[frame["code"] == code]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+
+        def _num(key: str, default: float = 0.0) -> float:
+            try:
+                value = float(row.get(key))
+                return value if value > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        price = _num("price")
+        if price <= 0:
+            return None
+        quote_time = str(row.get("quote_time") or "")
+        if len(quote_time) >= 8 and quote_time[:8].isdigit():
+            bar_date = f"{quote_time[0:4]}-{quote_time[4:6]}-{quote_time[6:8]}"
+        else:
+            bar_date = datetime.now().strftime("%Y-%m-%d")
+        low = _num("low")
+        return {
+            "date": bar_date,
+            "open": _num("open", price),
+            "high": max(_num("high"), price),
+            "low": min(low, price) if low > 0 else price,
+            "close": price,
+            "vol": _num("vol"),
+        }
+    except Exception as exc:
+        logger.debug(f"snapshot daily bar unavailable for {code} (fail-open): {exc}")
+        return None
+
+
+SNAPSHOT_BAR_COLUMN_MAP = {"open": "开盘", "high": "最高", "low": "最低", "close": "收盘", "vol": "成交量"}
+
+
+def apply_snapshot_bar_to_frame(
+    df: Optional[pd.DataFrame],
+    bar: Optional[Dict[str, Any]],
+    date_col: str = "日期",
+) -> bool:
+    """把实时快照的当日 OHLCV 写回日线 DataFrame 的最后一行（仅当日期匹配）。
+
+    用途：daily_k 的当日行可能是午间半日部分数据（收盘后的最终化同步若错过），
+    不校正会导致 K线、指标、价格行为分析与头部实时价不一致。
+    open/close 以快照为准，high/low 取更极端值，vol 仅在快照值>0 时替换。
+    返回是否写回；数据缺失/日期不匹配/异常时保持原样（fail-open）。
+    """
+    if df is None or getattr(df, "empty", True) or not bar or date_col not in df.columns:
+        return False
+    try:
+        if str(df.iloc[-1][date_col])[:10] != str(bar.get("date") or ""):
+            return False
+        idx = df.index[-1]
+        for key, column in SNAPSHOT_BAR_COLUMN_MAP.items():
+            if column not in df.columns:
+                continue
+            value = float(bar.get(key) or 0)
+            if value <= 0:
+                continue
+            current = float(df.at[idx, column]) if pd.notna(df.at[idx, column]) else 0.0
+            if key == "high":
+                value = max(current, value)
+            elif key == "low":
+                value = min(current if current > 0 else value, value)
+            df.at[idx, column] = round(value, 2) if key != "vol" else float(value)
+        return True
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.debug(f"snapshot bar patch skipped (fail-open): {exc}")
+        return False
+
+
+def _market_baseline_label(now: Optional[datetime] = None) -> str:
+    """Describe whether the market pulse is pre-open, intraday, or post-close."""
+    now = now or datetime.now()
+    from core.trading_calendar import is_a_share_trading_day
+
+    clock = (now.hour, now.minute)
+    if not is_a_share_trading_day(now) or clock < (9, 25):
+        return "上一交易日收盘状态"
+    if clock <= (15, 5):
+        return "盘中趋势参考"
+    return "今日收盘状态"
 
 # --- 统一根据配置禁用代理 ---
 from core.config import config
@@ -661,6 +793,87 @@ def sync_stock(code: str, name: str, engine=None) -> bool:
     except Exception as e:
         logger.error(f"sync_stock Error ({code}): {e}")
         return False
+
+
+def ensure_turnover_history(code: str, frame: pd.DataFrame, engine=None) -> pd.DataFrame:
+    """Backfill one viewed stock when local history lacks usable turnover data."""
+    if not validate_stock_code(code) or frame is None or frame.empty:
+        return frame
+    recent = frame.tail(120)
+    if '换手率' in recent.columns and float(recent['换手率'].notna().mean()) >= 0.8:
+        return frame
+
+    cache_key = f"chip_turnover_fetch:{code}"
+    cached = get_cached_data(cache_key, 3600)
+    if isinstance(cached, pd.DataFrame):
+        return cached
+    if cached is False:
+        return frame
+    start_date = (datetime.now() - timedelta(days=450)).strftime("%Y%m%d")
+
+    def _fetch_sina_history():
+        """Sina daily bars are a resilient fallback; derive turnover from float cap."""
+        import json
+        import re
+
+        snapshot = get_market_snapshot()
+        match = snapshot[snapshot.get('code', pd.Series(dtype=str)).astype(str) == code] if not snapshot.empty else pd.DataFrame()
+        if match.empty:
+            raise ValueError("current market cap unavailable")
+        quote = match.iloc[0]
+        current_price = pd.to_numeric(quote.get('price'), errors='coerce')
+        market_cap = pd.to_numeric(quote.get('float_mkt_cap'), errors='coerce')
+        if pd.isna(market_cap) or market_cap <= 0:
+            market_cap = pd.to_numeric(quote.get('mkt_cap'), errors='coerce')
+        current_price = float(current_price) if pd.notna(current_price) else 0.0
+        market_cap = float(market_cap) if pd.notna(market_cap) else 0.0
+        shares = market_cap / current_price if current_price > 0 else 0
+        if shares <= 0:
+            raise ValueError("current market cap unavailable")
+        market_prefix = "sh" if code.startswith(('5', '6', '9')) else "sz"
+        url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_data=/CN_MarketDataService.getKLineData"
+        response = requests.get(
+            url,
+            params={"symbol": f"{market_prefix}{code}", "scale": "240", "ma": "no", "datalen": "500"},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        match_json = re.search(r"=\((\[.*\])\)", response.text, re.S)
+        if not match_json:
+            raise ValueError("Sina returned invalid K-line payload")
+        rows = json.loads(match_json.group(1))
+        result = pd.DataFrame(rows).rename(columns={
+            "day": "日期", "open": "开盘", "high": "最高", "low": "最低", "close": "收盘",
+        })
+        result["成交量"] = pd.to_numeric(result["volume"], errors="coerce") / 100.0
+        result["换手率"] = pd.to_numeric(result["volume"], errors="coerce") / shares * 100.0
+        result["日期"] = pd.to_datetime(result["日期"], errors="coerce").dt.date
+        result = result[["日期", "开盘", "最高", "最低", "收盘", "成交量", "换手率"]]
+        return result[result["日期"] >= pd.Timestamp(start_date).date()]
+
+    def _fetch_eastmoney_history():
+        return ak.stock_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date=start_date,
+            adjust="qfq",
+        )
+
+    fetched = resilient_fetch([_fetch_sina_history, _fetch_eastmoney_history], timeout=8, label=f"chip_turnover_{code}")
+    usable = (
+        isinstance(fetched, pd.DataFrame)
+        and not fetched.empty
+        and '换手率' in fetched.columns
+        and float(fetched['换手率'].notna().mean()) >= 0.8
+    )
+    if not usable:
+        set_cached_data(cache_key, False)
+        logger.warning(f"Chip distribution unavailable for {code}: historical turnover fetch failed.")
+        return frame
+    save_to_db(fetched, code, engine=engine)
+    set_cached_data(cache_key, fetched)
+    return fetched
 
 def get_index_data() -> Dict[str, Dict[str, float]]:
     """获取主要指数实时行情 (容灾多源 + 缓存)"""

@@ -34,7 +34,8 @@ import {
 } from 'lucide-react';
 import { clampScore, cn } from '@/lib/utils';
 import api from '@/lib/api';
-import SplitKLineCharts from './SplitKLineCharts';
+import { getEffectiveStopPrice, getQuoteSourceLabel } from '@/lib/tradingLevels';
+import SplitKLineCharts, { ChipDistribution } from './SplitKLineCharts';
 
 interface StockDetailPageProps {
     code: string;
@@ -72,7 +73,16 @@ interface FullAnalysisData {
         action_label: string;
     };
     price_action?: any;
+    price_action_markers?: any[];
     price_action_lines?: any[];
+    trend_phases?: Array<{ time: string; phase: string; action?: string }>;
+    chart_hints?: Array<{ level: string; text: string }>;
+    trade_projection?: {
+        key_levels?: Array<{ label: string; price: number }>;
+        scenarios?: Array<{ name: string; offsets: number[]; values: number[] }>;
+        note?: string;
+    } | null;
+    chip_distribution?: ChipDistribution;
     money_flow?: MoneyFlowData;
 }
 
@@ -283,7 +293,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const isMainMoneyFlow = moneyFlow.flow_metric === 'main_net_inflow'
         || (!moneyFlow.flow_metric && !String(moneyFlow.source || '').startsWith('ths_'));
     const moneyDirectionLabel = isMainMoneyFlow ? '主力资金' : '资金净额';
-    const activeStopPrice = info.active_stop_price || info.stop_price || 0;
+    const activeStopPrice = getEffectiveStopPrice(info) || 0;
     const chartStrategy = data.signals?.strategy_type || info.chart_strategy_type || info.strategy_type || 'squeeze';
     const strategyLabels: Record<string, string> = {
         squeeze: '均线粘合（单策略）',
@@ -294,11 +304,8 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     };
     const buySignalCount = data.signals?.buy_count ?? data.signals?.buy_signals?.length ?? 0;
     const sellSignalCount = data.signals?.sell_count ?? data.signals?.sell_signals?.length ?? 0;
-    const priceSourceLabel = info.price_source === 'realtime_snapshot'
-        ? '实时快照'
-        : info.price_source === 'paper_cached_price'
-            ? '持仓缓存价'
-            : '日线收盘价';
+    const priceSourceLabel = getQuoteSourceLabel(info.price_source, info.price_updated_at);
+    const isLiveQuote = priceSourceLabel === '实时行情';
     const paExecutionStage = info.pa_execution_stage || (
         data.price_action?.pa_trade_plan?.action === 'READY' ? 'SETUP_READY' : 'WAITING_SETUP'
     );
@@ -443,21 +450,19 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                             <span
                                 className={cn(
                                     "text-[10px] font-bold px-2 py-0.5 rounded-full border inline-flex items-center gap-1",
-                                    info.price_source === 'realtime_snapshot'
+                                    isLiveQuote
                                         ? "text-emerald-600 bg-emerald-50 border-emerald-200"
                                         : "text-slate-400 bg-slate-50 border-slate-200"
                                 )}
                                 title={`价格来源：${priceSourceLabel}${info.price_updated_at ? ` · ${info.price_updated_at}` : ''}`}
                             >
-                                {info.price_source === 'realtime_snapshot' && (
+                                {isLiveQuote && (
                                     <span className="relative flex h-1.5 w-1.5">
                                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                                         <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
                                     </span>
                                 )}
-                                {info.price_source === 'realtime_snapshot'
-                                    ? `实时${info.price_updated_at ? ' ' + info.price_updated_at.slice(11, 19) : ''}`
-                                    : '收盘价'}
+                                {priceSourceLabel}{info.price_updated_at ? ` ${info.price_updated_at.slice(11, 19)}` : ''}
                             </span>
                             <span className={cn(
                                 "text-sm font-black px-2 py-0.5 rounded-lg",
@@ -519,15 +524,15 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                 <div className="w-px h-4 bg-slate-200" />
                                 <div className="flex items-center gap-1.5">
                                     <div className="w-3 h-0.5 bg-indigo-500 border-t border-dashed border-indigo-500" />
-                                    <span className="text-[10px] font-bold text-indigo-500">买入价</span>
+                                    <span className="text-[10px] font-bold text-indigo-500">持仓成本</span>
                                 </div>
                                 <div className="flex items-center gap-1.5">
                                     <div className="w-3 h-0.5 bg-rose-500 border-t border-dashed border-rose-500" />
-                                    <span className="text-[10px] font-bold text-rose-500">实时持仓风控线</span>
+                                    <span className="text-[10px] font-bold text-rose-500">执行风控/结构失效</span>
                                 </div>
                                 <div className="flex items-center gap-1.5">
                                     <div className="w-3 h-0.5 bg-emerald-500 border-t border-dashed border-emerald-500" />
-                                    <span className="text-[10px] font-bold text-emerald-500">止盈价</span>
+                                    <span className="text-[10px] font-bold text-emerald-500">第一止盈目标</span>
                                 </div>
                             </>
                         )}
@@ -553,8 +558,13 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                     buySignals={data.signals?.buy_signals || []}
                     sellSignals={data.signals?.sell_signals || []}
                     strategySignalSets={data.signals?.strategy_sets || {}}
+                    markers={data.price_action_markers || []}
                     priceAction={data.price_action}
                     priceActionLines={data.price_action_lines || []}
+                    trendPhases={data.trend_phases || []}
+                    chartHints={data.chart_hints || []}
+                    tradeProjection={data.trade_projection || null}
+                    chipDistribution={data.chip_distribution || null}
                     riskLevels={info}
                     paperLines={info.is_paper_trade ? [
                         { price: info.buy_price, label: '买入价', color: '#6366f1', date: info.entry_date },
@@ -656,6 +666,21 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                         {data.price_action.pa_multi_timeframe_score != null ? ` · ${data.price_action.pa_multi_timeframe_score}分` : ''}
                                     </span>
                                 )}
+                                {data.price_action.pa_monthly_state !== 'UNAVAILABLE' && data.price_action.pa_monthly_trend && (
+                                    <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 rounded-full border border-indigo-100" title={`已完成月线截至 ${data.price_action.pa_monthly_as_of}，仅供研究`}>
+                                        月线：{data.price_action.pa_monthly_trend}
+                                    </span>
+                                )}
+                                {data.price_action.pa_weekly_position_state !== 'UNAVAILABLE' && data.price_action.pa_weekly_position && (
+                                    <span className="px-2 py-0.5 bg-amber-50 text-amber-700 rounded-full border border-amber-100" title={`已完成周线截至 ${data.price_action.pa_weekly_position_as_of}，仅供研究`}>
+                                        周线位置：{data.price_action.pa_weekly_position}
+                                    </span>
+                                )}
+                                {data.price_action.pa_weekly_pattern_signals?.map((signal: string) => (
+                                    <span key={signal} className="px-2 py-0.5 bg-amber-50 text-amber-700 rounded-full border border-amber-100" title={`已完成周线截至 ${data.price_action.pa_weekly_position_as_of}；观察标签，非买入信号`}>
+                                        周线观察：{signal}
+                                    </span>
+                                ))}
                                 {data.price_action.pa_volume_pattern && data.price_action.pa_volume_pattern !== '量能中性' && (
                                     <span className={cn(
                                         "px-2 py-0.5 rounded-full border",
@@ -737,6 +762,13 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                             <div className="flex flex-wrap gap-1.5 lg:max-w-md">
                                 {info.trade_blockers.slice(0, 4).map((reason: string, idx: number) => (
                                     <span key={idx} className="text-[10px] px-2 py-0.5 bg-rose-50 text-rose-600 rounded-full font-bold border border-rose-100">{reason}</span>
+                                ))}
+                            </div>
+                        )}
+                        {Array.isArray(info.trade_cautions) && info.trade_cautions.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 lg:max-w-md">
+                                {info.trade_cautions.slice(0, 3).map((reason: string, idx: number) => (
+                                    <span key={idx} className="text-[10px] px-2 py-0.5 bg-amber-50 text-amber-600 rounded-full font-bold border border-amber-100" title="弱条件降级：不拦截交易，仅扣分/缩仓">{reason}</span>
                                 ))}
                             </div>
                         )}
@@ -1065,7 +1097,7 @@ function StockResearchCard({
                         </div>
                         <p className="mt-1 text-base font-black text-slate-800">{summary.label || (loading ? '正在加载研究证据' : '暂无研究结论')}</p>
                         <p className="mt-1 text-xs font-semibold text-slate-500">
-                            仅作证据展示，不参与A级、交易分或买卖资格计算
+                            仅作证据展示，不参与交易分或买卖资格计算
                             {data?.updated_at ? ` · ${String(data.updated_at).slice(0, 19)}` : ''}
                         </p>
                     </div>
@@ -1088,11 +1120,11 @@ function StockResearchCard({
                         <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">证据质量</div>
                         <div className={cn(
                             "mt-1 text-lg font-black",
-                            ['A', 'B'].includes(quality.grade || '') ? 'text-emerald-600' :
-                                quality.grade === 'C' ? 'text-amber-600' :
-                                    ['D', 'F'].includes(quality.grade || '') ? 'text-rose-600' : 'text-slate-500'
-                        )}>{quality.grade || 'UNRATED'} · {quality.status || 'NOT_ASSESSED'}</div>
-                        <p className="mt-1 text-xs font-bold text-slate-500">{quality.summary || '暂无评级说明'}</p>
+                            quality.status === 'PASS' ? 'text-emerald-600' :
+                                quality.status === 'DEGRADED' ? 'text-amber-600' :
+                                    quality.status === 'BLOCKED' ? 'text-rose-600' : 'text-slate-500'
+                        )}>{quality.status || 'NOT_ASSESSED'}</div>
+                        <p className="mt-1 text-xs font-bold text-slate-500">{quality.summary || '暂无质量说明'}</p>
                     </div>
                     <EvidenceMemoList title="看多依据" items={bullCase} tone="bull" />
                     <EvidenceMemoList title="主要反证" items={bearCase} tone="bear" />

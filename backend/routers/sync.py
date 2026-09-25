@@ -40,6 +40,11 @@ def background_sync_task():
         sync_progress["status_text"] = "正在初始化板块映射..."
 
     try:
+        try:
+            from core.db import save_setting
+            save_setting("last_market_sync_at", datetime.now().isoformat(timespec="seconds"))
+        except Exception:
+            pass
         from core.multi_source_sync import MultiSourceSync, SYNC_MAX_WORKERS
         from core.db import get_db_engine, init_db
 

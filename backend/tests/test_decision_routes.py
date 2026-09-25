@@ -461,6 +461,30 @@ def test_scan_task_result_is_celery_json_serializable(monkeypatch):
     dumps(result)
 
 
+def test_scan_task_combines_multiple_strategies_and_records_matches(monkeypatch):
+    calls = []
+
+    def fake_scan(**kwargs):
+        strategy = kwargs["strategy_type"]
+        calls.append((strategy, kwargs["publish_to_sentinel"]))
+        score = 70 if strategy == "consensus" else 60
+        return [{"代码": "000001", "名称": "平安银行", "strategy_type": strategy, "Score": score}]
+
+    monkeypatch.setattr("core.scanner.perform_market_scan", fake_scan)
+    monkeypatch.setattr(scan, "record_lifecycle_event", lambda *args, **kwargs: None)
+
+    result = scan.run_market_scan_task(
+        strategy_type="h2",
+        strategy_types="h2,consensus",
+    )
+
+    assert calls == [("h2", False), ("consensus", False)]
+    assert len(result) == 1
+    assert result[0]["strategy_type"] == "consensus"
+    assert result[0]["Score"] == 70
+    assert result[0]["matched_strategies"] == ["h2", "consensus"]
+
+
 def test_watchlist_rejects_invalid_stock_code():
     with pytest.raises(HTTPException) as exc:
         watchlist.add_watchlist_item({"code": "abc", "watch_price": 10})

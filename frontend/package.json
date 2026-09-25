@@ -6,15 +6,18 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:risk-lines": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/tradingLevels.test.mjs",
+    "test:signal-display": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/signalDisplay.test.mjs",
+    "test:dow-phase": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test tests/dowPhase.test.mjs"
   },
   "dependencies": {
-    "axios": "^1.16.0",
+    "axios": "^1.20.0",
     "clsx": "^2.1.1",
     "framer-motion": "^12.23.26",
     "lightweight-charts": "^5.1.0",
     "lucide-react": "^0.562.0",
-    "next": "^16.2.10",
+    "next": "^16.3.5",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "recharts": "^3.6.0",
@@ -28,7 +31,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "^16.2.10",
+    "eslint-config-next": "^16.3.5",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

@@ -20,6 +20,7 @@ class DailyK(Base):
     low = Column(Float)
     close = Column(Float)
     vol = Column(Float)
+    turnover = Column(Float, nullable=True)
 
 class ScanHistory(Base):
     __tablename__ = "scan_history"

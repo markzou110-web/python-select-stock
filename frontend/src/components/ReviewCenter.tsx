@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, CalendarDays, Copy, Download, Globe2, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
+import { Activity, BarChart3, Bot, CalendarDays, Copy, Download, Globe2, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -229,7 +229,6 @@ type DailyStrategyReport = {
         code?: string;
         name?: string;
         industry?: string;
-        grade?: string;
         bucket?: string;
         score?: number;
         blockers?: string[];
@@ -241,6 +240,20 @@ type DailyStrategyReport = {
         scan_candidate_count?: number;
     }>;
     next_actions?: string[];
+    ai_review?: {
+        status?: string;
+        model?: string | null;
+        source?: string | null;
+        market_summary?: string | null;
+        counts?: Record<string, number>;
+        top_analyses?: Array<{
+            code?: string;
+            name?: string;
+            action?: string;
+            confidence?: number;
+            summary?: string;
+        }>;
+    };
 };
 
 type ResearchContext = {
@@ -276,12 +289,6 @@ type SignalPerformanceItem = {
     signal_id?: string;
     code?: string;
     name?: string;
-    grade?: string;
-    sop_base_grade?: string;
-    sop_quality_score?: number;
-    display_quality_score?: number;
-    sop_quality_gap_to_a?: number;
-    sop_grade_reason?: string;
 };
 
 type SignalPerformancePayload = {
@@ -428,6 +435,26 @@ export default function ReviewCenter() {
             <CalibrationCard data={calibration} />
 
             <ExecutionReplayCard data={executionReplay} />
+
+            <div className="glass-card p-5">
+                <h3 className="font-black text-slate-800">月线／周线／日线影子对照</h3>
+                <p className="text-xs text-slate-500 mt-1">仅比较同批策略候选，不改变当前选股分类、仓位或卖出规则。</p>
+                {(data?.timeframe_shadow?.tagged_candidates || 0) === 0 ? (
+                    <p className="text-sm text-slate-500 mt-4">暂无带新标签的成熟扫描样本；后续扫描会开始积累。</p>
+                ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3 mt-4">
+                        {(data.timeframe_shadow.arms || []).map((arm: any) => (
+                            <div key={arm.name} className="rounded-xl border border-slate-100 bg-white p-3">
+                                <div className="text-xs font-black text-slate-700">{arm.name}</div>
+                                <div className="text-xs text-slate-500 mt-2">候选 {arm.candidates} · 已满5日 {arm.mature_5d}</div>
+                                <div className="text-sm font-black text-slate-800 mt-1">{arm.win_rate_5d_pct == null ? '胜率待验证' : `5日胜率 ${arm.win_rate_5d_pct}%`}</div>
+                                <div className="text-xs text-slate-500">{arm.avg_proxy_return_5d_pct == null ? '均收待验证' : `参考均收 ${arm.avg_proxy_return_5d_pct}%`}</div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+                <p className="text-[11px] text-slate-400 mt-3">{data?.timeframe_shadow?.contract?.limitations || '固定5日观察收益并非真实交易收益；样本成熟后才能比较。'}</p>
+            </div>
 
             <SignalPerformanceCard data={signalPerformance} />
 
@@ -624,7 +651,7 @@ function ResearchContextCard({ data }: { data: ResearchContext | null }) {
                 </div>
             </div>
             <div className="mt-3 rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2 text-[10px] font-bold text-slate-400">
-                {data?.policy || '只读研究上下文，不修改策略参数、评分、A级或交易资格'}{data?.as_of ? ` · ${String(data.as_of).slice(0, 19)}` : ''}
+                {data?.policy || '只读研究上下文，不修改策略参数、评分或交易资格'}{data?.as_of ? ` · ${String(data.as_of).slice(0, 19)}` : ''}
             </div>
         </div>
     );
@@ -759,6 +786,10 @@ function DailyStrategyReportCard({ data }: { data: DailyStrategyReport | null })
     const gaps = data?.sector_push_gaps || [];
     const actions = data?.next_actions || [];
     const candidates = data?.top_candidates || [];
+    const ai = data?.ai_review;
+    const aiAvailable = ai?.status === 'available';
+    const aiTop = ai?.top_analyses || [];
+    const aiCounts = ai?.counts || {};
 
     return (
         <div className="glass-card p-5">
@@ -822,7 +853,7 @@ function DailyStrategyReportCard({ data }: { data: DailyStrategyReport | null })
                             <div key={`${item.code}-${idx}`} className="flex items-center justify-between gap-3 border-b border-slate-50 pb-2 last:border-b-0 last:pb-0">
                                 <div className="min-w-0">
                                     <p className="truncate text-sm font-black text-slate-700">{item.name || item.code}</p>
-                                    <p className="text-[10px] font-bold text-slate-400">{item.industry || '--'} · {item.bucket || '--'} · {item.grade || '--'}</p>
+                                    <p className="text-[10px] font-bold text-slate-400">{item.industry || '--'} · {item.bucket || '--'}</p>
                                 </div>
                                 <span className="text-sm font-black text-indigo-600">{item.score ?? '--'}</span>
                             </div>
@@ -830,6 +861,51 @@ function DailyStrategyReportCard({ data }: { data: DailyStrategyReport | null })
                     </div>
                 </div>
             </div>
+
+            {ai && (
+                <div className={`mt-3 rounded-md border p-3 ${aiAvailable ? 'border-indigo-100 bg-indigo-50/50' : 'border-slate-100 bg-slate-50/60'}`}>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <Bot size={14} className="text-indigo-500" />
+                        <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">AI复核</span>
+                        {aiAvailable ? (
+                            <>
+                                <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-black text-slate-500">{ai.model || '--'}</span>
+                                <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-black text-emerald-600">BUY {aiCounts.BUY || 0}</span>
+                                <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-black text-amber-600">WAIT {aiCounts.WAIT || 0}</span>
+                                <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-black text-rose-500">AVOID {aiCounts.AVOID || 0}</span>
+                                {ai.source === 'scheduled' && (
+                                    <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-black text-slate-400">定时推送</span>
+                                )}
+                            </>
+                        ) : (
+                            <span className="text-xs font-bold text-slate-400">当日暂无AI复核记录</span>
+                        )}
+                    </div>
+                    {aiAvailable && (
+                        <div className="mt-2 space-y-1.5">
+                            {ai.market_summary && (
+                                <p className="text-xs font-bold text-slate-600">{ai.market_summary}</p>
+                            )}
+                            {aiTop.slice(0, 3).map((item, idx) => (
+                                <div key={`${item.code}-${idx}`} className="flex items-start gap-2">
+                                    <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-black ${
+                                        item.action === 'BUY' ? 'bg-emerald-100 text-emerald-700'
+                                        : item.action === 'AVOID' ? 'bg-rose-100 text-rose-600'
+                                        : 'bg-amber-100 text-amber-700'
+                                    }`}>
+                                        {item.action}
+                                    </span>
+                                    <p className="text-xs font-bold text-slate-600">
+                                        <span className="text-slate-800">{item.name || item.code}</span>
+                                        <span className="ml-1 text-slate-400">{item.confidence ?? 0}分</span>
+                                        <span className="ml-1">{item.summary}</span>
+                                    </p>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
@@ -849,7 +925,7 @@ function ProfitabilityLayerCard({ data }: { data: ProfitabilityPayload | null })
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between mb-5">
                 <div>
                     <h3 className="font-black text-slate-800">盈利能力分层</h3>
-                    <p className="text-xs font-bold text-slate-400 mt-1">按扫描、Bark、A/A-、实盘买入分别验证 1/3/5/10 日收益</p>
+                    <p className="text-xs font-bold text-slate-400 mt-1">按扫描、Bark、可交易候选、实盘买入分别验证 1/3/5/10 日收益</p>
                 </div>
                 <div className="grid grid-cols-3 gap-2 min-w-[260px]">
                     <MiniStat label="最佳层" value={summary.best_layer || '样本不足'} hot />
@@ -943,31 +1019,22 @@ function ExecutionReviewCard({ data, contract }: { data?: ExecutionReview; contr
 }
 
 function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
-    const monotonicity = data?.grade_monotonicity || {};
     const confirmationRows = (data?.by_confirmation_event || []).filter(row => row.value !== 'UNKNOWN');
     const earlyRows = (data?.by_early_value_transition || []).filter(row => row.value !== 'UNKNOWN');
     const reviewRules = (data?.blocker_analysis?.items || []).filter(row => row.recommendation === 'REVIEW_RULE');
     const bottom = data?.bottom_discovery_analysis;
-    const sampleText = Object.entries(monotonicity.samples || {}).map(([grade, count]) => `${grade}:${count}`).join(' / ');
-    const gradeUsage = data?.grade_usage;
     return (
         <div className="glass-card p-6">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                 <div>
-                    <h3 className="font-black text-slate-800">评级与确认校准</h3>
+                    <h3 className="font-black text-slate-800">确认与门禁校准</h3>
                     <p className="mt-1 text-xs font-bold text-slate-400">只展示成熟样本结论，样本不足时不触发调参</p>
                 </div>
-                <div className="grid grid-cols-3 gap-2 lg:min-w-[430px]">
+                <div className="grid grid-cols-2 gap-2 lg:min-w-[300px]">
                     <MiniStat label="5日成熟" value={`${data?.summary?.mature_5d || 0}`} />
-                    <MiniStat label="Grade单调" value={monotonicity.status || 'UNKNOWN'} hot={monotonicity.status === 'PASS'} />
                     <MiniStat label="待复核规则" value={`${data?.blocker_analysis?.summary?.review_rules || 0}`} />
                 </div>
             </div>
-            {gradeUsage?.mode === 'SHADOW_ONLY' && (
-                <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-xs font-bold text-amber-800">
-                    评级当前仅作影子描述，不会单独产生可交易资格。{gradeUsage.reason ? ` ${gradeUsage.reason}` : ''}
-                </div>
-            )}
             <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-4">
                 <CalibrationRows title="确认事件" rows={confirmationRows} empty="新事件尚未形成成熟样本" />
                 <CalibrationRows title="early_value 转化" rows={earlyRows} empty="早期策略尚未形成可验证转化" />
@@ -990,7 +1057,6 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
                     </div>
                 </div>
             </div>
-            <div className="mt-3 text-[10px] font-bold text-slate-400">Grade成熟样本：{sampleText || '暂无'}；{monotonicity.reason || '等待样本成熟'}</div>
             <MeasurementContractLine contract={data?.measurement_contract} />
         </div>
     );
@@ -1083,7 +1149,6 @@ function SignalPerformanceCard({ data }: { data: SignalPerformancePayload | null
     const execution = cohort('execution');
     const blocked = cohort('blocked');
     const shadow = cohort('strong_exception_shadow');
-    const ratingExplanations = (data.items || []).filter((item) => item.sop_grade_reason).slice(-3).reverse();
     const returnText = (value?: SignalMetric) => {
         if (!value?.signals) return '样本未成熟';
         const average = value.avg_return ?? 0;
@@ -1163,19 +1228,6 @@ function SignalPerformanceCard({ data }: { data: SignalPerformancePayload | null
                     </div>
                 </div>
             </div>
-            {ratingExplanations.length > 0 && (
-                <div className="mt-4 rounded-xl border border-slate-100 bg-slate-50/70 p-3">
-                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">最近评级解释</div>
-                    <div className="mt-2 space-y-2">
-                        {ratingExplanations.map((item) => (
-                            <div key={item.signal_id || `${item.code}-${item.grade}`} className="text-xs font-bold text-slate-600">
-                                <span className="font-black text-slate-800">{item.name || item.code}：</span>
-                                基础{item.sop_base_grade || item.grade || '--'}→最终{item.grade || '--'}；质量分{Math.max(0, Math.min(100, item.display_quality_score ?? item.sop_quality_score ?? 0)).toFixed(1)}/100；{item.sop_grade_reason}
-                            </div>
-                        ))}
-                    </div>
-                </div>
-            )}
             {data.note && <p className="mt-3 text-xs font-bold text-slate-400">{data.note}</p>}
         </div>
     );
@@ -1187,7 +1239,6 @@ function ExecutionReplayCard({ data }: { data: any }) {
     const statusTone = data.verdict === 'SUPPORTED' ? 'text-emerald-600' : data.verdict === 'NOT_SUPPORTED' ? 'text-rose-600' : 'text-amber-600';
     const policies = Array.isArray(data.policies) ? data.policies : [];
     const evidence = data.evidence_quality || {};
-    const grades = evidence.grade_distribution || {};
     const attribution = evidence.attribution || {};
     const operation = data.operation_advice_validation || {};
     const barkEvidence = operation.actual_bark_evidence || {};
@@ -1231,17 +1282,7 @@ function ExecutionReplayCard({ data }: { data: any }) {
                     </div>
                 ))}
             </div>
-            <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
-                <div className="rounded-xl border border-slate-100 bg-white p-3">
-                    <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">证据质量分布 · {evidence.mode || 'SHADOW'}</div>
-                    <div className="mt-2 flex flex-wrap gap-2">
-                        {['A', 'B', 'C', 'D', 'F', 'UNRATED'].map(grade => (
-                            <span key={grade} className="rounded-md border border-slate-100 bg-slate-50 px-2 py-1 text-xs font-black text-slate-600">
-                                {grade}: {grades[grade] || 0}
-                            </span>
-                        ))}
-                    </div>
-                </div>
+            <div className="mt-4 grid grid-cols-1 gap-3">
                 <div className="rounded-xl border border-slate-100 bg-white p-3">
                     <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">影子门禁归因</div>
                     <div className="mt-2 grid grid-cols-2 gap-2 text-xs font-bold text-slate-600">

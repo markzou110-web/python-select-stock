@@ -1,10 +1,40 @@
 """Tests for core/score_calibration.py — 历史胜率纳入综合排序分（改动 #6）。"""
 import os
 import sys
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.score_calibration import apply_score_display_contract, calibrate_scan_scores
+
+
+def test_probability_uses_raw_win_rate_while_ranking_keeps_wilson_bound():
+    row = {"strategy_type": "tv_dual", "Score": 70, "回测统计": {
+        "signal_count": 100, "win_count": 60, "win_rate": 60, "adjusted_win_rate": 47.1,
+    }}
+    calibrate_scan_scores([row])
+    assert row["p_win"] == 59.6
+    assert row["win_probability"]["trials"] == 100
+    assert row["score_components"]["historical_win_rate"] == 47.1
+
+
+@pytest.mark.parametrize("rate", [None, "invalid", float("nan"), float("inf"), -1, 101])
+def test_missing_or_invalid_raw_probability_evidence_uses_prior_only(rate):
+    row = {"strategy_type": "tv_dual", "Score": 70, "回测统计": {
+        "signal_count": 100, "win_rate": rate, "adjusted_win_rate": 47.1,
+    }}
+    calibrate_scan_scores([row])
+    assert row["p_win"] == 50.0
+    assert row["win_probability"]["trials"] == 0
+
+
+def test_raw_zero_win_rate_is_valid_evidence():
+    row = {"strategy_type": "tv_dual", "Score": 70, "回测统计": {
+        "signal_count": 100, "win_count": 0, "win_rate": 0, "adjusted_win_rate": 0,
+    }}
+    calibrate_scan_scores([row])
+    assert row["p_win"] == 1.9
+    assert row["win_probability"]["trials"] == 100
 
 
 def test_display_scores_are_bounded_without_changing_internal_scores():

@@ -84,7 +84,7 @@ export default function ResearchRadarView({ onOpenStock }: { onOpenStock: (stock
             </div>
 
             <div className="rounded-md border border-slate-200 bg-white/70 px-3 py-2 text-xs font-bold text-slate-500">
-                {data?.policy || '研究证据只展示，不修改策略分、A级或交易资格'}
+                {data?.policy || '研究证据只展示，不修改策略分或交易资格'}
                 {data?.updated_at ? ` · 更新于 ${String(data.updated_at).slice(0, 19)}` : ''}
                 {data?.cache_hit ? ' · 缓存' : ''}
             </div>

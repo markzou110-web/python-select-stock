@@ -2,10 +2,64 @@ import os
 import sys
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from routers import stock
 from routers.stock import _generate_ai_suggestion
+
+
+def test_detail_kline_loader_normalizes_numeric_strings(monkeypatch):
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    source = pd.DataFrame({
+        "日期": [today, today],
+        "开盘": ["10.00", "10.20"],
+        "最高": ["10.50", "10.80"],
+        "最低": ["9.90", "10.10"],
+        "收盘": ["10.20", "10.60"],
+        "成交量": ["100000", "120000"],
+    })
+
+    monkeypatch.setattr(stock, "get_db_engine", lambda: object())
+    monkeypatch.setattr(stock, "load_from_db", lambda *_args, **_kwargs: source.copy())
+    monkeypatch.setattr(
+        "core.data.ensure_turnover_history",
+        lambda _code, frame, engine=None: frame,
+    )
+    monkeypatch.setattr(stock, "calculate_indicators", lambda frame, periods: frame)
+
+    result = stock.fetch_stock_data_with_indicators("300292")
+
+    for column in ("开盘", "最高", "最低", "收盘", "成交量"):
+        assert is_numeric_dtype(result[column])
+    assert result.iloc[-1]["收盘"] == 10.6
+
+
+def test_detail_kline_loader_keeps_latest_price_when_volume_is_missing(monkeypatch):
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    source = pd.DataFrame({
+        "日期": [today, today],
+        "开盘": [10.0, 10.2],
+        "最高": [10.5, 10.8],
+        "最低": [9.9, 10.1],
+        "收盘": [10.2, 10.6],
+        "成交量": [100000, "--"],
+    })
+
+    monkeypatch.setattr(stock, "get_db_engine", lambda: object())
+    monkeypatch.setattr(stock, "load_from_db", lambda *_args, **_kwargs: source.copy())
+    monkeypatch.setattr(
+        "core.data.ensure_turnover_history",
+        lambda _code, frame, engine=None: frame,
+    )
+    monkeypatch.setattr(stock, "calculate_indicators", lambda frame, periods: frame)
+
+    result = stock.fetch_stock_data_with_indicators("300292")
+
+    assert len(result) == 2
+    assert result.iloc[-1]["收盘"] == 10.6
+    assert result.iloc[-1]["成交量"] == 0.0
 
 
 def test_ai_suggestion_uses_live_current_price_for_open_position():

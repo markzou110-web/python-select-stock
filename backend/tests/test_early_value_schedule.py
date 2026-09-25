@@ -32,6 +32,8 @@ def test_celery_routes_realtime_and_long_scans_to_separate_queues():
     routes = celery_app.conf.task_routes
 
     assert routes["tasks.check_realtime_alerts"]["queue"] == "realtime"
+    assert routes["tasks.check_position_operation_alerts"]["queue"] == "realtime"
+    assert routes["tasks.send_premarket_position_advice"]["queue"] == "realtime"
     assert routes["tasks.collect_limit_up_leadership"]["queue"] == "realtime"
     assert routes["tasks.intraday_monitor_checkpoint"]["queue"] == "scan"
     assert routes["tasks.recover_late_formal_scan"]["queue"] == "scan"

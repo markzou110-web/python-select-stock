@@ -38,6 +38,7 @@ export interface ScanResult {
     bottom_discovery_stage?: 'B0_BASE' | 'B1_REVERSAL' | string;
     bottom_discovery_action?: string;
     bottom_discovery_metrics?: Record<string, number | boolean>;
+    h2_watch_only?: boolean;
     sequoia_research_shadow_only?: boolean;
     release_state?: 'SHADOW' | string;
     shadow_instruction?: string;
@@ -48,14 +49,14 @@ export interface ScanResult {
     rps_acceleration?: number;
     影线比?: number;
     strategy_type?: string;
+    matched_strategies?: string[];
     warnings?: string[];
     ROE?: number;
     净利YOY?: number;
     结构?: string;
     体质?: string;
     回测统计?: BacktestStats;
-    // SOP 等级系统
-    sop_grade?: 'A' | 'B' | 'M' | 'C' | 'D';
+    // 质量与风控明细（不再输出字母评级）
     sop_vetoes?: string[];
     sop_checks?: string[];
     sop_bonuses?: string[];
@@ -67,7 +68,16 @@ export interface ScanResult {
     display_rank_score?: number;
     display_trade_score?: number;
     score_display_scale?: '0-100' | string;
-    sop_subgrade?: string;
+    trade_bucket?: 'TRADE' | 'EARLY' | 'OBSERVE' | 'BLOCK' | string;
+    trade_eligible?: boolean;
+    trade_blockers?: string[];
+    trade_cautions?: string[];
+    money_flow_status?: string;
+    money_flow?: {
+        main_net_inflow_yi?: number;
+        main_net_ratio?: number;
+        source?: string;
+    };
     entry_price?: number;
     stop_price?: number;
     plan_stop_price?: number;
@@ -161,6 +171,10 @@ export interface ScanResult {
     pa_failure_risk?: number;
     pa_entry_quality_score?: number;
     pa_h2_quality?: string;
+    pa_h2_state?: string;
+    pa_l2_state?: string;
+    pa_second_entry_retracement_quality?: string;
+    pa_follow_through_state?: string;
     pa_range_rule?: string;
     pa_failed_breakout_type?: string | null;
     pa_trap_risk?: number;
@@ -170,6 +184,16 @@ export interface ScanResult {
     pa_channel_state?: string;
     pa_position_strategy?: string;
     pa_weekly_context?: string;
+    pa_monthly_trend?: string;
+    pa_monthly_state?: 'UP' | 'REPAIR' | 'DOWN' | 'UNAVAILABLE';
+    pa_monthly_as_of?: string | null;
+    pa_weekly_position?: string;
+    pa_weekly_position_state?: 'PULLBACK' | 'EXTENDED' | 'WEAK' | 'NEUTRAL' | 'UNAVAILABLE';
+    pa_weekly_position_as_of?: string | null;
+    pa_weekly_pattern_signals?: string[];
+    weekly_pattern_watch_only?: boolean;
+    pa_swing_entry_route?: 'BREAKOUT' | 'PULLBACK' | 'WAIT';
+    pa_timeframe_shadow_only?: boolean;
     pa_multi_timeframe_score?: number;
     pa_multi_timeframe_note?: string;
     pa_volume_pattern?: string;
@@ -186,12 +210,22 @@ export interface ScanResult {
     pa_failed_second_entry?: string | null;
     pa_second_entry_risk?: number;
     pa_gap_type?: string;
+    pa_gap_type_v2?: string;
+    pa_gap_fill_pct?: number;
+    pa_opening_behavior?: string;
     pa_gap_risk?: number;
     pa_range_width_quality?: string;
     pa_range_center_risk?: number;
     pa_range_failed_breakout_count?: number;
     pa_trend_phase?: string;
     pa_trend_phase_action?: string;
+    pa_structure_state?: string;
+    pa_structure_state_label?: string;
+    pa_structure_state_action?: string;
+    pa_mtr_state?: string;
+    pa_mtr_direction?: string;
+    pa_sr_confluence_grade?: string;
+    pa_mtf_state?: string;
     pa_decision_summary?: string;
     pa_eight_rule_primary?: {
         rule_id: string;
@@ -245,8 +279,12 @@ export interface BacktestStats {
     stop_loss_hits: number;
 }
 
+export type ScanStrategyType = 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'weekly_four_patterns' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp' | 'h2' | 'high_tight_flag' | 'turtle_breakout' | 'limit_up_shakeout';
+
 export interface ScanParams {
-    strategy_type: 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp' | 'high_tight_flag' | 'turtle_breakout' | 'limit_up_shakeout';
+    strategy_type: ScanStrategyType;
+    strategy_types: ScanStrategyType[];
+    match_mode: 'any' | 'all';
     pine_min_signals: number;
     min_data_days: number;
     threshold: number;
@@ -277,6 +315,8 @@ export interface ScanProgress {
 export interface ScanCompletionSummary {
     taskId: string | null;
     strategyType: ScanParams['strategy_type'];
+    strategyTypes: ScanStrategyType[];
+    matchMode: ScanParams['match_mode'];
     strategyLabel: string;
     count: number;
     revivalCount: number;
@@ -299,14 +339,16 @@ export interface ScanResultGroups {
 const SCAN_STRATEGY_LABELS: Record<ScanParams['strategy_type'], string> = {
     tv_dual_strict: 'TV+ 强确认精选',
     tv_dual: 'TV 宽松观察池',
-    early_value: 'A- 早期性价比',
+    early_value: '早期性价比',
     bottom_discovery: 'B0 底部起涨发现',
+    weekly_four_patterns: '周线四形态观察',
     sector_watch: '板块观察',
     squeeze: '均线粘合',
     pine: 'Pine 多指标',
     both: '双重共振',
     consensus: '放量突破',
     tv_zp: 'TV-ZP',
+    h2: 'H2 二次入场',
     high_tight_flag: 'HTF 高位收敛（SHADOW）',
     turtle_breakout: '20日新高基准（SHADOW）',
     limit_up_shakeout: '涨停洗盘观察（SHADOW）',
@@ -314,22 +356,48 @@ const SCAN_STRATEGY_LABELS: Record<ScanParams['strategy_type'], string> = {
 
 let resultRequestGeneration = 0;
 
-function filterStrategyResults(rawResults: unknown, strategyType: ScanParams['strategy_type']): ScanResult[] {
-    const received = Array.isArray(rawResults) ? rawResults : [];
-    const seenCodes = new Set<string>();
-    return received.filter((item): item is ScanResult => {
-        if (!item || typeof item !== 'object') return false;
-        const candidate = item as Partial<ScanResult>;
-        if (candidate.strategy_type !== strategyType || !candidate.代码) return false;
-        const code = String(candidate.代码).padStart(6, '0');
-        if (seenCodes.has(code)) return false;
-        seenCodes.add(code);
-        return true;
-    });
+function selectedStrategies(params: ScanParams): ScanStrategyType[] {
+    return params.strategy_types?.length ? params.strategy_types : [params.strategy_type];
 }
 
-function groupStrategyResults(rawResults: unknown, strategyType: ScanParams['strategy_type']): ScanResultGroups {
-    const matched = filterStrategyResults(rawResults, strategyType);
+function filterStrategyResults(rawResults: unknown, strategyTypes: ScanStrategyType[], matchMode: ScanParams['match_mode']): ScanResult[] {
+    const received = Array.isArray(rawResults) ? rawResults : [];
+    const selected = new Set(strategyTypes);
+    const byCode = new Map<string, ScanResult>();
+    received.forEach((item) => {
+        if (!item || typeof item !== 'object') return;
+        const candidate = item as Partial<ScanResult>;
+        const matches = Array.from(new Set([
+            ...(candidate.matched_strategies || []),
+            ...(candidate.strategy_type ? [candidate.strategy_type] : []),
+        ])).filter(strategy => selected.has(strategy as ScanStrategyType));
+        if (matches.length === 0 || !candidate.代码) return;
+        const code = String(candidate.代码).padStart(6, '0');
+        const existing = byCode.get(code);
+        if (existing) {
+            const matchedStrategies = Array.from(new Set([
+                ...(existing.matched_strategies || []),
+                ...matches,
+            ]));
+            const existingRank = Number(existing.display_trade_score ?? existing.Score ?? 0);
+            const candidateRank = Number(candidate.display_trade_score ?? candidate.Score ?? 0);
+            if (candidateRank > existingRank) {
+                byCode.set(code, { ...candidate, matched_strategies: matchedStrategies } as ScanResult);
+            } else {
+                existing.matched_strategies = matchedStrategies;
+            }
+            return;
+        }
+        byCode.set(code, { ...candidate, matched_strategies: matches } as ScanResult);
+    });
+    const merged = Array.from(byCode.values());
+    return matchMode === 'all'
+        ? merged.filter(item => strategyTypes.every(strategy => item.matched_strategies?.includes(strategy)))
+        : merged;
+}
+
+function groupStrategyResults(rawResults: unknown, strategyTypes: ScanStrategyType[], matchMode: ScanParams['match_mode']): ScanResultGroups {
+    const matched = filterStrategyResults(rawResults, strategyTypes, matchMode);
     return matched.reduce<ScanResultGroups>((groups, candidate) => {
         if (candidate.result_group === 'FORMAL' || candidate.result_group === 'SHADOW_RESEARCH') {
             groups.formal.push(candidate);
@@ -364,14 +432,16 @@ function groupStrategyResults(rawResults: unknown, strategyType: ScanParams['str
 
 function buildScanCompletion(
     rawResults: unknown,
-    strategyType: ScanParams['strategy_type'],
+    strategyTypes: ScanStrategyType[],
+    matchMode: ScanParams['match_mode'],
     taskId: string | null,
     scanMeta?: { data_date?: string; data_mode?: string; as_of?: string },
 ): { results: ScanResult[]; groups: ScanResultGroups; summary: ScanCompletionSummary } {
     const received = Array.isArray(rawResults) ? rawResults : [];
-    const groups = groupStrategyResults(received, strategyType);
+    const groups = groupStrategyResults(received, strategyTypes, matchMode);
     const matchedCount = groups.formal.length + groups.revival.length + groups.momentum.length;
     const metadata = [...groups.formal, ...groups.revival, ...groups.momentum][0];
+    const strategyType = strategyTypes[0];
 
     return {
         results: groups.formal,
@@ -379,7 +449,9 @@ function buildScanCompletion(
         summary: {
             taskId,
             strategyType,
-            strategyLabel: SCAN_STRATEGY_LABELS[strategyType],
+            strategyTypes,
+            matchMode,
+            strategyLabel: strategyTypes.map(item => SCAN_STRATEGY_LABELS[item]).join(matchMode === 'all' ? ' 且 ' : ' 或 '),
             count: groups.formal.length,
             revivalCount: groups.revival.length,
             momentumCount: groups.momentum.length,
@@ -426,6 +498,8 @@ interface ScanStore {
 
 const DEFAULT_PARAMS: ScanParams = {
     strategy_type: 'tv_dual_strict',
+    strategy_types: ['tv_dual_strict'],
+    match_mode: 'any',
     pine_min_signals: 3,
     min_data_days: 120,
     threshold: 0.12,
@@ -479,8 +553,9 @@ export const useScanStore = create<ScanStore>((set, get) => ({
         const requestGeneration = ++resultRequestGeneration;
         let ws: WebSocket | null = null;
         const requestedParams = get().params;
-        const requestedStrategy = requestedParams.strategy_type;
-        const strategyLabel = SCAN_STRATEGY_LABELS[requestedStrategy];
+        const requestedStrategies = selectedStrategies(requestedParams);
+        const requestedStrategy = requestedStrategies[0];
+        const strategyLabel = requestedStrategies.map(item => SCAN_STRATEGY_LABELS[item]).join(requestedParams.match_mode === 'all' ? ' 且 ' : ' 或 ');
         set({
             isScanning: true,
             results: [],
@@ -494,15 +569,26 @@ export const useScanStore = create<ScanStore>((set, get) => ({
         const startTime = Date.now();
 
         try {
-            const cleanParams: Partial<ScanParams> = { ...requestedParams };
+            if (requestedParams.match_mode === 'all' && requestedStrategies.length > 1) {
+                try {
+                    const capability = await api.get('/api/scan/capabilities');
+                    if (!capability.data?.match_modes?.includes('all')) throw new Error('unsupported');
+                } catch {
+                    throw new Error('后端尚未更新，暂不能执行“且”关系扫描，请更新服务后重试。');
+                }
+            }
+            const cleanParams: Record<string, unknown> = {
+                ...requestedParams,
+                strategy_type: requestedStrategy,
+                strategy_types: requestedStrategies.join(','),
+            };
             Object.keys(cleanParams).forEach(key => {
-                const paramKey = key as keyof ScanParams;
-                const val = cleanParams[paramKey];
+                const val = cleanParams[key];
                 if (typeof val === 'number' && isNaN(val)) {
-                    delete cleanParams[paramKey];
+                    delete cleanParams[key];
                 }
             });
-            if (!cleanParams.data_date?.trim()) {
+            if (typeof cleanParams.data_date !== 'string' || !cleanParams.data_date.trim()) {
                 delete cleanParams.data_date;
             }
 
@@ -555,7 +641,8 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                                     }
                                     const completion = buildScanCompletion(
                                         statusRes.data.results,
-                                        requestedStrategy,
+                                        requestedStrategies,
+                                        requestedParams.match_mode,
                                         taskId,
                                         statusRes.data.scan_meta,
                                     );
@@ -621,7 +708,8 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                     const rawResults = submitRes.data.results || submitRes.data || [];
                     const completion = buildScanCompletion(
                         rawResults,
-                        requestedStrategy,
+                        requestedStrategies,
+                        requestedParams.match_mode,
                         null,
                         submitRes.data.scan_meta,
                     );
@@ -672,7 +760,10 @@ export const useScanStore = create<ScanStore>((set, get) => ({
     loadHistory: async (date: string) => {
         if (get().isScanning) return;
         const requestGeneration = ++resultRequestGeneration;
-        const strategyType = get().params.strategy_type;
+        const strategyTypes = selectedStrategies(get().params);
+        const matchMode = get().params.match_mode;
+        const strategyKey = strategyTypes.join(',');
+        const strategyType = strategyTypes[0];
         set({ selectedDate: date, isScanning: true, lastScanSummary: null });
         if (!date) {
             set({ isScanning: false });
@@ -683,9 +774,10 @@ export const useScanStore = create<ScanStore>((set, get) => ({
             if (
                 requestGeneration === resultRequestGeneration
                 && get().selectedDate === date
-                && get().params.strategy_type === strategyType
+                && selectedStrategies(get().params).join(',') === strategyKey
+                && get().params.match_mode === matchMode
             ) {
-                const groups = groupStrategyResults(res.data, strategyType);
+                const groups = groupStrategyResults(res.data, strategyTypes, matchMode);
                 set({ results: groups.formal, resultGroups: groups, activeResultGroup: 'formal', resultStrategyType: strategyType });
             }
         } catch (e) {
@@ -697,7 +789,10 @@ export const useScanStore = create<ScanStore>((set, get) => ({
 
     fetchHistory: async () => {
         const requestGeneration = ++resultRequestGeneration;
-        const strategyType = get().params.strategy_type;
+        const strategyTypes = selectedStrategies(get().params);
+        const matchMode = get().params.match_mode;
+        const strategyKey = strategyTypes.join(',');
+        const strategyType = strategyTypes[0];
         try {
             const dateRes = await api.get('/api/scan/dates');
             const dates = dateRes.data;
@@ -706,7 +801,8 @@ export const useScanStore = create<ScanStore>((set, get) => ({
             // If we have history and no current results, load latest
             if (
                 requestGeneration === resultRequestGeneration
-                && get().params.strategy_type === strategyType
+                && selectedStrategies(get().params).join(',') === strategyKey
+                && get().params.match_mode === matchMode
                 && dates.length > 0
                 && get().results.length === 0
                 && !get().isScanning
@@ -718,11 +814,12 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 if (
                     requestGeneration === resultRequestGeneration
                     && get().selectedDate === latestDate
-                    && get().params.strategy_type === strategyType
+                    && selectedStrategies(get().params).join(',') === strategyKey
+                    && get().params.match_mode === matchMode
                     && !get().isScanning
                     && !get().lastScanSummary
                 ) {
-                    const groups = groupStrategyResults(res.data, strategyType);
+                    const groups = groupStrategyResults(res.data, strategyTypes, matchMode);
                     set({ results: groups.formal, resultGroups: groups, activeResultGroup: 'formal', resultStrategyType: strategyType });
                 }
             }

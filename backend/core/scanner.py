@@ -36,6 +36,8 @@ from core.strategy import (
     STRATEGY_LOGIC_VERSION, BACKTEST_ENGINE_VERSION, EXIT_RULE_VERSION
 )
 from core.price_action import analyze_price_action
+from core.timeframe_context import build_completed_timeframe_context
+from core.chip_distribution import build_chip_distribution
 from core.pa_execution_policy import classify_price_action_execution
 from core.risk_engine import compute_paper_risk_levels
 from core.risk_constants import (
@@ -51,17 +53,20 @@ from core.risk_constants import (
     A_MINUS_TRIAL_POLICY_VERSION,
     BACKTEST_STOP_LOSS_PCT,
     EVIDENCE_GATE_MODE,
+    MONTHLY_SECTOR_LEADERS_PER_SECTOR,
     SOP_A_GRADE_5D_PENALTY_PER_PCT,
     SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT,
     SOP_A_GRADE_MAX_5D_GAIN_PCT,
-    SOP_A_GRADE_MIN_PRICE_ACTION_SCORE,
     SOP_A_GRADE_MIN_SCORE,
-    SOP_A_GRADE_POLICY_VERSION,
-    SOP_GRADE_EXECUTION_MODE,
-    SOP_A_GRADE_STRATEGIES,
+    TRADE_GATE_POLICY_VERSION,
+    TRADE_GATE_V2_ENABLED,
+    TRADE_GATE_V2_SOFT_CONDITION_MARKERS,
     PRIMARY_TV_STRATEGY,
     TV_MA_ONLY_MIN_PA_SCORE,
     TV_SIGNAL_WARMUP_DAYS,
+    UNIVERSE_LIQUIDITY_LOOKBACK_DAYS,
+    UNIVERSE_MIN_AVG_AMOUNT_YUAN,
+    UNIVERSE_NEW_ONE_PRICE_MAX_DAYS,
 )  # 与实盘硬止损同源，保证回测胜率反映真实规则
 from core.scan_preflight import build_scan_preflight
 from core.trading_calendar import shift_a_share_trading_date
@@ -166,13 +171,13 @@ def _summarize_rejection_reasons(
 # 避免单一-5%规则误杀强势股洗盘。
 BREAKDOWN_LOOKBACK_DAYS = 5          # 检测窗口（天）
 BREAKDOWN_DROP_PCT = -5.0            # 触发评分的单日跌幅阈值
-TRAP_VETO_SCORE = 70                 # 评分>=此值 → 一票否决降D级
+TRAP_VETO_SCORE = 70                 # 评分>=此值 → 一票否决并进入BLOCK
 TRAP_RISK_SCORE = 40                 # 评分>=此值 → 加风险标注（不否决，排序扣分）
 TRAP_VOLUME_RATIO_THRESHOLD = 2.0    # 恐慌抛售量比阈值（>=此值视为真洗盘，量能维度0分）
 TRAP_MA20_BREAK_DAYS = 3             # MA20下方停留天数阈值（>=此值加分）
 
 # 改动(上班族Bark)：实盘信号门槛收紧。True 时仅 A 级 + 多重共振(🔥核心热点)判为可交易，
-# B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。False 回退到原 A/B 均可交易逻辑。
+# 默认只允许完整确认的候选进入交易桶（上班族无暇盯盘纠错，宁缺毋滥）。
 STRICT_REAL_SIGNAL_GATE = True
 REVIVAL_LOOKBACK_DAYS = 10
 REVIVAL_SOURCE_STRATEGIES = ("tv_dual", "tv_dual_strict", "squeeze", "tv_zp")
@@ -192,8 +197,15 @@ BOTTOM_DISCOVERY_MAX_BASE_VOLUME_RATIO = 0.95
 BOTTOM_DISCOVERY_MAX_CURRENT_VOLUME_RATIO = 1.80
 BOTTOM_DISCOVERY_MAX_RANGE_CONTRACTION_RATIO = 1.05
 BOTTOM_DISCOVERY_MIN_EMA20_SLOPE_5D_PCT = -1.5
-from core.sector_strength import build_sector_strength, build_sector_history_context, classify_sector_role
+from core.sector_strength import (
+    build_previous_month_sector_context,
+    build_sector_history_context,
+    build_sector_leaders,
+    build_sector_strength,
+    classify_sector_role,
+)
 from core.money_flow import get_money_flow_rank
+from core.industry_prosperity import build_industry_prosperity
 from core.decision_layer import apply_decision_layer, apply_growth_segment_context
 from routers.market import fetch_mine_sweeper_data
 from core.data_source_quality import get_suspected_adjustment_gap_codes
@@ -209,7 +221,7 @@ BLOCKED_PA_SETUPS = {"外包K", "交易区间假突破"}
 MIN_RAW_EXECUTION_SCORE = 60.0
 MAX_EXECUTION_RISK_PCT = 16.0
 # 强信号分级加权：原始策略分(raw_score)≥此值时，视为信号强度极高，
-# 在 SOP 分级中等效为额外1个check+1个bonus，使强信号更容易达到A/B级
+# 在连续质量分中增加确认依据，使强信号更容易通过执行复核。
 # （避免历史胜率数据不足的新票/冷门票被拖累到C/D）。
 STRONG_SIGNAL_RAW_THRESHOLD = 95.0
 HARD_EXECUTION_RISK_PCT = 20.0
@@ -225,7 +237,7 @@ SMALL_CAP_MIN_EXECUTION_YI = 50.0
 MID_CAP_MIN_EXECUTION_YI = 50.0
 LARGE_CAP_TURNOVER_CONFIRM_YI = 500.0
 EARLY_ENTRY_MAX_CONFIRM_GAP_PCT = 0.8
-CORE_TRADE_STRATEGIES = {"tv_dual_strict", "tv_dual"}
+CORE_TRADE_STRATEGIES = {"tv_dual_strict", "tv_dual", "h2"}
 DISCOVERY_ONLY_STRATEGIES = set()  # tv_dual 已升格为核心交易策略，发现层白名单为空
 H1_STRONG_SECTOR_ALIGNMENT = 85.0
 H1_EARLY_SECTOR_ALIGNMENT = 90.0
@@ -273,6 +285,11 @@ def _blocker_category(blocker: str) -> str:
     if any(text_value in value for text_value in ("H1首次入场", "H2二次入场", "交易计划未确认")):
         return "setup_confirmation"
     return value
+
+
+def _is_soft_trade_gate_condition(blocker: str) -> bool:
+    """trade-gate-v2：判断阻断文本是否属于弱条件（应降级为 trade_cautions）。"""
+    return any(marker in blocker for marker in TRADE_GATE_V2_SOFT_CONDITION_MARKERS)
 
 
 def _dedupe_trade_blockers(blockers: List[str]) -> List[str]:
@@ -346,7 +363,6 @@ def _h1_execution_confirmed(res: Dict[str, Any], sector_alignment: float) -> boo
         and _has_volume_confirmation(res)
         and _has_stable_close_confirmation(res)
         and float(res.get('涨幅%', 0) or 0) < _near_limit_pct(res.get('代码'))
-        and float(res.get('pct_5d', 0) or 0) <= 15
     )
 
 
@@ -369,13 +385,14 @@ def _a_minus_trial_qualified(
     sector_strength: float,
     stock_sector_fit: float,
 ) -> bool:
-    """Allow only fully confirmed B-grade names into the controlled A- trial."""
+    """Allow fully confirmed names into the controlled A- trial without letter grades."""
     health = res.get("a_minus_trial_health") or {}
     checks = {
         "health_enabled": health.get("enabled") is True,
         "tv_trade_strategy": str(res.get("strategy_type") or "") in CORE_TRADE_STRATEGIES,
-        "b_grade": str(res.get("sop_grade") or "") == "B",
+        "core_resonance": res.get("共振") == "🔥 核心热点",
         "quality": _as_float(res.get("sop_quality_score")) >= A_MINUS_TRIAL_MIN_QUALITY_SCORE,
+        "below_primary_quality": _as_float(res.get("sop_quality_score")) < SOP_A_GRADE_MIN_SCORE,
         "price_action": _as_float(res.get("price_action_score")) >= A_MINUS_TRIAL_MIN_PRICE_ACTION_SCORE,
         "no_sop_veto": not list(res.get("sop_vetoes") or []),
         "ready": _pa_plan_action(res) == "READY",
@@ -425,12 +442,11 @@ def _a_eod_controlled_qualified(
         max(0.0, (current_price - entry_price) / entry_price * 100)
         if current_price > 0 and entry_price > 0 else 999.0
     )
-    grade = str(res.get("sop_grade") or "")
+    quality_score = _as_float(res.get("sop_quality_score"))
     checks = {
         "tv_trade_strategy": str(res.get("strategy_type") or "") in CORE_TRADE_STRATEGIES,
         "core_resonance": res.get("共振") == "🔥 核心热点",
-        "grade": grade in {"A", "B"},
-        "needs_controlled_route": grade == "B" or bool(cautions),
+        "needs_controlled_route": quality_score < SOP_A_GRADE_MIN_SCORE or bool(cautions),
         "quality": _as_float(res.get("sop_quality_score")) >= A_EOD_MIN_QUALITY_SCORE,
         "price_action": res.get("pa_execution_tier") == "NORMAL",
         "not_extended_5d": _as_float(res.get("pct_5d")) <= A_EOD_MAX_5D_GAIN_PCT,
@@ -464,6 +480,30 @@ def _build_scan_money_flow_map(limit: int = 6000) -> Dict[str, Dict[str, Any]]:
         return flow_map
     except Exception as exc:
         logger.warning(f"Money flow rank map unavailable: {exc}")
+        return {}
+
+
+def _load_sector_fund_flow_map() -> Dict[str, float]:
+    """行业 → 5日主力净流入（亿元）；接口降级/异常时返回空表（决策层不降权）。"""
+    try:
+        from core.money_flow import get_sector_money_flow_rank
+
+        payload = get_sector_money_flow_rank(
+            indicator="5日", sector_type="行业资金流", limit=100, force_refresh=False
+        )
+        items = payload.get("items") or []
+        flow_map = {
+            str(item.get("name") or "").strip(): float(item.get("main_net_inflow_yi") or 0)
+            for item in items
+            if item.get("name")
+        }
+        logger.info(
+            f"Loaded sector fund flow map: {len(flow_map)} industries "
+            f"({payload.get('status')}, cache={payload.get('cache_hit')})"
+        )
+        return flow_map
+    except Exception as exc:
+        logger.warning(f"Sector fund flow map unavailable: {exc}")
         return {}
 
 
@@ -531,6 +571,60 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _apply_liquidity_and_new_stock_filters(
+    candidates: pd.DataFrame,
+    history: pd.DataFrame,
+    *,
+    min_avg_amount_yuan: float = UNIVERSE_MIN_AVG_AMOUNT_YUAN,
+    lookback_days: int = UNIVERSE_LIQUIDITY_LOOKBACK_DAYS,
+) -> tuple[pd.DataFrame, Dict[str, int]]:
+    """Apply the five-session liquidity gate and explicit one-price IPO exclusion.
+
+    Historical ``daily_k`` rows do not persist amount, so missing values use the
+    project's canonical hand unit: close * volume * 100. A live snapshot amount,
+    when present, is kept as the exact value for that session.
+    """
+    stats = {"insufficient_liquidity": 0, "new_one_price_stock": 0}
+    if candidates is None or candidates.empty or history is None or history.empty:
+        return candidates.copy(), stats
+
+    work = history.copy()
+    work["code"] = work["code"].astype(str).str.zfill(6)
+    for column in ("开盘", "最高", "最低", "收盘", "成交量"):
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    exact_amount = pd.to_numeric(work.get("amount"), errors="coerce") if "amount" in work.columns else pd.Series(float("nan"), index=work.index)
+    estimated_amount = work["收盘"] * work["成交量"] * 100.0
+    work["__amount"] = exact_amount.where(exact_amount > 0, estimated_amount)
+    work["__amount_estimated"] = ~(exact_amount > 0)
+    work = work.sort_values(["code", "日期"])
+
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for code, group in work.groupby("code", sort=False):
+        recent = group.tail(max(1, int(lookback_days)))
+        avg_amount = float(recent["__amount"].mean()) if not recent.empty else 0.0
+        listed_days = int(len(group))
+        one_price = bool(
+            listed_days <= UNIVERSE_NEW_ONE_PRICE_MAX_DAYS
+            and ((group["最高"] - group["最低"]).abs() <= 0.001).all()
+            and ((group["开盘"] - group["收盘"]).abs() <= 0.001).all()
+        )
+        metrics[code] = {
+            "avg_amount_5d": avg_amount,
+            "avg_amount_5d_estimated": bool(recent["__amount_estimated"].any()),
+            "new_one_price_stock": one_price,
+        }
+
+    result = candidates.copy()
+    result["code"] = result["code"].astype(str).str.zfill(6)
+    result["avg_amount_5d"] = result["code"].map(lambda code: metrics.get(code, {}).get("avg_amount_5d", 0.0))
+    result["avg_amount_5d_estimated"] = result["code"].map(lambda code: metrics.get(code, {}).get("avg_amount_5d_estimated", True))
+    new_mask = result["code"].map(lambda code: metrics.get(code, {}).get("new_one_price_stock", False)).astype(bool)
+    liquid_mask = result["avg_amount_5d"] > float(min_avg_amount_yuan)
+    stats["new_one_price_stock"] = int(new_mask.sum())
+    stats["insufficient_liquidity"] = int((~liquid_mask & ~new_mask).sum())
+    return result[liquid_mask & ~new_mask].copy(), stats
 
 
 def _inject_missing_fundamentals(res: Dict[str, Any], fund_map: Dict[str, Dict[str, Any]]) -> None:
@@ -770,6 +864,9 @@ def _has_stable_close_confirmation(res: Dict[str, Any]) -> bool:
 
 
 def _is_h2_second_entry(setup: str, res: Dict[str, Any]) -> bool:
+    h2_state = str(res.get('pa_h2_state') or "")
+    if h2_state:
+        return h2_state == "H2_TRIGGERED"
     trend_phase = str(res.get('pa_trend_phase') or "")
     return "H2" in setup or "二次入场" in setup or "二次入场" in trend_phase
 
@@ -1068,7 +1165,7 @@ def _classify_historical_revival(res: Dict[str, Any], history: Dict[str, Any]) -
         and sector_alignment >= 85
         and _as_float(res.get('price_action_score')) >= 70
         and _as_float(res.get('pa_trap_risk')) < 60
-        and (_as_float(res.get('pct_5d')) >= 15 or pct >= 9)
+        and pct >= 9
     )
 
     blockers = []
@@ -1213,7 +1310,7 @@ def _build_momentum_acceleration_candidates(
         sector = sector_map.get(code, row.get('industry') or '未知')
         strength = sector_strength.get(sector, {})
         sector_alignment = _as_float(strength.get('sector_momentum_score'), 50) * 0.55 + _as_float(strength.get('sector_breadth'), 50) * 0.25
-        strong_momentum = pct_5d >= 15 or strong_days >= 2 or limit_like_days >= 1
+        strong_momentum = strong_days >= 2 or limit_like_days >= 1
         execution_shape = close_position >= 0.65 and upper_shadow_pct < 4
         liquidity_ok = turnover <= 0 or turnover >= 3
         if not (strong_momentum and near_new_high and execution_shape and liquidity_ok):
@@ -1655,7 +1752,7 @@ def _brooks_rank_adjustment(res: Dict[str, Any]) -> float:
 
 
 def _is_momentum_watch_candidate(res: Dict[str, Any], vetoes: List[str]) -> bool:
-    """Keep strong movers visible without promoting them to executable A/B candidates."""
+    """Keep strong movers visible without promoting them to executable candidates."""
     if not vetoes:
         return False
     fatal_vetoes = {
@@ -1724,7 +1821,6 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         res['trend_continuation_candidate'] = True
     if early_entry:
         res['early_trade_candidate'] = True
-        res['early_trade_grade'] = "A-"
         res['early_trade_reason'] = f"距确认价<{EARLY_ENTRY_MAX_CONFIRM_GAP_PCT:.1f}%，主线强联动，允许小仓提前复核"
     if observe_promotion:
         res['observe_promotion_candidate'] = True
@@ -1757,6 +1853,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
             blockers.append("MA单信号仅进攻市场允许执行")
     if res.get("bottom_discovery_watch_only"):
         blockers.append("底部起涨发现仅供观察，等待板块、确认价和量能共同确认")
+    if res.get("weekly_pattern_watch_only"):
+        blockers.append("周线四形态未经样本外验证，仅供观察，不产生交易指令")
     if res.get("sequoia_research_shadow_only"):
         blockers.append("外部策略概念尚未通过滚动样本外验证，仅限SHADOW观察")
     if res.get('sector_trend') == 'DOWN':
@@ -1819,6 +1917,8 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers.append("主力资金流出，等待资金回流")
     if res.get('capital_event_risk'):
         blockers.append("近期资本事件利好兑现，等待二次确认")
+    if _as_float(res.get('pct_5d')) > SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT:
+        blockers.append("5日涨幅过度延伸，等待回踩")
     if res.get('revival_level') == "MOMENTUM_ACCELERATION":
         blockers.append("动量加速票，次日不高开追价后小仓复核")
     elif res.get('revival_level') == "NEXT_DAY_CONFIRM":
@@ -1841,8 +1941,6 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         res['limit_up_unsealed'] = True  # 封板失败=抛压释放，标记为低吸机会（只增字段不改契约）
     elif float(res.get('涨幅%', 0) or 0) > 7 and not right_side_quality:
         blockers.append("涨幅偏高且质量未确认，等待回踩/次日确认")
-    if float(res.get('pct_5d', 0) or 0) > 15 and not right_side_quality:
-        blockers.append("5日涨幅偏高且质量未确认")
     if _is_h1_first_entry(setup) and not _h1_execution_confirmed(res, sector_alignment):
         blockers.append("H1首次入场仅强主线放量确认可小仓复核")
     if setup_quality == "H2_RAW":
@@ -1871,6 +1969,34 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
         blockers = _dedupe_trade_blockers(blockers)
 
     score = float(res.get('final_rank_score', res.get('Score', 0)) or 0)
+    chip_delta = float(res.get('chip_score_delta') or 0)
+    if chip_delta:
+        score += max(-8.0, min(6.0, chip_delta))
+        res['chip_strategy_adjustment'] = round(max(-8.0, min(6.0, chip_delta)), 1)
+        if res.get('chip_buy_impact') == '抑制买入':
+            blockers.append('筹码峰迁移不利，抑制新买点')
+
+    # ── trade-gate-v2：弱条件降级为 trade_cautions（不拦截TRADE，仅扣分/缩仓）──
+    # 硬阻断（数据异常/结构失效/风险>20%/严重公告/不可成交/板块明确退潮）保留在
+    # trade_blockers；关闭开关则恢复 v1 全拦截行为。
+    cautions: List[str] = []
+    if TRADE_GATE_V2_ENABLED:
+        cautions = [b for b in blockers if _is_soft_trade_gate_condition(b)]
+        if cautions:
+            blockers = [b for b in blockers if b not in cautions]
+        cautions = [
+            item.replace("禁止自动执行", "降低仓位优先级")
+            .replace("禁止实盘", "降低仓位优先级")
+            .replace("降级观察", "降低仓位优先级")
+            for item in cautions
+        ]
+        cautions.extend(str(item) for item in (res.get('sop_soft_vetoes') or []))
+        cautions = list(dict.fromkeys(cautions))
+    res['trade_gate_policy_version'] = (
+        TRADE_GATE_POLICY_VERSION if TRADE_GATE_V2_ENABLED else "trade-gate-v1"
+    )
+    res['trade_cautions'] = cautions
+
     if action == "READY":
         score += 8
     elif action == "WATCH":
@@ -1943,11 +2069,9 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     elif cap_bucket == "MEGA" and turnover >= 1.2:
         score += 3
 
-    grade = res.get('sop_grade')
     a_minus_trial = _a_minus_trial_qualified(res, blockers, sector_strength, stock_sector_fit)
     if a_minus_trial:
         res['a_minus_trial'] = True
-        res['a_minus_trial_grade'] = "A-"
         res['a_minus_trial_policy_version'] = A_MINUS_TRIAL_POLICY_VERSION
     a_eod_trial = False
     if not a_minus_trial:
@@ -1966,19 +2090,31 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
             res['a_eod_trade_cautions'] = a_eod_cautions
     fatal_markers = ("回避", "结构不进入交易池", "结构失效", "异常价格跳变", "板块下跌", "禁止实盘")
     has_fatal_blocker = any(any(marker in b for marker in fatal_markers) for b in blockers)
-    # 改动(上班族Bark)：实盘门槛收紧。STRICT_REAL_SIGNAL_GATE=True 时仅 A 级 + 多重共振
-    # (🔥核心热点) 判为可交易；B 级降为观察（上班族无暇盯盘纠错，宁缺毋滥）。
+    # 字母等级不再参与执行。严格模式直接使用策略、板块、价格行为和阻断条件。
     if STRICT_REAL_SIGNAL_GATE:
-        formal_a_structure = (grade == "A" and not blockers
-                              and strategy_type in CORE_TRADE_STRATEGIES
-                              and res.get('共振') == "🔥 核心热点"
-                              and _trade_quality_confirmed(res, sector_strength, stock_sector_fit))
-        res['grade_execution_mode'] = SOP_GRADE_EXECUTION_MODE
-        res['grade_execution_shadow_eligible'] = formal_a_structure
-        formal_a_trade = SOP_GRADE_EXECUTION_MODE == "ACTIVE" and formal_a_structure
-        trade_eligible = formal_a_trade or a_minus_trial or a_eod_trial
+        if TRADE_GATE_V2_ENABLED:
+            # v2：核心策略 + 无硬阻断 + PA计划READY + 站上确认价 + 收盘稳定。
+            # 共振与板块强度/联动/适配转为机会分加分与扣分，不再作为硬合取项。
+            formal_trade = (
+                not blockers
+                and not list(res.get('sop_vetoes') or [])
+                and strategy_type in CORE_TRADE_STRATEGIES
+                and pa_execution['tier'] == "NORMAL"
+                and action == "READY"
+                and price_triggered
+                and close_confirmed
+            )
+        else:
+            formal_trade = (
+                not blockers
+                and not list(res.get('sop_vetoes') or [])
+                and strategy_type in CORE_TRADE_STRATEGIES
+                and res.get('共振') == "🔥 核心热点"
+                and _trade_quality_confirmed(res, sector_strength, stock_sector_fit)
+            )
+        trade_eligible = formal_trade or a_minus_trial or a_eod_trial
     else:
-        trade_eligible = grade in {"A", "B"} and not blockers and strategy_type in CORE_TRADE_STRATEGIES
+        trade_eligible = not blockers and strategy_type in CORE_TRADE_STRATEGIES
     if trade_eligible:
         bucket = "TRADE"
         execution_policy = (
@@ -2183,20 +2319,23 @@ def _inject_breakdown_retracement(results, hist_map):
 
 
 def _apply_sop_filter(results, market_regime, sector_trends):
-    """SOP 过滤引擎：对扫描结果应用硬性条件、一票否决、加分项，生成 A/B/C/D 等级"""
+    """Apply continuous quality scoring, risk vetoes and execution evidence."""
     regime_status = market_regime.get('status', 'UNKNOWN')
 
     for res in results:
         vetoes = []
+        soft_vetoes = []
         checks = []
         bonuses = []
         risks = []
 
         # ── 一票否决 ──
         if res.get('影线比', 0) > 0.5:
-            vetoes.append("上影线过长")
-        if res.get('pct_5d', 0) > 15:
-            risks.append("5日涨幅>15%，排序扣分")
+            # v2：上影线属质量瑕疵而非结构失效，降级扣分（v1 仍为一票否决）。
+            if TRADE_GATE_V2_ENABLED:
+                soft_vetoes.append("上影线过长")
+            else:
+                vetoes.append("上影线过长")
         if res.get('warnings') and len(res['warnings']) > 0:
             vetoes.append("地雷预警")
         if 0 < res.get('mkt_cap_yi', 0) < 30:
@@ -2224,7 +2363,11 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             risks.append(f"破位反抽疑似(评分{trap_score})，排序扣分")
         # 改动 #17：近期失败模式否决（同一代码+策略近 N 天内多次失败 → 降级，避免反复踩雷）
         if res.get('recent_failure_count', 0) >= FAILURE_VETO_MIN_COUNT:
-            vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
+            # v2：历史连败是经验性风险而非当前结构失效，降级扣分。
+            if TRADE_GATE_V2_ENABLED:
+                soft_vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
+            else:
+                vetoes.append(f"近期失败模式命中({res['recent_failure_count']}次)")
 
         # ── 加权连续评分（替代原计数法）──
         # 胜率改进：优先用 adjusted_win_rate（Wilson 下界），fallback 原始胜率
@@ -2380,16 +2523,8 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             "sector_strength": _sector_strength, "stock_sector_fit": _stock_sector_fit, "market_cap": _d_cap,
         }
 
-        # ── 评分映射分级 ──
-        _hard_vetoes = {"板块下跌", "地雷预警", "破位反抽陷阱", "价格行为建议回避", "价格行为回避",
-                        "异常价格跳变", "低质量价格结构", "近期失败模式命中"}
-        _has_hard_veto = any(any(hv in v for hv in _hard_vetoes) for v in vetoes)
-
-        grade_strategy = str(res.get('strategy_type') or "")
-        grade_pa_score = float(res.get('price_action_score') or 0)
+        # 5日涨幅渐进惩罚：过度延伸只降低连续质量分，不再映射字母等级。
         grade_pct_5d = float(res.get('pct_5d') or 0)
-        a_grade_structure_ok = grade_pa_score >= SOP_A_GRADE_MIN_PRICE_ACTION_SCORE
-        # 5日涨幅渐进惩罚：软起扣点(10%)以上每超1%扣 quality_score，硬否决线(25%)以上不得评A。
         _5d_penalty = 0.0
         if grade_pct_5d > SOP_A_GRADE_MAX_5D_GAIN_PCT:
             _over_ext = grade_pct_5d - SOP_A_GRADE_MAX_5D_GAIN_PCT
@@ -2401,54 +2536,15 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             risks.append(
                 f"5日涨幅{grade_pct_5d:.1f}%超{SOP_A_GRADE_MAX_5D_GAIN_PCT:g}%起扣线，质量分扣{_5d_penalty:.1f}"
             )
-        a_grade_not_extended = grade_pct_5d <= SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT
-        if _has_hard_veto:
-            grade = "D"
-        elif vetoes:
+        if vetoes:
             quality_score -= 15
             risks.append(f"软否决: {', '.join(vetoes[:2])}")
-            # 有否决项的候选不得仅靠其他维度补分回到A级。
-            grade = "D" if quality_score < 30 else "C" if quality_score < 50 else "B"
-        else:
-            grade = (
-                "A"
-                if (
-                    quality_score >= SOP_A_GRADE_MIN_SCORE
-                    and grade_strategy in SOP_A_GRADE_STRATEGIES
-                    and a_grade_structure_ok
-                    and a_grade_not_extended
-                )
-                else "B" if quality_score >= 50 else "C"
-            )
-        a_grade_gate_reasons = []
-        if quality_score >= SOP_A_GRADE_MIN_SCORE:
-            if grade_strategy not in SOP_A_GRADE_STRATEGIES:
-                a_grade_gate_reasons.append("仅核心交易策略可评A级")
-            if not a_grade_structure_ok:
-                a_grade_gate_reasons.append(
-                    f"价格行为评分低于{SOP_A_GRADE_MIN_PRICE_ACTION_SCORE:g}"
-                )
-            if not a_grade_not_extended:
-                a_grade_gate_reasons.append(
-                    f"5日涨幅超过{SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT:g}%"
-                )
-            if _5d_penalty > 0 and grade == "B" and quality_score < SOP_A_GRADE_MIN_SCORE:
-                a_grade_gate_reasons.append(
-                    f"5日涨幅超{SOP_A_GRADE_MAX_5D_GAIN_PCT:g}%起扣线，质量分扣{_5d_penalty:.1f}后未达A级线"
-                )
-            if vetoes:
-                a_grade_gate_reasons.append("存在SOP否决项")
-        base_grade = grade
-        if quality_score < 30 and grade == "C":
-            res['sop_subgrade'] = 'C2'
-        elif grade == "C":
-            res['sop_subgrade'] = 'C1'
+        if soft_vetoes:
+            quality_score -= min(8, 4 * len(soft_vetoes))
+            risks.append(f"软否决降级(v2): {', '.join(soft_vetoes[:2])}")
+        res['sop_soft_vetoes'] = soft_vetoes
 
         res['sop_quality_score'] = quality_score
-        res['sop_grade'] = grade
-        res['sop_a_grade_eligible'] = grade == "A"
-        res['sop_a_grade_gate_reasons'] = a_grade_gate_reasons
-        res['sop_grade_policy_version'] = SOP_A_GRADE_POLICY_VERSION
         res['sop_vetoes'] = vetoes
         res['sop_checks'] = checks
         res['sop_bonuses'] = bonuses
@@ -2493,24 +2589,18 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             res['final_rank_score'] = round(res['final_rank_score'] - 5, 2)
         elif _cap_bucket == "MICRO":
             res['final_rank_score'] = round(res['final_rank_score'] - 12, 2)
-        if res.get('pct_5d', 0) > 15:
-            res['final_rank_score'] = round(res['final_rank_score'] - 6, 2)
         if brooks_adjustment >= 6:
             bonuses.append("Brooks结构加分")
         if brooks_adjustment <= -6:
             vetoes.append("Brooks风险偏高")
-            res['sop_grade'] = "D" if grade in {"C", "D"} else "C"
         if res.get('sequoia_research_shadow_only'):
-            res['sop_grade'] = "D" if vetoes else "C"
             res['sop_checks'].append("外部研究形态SHADOW")
             res['sop_bonuses'].append("独立形态研究样本")
         elif res.get('bottom_discovery_watch_only'):
-            res['sop_grade'] = "D" if vetoes else "C"
             stage = str(res.get('bottom_discovery_stage') or "B0_BASE")
             res['sop_checks'].append("B1止跌转强" if stage == "B1_REVERSAL" else "B0底部候选")
             res['sop_bonuses'].append("低位起涨研究样本")
         elif res.get('early_watch_only'):
-            res['sop_grade'] = "D" if vetoes else "C"
             res['sop_checks'].append("等待TV-ZP确认")
             res['sop_bonuses'].append("早期异动观察")
         elif res.get('revival_watch_only'):
@@ -2519,23 +2609,16 @@ def _apply_sop_filter(results, market_regime, sector_trends):
             if level == "MOMENTUM_ACCELERATION":
                 res['sop_checks'].append("复活动量加速")
                 res['sop_bonuses'].append("连续强势加速")
-                if res['sop_grade'] == "C":
-                    res['sop_grade'] = "B"
             elif level == "FOLLOW_SMALL":
                 res['sop_checks'].append("复活信号可复核")
             elif level == "NEXT_DAY_CONFIRM":
                 res['sop_checks'].append("复活信号等次日确认")
-                if res['sop_grade'] == "A":
-                    res['sop_grade'] = "B"
             else:
                 res['sop_checks'].append("复活信号禁止追涨")
-                res['sop_grade'] = "D" if vetoes else "C"
         elif res.get('tv_reversal_watch_only'):
-            res['sop_grade'] = "M"
             res['sop_checks'].append("TV-ZP原始long + 日线B确认")
             res['sop_bonuses'].append("暴跌后强修复观察")
         elif res.get('momentum_acceleration_watch_only'):
-            res['sop_grade'] = "M"
             res['sop_checks'].append("强趋势加速")
             res['sop_bonuses'].append("涨停/大阳加速观察")
             res['momentum_watch_only'] = True
@@ -2544,48 +2627,14 @@ def _apply_sop_filter(results, market_regime, sector_trends):
                 "强趋势加速，不追买；次日确认后小仓复核",
             )
         elif res.get('sector_watch_only'):
-            fatal_vetoes = {"地雷预警", "板块下跌", "板块扩散转弱", "Brooks风险偏高"}
-            res['sop_grade'] = "D" if any(v in fatal_vetoes for v in vetoes) else "C"
             res['sop_checks'].append("等待TV买点")
             res['sop_bonuses'].append("板块趋势确认观察")
         elif _is_momentum_watch_candidate(res, vetoes):
-            res['sop_grade'] = "M"
             res['sop_checks'].append("动量观察")
             res['sop_bonuses'].append("强势动量观察")
             res['momentum_watch_only'] = True
             res['momentum_watch_reason'] = "涨幅/短线涨幅偏高，不追买；保留观察回踩或次日确认"
-        transition_reasons = []
-        if res.get('sop_grade') != base_grade:
-            if res.get('revival_watch_only'):
-                transition_reasons.append("历史信号复活按确认状态调整等级")
-            if res.get('momentum_acceleration_watch_only') or res.get('momentum_watch_only'):
-                transition_reasons.append("强趋势加速改为M级观察，禁止追高")
-            if res.get('tv_reversal_watch_only'):
-                transition_reasons.append("强修复入口固定为M级观察，等待周线与次日确认")
-            if res.get('sector_watch_only'):
-                transition_reasons.append("板块观察入口不直接生成交易等级")
-            if res.get('bottom_discovery_watch_only'):
-                transition_reasons.append("底部发现入口固定为C级观察，不产生交易权限")
-            if brooks_adjustment <= -6:
-                transition_reasons.append("Brooks风险导致等级下调")
-            if not transition_reasons:
-                transition_reasons.append("执行语义规则调整最终等级")
-        gap_to_a = round(max(0.0, SOP_A_GRADE_MIN_SCORE - float(quality_score)), 1)
-        if gap_to_a > 0:
-            quality_reason = f"质量分{quality_score:.1f}，距A级还差{gap_to_a:.1f}分"
-        elif a_grade_gate_reasons:
-            quality_reason = (
-                f"质量分{quality_score:.1f}，已达到A级分数线；"
-                f"A级校准门禁未通过：{'、'.join(a_grade_gate_reasons)}"
-            )
-        else:
-            quality_reason = f"质量分{quality_score:.1f}，已达到A级分数线"
-        if transition_reasons:
-            quality_reason += f"；基础{base_grade}→最终{res.get('sop_grade')}：{'、'.join(transition_reasons)}"
-        res['sop_base_grade'] = base_grade
-        res['sop_quality_gap_to_a'] = gap_to_a
-        res['sop_grade_transition_reasons'] = transition_reasons
-        res['sop_grade_reason'] = quality_reason
+        res['quality_reason'] = f"连续质量分{quality_score:.1f}；按风险否决、交易桶与价格行为执行"
         _apply_trade_execution_profile(res)
 
 
@@ -2885,6 +2934,44 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 df, code, name, price, current_vol=vol, current_open=open_price,
             )
             return stats
+        elif strategy_type == "weekly_four_patterns":
+            context = build_completed_timeframe_context(df)
+            signals = context["pa_weekly_pattern_signals"]
+            if not signals:
+                return {"reason": "已完成周线未命中四形态"}
+            return {
+                **context,
+                "代码": code,
+                "名称": name,
+                "现价": float(df["收盘"].iloc[-1]),
+                "Score": 0,
+                "strategy_type": "weekly_four_patterns",
+                "weekly_pattern_watch_only": True,
+                "reason": "、".join(signals) + "（仅观察）",
+            }
+        elif strategy_type == "h2":
+            pa = analyze_price_action(df)
+            h2_state = pa.get("pa_h2_state")
+            legacy_h2 = pa.get("price_action_pattern") == "H2二次入场" or "H2" in (pa.get("pa_tags") or [])
+            if (h2_state and h2_state != "H2_TRIGGERED") or (not h2_state and not legacy_h2):
+                return {"reason": "未形成H2二次入场"}
+            current = float(df["收盘"].iloc[-1])
+            previous = float(df["收盘"].iloc[-2])
+            plan_action = str((pa.get("pa_trade_plan") or {}).get("action") or "WATCH")
+            return {
+                **pa,
+                "代码": code,
+                "名称": name,
+                "现价": round(current, 2),
+                "涨幅%": round((current / previous - 1) * 100, 2) if previous > 0 else 0.0,
+                "Score": float(pa.get("price_action_score") or 0),
+                "raw_score": float(pa.get("price_action_score") or 0),
+                "strategy_type": "h2",
+                "signal": "H2二次入场",
+                "reason": pa.get("price_action_summary") or "多头趋势双腿回调后向上突破",
+                "结构": "H2二次入场",
+                "h2_watch_only": plan_action != "READY",
+            }
         elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
             match, stats = _check_sequoia_research_strategy(df, code, name, strategy_type)
             return stats
@@ -2941,6 +3028,7 @@ def perform_market_scan(
     tv_weekly_gate: bool = False,
     require_live_snapshot: bool = False,
     scan_context: Optional[Dict[str, Any]] = None,
+    publish_to_sentinel: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Executes the main market scan logic.
@@ -3361,6 +3449,35 @@ def perform_market_scan(
                 # 重新排序并重置索引，确保 batch calculation 的索引对齐逻辑正常工作
                 master_df = master_df.sort_values(['code', '日期']).reset_index(drop=True)
 
+            candidates, universe_filter_stats = _apply_liquidity_and_new_stock_filters(
+                candidates,
+                master_df,
+            )
+            allowed_codes = set(candidates["code"].astype(str))
+            master_df = master_df[master_df["code"].astype(str).isin(allowed_codes)].copy()
+            audit_payload["candidate_count"] = len(candidates)
+            audit_payload["params_snapshot"]["universe_filters"] = {
+                "avg_amount_lookback_days": UNIVERSE_LIQUIDITY_LOOKBACK_DAYS,
+                "min_avg_amount_yuan": UNIVERSE_MIN_AVG_AMOUNT_YUAN,
+                "amount_estimation": "close_x_volume_hands_x_100_when_exact_missing",
+                **universe_filter_stats,
+            }
+            audit_payload["effective_filters"] = list(dict.fromkeys([
+                *audit_payload.get("effective_filters", []),
+                "avg_amount_5d",
+                "exclude_new_one_price_stock",
+            ]))
+            if candidates.empty:
+                logger.info("No candidates remain after five-day liquidity and new-stock filters.")
+                audit_payload.update({
+                    "scan_date": resolved_data_date,
+                    "finished_at": datetime.now(),
+                    "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
+                    "result_count": 0,
+                })
+                save_scan_audit_log(audit_payload, engine)
+                return []
+
             logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
 
             # --- 向量化指标计算 ---
@@ -3521,7 +3638,18 @@ def perform_market_scan(
             from core.db import record_breadth_snapshot
             record_breadth_snapshot(snapshot_df, sector_map, engine)
         sector_history = build_sector_history_context(engine, sector_map)
-        sector_strength = build_sector_strength(snapshot_df, sector_map, sector_trends, sector_history)
+        monthly_sector_context = build_previous_month_sector_context(
+            engine,
+            sector_map,
+            as_of_date=resolved_data_date,
+        )
+        sector_strength = build_sector_strength(
+            snapshot_df,
+            sector_map,
+            sector_trends,
+            sector_history,
+            monthly_sector_context,
+        )
 
         if strategy_type == "early_value":
             results, dropped, kept_pending = _apply_early_value_sector_filter(results, sector_map, sector_strength)
@@ -3638,6 +3766,20 @@ def perform_market_scan(
                     bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
                 elif strategy_type == "consensus":
                     bt = calculate_consensus_win_rate(df_labeled, stop_loss_pct=sl_pct)
+                elif strategy_type == "h2":
+                    bt = {
+                        "win_rate": 0,
+                        "signal_count": 0,
+                        "avg_return": 0,
+                        "max_drawdown": 0,
+                        "profit_factor": 0,
+                        "avg_hold_days": 0,
+                        "stop_loss_hits": 0,
+                        "adjusted_win_rate": 0,
+                        "confidence": 0,
+                        "expectancy": 0,
+                        "sample_warning": "H2独立策略暂无单股专项回测样本",
+                    }
                 elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
                     bt = calculate_research_pattern_win_rate(
                         df_labeled,
@@ -3702,6 +3844,12 @@ def perform_market_scan(
                 if df_hist is not None and not df_hist.empty:
                     pa = analyze_price_action(df_hist)
                     res.update(pa)
+                    chip = build_chip_distribution(df_hist)
+                    if chip.get('available'):
+                        res['chip_distribution'] = chip
+                        res['chip_buy_impact'] = chip.get('buy_impact')
+                        res['chip_holding_impact'] = chip.get('holding_impact')
+                        res['chip_score_delta'] = chip.get('score_delta', 0)
                     entry_price = float(pa.get('pa_entry_price') or df_hist['最高'].iloc[-1])
                     current_price = float(df_hist['收盘'].iloc[-1])
                     risk = compute_paper_risk_levels(entry_price, entry_price, current_price, pa)
@@ -3789,6 +3937,13 @@ def perform_market_scan(
         snap_mkt_map = {}
         snap_turnover_map = {}
         snap_pe_map = {}
+        liquidity_map = {
+            str(row["code"]).zfill(6): {
+                "avg_amount_5d": float(row.get("avg_amount_5d") or 0),
+                "avg_amount_5d_estimated": bool(row.get("avg_amount_5d_estimated", True)),
+            }
+            for _, row in candidates.iterrows()
+        }
         if not snapshot_df.empty and 'mkt_cap' in snapshot_df.columns:
             for _, row in snapshot_df.iterrows():
                 code = str(row['code'])
@@ -3798,6 +3953,7 @@ def perform_market_scan(
                 snap_pe_map[code] = row.get('pe', None)
         for res in results:
             code = res['代码']
+            res.update(liquidity_map.get(str(code).zfill(6), {}))
             mkt_raw = snap_mkt_map.get(code, 0)
             res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
             turnover_raw = snap_turnover_map.get(code)
@@ -3834,6 +3990,7 @@ def perform_market_scan(
                     stock_sector_rank_map[str(_row['code']).zfill(6)] = _r
 
         # 注入板块走势到每个结果
+        sector_fund_flow_map = _load_sector_fund_flow_map()
         for res in results:
             sector = res.get('行业', '')
             s_info = sector_trends.get(sector, {})
@@ -3841,6 +3998,8 @@ def perform_market_scan(
             res['sector_pct'] = s_info.get('pct', 0)
             strength = sector_strength.get(sector, {})
             res.update(strength)
+            if sector in sector_fund_flow_map:
+                res['sector_main_net_inflow_5d_yi'] = sector_fund_flow_map[sector]
             stock_pct = float(res.get('涨幅%', 0) or 0)
             sector_avg = float(strength.get('sector_avg_pct', res.get('sector_pct', 0)) or 0)
             relative_pct = round(stock_pct - sector_avg, 2)
@@ -3866,6 +4025,48 @@ def perform_market_scan(
                 res['sector_strength_score'],
                 res['stock_sector_fit_score'],
             )
+
+        # 行业景气度聚合（ROE/净利同比中位数）：供逻辑链展示与AI复核参考，不参与风控判定。
+        prosperity_map = build_industry_prosperity(results)
+        if prosperity_map:
+            for res in results:
+                _prosperity = prosperity_map.get(str(res.get('行业') or '').strip())
+                if _prosperity:
+                    res['industry_prosperity'] = _prosperity
+
+        if monthly_sector_context:
+            # 月度板块强弱只做标注与排序参考，不做硬性剔除。
+            # 上月前5板块 × 每板块2只月度龙头的硬闸门曾把全市场日信号压到个位数。
+            monthly_leaders = build_sector_leaders(
+                engine,
+                snapshot_df,
+                sector_map,
+                sector_strength,
+                top_n=MONTHLY_SECTOR_LEADERS_PER_SECTOR,
+            )
+            leader_code_set = {
+                str(item.get("code") or "").zfill(6)
+                for items in monthly_leaders.values()
+                for item in items
+            }
+            for res in results:
+                res["monthly_sector_leader"] = str(res.get("代码") or "").zfill(6) in leader_code_set
+            monthly_sample = next(iter(monthly_sector_context.values()))
+            audit_payload["params_snapshot"]["monthly_sector_gate"] = {
+                "period": monthly_sample.get("sector_prev_month_period"),
+                "mode": "annotate_only",
+                "top_sectors": sorted(
+                    sector for sector, context in monthly_sector_context.items()
+                    if context.get("sector_prev_month_top5")
+                ),
+                "leaders_per_sector": MONTHLY_SECTOR_LEADERS_PER_SECTOR,
+                "results_in_top5_sectors": sum(
+                    1 for res in results if res.get("sector_prev_month_top5")
+                ),
+                "results_monthly_leaders": sum(
+                    1 for res in results if res.get("monthly_sector_leader")
+                ),
+            }
 
         # 横截面 RPS 使用最新完整日线截面计算，只参与排序和解释，不授予交易权限。
         from core.sequoia_research import load_cross_sectional_rps
@@ -3897,7 +4098,7 @@ def perform_market_scan(
             if history:
                 res.update(_classify_historical_revival(res, history))
 
-        # A-受控试仓先读取历史健康度；数据库异常时健康门禁故障安全关闭。
+        # 受控试仓先读取历史健康度；数据库异常时健康门禁故障安全关闭。
         from core.a_minus_trial import build_a_minus_trial_health
         a_minus_trial_health = build_a_minus_trial_health(engine)
         for res in results:
@@ -3908,8 +4109,17 @@ def perform_market_scan(
         market_regime['growth_segments'] = growth_segment_context
         mark_phase("result_enrichment")
 
-        # 应用 SOP 等级评定
+        # 应用质量与风险评估；旧字母等级只在函数内部保留以兼容历史测试，
+        # 不再参与后续准入、排序、推送或持久化。
         _apply_sop_filter(results, market_regime, sector_trends)
+        for res in results:
+            for legacy_grade_field in (
+                "sop_grade", "sop_subgrade", "sop_base_grade", "sop_a_grade_eligible",
+                "sop_a_grade_gate_reasons", "sop_grade_policy_version",
+                "sop_quality_gap_to_a", "sop_grade_transition_reasons", "sop_grade_reason",
+                "grade_execution_mode", "grade_execution_shadow_eligible",
+            ):
+                res.pop(legacy_grade_field, None)
         for res in results:
             res['market_regime'] = market_regime.get('status', 'UNKNOWN')
         from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
@@ -3991,27 +4201,26 @@ def perform_market_scan(
         )
         audit_payload["params_snapshot"]["market_sentiment_stage"] = decision_context.get("market_sentiment_stage")
         audit_payload["params_snapshot"]["portfolio_position_cap_pct"] = decision_context.get("portfolio_position_cap_pct")
-        logger.info(f"SOP Grades: A={sum(1 for r in results if r.get('sop_grade')=='A')}, "
-                    f"B={sum(1 for r in results if r.get('sop_grade')=='B')}, "
-                    f"M={sum(1 for r in results if r.get('sop_grade')=='M')}, "
-                    f"C={sum(1 for r in results if r.get('sop_grade')=='C')}, "
-                    f"D={sum(1 for r in results if r.get('sop_grade')=='D')}")
+        bucket_counts = {
+            bucket: sum(1 for row in results if row.get("trade_bucket") == bucket)
+            for bucket in ("TRADE", "EARLY", "OBSERVE", "BLOCK")
+        }
+        logger.info("Execution buckets: %s", bucket_counts)
 
-        # 按 SOP 等级排序: A > B > M > C > D, 同等级内按 Brooks/板块调整后的 Score 排序
-        grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4}
+        bucket_order = {'TRADE': 0, 'EARLY': 1, 'OBSERVE': 2, 'BLOCK': 3}
         results = sorted(
             results,
             key=lambda x: (
-                grade_order.get(x.get('sop_grade', 'D'), 4),
+                bucket_order.get(str(x.get('trade_bucket') or 'OBSERVE'), 2),
                 -float(x.get('trade_opportunity_score') or 0),
                 -float(x.get('calibrated_score', x.get('Score', 0)) or 0),
             ),
         )
 
-        # Update Sentinel memory (仅 A/B 级)
-        from core.sentinel import sentinel, _select_intraday_push_stocks
-        ab_results = [r for r in results if r.get('sop_grade') in ('A', 'B')]
-        sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else ab_results[:5]
+        # Only the designated execution strategy may update Bark/Sentinel memory.
+        if publish_to_sentinel:
+            from core.sentinel import sentinel, _select_intraday_push_stocks
+            sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else []
         mark_phase("result_ranking")
 
         # --- 持久化保存 ---
@@ -4048,7 +4257,10 @@ def perform_market_scan(
         ws_manager.broadcast_threadsafe({
             "type": "scan_end",
             "matches": len(results),
-            "message": f"扫描完成！A级{sum(1 for r in results if r.get('sop_grade')=='A')}只 B级{sum(1 for r in results if r.get('sop_grade')=='B')}只"
+            "message": (
+                f"扫描完成！可交易{sum(1 for r in results if r.get('trade_bucket') == 'TRADE')}只 "
+                f"观察{sum(1 for r in results if r.get('trade_bucket') in {'EARLY', 'OBSERVE'})}只"
+            )
         })
 
         # 在结果中注入数据日期

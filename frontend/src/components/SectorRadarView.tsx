@@ -31,6 +31,10 @@ interface SectorStrengthItem {
     sector_5d_pct?: number;
     sector_consecutive_up_days?: number;
     sector_trend_slope?: number;
+    sector_prev_month_pct?: number;
+    sector_prev_month_rank?: number;
+    sector_prev_month_top5?: boolean;
+    sector_prev_month_period?: string;
     leaders: SectorLeader[];
 }
 
@@ -149,7 +153,7 @@ export default function SectorRadarView() {
                         板块雷达
                     </h2>
                     <p className="text-xs font-bold text-slate-400 mt-1">
-                        先识别强势板块，再从板块前排中筛选个股
+                        上月前5板块定方向，实时强度二次确认，每个板块保留前2只龙头
                     </p>
                 </div>
                 <button
@@ -201,6 +205,16 @@ export default function SectorRadarView() {
                                             <span className={cn("px-2 py-0.5 rounded border text-[10px] font-black", phaseTone[item.sector_phase] || phaseTone.SECTOR_NEUTRAL)}>
                                                 {phaseLabel[item.sector_phase] || item.sector_phase}
                                             </span>
+                                            {item.sector_prev_month_rank != null && (
+                                                <span className={cn(
+                                                    "px-2 py-0.5 rounded border text-[10px] font-black",
+                                                    item.sector_prev_month_top5
+                                                        ? "bg-indigo-50 text-indigo-700 border-indigo-100"
+                                                        : "bg-slate-50 text-slate-400 border-slate-100",
+                                                )}>
+                                                    上月 #{item.sector_prev_month_rank} · {formatPct(item.sector_prev_month_pct)}
+                                                </span>
+                                            )}
                                         </div>
                                         <div className="mt-1 flex items-center gap-3 text-[10px] font-bold text-slate-400">
                                             <span className="flex items-center gap-1"><TrendingUp size={11} /> 均涨 {item.sector_avg_pct >= 0 ? '+' : ''}{item.sector_avg_pct}%</span>
@@ -220,7 +234,7 @@ export default function SectorRadarView() {
                                         <div className="mt-1 text-[10px] font-black text-slate-500">强度 {item.sector_momentum_score.toFixed(1)} / 100</div>
                                     </div>
                                     <div className="flex flex-wrap gap-1.5 justify-end">
-                                        {item.leaders?.slice(0, 5).map((leader, idx) => {
+                                        {item.leaders?.slice(0, 2).map((leader, idx) => {
                                             const isTopLeader = idx === 0 && leader.leader_score != null && leader.leader_score >= 80;
                                             return (
                                                 <span

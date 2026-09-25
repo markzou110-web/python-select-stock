@@ -11,9 +11,10 @@ Alpha Vision 是一个 A股全市场选股与监控交易系统，采用前后�
 
 ### 1. 系统要求
 - macOS / Linux
-- Python 3.8+
-- Node.js 16+
+- Python 3.12（对应 `backend/venv_new`；仓库内 `backend/venv` 为遗留的 3.14 环境，可删除）
+- Node.js 18+
 - PostgreSQL 12+
+- Redis（可选：未启动时 Celery 自动降级为同步执行模式）
 
 ### 2. 环境配置
 
@@ -55,10 +56,8 @@ cd frontend
 ```bash
 cd backend
 
-# 激活虚拟环境
+# 激活虚拟环境（必须使用 venv_new / Python 3.12）
 source venv_new/bin/activate
-# 或
-source venv/bin/activate
 
 # 安装依赖（首次）
 pip install -r requirements.txt
@@ -126,7 +125,7 @@ brew install node
 **问题**: `Cannot connect to backend`
 ```bash
 # 解决：确保后端已启动在 http://localhost:8000
-curl http://localhost:8000/health
+curl http://localhost:8000/api/health
 ```
 
 ## 开发模式
@@ -143,6 +142,22 @@ uvicorn api:app --reload --host 0.0.0.0 --port 8000
 cd frontend
 npm run dev
 # Next.js 默认开启热重载
+```
+
+## 质量校验
+
+```bash
+# 后端测试（115 个文件 / 1040 用例）
+cd backend
+source venv_new/bin/activate
+pip install -r requirements-dev.txt   # 仅首次（pytest/httpx 不在生产依赖中）
+pytest tests/
+
+# 前端：类型检查 + Lint + 单测
+cd frontend
+npx tsc --noEmit
+npm run lint
+npm run test:risk-lines && npm run test:signal-display
 ```
 
 ## 数据同步
@@ -167,20 +182,30 @@ venv_new/bin/python sync_cli.py check --code 000001
 
 ## 生产部署
 
-### 后端部署
+本仓库**未提供 Dockerfile，也没有 systemd unit 文件**；当前实际部署方式就是根目录的 `./start.sh`（前台常驻）。
+`docker-compose.yml` 仅用于启动 Redis 容器。
+
+### 后端
+
 ```bash
-# 使用 systemd 服务
-sudo cp alpha-vision-backend.service /etc/systemd/system/
-sudo systemctl enable alpha-vision-backend
-sudo systemctl start alpha-vision-backend
+cd backend && source venv_new/bin/activate
+
+# 前台运行
+python3 api.py
+
+# 或后台驻留（日志写入 backend/logs/）
+nohup python3 api.py > logs/api.log 2>&1 &
 ```
 
-### 前端部署
+如需 systemd / launchd 常驻，请自行编写 unit 文件，关键三项：
+`ExecStart=<repo>/backend/venv_new/bin/python api.py`、`WorkingDirectory=<repo>/backend`、`EnvironmentFile=<repo>/backend/.env`。
+
+### 前端
+
 ```bash
-# 构建生产版本
 cd frontend
 npm run build
-npm run start
+npm run start        # 生产模式，端口 3000
 ```
 
 ## 端口占用检查

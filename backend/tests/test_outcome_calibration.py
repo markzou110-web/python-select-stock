@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from core.outcome_calibration import (
     build_a_grade_policy_report, build_blocker_report, build_bottom_discovery_report, build_calibration_report, build_execution_cohort_report,
     build_feature_ablation_report, build_opportunity_threshold_report,
+    build_price_action_shadow_calibration, build_trade_gate_readiness_report,
     load_scan_outcomes, mark_independent_signal_events,
 )
 
@@ -62,6 +63,57 @@ def _sample_frame() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _trade_gate_row(*, version="trade-gate-v2", regime="OFFENSIVE", bucket="TRADE", ret=2.0):
+    return {
+        "code": f"{abs(hash((version, regime, bucket, ret))) % 1_000_000:06d}",
+        "signal_date": "2026-07-01",
+        "strategy_type": "tv_dual",
+        "trade_gate_policy_version": version,
+        "trade_bucket": bucket,
+        "trade_eligible": bucket == "TRADE",
+        "market_regime": regime,
+        "mature_5d": True,
+        "ret_5d": ret,
+        "sop_quality_score": 70 + ret,
+        "trade_opportunity_score": 72 + ret,
+        "final_trade_score": 74 + ret,
+    }
+
+
+def test_trade_gate_readiness_requires_samples_in_all_market_regimes():
+    frame = pd.DataFrame([
+        _trade_gate_row(regime="OFFENSIVE", ret=1.0),
+        _trade_gate_row(regime="OFFENSIVE", ret=2.0),
+        _trade_gate_row(bucket="OBSERVE", ret=-1.0),
+    ])
+
+    report = build_trade_gate_readiness_report(frame, min_samples=1)
+    sample_check = next(item for item in report["checks"] if item["name"] == "regime_trade_samples")
+
+    assert sample_check["status"] == "FAIL"
+    assert sample_check["detail"]["per_regime_mature_5d"] == {
+        "CRITICAL": 0,
+        "DEFENSIVE": 0,
+        "OFFENSIVE": 2,
+    }
+    assert report["gates_ready"] is False
+
+
+def test_trade_gate_readiness_ignores_non_current_policy_versions_for_release():
+    rows = []
+    for regime in ("OFFENSIVE", "DEFENSIVE", "CRITICAL"):
+        rows.extend([
+            _trade_gate_row(version="trade-gate-v1", regime=regime, ret=2.0),
+            _trade_gate_row(version="trade-gate-v1", regime=regime, ret=3.0),
+        ])
+    rows.append(_trade_gate_row(version="trade-gate-v1", bucket="OBSERVE", ret=-1.0))
+
+    report = build_trade_gate_readiness_report(pd.DataFrame(rows), min_samples=1)
+
+    assert report["gates_ready"] is False
+    assert "当前v2策略版本暂无样本" in report["notes"]
+
+
 def test_calibration_report_excludes_immature_horizons_and_groups_dimensions():
     report = build_calibration_report(_sample_frame(), min_samples=10)
 
@@ -74,6 +126,19 @@ def test_calibration_report_excludes_immature_horizons_and_groups_dimensions():
     assert {row["value"] for row in report["by_grade_stage"]} == {"A-TRADE", "B-STRUCTURE"}
     assert {row["value"] for row in report["by_confirmation_event"]} == {"CONFIRMED", "NOT_READY"}
     assert report["grade_monotonicity"]["status"] == "INSUFFICIENT"
+    assert report["price_action_shadow_calibration"]["production_effect"] is False
+
+
+def test_price_action_calibration_stays_shadow_until_oos_review():
+    frame = _sample_frame()
+    frame["pa_h2_state"] = ["H2_TRIGGERED", "NONE"] * 12
+    frame["pa_follow_through_state"] = ["STRONG", "FAILED"] * 12
+
+    report = build_price_action_shadow_calibration(frame, min_samples=10)
+
+    assert report["status"] == "READY_FOR_OOS_REVIEW"
+    assert report["production_effect"] is False
+    assert {row["value"] for row in report["dimensions"]["pa_h2_state"]} == {"H2_TRIGGERED", "NONE"}
 
 
 def test_grade_monotonicity_passes_with_mature_a_b_c_samples():

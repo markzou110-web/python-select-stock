@@ -14,7 +14,12 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.models import Base
-from core.sector_strength import build_sector_leaders, classify_sector_role, build_sector_strength
+from core.sector_strength import (
+    build_previous_month_sector_context,
+    build_sector_leaders,
+    build_sector_strength,
+    classify_sector_role,
+)
 
 
 def _setup_engine():
@@ -177,6 +182,33 @@ def test_sector_avg_weighted_by_amount_filters_inactive_stocks():
     # 简单均值 = (5*2 + (-2)*8)/10 = -0.6%（被僵尸股拉负）
     # 加权均值 ≈ 5%（活跃股主导）
     assert avg > 3.0, f"加权后板块均值应反映活跃股(>3%)，实际 {avg}（僵尸股拉低了基准）"
+
+
+def test_previous_month_sector_context_marks_only_top_five():
+    engine = _setup_engine()
+    sector_map = {}
+    with engine.begin() as conn:
+        for index in range(6):
+            code = f"00001{index}"
+            sector = f"板块{index + 1}"
+            sector_map[code] = sector
+            conn.execute(text("INSERT INTO stock_basic (code, name) VALUES (:code, :name)"), {"code": code, "name": code})
+            conn.execute(text("""
+                INSERT INTO daily_k (code, date, open, high, low, close, vol)
+                VALUES (:code, '2026-02-02', 10, 10, 10, 10, 100000),
+                       (:code, '2026-02-27', 10, :last, 10, :last, 100000)
+            """), {"code": code, "last": 10 + (6 - index)})
+
+    context = build_previous_month_sector_context(
+        engine,
+        sector_map,
+        as_of_date="2026-03-15",
+        top_n=5,
+    )
+
+    assert context["板块1"]["sector_prev_month_rank"] == 1
+    assert context["板块5"]["sector_prev_month_top5"] is True
+    assert context["板块6"]["sector_prev_month_top5"] is False
 
 
 def test_sector_avg_falls_back_to_simple_when_no_amount():

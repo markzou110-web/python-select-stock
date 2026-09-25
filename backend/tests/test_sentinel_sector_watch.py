@@ -20,6 +20,7 @@ from core.sentinel import (
     _real_position_action,
     _select_after_close_watchlist,
     _select_intraday_push_stocks,
+    _select_reference_push_stocks,
     send_after_close_watchlist,
     send_intraday_notification,
 )
@@ -82,6 +83,135 @@ def test_candidate_brief_omits_verbose_observation_source():
 
     assert "候选来源" not in body
     assert len(body.splitlines()) == 3
+
+
+def test_intraday_reference_push_when_market_risk_blocks_all(monkeypatch):
+    sent = []
+    persisted_events = []
+    persisted_snapshots = []
+    created_intents = []
+    stocks = [
+        {
+            "代码": "000001", "名称": "观察一", "sop_grade": "B", "Score": 82,
+            "strategy_type": "tv_zp", "trade_bucket": "OBSERVE", "trade_eligible": False,
+            "trade_blockers": ["CRITICAL市场默认禁止新仓，等待环境修复"],
+        },
+        {
+            "代码": "000002", "名称": "观察二", "sop_grade": "B", "Score": 70,
+            "strategy_type": "tv_zp", "trade_bucket": "OBSERVE", "trade_eligible": False,
+            "trade_blockers": ["CRITICAL市场默认禁止新仓，等待环境修复"],
+        },
+        {
+            "代码": "000003", "名称": "禁买", "sop_grade": "C", "Score": 99,
+            "strategy_type": "tv_zp", "trade_bucket": "BLOCK", "trade_eligible": False,
+        },
+    ]
+    monkeypatch.setattr("core.sentinel.is_a_share_intraday_session", lambda: True)
+    monkeypatch.setattr("core.sentinel._load_recommendation_priority_adjustments", lambda: {})
+    monkeypatch.setattr("core.sentinel._format_market_line", lambda *_: "退潮 35.2分 | 总仓上限 30% | 🛡️ 严格防守")
+    monkeypatch.setattr("core.sentinel._should_send_intraday_state", lambda *_: True)
+    monkeypatch.setattr(
+        "core.sentinel._send_bark_message",
+        lambda title, body, **kwargs: sent.append((title, body)) or True,
+    )
+    monkeypatch.setattr("core.sentinel._append_real_position_status", lambda *_: None)
+    monkeypatch.setattr("core.sentinel._mark_intraday_state_sent", lambda *_: None)
+    monkeypatch.setattr("core.data.get_market_regime", lambda: {"status": "CRITICAL"})
+    monkeypatch.setattr("core.data.get_market_snapshot", lambda: {})
+    monkeypatch.setattr("core.data.format_freshness", lambda *_: "测试快照")
+    monkeypatch.setattr(
+        "core.db.save_recommendation_events",
+        lambda *args, **kwargs: persisted_events.append(args) or True,
+    )
+    monkeypatch.setattr(
+        "core.signal_performance.save_intraday_signal_snapshots",
+        lambda *args, **kwargs: persisted_snapshots.append(args) or 0,
+    )
+    monkeypatch.setattr(
+        "core.execution_intents.create_bark_execution_intents",
+        lambda *args, **kwargs: created_intents.append(args) or [],
+    )
+
+    body = send_intraday_notification(stocks)
+
+    assert body
+    assert len(sent) == 1
+    title, pushed = sent[0]
+    assert "盘中参考" in title
+    assert "【策略信号｜仅供参考】" in pushed
+    assert "市场风控禁新仓" in pushed
+    assert "CRITICAL市场默认禁止新仓" in pushed
+    assert "000001" in pushed and "000002" in pushed
+    assert "000003" not in pushed
+    assert persisted_events == []
+    assert persisted_snapshots == []
+    assert created_intents == []
+
+
+def test_intraday_reference_push_dedupes_unchanged_state(monkeypatch):
+    sent = []
+    settings = {}
+    stocks = [
+        {
+            "代码": "000001", "名称": "观察一", "sop_grade": "B", "Score": 82,
+            "strategy_type": "tv_zp", "trade_bucket": "OBSERVE", "trade_eligible": False,
+            "trade_blockers": ["CRITICAL市场默认禁止新仓，等待环境修复"],
+        },
+    ]
+    monkeypatch.setattr("core.sentinel.is_a_share_intraday_session", lambda: True)
+    monkeypatch.setattr("core.sentinel._load_recommendation_priority_adjustments", lambda: {})
+    monkeypatch.setattr("core.sentinel._format_market_line", lambda *_: "测试行情")
+    monkeypatch.setattr(
+        "core.sentinel._send_bark_message",
+        lambda title, body, **kwargs: sent.append((title, body)) or True,
+    )
+    monkeypatch.setattr("core.sentinel._append_real_position_status", lambda *_: None)
+    monkeypatch.setattr("core.sentinel.get_setting", lambda key, default=None: settings.get(key, default))
+    monkeypatch.setattr("core.sentinel.save_setting", lambda key, value: settings.update({key: value}) or True)
+    monkeypatch.setattr("core.data.get_market_regime", lambda: {"status": "CRITICAL"})
+    monkeypatch.setattr("core.data.get_market_snapshot", lambda: {})
+    monkeypatch.setattr("core.data.format_freshness", lambda *_: "测试快照")
+
+    first = send_intraday_notification(stocks)
+    second = send_intraday_notification(stocks)
+
+    assert first
+    assert second == ""
+    assert len(sent) == 1
+
+
+def test_intraday_reference_push_disabled_rolls_back_to_silent(monkeypatch):
+    sent = []
+    stocks = [
+        {
+            "代码": "000001", "名称": "观察一", "sop_grade": "B", "Score": 82,
+            "trade_bucket": "OBSERVE", "trade_eligible": False,
+        },
+    ]
+    monkeypatch.setattr("core.sentinel.is_a_share_intraday_session", lambda: True)
+    monkeypatch.setattr("core.sentinel._load_recommendation_priority_adjustments", lambda: {})
+    monkeypatch.setattr("core.data.get_market_regime", lambda: {"status": "CRITICAL"})
+    monkeypatch.setattr(
+        "core.sentinel._send_bark_message",
+        lambda title, body, **kwargs: sent.append((title, body)) or True,
+    )
+    monkeypatch.setattr("core.sentinel.REGIME_REFERENCE_PUSH_ENABLED", False)
+
+    assert send_intraday_notification(stocks) is None
+    assert sent == []
+
+
+def test_reference_selection_excludes_block_and_ranks_by_score():
+    stocks = [
+        {"代码": "000001", "名称": "低分", "Score": 50, "trade_bucket": "OBSERVE"},
+        {"代码": "000002", "名称": "高分", "Score": 90, "trade_bucket": "OBSERVE"},
+        {"代码": "000003", "名称": "禁买", "Score": 99, "trade_bucket": "BLOCK"},
+        {"代码": "000004", "名称": "板块观察", "Score": 80, "sector_watch_only": True},
+    ]
+
+    selected = _select_reference_push_stocks(stocks, limit=2)
+
+    assert [s["代码"] for s in selected] == ["000002", "000001"]
 
 
 def test_intraday_push_splits_oversized_bark_body(monkeypatch):
@@ -368,7 +498,7 @@ def test_intraday_candidate_uses_structure_label_and_capped_display_score():
 
     body = "\n".join(_candidate_brief_lines(stock))
 
-    assert "禁止买入｜A级结构" in body
+    assert "禁止买入｜结构观察" in body
     assert "结构分" not in body
     assert "132.02" not in body
 
@@ -449,7 +579,7 @@ def test_after_close_watchlist_keeps_high_opportunity_d_grade_as_observation_onl
     body = _build_after_close_watchlist_body(selected, "2026-06-11")
 
     assert selected == [stock]
-    assert "D级结构｜等待确认" in body
+    assert "结构观察｜等待确认" in body
     assert "仅观察" in body
 
 
@@ -486,7 +616,7 @@ def test_after_close_watchlist_prioritizes_backtested_a_eod_t1_plan():
     assert selected[0]["a_eod_t1_plan"] is True
     assert selected[0]["execution_review_state"] == "NEXT_DAY_REVIEW"
     assert selected[0]["trade_eligible"] is False
-    assert "A-EOD-T1｜次日计划" in body
+    assert "尾盘T1｜次日计划" in body
     assert "不是买入指令" in body
 
 
@@ -720,3 +850,21 @@ def test_position_breakout_uses_price_action_dynamic_volume_threshold():
 
     assert plan["volume_ratio_threshold"] == 1.2
     assert plan["volume_ok"] is True
+
+
+def test_candidate_brief_includes_logic_and_capital_lines():
+    stock = {
+        "代码": "000001", "名称": "测试", "sop_grade": "B",
+        "trade_bucket": "TRADE", "trade_eligible": True,
+        "market_sentiment_label": "修复 55分",
+        "行业": "化工", "sector_phase": "SECTOR_CONFIRM", "sector_mainline": "MAIN",
+        "sector_role": "CORE",
+        "money_flow": {"main_net_inflow_yi": 2.13},
+        "rps_120": 95.4,
+        "sector_limit_count": 3,
+    }
+
+    body = "\n".join(_candidate_brief_lines(stock))
+
+    assert "逻辑：市场修复 55分 → 化工板块主升·主线 → 板块核心" in body
+    assert "资金：主力净流入2.1亿｜RPS120=95｜板块涨停3家" in body

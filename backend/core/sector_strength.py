@@ -3,6 +3,8 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 from sqlalchemy import text
 
+from core.risk_constants import MONTHLY_SECTOR_TOP_N
+
 
 def sector_phase(score: float, breadth: float, avg_pct: float, hot_ratio: float, history: Optional[Dict[str, Any]] = None) -> str:
     history = history or {}
@@ -100,6 +102,83 @@ def _load_today_sector_breadth(engine) -> Dict[str, Dict[str, Any]]:
             'bar_date': str(row['bar_date']),
         }
     return result
+
+
+def build_previous_month_sector_context(
+    engine,
+    sector_map: Dict[str, str],
+    *,
+    as_of_date: Optional[str] = None,
+    top_n: int = MONTHLY_SECTOR_TOP_N,
+) -> Dict[str, Dict[str, Any]]:
+    """Rank sectors using only the completed previous calendar month."""
+    if engine is None or not sector_map:
+        return {}
+    try:
+        if as_of_date:
+            as_of = pd.Timestamp(str(as_of_date)[:10])
+        else:
+            latest = pd.read_sql(text("SELECT MAX(date) AS max_date FROM daily_k"), engine)
+            as_of = pd.Timestamp(latest.iloc[0]["max_date"])
+        if pd.isna(as_of):
+            return {}
+        month_start = as_of.normalize().replace(day=1)
+        previous_start = month_start - pd.offsets.MonthBegin(1)
+        frame = pd.read_sql(
+            text("""
+                SELECT code, date, close
+                FROM daily_k
+                WHERE date >= :start_date AND date < :end_date
+                ORDER BY code, date
+            """),
+            engine,
+            params={
+                "start_date": previous_start.strftime("%Y-%m-%d"),
+                "end_date": month_start.strftime("%Y-%m-%d"),
+            },
+        )
+    except Exception:
+        return {}
+    if frame.empty:
+        return {}
+
+    frame["code"] = frame["code"].astype(str).str.zfill(6)
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    frame["industry"] = frame["code"].map(sector_map).fillna("未知")
+    frame = frame.dropna(subset=["close"])
+    frame = frame[frame["industry"] != "未知"]
+    if frame.empty:
+        return {}
+
+    stock_returns = []
+    for (industry, _code), group in frame.groupby(["industry", "code"]):
+        ordered = group.sort_values("date")
+        first_close = float(ordered["close"].iloc[0])
+        last_close = float(ordered["close"].iloc[-1])
+        if len(ordered) >= 2 and first_close > 0:
+            stock_returns.append({
+                "industry": industry,
+                "return_pct": (last_close / first_close - 1) * 100,
+            })
+    if not stock_returns:
+        return {}
+
+    ranked = (
+        pd.DataFrame(stock_returns)
+        .groupby("industry")["return_pct"]
+        .mean()
+        .sort_values(ascending=False)
+    )
+    cutoff = max(1, int(top_n))
+    return {
+        str(industry): {
+            "sector_prev_month_pct": round(float(return_pct), 2),
+            "sector_prev_month_rank": rank,
+            "sector_prev_month_top5": rank <= cutoff,
+            "sector_prev_month_period": previous_start.strftime("%Y-%m"),
+        }
+        for rank, (industry, return_pct) in enumerate(ranked.items(), start=1)
+    }
 
 
 def build_sector_history_context(engine, sector_map: Dict[str, str], lookback: int = 6) -> Dict[str, Dict[str, Any]]:
@@ -207,6 +286,7 @@ def build_sector_strength(
     sector_map: Dict[str, str],
     sector_trends: Dict[str, Dict[str, Any]],
     history_context: Optional[Dict[str, Dict[str, Any]]] = None,
+    monthly_context: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Build intraday sector breadth/momentum stats from the realtime stock snapshot."""
     if snapshot_df is None or snapshot_df.empty or not sector_map:
@@ -273,6 +353,7 @@ def build_sector_strength(
         )
         score = round(max(0, min(100, score)), 1)
         history = (history_context or {}).get(industry, {})
+        monthly = (monthly_context or {}).get(industry, {})
         result[industry] = {
             'sector_momentum_score': score,
             'sector_breadth': round(breadth, 1),
@@ -285,6 +366,7 @@ def build_sector_strength(
             'sector_board_pct': round(board_pct, 2),
             'sector_turnover_avg': round(turnover_avg, 2),
             **history,
+            **monthly,
             'sector_phase': sector_phase(score, breadth, avg_pct, hot_ratio, history),
             'lead_stock': trend_info.get('lead_stock', ''),
             'trend': trend_info.get('trend', 'UNKNOWN'),

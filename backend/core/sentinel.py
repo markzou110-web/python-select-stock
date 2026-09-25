@@ -26,8 +26,10 @@ from core.risk_constants import (
     A_EOD_T1_POLICY_VERSION,
     A_EOD_T1_PORTFOLIO_CAP_PCT,
     A_EOD_T1_POSITION_PCT,
-    SOP_A_GRADE_STRATEGIES,
+    REFERENCE_PUSH_MAX_STOCKS,
+    REGIME_REFERENCE_PUSH_ENABLED,
 )
+from core.logic_chain import build_capital_evidence_line, build_logic_chain_line
 
 
 _last_new_strategy_shadow_fingerprint: Optional[str] = None
@@ -62,26 +64,21 @@ def _candidate_action_label(stock: Dict[str, Any]) -> str:
         return "尾盘动作：板块趋势观察，出现TV买点或回踩确认再考虑"
 
     if stock.get("a_eod_controlled_trial") and _is_executable_candidate(stock):
-        return "尾盘动作：A-EOD受控小仓，单票不超过5%，合计不超过15%，最多3只"
+        return "尾盘动作：受控小仓，单票不超过5%，合计不超过15%，最多3只"
     if stock.get("a_minus_trial") and _is_executable_candidate(stock):
-        return "尾盘动作：A-受控试仓，单票不超过5%，A-合计不超过10%"
+        return "尾盘动作：受控试仓，单票不超过5%，合计不超过10%"
 
-    grade = stock.get('sop_grade')
     score = float(stock.get('Score') or stock.get('score') or 0)
     pa_score = float(stock.get('price_action_score') or 0)
     entry_quality = stock.get('price_action_entry_quality') or ''
     sector_trend = stock.get('sector_trend') or ''
 
-    if grade == 'A' and score >= 80 and pa_score >= 70 and sector_trend in ('LEAD', 'FOLLOW'):
+    if _is_executable_candidate(stock) and score >= 80 and pa_score >= 70 and sector_trend in ('LEAD', 'FOLLOW'):
         return "尾盘动作：可小仓试买候选，确认不追高"
-    if grade == 'A':
-        return "尾盘动作：重点观察，突破入场线且站稳再买"
-    if grade == 'B' and ('高' in entry_quality or pa_score >= 65):
+    if '高' in entry_quality or pa_score >= 65:
         return "尾盘动作：轻仓观察，回踩确认优先"
-    if grade == 'M':
+    if stock.get('momentum_watch_only'):
         return "尾盘动作：动量观察，不追涨停/大阳线，等回踩或次日确认"
-    if grade == 'C':
-        return "尾盘动作：观察池候选，只跟踪不买入"
     return "尾盘动作：只观察，不追价"
 
 
@@ -164,9 +161,9 @@ def _annotate_push_priority(
 def _candidate_brief_action(stock: Dict[str, Any]) -> str:
     if _is_executable_candidate(stock):
         if stock.get("a_eod_controlled_trial"):
-            return "A-EOD受控小仓"
+            return "尾盘受控小仓"
         if stock.get("a_minus_trial"):
-            return "A-受控试仓"
+            return "受控试仓"
         if stock.get("event_trial_trade"):
             return "事件回踩试仓"
         return "可小仓复核"
@@ -200,8 +197,8 @@ def _candidate_brief_action(stock: Dict[str, Any]) -> str:
     return "只观察"
 
 
-def _candidate_grade_label(stock: Dict[str, Any]) -> str:
-    explicit = str(stock.get("grade_label") or "").strip()
+def _candidate_state_label(stock: Dict[str, Any]) -> str:
+    explicit = str(stock.get("decision_label") or "").strip()
     if explicit:
         return explicit
     if stock.get("bottom_discovery_watch_only"):
@@ -209,19 +206,20 @@ def _candidate_grade_label(stock: Dict[str, Any]) -> str:
     if stock.get("sequoia_research_shadow_only"):
         return "SHADOW研究形态"
     if stock.get("tv_reversal_watch_only"):
-        return "M级强修复"
+        return "强修复观察"
     if stock.get("pa_execution_tier") == "PULLBACK_WATCH":
         return "PA回踩观察"
     if stock.get("a_eod_controlled_trial") and _is_executable_candidate(stock):
-        return "A-EOD级受控交易"
+        return "尾盘受控试仓"
     if stock.get("a_minus_trial") and _is_executable_candidate(stock):
-        return "A-级受控试仓"
-    grade = str(stock.get("early_trade_grade") or stock.get("sop_grade") or "?").upper()
+        return "早期受控试仓"
     if _is_executable_candidate(stock):
-        return f"{grade}级可交易"
+        return "可交易候选"
     if stock.get("trade_bucket") == "EARLY" or stock.get("early_trade_candidate"):
-        return f"{grade}级提前复核"
-    return f"{grade}级结构"
+        return "提前复核"
+    if stock.get("trade_bucket") == "BLOCK":
+        return "禁止交易"
+    return "结构观察"
 
 
 def _candidate_brief_reason(stock: Dict[str, Any]) -> str:
@@ -268,11 +266,7 @@ def _is_high_extension(stock: Dict[str, Any]) -> bool:
         pct = float(stock.get("涨幅%") or stock.get("pct_chg") or 0)
     except (TypeError, ValueError):
         pct = 0.0
-    try:
-        pct_5d = float(stock.get("pct_5d") or 0)
-    except (TypeError, ValueError):
-        pct_5d = 0.0
-    return pct >= 7 or pct_5d >= 15 or "涨幅偏高" in blocker_text or "涨停/近涨停" in blocker_text
+    return pct >= 7 or "涨幅偏高" in blocker_text or "涨停/近涨停" in blocker_text
 
 
 def _no_chase_line(stock: Dict[str, Any]) -> Optional[str]:
@@ -286,7 +280,7 @@ def _no_chase_line(stock: Dict[str, Any]) -> Optional[str]:
 
 
 def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
-    grade_label = _candidate_grade_label(stock)
+    state_label = _candidate_state_label(stock)
     name = stock.get('名称', stock.get('name', ''))
     code = stock.get('代码', stock.get('code', ''))
     action = _candidate_brief_action(stock)
@@ -306,7 +300,7 @@ def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
     review_label = review_labels.get(review_state)
     state_text = f"｜{review_label}" if review_label else ""
     lines = [
-        f"指令：{instruction}{state_text}｜{action}｜{grade_label} {name}({code})",
+        f"指令：{instruction}{state_text}｜{action}｜{state_label} {name}({code})",
         (
             f"价格：现价{price if price else '--'}｜确认>{entry if entry else '--'}"
             f"｜失效<{close_guard if close_guard else '--'}"
@@ -317,6 +311,12 @@ def _candidate_brief_lines(stock: Dict[str, Any]) -> List[str]:
             f"环境：{stock.get('market_segment', '成长板块')}结构性强修复"
             f"｜全市场{stock.get('market_regime', '--')}"
         )
+    logic_line = build_logic_chain_line(stock)
+    if logic_line:
+        lines.append(logic_line)
+    capital_line = build_capital_evidence_line(stock)
+    if capital_line:
+        lines.append(capital_line)
     lines.append(f"原因：{_candidate_brief_reason(stock)}")
     return lines
 
@@ -331,7 +331,7 @@ def _intraday_state_fingerprint(stocks: List[Dict[str, Any]], regime: Dict[str, 
             "code": stock.get("代码") or stock.get("code"),
             "action": _candidate_brief_action(stock),
             "bucket": stock.get("trade_bucket"),
-            "grade": stock.get("grade_stage") or stock.get("sop_grade"),
+            "decision": stock.get("decision_stage") or stock.get("trade_state"),
             "blockers": [str(item) for item in blockers[:2]],
             "health": (stock.get("strategy_health") or {}).get("status"),
             "review_state": stock.get("execution_review_state"),
@@ -535,18 +535,11 @@ def _select_intraday_push_stocks(
     push_source: str = "bark",
 ) -> List[Dict[str, Any]]:
     """Keep the interruptive Bark channel for executable candidates only."""
-    grade_order = {'A': 0, 'A-EOD': 1, 'A-': 2, 'B': 3, 'M': 4, 'C': 5, 'D': 6, '?': 7}
-
     def rank_key(stock: Dict[str, Any]):
         adjustment = _push_priority_adjustment(stock, push_source, priority_adjustments)
         effective_score = float(stock.get('final_rank_score', stock.get('Score', 0)) or 0) + float(adjustment["delta"] or 0)
         return (
-            grade_order.get(
-                'A-EOD' if stock.get('a_eod_controlled_trial')
-                else 'A-' if stock.get('a_minus_trial')
-                else stock.get('sop_grade', '?'),
-                7,
-            ),
+            0 if _is_executable_candidate(stock) else 1,
             -effective_score,
         )
 
@@ -554,7 +547,6 @@ def _select_intraday_push_stocks(
         s for s in stock_list
         if (
             not s.get('sector_watch_only')
-            and s.get('sop_grade') in ('A', 'B', 'M', 'C')
             and _is_executable_candidate(s)
         )
     ]
@@ -581,6 +573,21 @@ def _select_intraday_push_stocks(
     return selected
 
 
+def _select_reference_push_stocks(
+    stock_list: List[Dict[str, Any]],
+    limit: int = REFERENCE_PUSH_MAX_STOCKS,
+) -> List[Dict[str, Any]]:
+    """Fallback list when market risk control blocks every executable candidate."""
+    def rank_key(stock: Dict[str, Any]):
+        return -float(stock.get('final_rank_score', stock.get('Score', 0)) or 0)
+
+    candidates = [
+        s for s in stock_list
+        if s.get('trade_bucket') != 'BLOCK' and not s.get('sector_watch_only')
+    ]
+    return sorted(candidates, key=rank_key)[:limit]
+
+
 def _select_after_close_watchlist(
     stock_list: List[Dict[str, Any]],
     limit: int = 5,
@@ -588,7 +595,15 @@ def _select_after_close_watchlist(
     push_source: str = "bark_next_day",
 ) -> List[Dict[str, Any]]:
     """Select next-day observation candidates without presenting blocked stocks as opportunities."""
-    grade_order = {'A': 0, 'B': 1, 'M': 2, 'C': 3, 'D': 4}
+    def watch_score(stock: Dict[str, Any]) -> float:
+        for key in ('trade_opportunity_score', 'final_trade_score', 'Score'):
+            if stock.get(key) is not None:
+                try:
+                    return float(stock[key])
+                except (TypeError, ValueError):
+                    return 0.0
+        return 60.0 if stock.get('trade_bucket') in {'TRADE', 'EARLY', 'OBSERVE'} else 0.0
+
     t1_plans = [
         _annotate_a_eod_t1_plan(stock)
         for stock in stock_list
@@ -609,10 +624,7 @@ def _select_after_close_watchlist(
     candidates = [
         stock for stock in stock_list
         if (
-            (
-                stock.get('sop_grade') in {'A', 'B', 'M', 'C'}
-                or float(stock.get('trade_opportunity_score') or 0) >= 60
-            )
+            watch_score(stock) >= 60
             and stock.get('trade_bucket') != 'BLOCK'
             and not stock.get('sector_watch_only')
             and not stock.get('sequoia_research_shadow_only')
@@ -626,7 +638,7 @@ def _select_after_close_watchlist(
     ordinary = sorted(
         candidates,
         key=lambda stock: (
-            grade_order.get(stock.get('sop_grade'), 4),
+            0 if stock.get('trade_eligible') is True else 1,
             -(
                 float(stock.get('final_trade_score', stock.get('Score', 0)) or 0)
                 + float(_push_priority_adjustment(stock, push_source, priority_adjustments)["delta"] or 0)
@@ -644,7 +656,7 @@ def _is_a_eod_t1_plan_candidate(stock: Dict[str, Any]) -> bool:
         or stock.get('tv_reversal_watch_only')
         or stock.get('bottom_discovery_watch_only')
         or stock.get('sequoia_research_shadow_only')
-        or str(stock.get('strategy_type') or '') not in SOP_A_GRADE_STRATEGIES
+        or str(stock.get('strategy_type') or '') not in {'tv_dual', 'tv_dual_strict'}
     ):
         return False
     pa_execution = classify_price_action_execution(stock)
@@ -739,7 +751,7 @@ def _build_after_close_watchlist_body(
     for stock in stock_list:
         name = stock.get('名称') or stock.get('name') or ''
         code = stock.get('代码') or stock.get('code') or ''
-        grade_label = _candidate_grade_label(stock)
+        state_label = _candidate_state_label(stock)
         current = _after_close_price(stock, '现价', 'price')
         entry = _after_close_price(stock, 'a_eod_t1_frozen_entry_price', 'entry_price', 'pa_entry_price')
         stop = _after_close_price(stock, 'a_eod_t1_frozen_stop_price', 'plan_stop_price', 'stop_price', 'pa_stop_price', 'pa_pullback_invalidation_price')
@@ -751,11 +763,11 @@ def _build_after_close_watchlist_body(
 
         price_label = stock.get("after_close_price_label") or "最近快照"
         if stock.get('a_eod_t1_plan'):
-            heading = "A-EOD-T1｜次日计划"
+            heading = "尾盘T1｜次日计划"
         elif stock.get('pa_execution_tier') == 'PULLBACK_WATCH':
             heading = "PA回踩观察｜不可交易"
         else:
-            heading = f"{grade_label}｜等待确认"
+            heading = f"{state_label}｜等待确认"
         lines.append(f"【{heading}】{name} ({code}) | {price_label} {current if current else '--'}")
         segment_text = (
             f" | {stock.get('market_segment')}结构性强修复"
@@ -1192,7 +1204,7 @@ def _format_market_line(stock_list: List[Dict[str, Any]], regime: Dict[str, Any]
 
 def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Optional[str]:
     """
-    Sends a Sentinel heartbeat when the scheduled scan runs but has no actionable A/B candidates.
+    Sends a Sentinel heartbeat when the scheduled scan runs but has no actionable candidates.
     """
     if not is_a_share_intraday_session():
         logger.info("Sentinel: Market is closed, skip Bark heartbeat.")
@@ -1211,11 +1223,8 @@ def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Op
 
     now_str = datetime.now().strftime("%H:%M")
     total = len(stock_list)
-    grade_counts = {}
-    for s in stock_list:
-        grade = s.get('sop_grade') or '?'
-        grade_counts[grade] = grade_counts.get(grade, 0) + 1
-    grade_text = " / ".join(f"{g}级{n}只" for g, n in sorted(grade_counts.items())) if grade_counts else "无命中"
+    trade_count = sum(1 for stock in stock_list if _is_executable_candidate(stock))
+    observe_count = sum(1 for stock in stock_list if stock.get('trade_bucket') in {'EARLY', 'OBSERVE'})
     watch_names = "、".join(
         f"{s.get('名称', s.get('name', ''))}({s.get('代码', s.get('code', ''))})"
         for s in stock_list[:3]
@@ -1231,8 +1240,8 @@ def send_intraday_heartbeat(stock_list: List[Dict[str, Any]], reason: str) -> Op
         f"大盘：{market_line}",
         f"策略：{strategy_label} | {freshness_line}",
         f"结果：{reason}",
-        f"统计：TV宽松池命中 {total} 只 | {grade_text}",
-        "执行：无A/B级不买入；等待14:30尾盘确认，不追D级和冲高回落票。",
+        f"统计：TV宽松池命中 {total} 只 | 可交易{trade_count}只 / 观察{observe_count}只",
+        "执行：仅TRADE候选可复核；等待14:30尾盘确认，不追高和冲高回落票。",
     ]
     if watch_names:
         lines.append(f"观察但不操作：{watch_names}")
@@ -1349,7 +1358,7 @@ def send_new_strategy_shadow_notification(report: Dict[str, Any]) -> Optional[st
             [
                 "",
                 "【路线C｜市场级修复影子】",
-                "当前仅记录修复环境；尚无独立个股入场模型，不迁移路线A/B候选。",
+                "当前仅记录修复环境；尚无独立个股入场模型，不迁移原策略候选。",
             ]
         )
 
@@ -1397,30 +1406,49 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         priority_adjustments=priority_adjustments,
         push_source="bark",
     )
-    if not push_stocks:
-        logger.info("Sentinel: No executable stocks to push.")
-        return None
-
     # 获取大盘状态
     from core.data import get_market_regime, get_market_snapshot, format_freshness
     regime = get_market_regime()
+    reference_mode = False
+    if not push_stocks:
+        # CRITICAL 市场一刀切挡住全部可交易候选时，降级为"参考版"推送；
+        # 其它原因导致的无可交易候选（事件降级、底部观察等）维持静默，避免打扰。
+        market_gate_blocked = bool(REGIME_REFERENCE_PUSH_ENABLED) and str(
+            regime.get("status") or ""
+        ).upper() == "CRITICAL"
+        if market_gate_blocked:
+            push_stocks = _select_reference_push_stocks(stock_list)
+            if push_stocks:
+                reference_mode = True
+                logger.info(
+                    "Sentinel: No executable candidates (market risk control); "
+                    "pushing %d reference signals.",
+                    len(push_stocks),
+                )
+        if not push_stocks:
+            logger.info("Sentinel: No executable stocks to push.")
+            return None
     market_line = _format_market_line(push_stocks, regime)
     fingerprint = _intraday_state_fingerprint(push_stocks, regime)
+    if reference_mode:
+        fingerprint = f"ref:{fingerprint}"
     if not _should_send_intraday_state(fingerprint):
         logger.info("Sentinel: Bark state unchanged, skip duplicate intraday push.")
         return ""
     engine = None
-    try:
-        from core.db import get_db_engine, save_recommendation_events
-        engine = get_db_engine()
-        save_recommendation_events(
-            push_stocks,
-            engine=engine,
-            source="bark",
-            market_regime=regime.get("status", "UNKNOWN"),
-        )
-    except Exception as exc:
-        logger.warning(f"Sentinel recommendation event persistence skipped: {exc}")
+    if not reference_mode:
+        # 参考版只是信息性推送：不写推荐事件/信号快照，避免污染策略绩效统计。
+        try:
+            from core.db import get_db_engine, save_recommendation_events
+            engine = get_db_engine()
+            save_recommendation_events(
+                push_stocks,
+                engine=engine,
+                source="bark",
+                market_regime=regime.get("status", "UNKNOWN"),
+            )
+        except Exception as exc:
+            logger.warning(f"Sentinel recommendation event persistence skipped: {exc}")
 
     notification_time = datetime.now()
     now_str = notification_time.strftime("%H:%M")
@@ -1429,6 +1457,8 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     primary_strategy = stock_list[0].get('strategy_type') if stock_list else None
     if primary_strategy == "bottom_discovery":
         title_prefix = "Alpha Vision 底部观察｜不可交易"
+    elif reference_mode:
+        title_prefix = "Alpha Vision 尾盘参考" if is_tail_decision_window else "Alpha Vision 盘中参考"
     else:
         title_prefix = "Alpha Vision 尾盘决策" if is_tail_decision_window else "Alpha Vision 盘中哨兵"
     title = f"{title_prefix} {now_str}"
@@ -1454,14 +1484,16 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         (stock.get("strategy_health") or {}).get("status") == "PAUSED"
         for stock in push_stocks
     )
+    if reference_mode:
+        conclusion_line = "结论：市场风控禁新仓，以下仅策略信号参考，不可下单。"
+    elif all_paused:
+        conclusion_line = "结论：策略已暂停，以下只观察。"
+    else:
+        conclusion_line = "结论：仅“可交易”可复核，其余不下单。"
     lines = [
         f"市场：{market_line}",
         f"策略：{strategy_label} | {freshness_line}",
-        (
-            "结论：策略已暂停，以下只观察。"
-            if all_paused
-            else "结论：仅“可交易”可复核，其余不下单。"
-        ),
+        conclusion_line,
         "",
     ]
     section_titles = {
@@ -1470,29 +1502,35 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
         "观察": "【只观察】",
         "禁止追买": "【禁止买入】",
     }
-    grouped = {"可交易": [], "强势异动": [], "观察": [], "禁止追买": []}
-    for s in push_stocks[:10]:
-        grouped.setdefault(_candidate_push_bucket(s), []).append(s)
-
-    for section in ("可交易", "强势异动", "观察", "禁止追买"):
-        stocks = grouped.get(section) or []
-        if not stocks:
-            continue
-        lines.append(section_titles[section])
-        for s in stocks:
+    if reference_mode:
+        lines.append("【策略信号｜仅供参考】")
+        for s in push_stocks:
             lines.extend(_candidate_brief_lines(s))
             lines.append("")
+    else:
+        grouped = {"可交易": [], "强势异动": [], "观察": [], "禁止追买": []}
+        for s in push_stocks[:10]:
+            grouped.setdefault(_candidate_push_bucket(s), []).append(s)
 
-    total_a = sum(1 for s in stock_list if s.get('sop_grade') == 'A')
+        for section in ("可交易", "强势异动", "观察", "禁止追买"):
+            stocks = grouped.get(section) or []
+            if not stocks:
+                continue
+            lines.append(section_titles[section])
+            for s in stocks:
+                lines.extend(_candidate_brief_lines(s))
+                lines.append("")
+
     total_a_eod = sum(1 for s in stock_list if s.get('a_eod_controlled_trial'))
     total_a_minus = sum(1 for s in stock_list if s.get('a_minus_trial'))
-    total_b = sum(1 for s in stock_list if s.get('sop_grade') == 'B')
-    total_m = sum(1 for s in stock_list if s.get('sop_grade') == 'M')
-    total_c = sum(1 for s in stock_list if s.get('sop_grade') == 'C')
-    total_sector_watch = sum(1 for s in stock_list if s.get('sector_watch_only') and s.get('sop_grade') != 'D')
+    total_trade = sum(1 for s in stock_list if _is_executable_candidate(s))
+    total_early = sum(1 for s in stock_list if s.get('trade_bucket') == 'EARLY')
+    total_observe = sum(1 for s in stock_list if s.get('trade_bucket') == 'OBSERVE')
+    total_block = sum(1 for s in stock_list if s.get('trade_bucket') == 'BLOCK')
+    total_sector_watch = sum(1 for s in stock_list if s.get('sector_watch_only') and s.get('trade_bucket') != 'BLOCK')
     lines.append(
-        f"汇总：A {total_a}｜A-EOD {total_a_eod}｜A- {total_a_minus}｜B {total_b}｜"
-        f"M {total_m}｜C {total_c}｜板块观察 {total_sector_watch}"
+        f"汇总：可交易 {total_trade}｜尾盘受控 {total_a_eod}｜早期受控 {total_a_minus}｜"
+        f"提前复核 {total_early}｜观察 {total_observe}｜禁止 {total_block}｜板块观察 {total_sector_watch}"
     )
 
     _append_real_position_status(lines)
@@ -1501,11 +1539,12 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
 
     # Persist the decision before delivery so Bark availability cannot bias
     # later strategy-performance measurement.
-    try:
-        from core.signal_performance import save_intraday_signal_snapshots
-        save_intraday_signal_snapshots(push_stocks, engine, source="bark", signal_time=notification_time)
-    except Exception as exc:
-        logger.warning(f"Signal snapshot persistence skipped: {exc}")
+    if not reference_mode:
+        try:
+            from core.signal_performance import save_intraday_signal_snapshots
+            save_intraday_signal_snapshots(push_stocks, engine, source="bark", signal_time=notification_time)
+        except Exception as exc:
+            logger.warning(f"Signal snapshot persistence skipped: {exc}")
 
     # A delayed executable instruction can become unsafe; later checkpoints
     # recompute it instead of retrying a stale instruction from the outbox.
@@ -1521,11 +1560,12 @@ def send_intraday_notification(stock_list: List[Dict[str, Any]]) -> Optional[str
     ]
     sent = all(deliveries)
     if sent:
-        try:
-            from core.execution_intents import create_bark_execution_intents
-            create_bark_execution_intents(push_stocks, engine, issued_at=notification_time)
-        except Exception as exc:
-            logger.warning(f"Execution intent persistence skipped: {exc}")
+        if not reference_mode:
+            try:
+                from core.execution_intents import create_bark_execution_intents
+                create_bark_execution_intents(push_stocks, engine, issued_at=notification_time)
+            except Exception as exc:
+                logger.warning(f"Execution intent persistence skipped: {exc}")
         _mark_intraday_state_sent(fingerprint)
     return body if sent else None
 

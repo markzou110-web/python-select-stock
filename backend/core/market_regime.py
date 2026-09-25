@@ -4,6 +4,7 @@
 """
 import pandas as pd
 import numpy as np
+from datetime import datetime
 from enum import Enum
 from typing import Dict, Any, Optional
 
@@ -200,8 +201,6 @@ def map_status_to_regime(status: str) -> str:
 
 def _fetch_index_data() -> Optional[pd.DataFrame]:
     """从数据库获取上证指数的K线数据。
-
-    修复 BUG：原用 load_from_db("000001") 从 daily_k 取数据，但 000001 在库里是
     **平安银行**（个股，收盘 ~10），不是上证指数（收盘 ~3000+）。这导致市场状态
     判定（牛/熊/震荡）以及弱市止损收紧完全基于一只银行股，系统性失真。
     改为复用 data.get_index_hist("000001")：优先新浪在线接口（返回真正指数），
@@ -218,3 +217,85 @@ def _fetch_index_data() -> Optional[pd.DataFrame]:
     except Exception as e:
         logger.error(f"Failed to fetch index data: {e}")
         return None
+
+
+def to_daily_close_series(df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
+    """从指数日线 DataFrame 提取带日期索引的收盘序列（兼容新浪/腾讯/东财格式）。"""
+    if df is None or df.empty:
+        return None
+    close_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
+    if close_col is None:
+        return None
+    series = pd.Series(pd.to_numeric(df[close_col], errors="coerce").values).dropna()
+    if "date" in df.columns:
+        series.index = pd.to_datetime(df["date"].values[: len(series)])
+    elif isinstance(df.index, pd.DatetimeIndex):
+        series.index = df.index[: len(series)]
+    else:
+        return None
+    series = series[~series.index.isna()].sort_index()
+    return series if not series.empty else None
+
+
+def detect_weekly_macd_top_divergence(daily_closes: Optional[pd.Series]) -> bool:
+    """周线 MACD 顶背离：价格创近端新高而 MACD 柱峰值走低。
+
+    《交易之路》长周期情绪度量："周线MACD顶背离，撒丫子就走"。
+    实现：日线收盘重采样为周线（W-FRI），计算 MACD(12,26,9) 柱，
+    取"最近的内部大顶"（±4周局部高点）与"最近8周的当前顶"比较：
+    当前顶价创新高（>0.5%）而柱峰值走低（<90%）判定为顶背离。
+    数据不足/索引非日期/任何异常 → False（fail-open，不误降级）。
+    """
+    try:
+        if daily_closes is None or len(daily_closes) < 120:
+            return False
+        closes = pd.Series(daily_closes, dtype="float64").dropna()
+        if not isinstance(closes.index, pd.DatetimeIndex):
+            return False
+        weekly = closes.resample("W-FRI").last().dropna().tail(60)
+        if len(weekly) < 30:
+            return False
+        ema12 = weekly.ewm(span=12, adjust=False).mean()
+        ema26 = weekly.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        dea = dif.ewm(span=9, adjust=False).mean()
+        hist = (dif - dea) * 2
+        price = weekly.values
+        hist_values = hist.values
+        n = len(price)
+        # 内部大顶：±4周窗口内的局部最高点（需要右侧确认，排除序列末端）
+        major_peaks = [
+            i for i in range(4, n - 4)
+            if price[i] >= max(price[i - 4:i + 5]) - 1e-9 and hist_values[i] > 0
+        ]
+        # 当前顶：最近8周内的最高收盘（允许出现在序列末端——“今天创新高”正是检测时机）
+        p2 = int(np.argmax(price[max(0, n - 8):n])) + max(0, n - 8)
+        if hist_values[p2] < 0:
+            return False
+        prior = [i for i in major_peaks if i <= p2 - 4]
+        if not prior:
+            return False
+        p1 = prior[-1]
+        return bool(price[p2] > price[p1] * 1.005 and hist_values[p2] < hist_values[p1] * 0.9)
+    except Exception as e:
+        logger.warning(f"weekly MACD divergence detection failed (fail-open): {e}")
+        return False
+
+
+# 月度季节性备注（本库 2022 以来中证500日度均值统计，样本仅约4年）。
+# 只做信息提示，不进入任何闸门/评分——样本太短，可能由单一年份主导。
+SEASONALITY_NOTES = {
+    10: "历史强月（10-12月偏强，样本仅约4年，仅供参考）",
+    11: "历史强月（10-12月偏强，样本仅约4年，仅供参考）",
+    12: "历史强月（10-12月偏强，样本仅约4年，仅供参考）",
+    7: "历史偏强月（样本仅约4年，仅供参考）",
+    6: "历史最弱月（样本仅约4年，仅供参考），注意控制仓位节奏",
+    1: "历史偏弱月（样本仅约4年，仅供参考）",
+    2: "历史偏弱月（样本仅约4年，仅供参考）",
+    4: "历史偏弱月（样本仅约4年，仅供参考）",
+}
+
+
+def get_seasonality_note(month: Optional[int] = None) -> Optional[str]:
+    month = int(month) if month else datetime.now().month
+    return SEASONALITY_NOTES.get(month)

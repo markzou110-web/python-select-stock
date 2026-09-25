@@ -12,6 +12,10 @@ class _PendingTaskResult:
     state = "PENDING"
 
 
+def test_scan_capabilities_advertise_match_modes():
+    assert scan.scan_capabilities() == {"match_modes": ["any", "all"]}
+
+
 class _CapturedTask:
     def __init__(self):
         self.args = None
@@ -60,8 +64,72 @@ def test_live_policy_applies_only_to_tv_strategies(monkeypatch):
 
     assert scan.manual_scan_requires_live_snapshot("tv_dual", None)
     assert scan.manual_scan_requires_live_snapshot("tv_dual_strict", None)
+    assert scan.manual_scan_requires_live_snapshot("tv_zp", None)
+    assert scan.manual_scan_requires_live_snapshot("h2", None)
     assert not scan.manual_scan_requires_live_snapshot("pine", None)
     assert not scan.manual_scan_requires_live_snapshot("tv_dual", "2026-08-07")
+
+
+def test_manual_multi_strategy_scan_passes_selection_to_task(monkeypatch):
+    task = _CapturedTask()
+    monkeypatch.setattr(scan, "run_market_scan_task", task)
+    monkeypatch.setattr(scan, "is_a_share_intraday_session", lambda now=None: True)
+
+    scan.scan_market(
+        strategy_type="h2",
+        strategy_types="h2,consensus",
+        match_mode="all",
+        local_only=True,
+        data_date="",
+    )
+
+    assert task.args[11] is False
+    assert task.args[18] is True
+    assert task.args[20] == "h2,consensus"
+    assert task.args[21] == "all"
+
+
+def test_multi_strategy_match_mode_uses_union_or_intersection():
+    rows = [
+        {"代码": "000001", "strategy_type": "h2", "Score": 60},
+        {"代码": "000001", "strategy_type": "consensus", "Score": 70},
+        {"代码": "000002", "strategy_type": "h2", "Score": 80},
+    ]
+    selected = ["h2", "consensus"]
+
+    any_results = scan._merge_strategy_results(rows, selected, "any")
+    all_results = scan._merge_strategy_results(rows, selected, "all")
+
+    assert {item["代码"] for item in any_results} == {"000001", "000002"}
+    assert [item["代码"] for item in all_results] == ["000001"]
+    assert all_results[0]["matched_strategies"] == selected
+
+
+def test_all_mode_filters_task_results_without_publishing_unfiltered_watchlist(monkeypatch):
+    from core import scanner, sentinel
+
+    calls = []
+    sent = []
+
+    def fake_scan(**kwargs):
+        calls.append((kwargs["strategy_type"], kwargs["publish_to_sentinel"]))
+        strategy = kwargs["strategy_type"]
+        codes = ["000001", "000002"] if strategy == "tv_dual" else ["000001"]
+        return [{"代码": code, "strategy_type": strategy, "Score": 50} for code in codes]
+
+    monkeypatch.setattr(scanner, "perform_market_scan", fake_scan)
+    monkeypatch.setattr(scan, "record_lifecycle_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sentinel, "send_after_close_watchlist", lambda *args, **kwargs: sent.append(True))
+
+    result = scan.run_market_scan_task(
+        strategy_type="tv_dual", strategy_types="tv_dual,weekly_four_patterns",
+        match_mode="all", include_scan_metadata=True,
+    )
+
+    assert [item["代码"] for item in result["results"]] == ["000001"]
+    assert result["scan_meta"]["match_mode"] == "all"
+    assert calls == [("tv_dual", False), ("weekly_four_patterns", False)]
+    assert sent == []
 
 
 def test_live_policy_is_disabled_outside_intraday_session(monkeypatch):

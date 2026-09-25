@@ -108,6 +108,7 @@ if config.RATE_LIMIT_ENABLED:
     _rate_limiter = RateLimiter()
     _rate_limiter.register("/api/scan", config.RATE_LIMIT_SCAN)       # e.g. 10/minute
     _rate_limiter.register("/api/sync", config.RATE_LIMIT_SYNC)       # e.g. 1/hour
+    _rate_limiter.register("/api/ai/analyze-", config.RATE_LIMIT_AI)
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
@@ -161,6 +162,7 @@ from routers.system import router as system_router
 from routers.backtest import router as backtest_router
 from routers.money_flow import router as money_flow_router
 from routers.execution_intents import router as execution_intents_router
+from routers.ai_analysis import router as ai_analysis_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -177,6 +179,7 @@ app.include_router(system_router)
 app.include_router(backtest_router)
 app.include_router(money_flow_router)
 app.include_router(execution_intents_router)
+app.include_router(ai_analysis_router)
 
 @app.get("/api/market/pulse")
 async def get_market_pulse():
@@ -199,4 +202,4 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=config.API_HOST, port=8000)

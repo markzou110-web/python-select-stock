@@ -33,7 +33,14 @@ import { useMarketStore } from '@/stores/marketStore';
 
 interface MarketPulseIndex {
     trend?: string;
+    trend_label?: string;
+    ema20_gap_pct?: number;
+    chg_pct?: number;
 }
+
+const signedPct = (value?: number) => value == null || !Number.isFinite(value)
+    ? '--'
+    : `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 
 export default function Dashboard() {
     // ── Market store ──
@@ -224,7 +231,9 @@ export default function Dashboard() {
                                         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                                             <div className="flex min-w-0 flex-wrap items-center gap-3">
                                                 <div>
-                                                    <p className="text-[11px] font-semibold tracking-wide text-slate-400">今日决策基线</p>
+                                                    <p className="text-[11px] font-semibold tracking-wide text-slate-400">
+                                                        {marketRegime?.baseline_label || '市场决策基线'}
+                                                    </p>
                                                     <h2 id="market-risk-heading" className="mt-0.5 text-base font-bold">
                                                         大盘风控
                                                     </h2>
@@ -246,7 +255,7 @@ export default function Dashboard() {
                                                     {marketRegime.desc}
                                                     <span className="mt-1 block text-xs text-slate-400">
                                                         {Object.entries(marketRegime.indices as Record<string, MarketPulseIndex>).map(([name, d]) =>
-                                                            `${name} ${d.trend === 'BULL' ? '多头' : '空头'}`
+                                                            `${name === '创业' ? '创业板' : name} ${d.trend_label || (d.trend === 'BULL' ? '站上EMA20' : '低于EMA20')}｜当日${signedPct(d.chg_pct)}｜距EMA20 ${signedPct(d.ema20_gap_pct)}`
                                                         ).join(' · ')}
                                                     </span>
                                                 </p>
@@ -283,7 +292,9 @@ export default function Dashboard() {
                                                 {lastScanSummary.strategyLabel}扫描完成
                                             </p>
                                             <p className="mt-1 text-xs font-semibold opacity-80">
-                                                {lastScanSummary.strategyType === 'tv_dual' || lastScanSummary.strategyType === 'tv_dual_strict'
+                                                {lastScanSummary.matchMode === 'all' && lastScanSummary.strategyTypes.length > 1
+                                                    ? `同时命中全部已选策略 ${lastScanSummary.count} 只；组合仅用于筛选，不新增买卖指令`
+                                                    : lastScanSummary.strategyType === 'tv_dual' || lastScanSummary.strategyType === 'tv_dual_strict'
                                                     ? `当前信号 ${lastScanSummary.count} 只 · 历史复活 ${lastScanSummary.revivalCount} 只 · 动量观察 ${lastScanSummary.momentumCount} 只`
                                                     : ['high_tight_flag', 'turtle_breakout', 'limit_up_shakeout'].includes(lastScanSummary.strategyType)
                                                         ? `SHADOW研究命中 ${lastScanSummary.count} 只，不进入交易或Bark操作推送`

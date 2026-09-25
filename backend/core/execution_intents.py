@@ -6,6 +6,66 @@ from typing import Any, Dict, Iterable
 
 from sqlalchemy import text
 
+from core.risk_constants import (
+    LOSS_STREAK_BREAKER_ENABLED,
+    LOSS_STREAK_COOLDOWN_DAYS,
+    MAX_CONSECUTIVE_LOSSES,
+)
+
+
+def get_paper_loss_streak(engine) -> Dict[str, Any]:
+    """最近连续亏损笔数与最后一笔平仓日期（用于连错熔断）。
+
+    数据缺失/查询失败时 fail-open（不熔断），避免数据问题冻结全部指令。
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT entry_price, close_price, close_date
+                FROM paper_trading
+                WHERE status='CLOSED' AND entry_price > 0 AND close_price > 0
+                ORDER BY close_date DESC, id DESC
+                LIMIT 30
+            """)).mappings().all()
+    except Exception as e:
+        from .logging_config import logger
+        logger.warning(f"loss streak query failed (fail-open): {e}")
+        return {"streak": 0, "last_close_date": None}
+    streak = 0
+    last_close_date = None
+    for row in rows:
+        if last_close_date is None:
+            last_close_date = row["close_date"]
+        if float(row["close_price"]) < float(row["entry_price"]):
+            streak += 1
+        else:
+            break
+    return {"streak": streak, "last_close_date": last_close_date}
+
+
+def _loss_streak_breaker_reason(engine, now: datetime) -> str | None:
+    """连错熔断：连续亏损达阈值且最后一笔平仓在冷却期内 → 暂停签发新指令。
+
+    冷却期过后自动恢复（不做人工解锁，避免长期冻结）。返回 None 表示放行。
+    """
+    if not LOSS_STREAK_BREAKER_ENABLED:
+        return None
+    info = get_paper_loss_streak(engine)
+    streak = int(info.get("streak") or 0)
+    if streak < MAX_CONSECUTIVE_LOSSES:
+        return None
+    last_close = info.get("last_close_date")
+    if last_close is None:
+        return None
+    if isinstance(last_close, str):
+        try:
+            last_close = datetime.strptime(last_close[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    if (now.date() - last_close).days > LOSS_STREAK_COOLDOWN_DAYS:
+        return None  # 冷却期已过，恢复签发
+    return f"连亏{streak}笔熔断：暂停签发新可交易指令（{LOSS_STREAK_COOLDOWN_DAYS}个交易日冷却）"
+
 
 STATES = ("ISSUED", "SEEN", "ACCEPTED", "SKIPPED", "ORDERED", "PARTIAL", "FILLED", "CANCELLED", "EXPIRED")
 TERMINAL_STATES = {"SKIPPED", "FILLED", "CANCELLED", "EXPIRED"}
@@ -29,6 +89,13 @@ def _number(value: Any) -> float | None:
 def create_bark_execution_intents(stocks: Iterable[Dict[str, Any]], engine, issued_at: datetime | None = None) -> list[str]:
     """Create intents only for successfully delivered, explicitly tradable candidates."""
     now = issued_at or datetime.now()
+    # 连错熔断（《交易之路》：连错3次必须休息）：只挡本次新增签发，
+    # 不影响已签发意图的状态流转与平仓管理。
+    breaker = _loss_streak_breaker_reason(engine, now)
+    if breaker:
+        from core.logging_config import logger
+        logger.warning(f"连错熔断生效，本次跳过可交易指令签发：{breaker}")
+        return []
     json_expr = ":snapshot" if engine.dialect.name == "sqlite" else "CAST(:snapshot AS JSON)"
     created = []
     with engine.begin() as conn:
@@ -48,9 +115,8 @@ def create_bark_execution_intents(stocks: Iterable[Dict[str, Any]], engine, issu
             if not isinstance(position_plan, dict):
                 position_plan = {}
             snapshot = {
-                "grade": stock.get("sop_grade"), "score": stock.get("Score") or stock.get("score"),
+                "score": stock.get("Score") or stock.get("score"),
                 "a_minus_trial": bool(stock.get("a_minus_trial")),
-                "a_minus_trial_grade": stock.get("a_minus_trial_grade"),
                 "a_minus_trial_policy_version": stock.get("a_minus_trial_policy_version"),
                 "a_minus_trial_health": stock.get("a_minus_trial_health"),
                 "a_minus_portfolio_cap_pct": stock.get("a_minus_portfolio_cap_pct"),

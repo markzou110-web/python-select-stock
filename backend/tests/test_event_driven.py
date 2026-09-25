@@ -72,6 +72,12 @@ def test_event_trial_never_bypasses_price_or_volume_hard_gate():
     assert row["trade_bucket"] == "OBSERVE"
 
 
+def test_five_day_gain_alone_does_not_force_pullback_state():
+    from core.event_driven import classify_post_limit_state
+
+    assert classify_post_limit_state({"pct_5d": 20.0}) == "EVENT_DISCOVERY"
+
+
 def test_blocker_dedupe_keeps_one_actionable_reason_per_cause():
     blockers = _dedupe_trade_blockers([
         "历史信号复活仅观察，等次日确认",

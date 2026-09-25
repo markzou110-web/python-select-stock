@@ -30,6 +30,16 @@ class Config:
     BARK_KEY: str = os.getenv("BARK_KEY", "")
     BARK_URL_TEMPLATE: str = "https://api.day.app/{key}/{title}/{body}?icon=https://i.imgur.com/8p4jA4w.png"
 
+    # AI candidate review (OpenAI-compatible chat completions API)
+    AI_ANALYSIS_ENABLED: bool = os.getenv("AI_ANALYSIS_ENABLED", "true").lower() == "true"
+    AI_API_KEY: str = os.getenv("AI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    AI_BASE_URL: str = os.getenv(
+        "AI_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    ).rstrip("/")
+    AI_MODEL: str = os.getenv("AI_MODEL", os.getenv("OPENAI_MODEL", ""))
+    AI_TIMEOUT_SECONDS: int = min(120, max(5, int(os.getenv("AI_TIMEOUT_SECONDS", "45"))))
+    AI_MAX_CANDIDATES: int = min(20, max(1, int(os.getenv("AI_MAX_CANDIDATES", "10"))))
+
     # Database
     DATABASE_HOST: str = os.getenv("DB_HOST", "localhost")
     DATABASE_PORT: str = os.getenv("DB_PORT", "5432")
@@ -41,6 +51,7 @@ class Config:
     # API Security
     API_TOKEN: Optional[str] = os.getenv("API_TOKEN")
     ENABLE_AUTH: bool = os.getenv("ENABLE_AUTH", "false").lower() == "true"
+    API_HOST: str = os.getenv("API_HOST", "127.0.0.1")
 
     # CORS
     ALLOWED_ORIGINS: list = os.getenv(
@@ -52,6 +63,7 @@ class Config:
     RATE_LIMIT_ENABLED: bool = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
     RATE_LIMIT_SCAN: str = os.getenv("RATE_LIMIT_SCAN", "10/minute")
     RATE_LIMIT_SYNC: str = os.getenv("RATE_LIMIT_SYNC", "30/minute")
+    RATE_LIMIT_AI: str = os.getenv("RATE_LIMIT_AI", "30/day")
 
     # Sentinel
     SENTINEL_DEFAULT_TIME: str = os.getenv("SENTINEL_DEFAULT_TIME", "09:30")
@@ -97,6 +109,26 @@ class Config:
         return {
             "configured": cls.is_bark_configured(),
             "sentinel_time": os.getenv("SENTINEL_DEFAULT_TIME", cls.SENTINEL_DEFAULT_TIME)
+        }
+
+    def is_ai_analysis_configured(self) -> bool:
+        """Return whether the optional AI review layer can make requests."""
+        if not self.AI_ANALYSIS_ENABLED or not self.AI_BASE_URL or not self.AI_MODEL:
+            return False
+        # Local OpenAI-compatible servers such as Ollama commonly need no API key.
+        return bool(self.AI_API_KEY) or self.AI_BASE_URL.startswith(
+            ("http://127.0.0.1", "http://localhost")
+        )
+
+    def get_ai_safe_status(self) -> dict:
+        return {
+            "enabled": self.AI_ANALYSIS_ENABLED,
+            "configured": self.is_ai_analysis_configured(),
+            "model": self.AI_MODEL or None,
+            "provider": self.AI_BASE_URL.split("//", 1)[-1].split("/", 1)[0],
+            "max_candidates": self.AI_MAX_CANDIDATES,
+            "auth_enabled": self.ENABLE_AUTH,
+            "security_warning": None if self.ENABLE_AUTH else "AI写接口未启用令牌校验，仅建议本机访问",
         }
 
     @classmethod

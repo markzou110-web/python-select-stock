@@ -1,6 +1,7 @@
 fastapi==0.111.0
 uvicorn==0.30.1
-akshare>=1.14.0
+# akshare 破坏性变更频繁，锁定上限与本地已装版本（1.18.38）保持一致，避免升级后接口失效
+akshare>=1.14.0,<1.19
 pandas==2.2.2
 numpy==1.26.4
 sqlalchemy==2.0.30

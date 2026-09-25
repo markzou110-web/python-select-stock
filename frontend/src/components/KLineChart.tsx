@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import api from '@/lib/api';
+import { DOW_PHASE_LEGEND } from '@/lib/dowPhase';
 import { Target, TrendingDown, TrendingUp, Zap } from 'lucide-react';
 import SplitKLineCharts from './SplitKLineCharts';
 
@@ -98,6 +99,16 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                     <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" />EMA20</span>
                     <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-blue-500" />EMA120</span>
                     <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-purple-500" />EMA250</span>
+                    {(chartData.trend_phases || []).length > 0 && (
+                        <span className="flex items-center gap-2 pl-2 border-l border-slate-200">
+                            {DOW_PHASE_LEGEND.map((item) => (
+                                <span key={item.label} className="flex items-center gap-1" title="道氏趋势阶段（K线上的方块标记，悬停查看操作建议）">
+                                    <span className="w-2 h-2 rounded-sm" style={{ backgroundColor: item.color }} />
+                                    {item.label}
+                                </span>
+                            ))}
+                        </span>
+                    )}
                 </div>
             </div>
 
@@ -112,6 +123,10 @@ export default function KLineChart({ code, name, strategyType = 'squeeze' }: KLi
                     sellSignals={signalData?.sell_signals || []}
                     priceAction={chartData.price_action || null}
                     priceActionLines={chartData.price_action_lines || []}
+                    trendPhases={chartData.trend_phases || []}
+                    chartHints={chartData.chart_hints || []}
+                    tradeProjection={chartData.trade_projection || null}
+                    chipDistribution={chartData.chip_distribution || null}
                     height={400}
                 />
             )}

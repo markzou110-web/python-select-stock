@@ -143,8 +143,8 @@ def test_bark_names_a_eod_controlled_trade_and_position_limits_clearly():
     })
 
     assert lines[0].startswith("指令：可交易")
-    assert "A-EOD受控小仓" in lines[0]
-    assert "A-EOD级受控交易" in lines[0]
+    assert "尾盘受控小仓" in lines[0]
+    assert "尾盘受控试仓" in lines[0]
     assert "单票≤5%" in lines[2]
 
 

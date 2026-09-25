@@ -7,13 +7,18 @@ from .data import get_market_snapshot, is_snapshot_stale
 from .indicators import calculate_indicators
 from core.strategy import evaluate_exit_signals
 from core.risk_engine import safe_float
+from core.logic_chain import build_capital_evidence_line, build_logic_chain_line
 from core.trading_calendar import is_a_share_intraday_session, is_a_share_trading_day
 import asyncio
 import json
 import pandas as pd
 import re
+import time
 from datetime import datetime, time as datetime_time
 from sqlalchemy import text
+
+# 收盘AI复核前的个股研究快照预热预算（新闻/公告等15个数据源，纯增量缓存）
+_DAILY_AI_RESEARCH_WARMUP_SECONDS = 240
 
 _ALERT_DEDUPE_CACHE = {}
 _ALERT_DEDUPE_SECONDS = 30 * 60
@@ -42,6 +47,351 @@ def _is_after_close_review_window(now: datetime) -> bool:
         is_a_share_trading_day(now)
         and datetime_time(15, 0) <= now.time() <= _AFTER_CLOSE_REVIEW_END
     )
+
+
+def _premarket_position_action(plan: dict) -> str:
+    current = safe_float(plan.get("current_price"))
+    stop = safe_float(plan.get("active_stop_price"))
+    guard = safe_float(plan.get("add_guard_price"))
+    trigger = safe_float(plan.get("add_trigger_price"))
+    if stop > 0 and current <= stop:
+        return "已低于防守线，开盘优先减仓或退出复核"
+    if guard > 0 and current <= guard:
+        return "持有观察，不加仓；已低于撤退线，转弱则执行风控"
+    if trigger > 0 and current < trigger:
+        return "持有观察，不加仓；等待放量站上转强线"
+    return "已到转强线，等待开盘后量价确认；不自动加仓"
+
+
+def build_premarket_position_advice(
+    positions: list[dict],
+    market: dict | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Build one compact, actionable Bark card for open real positions."""
+    now = now or datetime.now()
+    market_desc = str((market or {}).get("desc") or "市场状态待开盘确认")
+    lines = [f"市场：{market_desc}", "纪律：盘前价位基于上一交易日收盘，不自动下单", ""]
+    visible = positions[:8]
+    for item in visible:
+        plan = item.get("plan") or {}
+        entry = safe_float(plan.get("entry_price"))
+        current = safe_float(plan.get("current_price"), entry)
+        stop = safe_float(plan.get("active_stop_price"))
+        guard = safe_float(plan.get("add_guard_price"))
+        trigger = safe_float(plan.get("add_trigger_price"))
+        price_action = item.get("price_action") or {}
+        pl_pct = (current - entry) / entry * 100 if entry > 0 else 0
+        lines.extend([
+            f"{item.get('name') or item.get('code')}({item.get('code')})",
+            f"昨收 {current:.2f}｜成本 {entry:.2f}｜{pl_pct:+.2f}%",
+            f"防守 {stop:.2f}｜撤退 {guard:.2f}｜转强 {trigger:.2f}",
+            f"建议：{_premarket_position_action(plan)}",
+        ])
+        structure_bits = [
+            str(value) for value in (
+                price_action.get("structure_state_label"),
+                f"突破跟进{price_action.get('follow_through_state')}" if price_action.get("follow_through_state") not in {None, "NONE"} else None,
+                f"MTR {price_action.get('mtr_state')}" if price_action.get("mtr_state") not in {None, "NONE"} else None,
+            ) if value
+        ]
+        if structure_bits:
+            lines.append(f"价格行为：{'｜'.join(structure_bits)}")
+        nearest_support = price_action.get("nearest_support") or {}
+        nearest_resistance = price_action.get("nearest_resistance") or {}
+        if nearest_support.get("center") or nearest_resistance.get("center"):
+            lines.append(
+                f"结构区：支撑 {nearest_support.get('center') or '--'}｜压力 {nearest_resistance.get('center') or '--'}"
+            )
+        lines.append("")
+    if len(positions) > len(visible):
+        lines.append(f"另有 {len(positions) - len(visible)} 只持仓请在系统内查看。")
+    lines.append("盘中仅在关键区间首次进入或状态变化时提醒；同类信号重入冷却30分钟。")
+    return {
+        "title": f"📋 盘前持仓策略 {now:%m-%d}",
+        "body": "\n".join(lines),
+        "count": len(positions),
+    }
+
+
+def build_position_status_summary(
+    positions: list[dict],
+    *,
+    slot: str,
+    now: datetime | None = None,
+    live_refreshed: bool = True,
+) -> dict:
+    """Build the fixed 11:25/14:50 heartbeat without changing alert state."""
+    from core.operation_plan import evaluate_operation_trigger
+
+    now = now or datetime.now()
+    titles = {
+        "morning": "☀️ 上午持仓摘要",
+        "late": "🎯 尾盘持仓确认",
+    }
+    refresh_text = "实时行情已刷新" if live_refreshed else "实时行情刷新异常，使用最近缓存价"
+    lines = [
+        f"监控{'正常' if live_refreshed else '在线'}｜{refresh_text} {now:%H:%M}",
+        f"本次检查 {len(positions)} 只实盘持仓；本条为定时状态确认。",
+        "",
+    ]
+    action_labels = {
+        "STRUCTURE_EXIT": "退出复核",
+        "REDUCE": "减仓/收紧风控",
+        "CANCEL_ADD": "撤回加仓计划",
+        "ADD_TRIGGER": "加仓复核（等待价量与收盘确认）",
+        "HOLD": "持有观察（未触发新操作）",
+    }
+    visible = positions[:8]
+    for item in visible:
+        plan = item.get("plan") or {}
+        entry = safe_float(plan.get("entry_price"))
+        current = safe_float(plan.get("current_price"), entry)
+        stop = safe_float(plan.get("active_stop_price"))
+        guard = safe_float(plan.get("add_guard_price"))
+        trigger_price = safe_float(plan.get("add_trigger_price"))
+        pl_pct = (current - entry) / entry * 100 if entry > 0 else 0
+        trigger = evaluate_operation_trigger(current, plan)
+        kind = str(trigger.get("kind") or "HOLD")
+        lines.extend([
+            f"{item.get('name') or item.get('code')}({item.get('code')})",
+            f"现价 {current:.2f}｜成本 {entry:.2f}｜{pl_pct:+.2f}%",
+            f"状态：{action_labels.get(kind, str(trigger.get('action') or '持有观察'))}",
+            f"防守 {stop:.2f}｜撤退 {guard:.2f}｜转强 {trigger_price:.2f}",
+            "",
+        ])
+    if len(positions) > len(visible):
+        lines.append(f"另有 {len(positions) - len(visible)} 只持仓请在系统内查看。")
+    if slot == "late":
+        lines.append("尾盘纪律：仅按已确认价位执行；未站稳转强线不加仓，跌破防守线优先风控。")
+    lines.append("即时提醒仍在运行；后续仅在操作状态变化时另行推送。")
+    return {
+        "title": f"{titles[slot]} {now:%m-%d}",
+        "body": "\n".join(lines),
+        "count": len(positions),
+    }
+
+
+@celery_app.task(name="tasks.send_premarket_position_advice")
+@daily_task_slot("premarket-position-advice", timeout_minutes=30)
+def send_premarket_position_advice():
+    """Send the trading-day 08:45 plan for REAL + OPEN positions."""
+    now = datetime.now()
+    if not is_a_share_trading_day(now):
+        return {"status": "skipped", "reason": "non_trading_day"}
+    try:
+        from core.data import get_market_regime
+        from routers.paper_trade import get_open_trade_plans
+
+        payload = get_open_trade_plans()
+        positions = [
+            item for item in (payload.get("items") or [])
+            if str(item.get("trade_mode") or "").upper() == "REAL"
+        ]
+        if not positions:
+            return {"status": "skipped", "reason": "no_open_real_positions"}
+        try:
+            market = get_market_regime()
+        except Exception as exc:
+            logger.warning(f"Premarket regime unavailable: {exc}")
+            market = None
+        message = build_premarket_position_advice(positions, market=market, now=now)
+        delivery = asyncio.run(notifier.send(
+            message["title"],
+            message["body"],
+            channels=["bark"],
+            group="AlphaVision_Position",
+            url="http://localhost:3000",
+        ))
+        sent = bool(delivery.get("bark"))
+        return {
+            "status": "success" if sent else "queued",
+            "bark": sent,
+            "count": message["count"],
+        }
+    except Exception as exc:
+        logger.error(f"Premarket position advice failed: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+
+@celery_app.task(name="tasks.send_position_status_summary")
+@daily_task_slot("position-status-summary", slot_argument="slot", timeout_minutes=30)
+def send_position_status_summary(slot: str):
+    """Send one low-noise position heartbeat at 11:25 or 14:50."""
+    if slot not in {"morning", "late"}:
+        return {"status": "error", "reason": "invalid_slot", "slot": slot}
+    now = datetime.now()
+    if not is_a_share_intraday_session(now):
+        return {"status": "skipped", "reason": "market_closed", "slot": slot}
+    try:
+        from routers.paper_trade import check_operation_triggers, get_open_trade_plans
+
+        refresh = check_operation_triggers(notify=False, trade_mode="REAL")
+        live_refreshed = refresh.get("status") == "success" and not refresh.get("reason")
+        payload = get_open_trade_plans()
+        positions = [
+            item for item in (payload.get("items") or [])
+            if str(item.get("trade_mode") or "").upper() == "REAL"
+        ]
+        if not positions:
+            return {"status": "skipped", "reason": "no_open_real_positions", "slot": slot}
+        message = build_position_status_summary(
+            positions,
+            slot=slot,
+            now=now,
+            live_refreshed=live_refreshed,
+        )
+        delivery = asyncio.run(notifier.send(
+            message["title"],
+            message["body"],
+            channels=["bark"],
+            group="AlphaVision_Position",
+            url="http://localhost:3000",
+        ))
+        sent = bool(delivery.get("bark"))
+        return {
+            "status": "success" if sent else "queued",
+            "bark": sent,
+            "count": message["count"],
+            "slot": slot,
+            "live_refreshed": live_refreshed,
+        }
+    except Exception as exc:
+        logger.error(f"Position status summary failed ({slot}): {exc}")
+        return {"status": "error", "detail": str(exc), "slot": slot}
+
+
+@celery_app.task(name="tasks.send_daily_ai_review")
+@daily_task_slot("daily-ai-review", timeout_minutes=30)
+def send_daily_ai_review():
+    """After-close AI review of the day's top candidates; persists and pushes via Bark."""
+    now = datetime.now()
+    if not is_a_share_trading_day(now):
+        return {"status": "skipped", "reason": "non_trading_day"}
+    from core.config import config
+
+    if not config.is_ai_analysis_configured():
+        return {"status": "skipped", "reason": "ai_not_configured"}
+    try:
+        from core.ai_stock_analysis import analyze_strategy_candidates
+        from core.daily_strategy_report import build_daily_strategy_report, build_daily_strategy_report_body
+        from core.db import (
+            get_scan_dates,
+            get_scan_history_by_date,
+            save_ai_candidate_reviews,
+        )
+        from core.stock_research import build_stock_research_signals
+
+        dates = get_scan_dates()
+        scan_date = dates[0] if dates else ""
+        expected_date = now.strftime("%Y-%m-%d")
+        if scan_date and scan_date != expected_date:
+            return {
+                "status": "skipped",
+                "reason": "stale_scan_date",
+                "scan_date": scan_date,
+                "expected_date": expected_date,
+            }
+        results = get_scan_history_by_date(scan_date) if scan_date else []
+        if not results:
+            return {"status": "skipped", "reason": "no_scan_results", "scan_date": scan_date}
+
+        def _candidate_rank(stock: dict):
+            trade_eligible = bool(stock.get("trade_eligible")) and str(stock.get("trade_bucket") or "").upper() == "TRADE"
+            score = float(
+                stock.get("display_opportunity_score")
+                or stock.get("final_trade_score")
+                or stock.get("Score")
+                or 0
+            )
+            return (0 if trade_eligible else 1, -score)
+
+        candidates = sorted(results, key=_candidate_rank)[: config.AI_MAX_CANDIDATES]
+
+        # 附上行业景气聚合（ROE/净利同比中位数），给AI复核板块级基本面参考
+        from core.industry_prosperity import build_industry_prosperity
+
+        prosperity_map = build_industry_prosperity(results)
+        if prosperity_map:
+            for stock in candidates:
+                industry = str(stock.get("行业") or stock.get("industry") or "").strip()
+                if prosperity_map.get(industry):
+                    stock["industry_prosperity"] = prosperity_map[industry]
+
+        # 预热研究快照（新闻/公告/龙虎榜），让 AI 复核读到舆情证据；超预算即止
+        warmup_deadline = time.monotonic() + _DAILY_AI_RESEARCH_WARMUP_SECONDS
+        warmed = 0
+        for stock in candidates:
+            if time.monotonic() > warmup_deadline:
+                break
+            code = str(stock.get("代码") or stock.get("code") or "").zfill(6)
+            if not code.isdigit() or len(code) != 6:
+                continue
+            try:
+                build_stock_research_signals(code, trade_date=scan_date, force_refresh=False)
+                warmed += 1
+            except Exception as exc:
+                logger.warning(f"AI review research warmup failed for {code}: {exc}")
+
+        review = analyze_strategy_candidates(candidates)
+        if review.get("status") != "success":
+            return {
+                "status": "degraded",
+                "reason": review.get("message"),
+                "scan_date": scan_date,
+                "warmed_research": warmed,
+            }
+        saved = save_ai_candidate_reviews(
+            review["analyses"],
+            review_date=scan_date,
+            model=review.get("model") or "",
+            market_summary=review.get("market_summary") or "",
+            source="scheduled",
+        )
+        buy_count = sum(
+            1 for item in review["analyses"] if str(item.get("action") or "").upper() == "BUY"
+        )
+        report = build_daily_strategy_report(
+            results,
+            scan_date=scan_date,
+            ai_review={**review, "source": "scheduled"},
+        )
+        report_body = build_daily_strategy_report_body(report)
+        if buy_count == 0:
+            # 无BUY不再静默：照常推送观察版，附确定性市场概况，便于人工研判。
+            report_body = (
+                f"今日无BUY推荐（{len(review['analyses'])}只候选全部等待/回避）。\n{report_body}"
+            )
+            title = f"收盘AI复核 {scan_date}｜无BUY"
+        else:
+            title = f"收盘AI复核 {scan_date}"
+        try:
+            from core.data import get_market_regime
+            market_desc = str(get_market_regime().get("desc") or "")
+        except Exception:
+            market_desc = ""
+        if market_desc:
+            report_body = f"市场：{market_desc}\n{report_body}"
+        delivery = asyncio.run(notifier.send(
+            title,
+            report_body,
+            channels=["bark"],
+            group="AlphaVision_Report",
+            url="http://localhost:3000",
+        ))
+        return {
+            "status": "success" if delivery.get("bark") else "queued",
+            "bark": bool(delivery.get("bark")),
+            **({"reason": "no_buy_candidates"} if buy_count == 0 else {}),
+            "scan_date": scan_date,
+            "buy_count": buy_count,
+            "candidates": len(review["analyses"]),
+            "warmed_research": warmed,
+            "batch_id": (saved or {}).get("batch_id"),
+        }
+    except Exception as exc:
+        logger.error(f"Daily AI review failed: {exc}")
+        return {"status": "error", "detail": str(exc)}
 
 
 @celery_app.task(name="tasks.discover_event_catalysts")
@@ -423,6 +773,21 @@ def check_realtime_alerts():
         return str(e)
 
 
+@celery_app.task(name="tasks.check_position_operation_alerts")
+def check_position_operation_alerts():
+    """Check REAL positions every five minutes and notify only on state changes."""
+    now = datetime.now()
+    if not is_a_share_intraday_session(now):
+        return {"status": "skipped", "reason": "market_closed"}
+    try:
+        from routers.paper_trade import check_operation_triggers
+
+        return check_operation_triggers(notify=True, trade_mode="REAL")
+    except Exception as exc:
+        logger.error(f"Position operation alert failed: {exc}")
+        return {"status": "error", "alerts": [], "detail": str(exc)}
+
+
 @celery_app.task(name="tasks.intraday_monitor_checkpoint")
 @daily_task_slot("intraday-monitor", slot_argument="slot", timeout_minutes=45)
 def intraday_monitor_checkpoint(slot: str = "price_watch"):
@@ -632,11 +997,10 @@ def _scan_display_score(item: dict) -> float:
 
 
 def _noon_action_text(item: dict) -> str:
-    grade = str(item.get("early_trade_grade") or item.get("sop_grade") or item.get("评级") or item.get("grade") or "").upper()
     action = str(item.get("sop_action") or item.get("pa_trade_action") or item.get("trade_bucket") or "WATCH").upper()
     bucket = str(item.get("trade_bucket") or "").upper()
-    if grade == "D" or bucket == "BLOCK" or action in {"AVOID", "D"}:
-        return "排除/不买：评级或交易桶未通过，最多复盘观察"
+    if bucket == "BLOCK" or action == "AVOID":
+        return "排除/不买：风控或交易条件未通过，最多复盘观察"
     if action == "READY":
         return "待确认：可复核，不等于立即买入；需下午放量站稳确认价"
     if action == "WATCH":
@@ -653,26 +1017,58 @@ def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
         item for item in results
         if item.get("trade_bucket") == "TRADE" and item.get("trade_eligible") is True
     ]
-    if not actionable:
-        return False
+    reference_mode = not actionable
+    pool = actionable
+    market_desc = ""
+    if reference_mode:
+        # 仅当市场状态一刀切（CRITICAL）挡住全部候选时降级为参考版，
+        # 其它原因导致的无可交易候选维持静默。
+        from core.risk_constants import REGIME_REFERENCE_PUSH_ENABLED
+        try:
+            from core.data import get_market_regime
+            regime = get_market_regime()
+            market_desc = str(regime.get("desc") or "")
+            market_gate_blocked = str(regime.get("status") or "").upper() == "CRITICAL"
+        except Exception:
+            market_gate_blocked = False
+        if not (REGIME_REFERENCE_PUSH_ENABLED and market_gate_blocked):
+            return False
+        pool = [item for item in results if item.get("trade_bucket") != "BLOCK"]
+        if not pool:
+            return False
 
-    selected = sorted(actionable, key=_scan_score, reverse=True)[:limit]
+    selected = sorted(pool, key=_scan_score, reverse=True)[:limit]
     scan_date = selected[0].get("data_date") or datetime.now().strftime("%Y-%m-%d")
-    lines = [
-        f"午间全量同步后选股 {scan_date}",
-        "性质：午间候选清单，下午需结合放量站稳和市场情绪复核。",
-        "",
-    ]
+    lines = [f"午间全量同步后选股 {scan_date}"]
+    if reference_mode:
+        if market_desc:
+            lines.append(f"市场：{market_desc}")
+        lines.append("性质：市场风控禁新仓，以下仅策略信号参考，不可下单。")
+    else:
+        lines.append("性质：午间候选清单，下午需结合放量站稳和市场情绪复核。")
+    lines.append("")
     for item in selected:
         code = item.get("代码") or item.get("code") or ""
         name = item.get("名称") or item.get("name") or ""
         price = item.get("现价") or item.get("current_price") or item.get("price") or "--"
         score = _scan_display_score(item)
-        grade = item.get("early_trade_grade") or item.get("sop_grade") or item.get("评级") or item.get("grade") or "--"
-        lines.append(f"{name}({code}) 现价 {price} | 评分 {score:.1f} | {grade}")
+        bucket = item.get("trade_bucket") or "OBSERVE"
+        lines.append(f"{name}({code}) 现价 {price} | 评分 {score:.1f} | {bucket}")
         if item.get("bark_selection_source_label"):
             lines.append(f"  候选来源：{item['bark_selection_source_label']}")
         lines.append(f"  建议：{_noon_action_text(item)}")
+        logic_line = build_logic_chain_line(item)
+        if logic_line:
+            lines.append(f"  {logic_line}")
+        capital_line = build_capital_evidence_line(item)
+        if capital_line:
+            lines.append(f"  {capital_line}")
+        if reference_mode:
+            blockers = item.get("trade_blockers") or []
+            if isinstance(blockers, str):
+                blockers = [blockers]
+            if blockers:
+                lines.append(f"  风控：{'、'.join(str(b) for b in blockers[:2])}")
         if item.get("early_trade_candidate") and item.get("early_trade_reason"):
             lines.append(f"  提前复核：{item['early_trade_reason']}；仅小仓，不追高")
         if item.get("observe_promotion_candidate") and item.get("observe_promotion_action"):
@@ -688,9 +1084,14 @@ def _send_noon_scan_push(results: list[dict], limit: int = 5) -> bool:
         pass
 
     body = "\n".join(lines).rstrip()
+    title = (
+        f"Alpha Vision 午间参考 {scan_date}"
+        if reference_mode
+        else f"Alpha Vision 午间选股 {scan_date}"
+    )
     try:
         delivery = asyncio.run(notifier.send(
-            f"Alpha Vision 午间选股 {scan_date}",
+            title,
             body,
             channels=["bark"],
             group="AlphaVision_Noon",

@@ -84,10 +84,17 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_pullback_status_label", "pa_pullback_support_price", "pa_pullback_confirmation_price",
     "pa_pullback_invalidation_price", "pa_pullback_action", "pa_breakout_quality", "pa_failure_risk",
     "pa_entry_quality_score", "pa_h2_quality", "pa_range_rule",
+    "pa_h2_state", "pa_l2_state", "pa_second_entry_retracement_quality",
+    "pa_follow_through_state", "pa_follow_through",
     "pa_failed_breakout_type", "pa_trap_risk", "pa_micro_channel",
     "pa_always_in_strength", "pa_trend_damage", "pa_channel_state",
     "pa_position_strategy", "pa_weekly_context", "pa_multi_timeframe_score",
     "pa_multi_timeframe_note", "pa_current_week_complete",
+    "pa_monthly_trend", "pa_monthly_state", "pa_monthly_as_of",
+    "pa_weekly_position", "pa_weekly_position_state", "pa_weekly_position_as_of",
+    "pa_weekly_pattern_signals",
+    "weekly_pattern_watch_only",
+    "pa_swing_entry_route", "pa_timeframe_shadow_only",
     "price_action_version", "target_model_version", "score_model_version",
     "pa_volume_pattern", "pa_volume_confirmed", "pa_volume_pullback",
     "pa_volume_pullback_status", "pa_volume_pullback_label", "pa_volume_pullback_score_delta",
@@ -101,15 +108,21 @@ PRICE_ACTION_DETAIL_KEYS = [
     "pa_volume_ratio", "pa_volume_ratio_percentile", "pa_breakout_volume_threshold",
     "pa_confirmation_volume_threshold",
     "pa_volume_risk", "pa_failed_second_entry", "pa_second_entry_risk",
-    "pa_gap_type", "pa_gap_risk", "pa_range_width_quality",
+    "pa_gap_type", "pa_gap_type_v2", "pa_gap_fill_pct", "pa_opening_behavior",
+    "pa_gap_edges", "pa_gap_risk", "pa_range_width_quality",
     "pa_range_center_risk", "pa_range_failed_breakout_count",
-    "pa_trend_phase", "pa_trend_phase_action", "pa_decision_summary",
+    "pa_trend_phase", "pa_trend_phase_action", "pa_structure_state",
+    "pa_structure_state_label", "pa_structure_state_action", "pa_mtr_state",
+    "pa_mtr_direction", "pa_nearest_support_zone",
+    "pa_nearest_resistance_zone", "pa_sr_confluence_grade", "pa_mtf_state",
+    "pa_mtf_intraday", "pa_decision_summary",
     "pa_trend_path_quality", "pa_information_discreteness", "pa_trend_efficiency",
     "pa_top_day_contribution", "pa_trend_net_return", "pa_nonlinear_trend_strength",
     "pa_trend_extension_atr", "pa_extreme_trend", "pa_path_research_score_delta",
     "pa_eight_rules", "pa_eight_rule_primary", "pa_eight_rule_score_delta",
     "pa_eight_rule_risk_delta",
     "pa_trade_plan", "trade_eligible", "trade_bucket", "trade_blockers",
+    "trade_cautions", "trade_gate_policy_version", "sop_soft_vetoes",
     "final_trade_score", "trade_timeframe", "exit_hint",
     "a_eod_controlled_trial", "a_eod_policy_version", "a_eod_trial_checks",
     "a_eod_entry_extension_pct", "a_eod_trade_cautions",
@@ -175,6 +188,7 @@ PRICE_ACTION_DETAIL_KEYS = [
     "display_quality_score", "display_opportunity_score", "display_rank_score",
     "score_display_scale",
     "result_group", "data_mode", "as_of",
+    "mkt_cap_yi", "money_flow", "money_flow_status", "回测统计",
     "frozen_entry_extension_pct", "frozen_confirmation_triggered",
 ]
 
@@ -745,6 +759,38 @@ def init_db(engine=None):
             except Exception as e:
                 logger.debug(f"recommendation event migration skipped: {e}")
 
+            # --- AI candidate review persistence (manual + scheduled batches) ---
+            try:
+                id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if engine.dialect.name == "sqlite" else "SERIAL PRIMARY KEY"
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS ai_candidate_reviews (
+                        id {id_type},
+                        review_date VARCHAR(10) NOT NULL,
+                        code VARCHAR(10) NOT NULL,
+                        name VARCHAR(40),
+                        action VARCHAR(10) NOT NULL,
+                        confidence INTEGER,
+                        summary TEXT,
+                        positive_factors TEXT,
+                        risk_factors TEXT,
+                        data_limitations TEXT,
+                        guardrail_adjusted INTEGER DEFAULT 0,
+                        entry_price FLOAT,
+                        stop_price FLOAT,
+                        target_price FLOAT,
+                        market_summary TEXT,
+                        model VARCHAR(80),
+                        source VARCHAR(20) NOT NULL,
+                        batch_id VARCHAR(48) NOT NULL,
+                        created_at TIMESTAMP,
+                        UNIQUE(review_date, code, source)
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ai_candidate_reviews_date ON ai_candidate_reviews(review_date DESC, id DESC);"))
+                logger.info("Migration: ai_candidate_reviews ensured.")
+            except Exception as e:
+                logger.debug(f"ai_candidate_reviews migration skipped: {e}")
+
             # --- Intraday limit-up / broken-board leadership evidence ---
             try:
                 id_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if engine.dialect.name == "sqlite" else "SERIAL PRIMARY KEY"
@@ -830,6 +876,23 @@ def init_db(engine=None):
                 logger.info("Migration: paper_trading unique index (code, entry_date) ensured.")
             except Exception as e:
                 logger.debug(f"paper_trading unique index migration skipped: {e}")
+
+            # 筹码分布需要历史换手率。仅增加可空列，旧行情与交易记录保持不变。
+            try:
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(daily_k)"))}
+                    if "turnover" not in existing:
+                        conn.execute(text("ALTER TABLE daily_k ADD COLUMN turnover FLOAT"))
+                else:
+                    conn.execute(text("ALTER TABLE daily_k ADD COLUMN IF NOT EXISTS turnover FLOAT"))
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-09-daily-k-turnover-v1', CURRENT_TIMESTAMP, 'add historical turnover for estimated chip distribution')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: daily_k turnover column ensured.")
+            except Exception as e:
+                logger.debug(f"daily_k turnover migration skipped: {e}")
 
             conn.commit()
     except Exception as e:
@@ -1367,12 +1430,148 @@ def save_recommendation_events(
         logger.error(f"Failed to save recommendation events: {exc}")
         return False
 
+
+def save_ai_candidate_reviews(
+    analyses: List[Dict[str, Any]],
+    *,
+    review_date: str,
+    model: str = "",
+    market_summary: str = "",
+    source: str = "manual",
+    engine=None,
+) -> Optional[Dict[str, Any]]:
+    """Persist one AI review batch; upserts per (review_date, code, source)."""
+    if engine is None:
+        engine = get_db_engine()
+    if not engine or not analyses:
+        return None
+    batch_id = f"{source}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    rows = []
+    for item in analyses:
+        levels = item.get("system_levels") if isinstance(item.get("system_levels"), dict) else {}
+        rows.append({
+            "review_date": str(review_date)[:10],
+            "code": str(item.get("code") or "").zfill(6),
+            "name": str(item.get("name") or "")[:40],
+            "action": str(item.get("action") or "WAIT")[:10],
+            "confidence": int(item.get("confidence") or 0),
+            "summary": str(item.get("summary") or "")[:500],
+            "positive_factors": json.dumps(item.get("positive_factors") or [], ensure_ascii=False),
+            "risk_factors": json.dumps(item.get("risk_factors") or [], ensure_ascii=False),
+            "data_limitations": json.dumps(item.get("data_limitations") or [], ensure_ascii=False),
+            "guardrail_adjusted": 1 if item.get("guardrail_adjusted") else 0,
+            "entry_price": levels.get("entry_price"),
+            "stop_price": levels.get("stop_price"),
+            "target_price": levels.get("target_price"),
+            "market_summary": str(market_summary or "")[:500],
+            "model": str(model or "")[:80],
+            "source": str(source or "manual")[:20],
+            "batch_id": batch_id,
+            "created_at": datetime.now(),
+        })
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO ai_candidate_reviews (
+                    review_date, code, name, action, confidence, summary,
+                    positive_factors, risk_factors, data_limitations, guardrail_adjusted,
+                    entry_price, stop_price, target_price, market_summary,
+                    model, source, batch_id, created_at
+                ) VALUES (
+                    :review_date, :code, :name, :action, :confidence, :summary,
+                    :positive_factors, :risk_factors, :data_limitations, :guardrail_adjusted,
+                    :entry_price, :stop_price, :target_price, :market_summary,
+                    :model, :source, :batch_id, :created_at
+                )
+                ON CONFLICT (review_date, code, source) DO UPDATE SET
+                    name = excluded.name,
+                    action = excluded.action,
+                    confidence = excluded.confidence,
+                    summary = excluded.summary,
+                    positive_factors = excluded.positive_factors,
+                    risk_factors = excluded.risk_factors,
+                    data_limitations = excluded.data_limitations,
+                    guardrail_adjusted = excluded.guardrail_adjusted,
+                    entry_price = excluded.entry_price,
+                    stop_price = excluded.stop_price,
+                    target_price = excluded.target_price,
+                    market_summary = excluded.market_summary,
+                    model = excluded.model,
+                    batch_id = excluded.batch_id,
+                    created_at = excluded.created_at
+            """), rows)
+        return {"batch_id": batch_id, "count": len(rows)}
+    except Exception as exc:
+        logger.error(f"Failed to save AI candidate reviews: {exc}")
+        return None
+
+
+def get_latest_ai_candidate_reviews(review_date: str, engine=None) -> Optional[Dict[str, Any]]:
+    """Return the most recent AI review batch for one review date."""
+    if engine is None:
+        engine = get_db_engine()
+    if not engine or not review_date:
+        return None
+    try:
+        with engine.connect() as conn:
+            batch_id = conn.execute(text(
+                "SELECT batch_id FROM ai_candidate_reviews WHERE review_date = :d "
+                "ORDER BY created_at DESC, id DESC LIMIT 1"
+            ), {"d": str(review_date)[:10]}).scalar()
+            if not batch_id:
+                return None
+            rows = conn.execute(text(
+                "SELECT * FROM ai_candidate_reviews WHERE batch_id = :b ORDER BY id ASC"
+            ), {"b": batch_id}).mappings().all()
+    except Exception as exc:
+        logger.error(f"Failed to load AI candidate reviews: {exc}")
+        return None
+    if not rows:
+        return None
+    action_order = {"BUY": 0, "WAIT": 1, "AVOID": 2}
+
+    def _parse_list(raw: Any) -> List[str]:
+        if isinstance(raw, list):
+            return raw
+        try:
+            parsed = json.loads(str(raw or "[]"))
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    analyses = [{
+        "code": row["code"],
+        "name": row["name"],
+        "action": row["action"],
+        "confidence": int(row["confidence"] or 0),
+        "summary": row["summary"],
+        "positive_factors": _parse_list(row["positive_factors"]),
+        "risk_factors": _parse_list(row["risk_factors"]),
+        "data_limitations": _parse_list(row["data_limitations"]),
+        "guardrail_adjusted": bool(row["guardrail_adjusted"]),
+        "system_levels": {
+            "entry_price": row["entry_price"],
+            "stop_price": row["stop_price"],
+            "target_price": row["target_price"],
+        },
+    } for row in rows]
+    analyses.sort(key=lambda item: (action_order.get(item["action"], 3), -item["confidence"]))
+    first = rows[0]
+    return {
+        "batch_id": batch_id,
+        "review_date": first["review_date"],
+        "model": first["model"],
+        "source": first["source"],
+        "market_summary": first["market_summary"],
+        "analyses": analyses,
+    }
+
 def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
     """
     将数据保存到 PostgreSQL (增量)
 
     Args:
-        df: DataFrame with columns ['日期', '开盘', '最高', '最低', '收盘', '成交量']
+        df: DataFrame with OHLCV columns and optional '换手率'
         code: Stock code (validated)
         engine: Database engine (optional)
 
@@ -1390,9 +1589,14 @@ def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
         return False
 
     try:
-        data = df[['日期', '开盘', '最高', '最低', '收盘', '成交量']].copy()
+        columns = ['日期', '开盘', '最高', '最低', '收盘', '成交量']
+        data = df[columns].copy()
+        data['换手率'] = pd.to_numeric(df['换手率'], errors='coerce') if '换手率' in df.columns else None
         data['code'] = code
-        data = data.rename(columns={'日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low', '收盘': 'close', '成交量': 'vol'})
+        data = data.rename(columns={
+            '日期': 'date', '开盘': 'open', '最高': 'high', '最低': 'low',
+            '收盘': 'close', '成交量': 'vol', '换手率': 'turnover',
+        })
 
         # 统一将 date 列转为字符串，确保数据库能够一致解析
         data['date'] = data['date'].astype(str)
@@ -1402,14 +1606,15 @@ def save_to_db(df: pd.DataFrame, code: str, engine=None) -> bool:
 
         with engine.connect() as conn:
             conn.execute(text('''
-                INSERT INTO daily_k (code, date, open, high, low, close, vol)
-                VALUES (:code, CAST(:date AS DATE), :open, :high, :low, :close, :vol)
+                INSERT INTO daily_k (code, date, open, high, low, close, vol, turnover)
+                VALUES (:code, CAST(:date AS DATE), :open, :high, :low, :close, :vol, :turnover)
                 ON CONFLICT (code, date) DO UPDATE SET
                     open = EXCLUDED.open,
                     high = EXCLUDED.high,
                     low = EXCLUDED.low,
                     close = EXCLUDED.close,
-                    vol = EXCLUDED.vol
+                    vol = EXCLUDED.vol,
+                    turnover = COALESCE(EXCLUDED.turnover, daily_k.turnover)
             '''), rows)
             conn.commit()
         return True
@@ -1443,7 +1648,8 @@ def load_from_db(code: str, start_date: str, engine=None) -> pd.DataFrame:
         # 使用参数化查询防止 SQL 注入
         query = text("""
             SELECT date as "日期", open as "开盘", high as "最高",
-                   low as "最低", close as "收盘", vol as "成交量"
+                   low as "最低", close as "收盘", vol as "成交量",
+                   turnover as "换手率"
             FROM daily_k
             WHERE code = :code AND date >= :start_date
             ORDER BY date ASC

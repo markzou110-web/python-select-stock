@@ -90,6 +90,10 @@ def test_morning_confirm_runs_tv_or_scan_and_pushes_results(monkeypatch):
 
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
     monkeypatch.setattr(
+        "core.bark_scan_selection.get_setting",
+        lambda key, default=None: "tv_dual" if key == "bark_scan_strategy" else default,
+    )
+    monkeypatch.setattr(
         "routers.paper_trade.check_operation_triggers",
         lambda notify=True, trade_mode="REAL": {"alerts": []},
     )
@@ -136,6 +140,10 @@ def test_late_decision_keeps_watchlist_conclusion_in_app(monkeypatch):
     watch_calls = []
 
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
+    monkeypatch.setattr(
+        "core.bark_scan_selection.get_setting",
+        lambda key, default=None: "tv_dual" if key == "bark_scan_strategy" else default,
+    )
     monkeypatch.setattr("routers.paper_trade.check_operation_triggers", lambda notify=True, trade_mode="REAL": {"alerts": []})
     monkeypatch.setattr("routers.watchlist.refresh_watchlist_decisions", lambda: None)
     monkeypatch.setattr("routers.watchlist.auto_prune_watchlist", lambda max_watch_days=15: {"updated": 0})
@@ -235,6 +243,56 @@ def test_noon_scan_push_translates_ready_as_confirmation_not_buy(monkeypatch):
     assert "大恒科技" not in body
 
 
+def test_noon_scan_push_falls_back_to_reference_when_market_blocks_all(monkeypatch):
+    sent = []
+
+    async def fake_send(title, body, channels=None, group=None, url=None):
+        sent.append((title, body, channels, group, url))
+        return {"bark": True}
+
+    monkeypatch.setattr(tasks.notifier, "send", fake_send)
+    monkeypatch.setattr("core.data.get_stale_cache", lambda key: None)
+    monkeypatch.setattr("core.data.format_freshness", lambda cache: "行情 13:05 (实时) · 腾讯")
+    monkeypatch.setattr(
+        "core.data.get_market_regime",
+        lambda: {"status": "CRITICAL", "desc": "空仓防守：双指数均跌破20日线"},
+    )
+
+    ok = tasks._send_noon_scan_push([
+        {
+            "代码": "000100",
+            "名称": "TCL科技",
+            "现价": 5.2,
+            "Score": 53.7,
+            "sop_grade": "M",
+            "pa_trade_action": "WATCH",
+            "trade_bucket": "OBSERVE",
+            "trade_eligible": False,
+            "trade_blockers": ["CRITICAL市场默认禁止新仓，等待环境修复"],
+            "data_date": "2026-09-17",
+        },
+        {
+            "代码": "600000",
+            "名称": "禁买股",
+            "现价": 9.9,
+            "Score": 88,
+            "sop_grade": "D",
+            "trade_bucket": "BLOCK",
+            "trade_eligible": False,
+            "data_date": "2026-09-17",
+        },
+    ])
+
+    assert ok is True
+    title, body = sent[0][0], sent[0][1]
+    assert "午间参考" in title
+    assert "市场：空仓防守" in body
+    assert "仅策略信号参考，不可下单" in body
+    assert "TCL科技" in body
+    assert "风控：CRITICAL市场默认禁止新仓" in body
+    assert "禁买股" not in body
+
+
 def test_noon_scan_push_does_not_treat_failed_result_dict_as_success(monkeypatch):
     async def fake_send(*args, **kwargs):
         return {"bark": False}
@@ -291,6 +349,10 @@ def test_noon_review_continues_when_scan_fails(monkeypatch):
     calls = []
 
     monkeypatch.setattr(tasks, "is_a_share_trading_day", lambda now=None: True)
+    monkeypatch.setattr(
+        "core.bark_scan_selection.get_setting",
+        lambda key, default=None: "tv_dual" if key == "bark_scan_strategy" else default,
+    )
 
     def fail_scan(**kwargs):
         calls.append(("scan", kwargs))
@@ -380,6 +442,10 @@ def test_retry_pending_notifications_drops_oversized_bark_without_delivery(monke
 def test_late_recovery_runs_formal_scan_without_duplicate_watchlist_report(monkeypatch):
     calls = []
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
+    monkeypatch.setattr(
+        "core.bark_scan_selection.get_setting",
+        lambda key, default=None: "tv_dual" if key == "bark_scan_strategy" else default,
+    )
     monkeypatch.setattr(
         "routers.scan.run_market_scan_task",
         lambda **kwargs: calls.append(("scan", kwargs)) or [{

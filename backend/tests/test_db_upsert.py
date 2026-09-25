@@ -98,6 +98,10 @@ def test_sop_detail_fields_in_persistence_whitelist():
         "a_eod_trade_cautions",
         "a_eod_portfolio_cap_pct",
         "a_eod_max_positions",
+        "mkt_cap_yi",
+        "money_flow",
+        "money_flow_status",
+        "回测统计",
     ]
     missing = [f for f in required if f not in PRICE_ACTION_DETAIL_KEYS]
     assert not missing, f"以下字段未在持久化白名单（无法复盘SOP判定）: {missing}"

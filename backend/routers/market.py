@@ -20,7 +20,13 @@ from core.data import (
     snapshot_matches_date,
 )
 from core.db import get_db_engine, get_scan_dates, get_scan_history_by_date
-from core.sector_strength import build_sector_strength, build_sector_leaders, build_sector_history_context, classify_sector_role
+from core.sector_strength import (
+    build_previous_month_sector_context,
+    build_sector_history_context,
+    build_sector_leaders,
+    build_sector_strength,
+    classify_sector_role,
+)
 from core.sector_push_analysis import build_hot_sector_push_gap_analysis
 from core.research_radar import build_candidate_research_radar
 
@@ -185,12 +191,13 @@ def get_sector_strength(limit: int = 20, force: bool = False):
         data_date = snapshot_data_date(snapshot)
         sector_map = get_sector_map()
         history_context = build_sector_history_context(engine, sector_map)
-        strength = build_sector_strength(snapshot, sector_map, sector_trends, history_context)
+        monthly_context = build_previous_month_sector_context(engine, sector_map, as_of_date=data_date)
+        strength = build_sector_strength(snapshot, sector_map, sector_trends, history_context, monthly_context)
         if not strength:
             return {"items": [], "updated_at": datetime.now().isoformat()}
 
         lead_map: Dict[str, List[Dict[str, Any]]] = build_sector_leaders(
-            engine, snapshot, sector_map, strength
+            engine, snapshot, sector_map, strength, top_n=2
         )
 
         # 兜底：多日历史缺失时退回当日涨幅排序（保留原契约 code/name/price/pct/role）
@@ -205,7 +212,7 @@ def get_sector_strength(limit: int = 20, force: bool = False):
                 if lead_map.get(industry):
                     continue
                 sector_avg = float(strength.get(industry, {}).get('sector_avg_pct', group['pct_chg'].mean()) or 0)
-                leaders = group.sort_values('pct_chg', ascending=False).head(5)
+                leaders = group.sort_values('pct_chg', ascending=False).head(2)
                 lead_map[industry] = [
                     {
                         "code": str(row.get('code', '')),
@@ -316,15 +323,35 @@ def get_hot_stock_chart_data(
 
 @router.get("/market/regime")
 def get_market_regime(strategy_type: str = "squeeze"):
-    """获取当前市场状态和推荐参数"""
-    from core.market_regime import detect_market_regime, get_adaptive_params
-    
-    regime_info = detect_market_regime()
-    recommended = get_adaptive_params(regime_info["regime"], strategy_type)
+    """Use the same dual-index EMA20 state as the dashboard and scanner."""
+    from core.data import get_market_regime as get_market_pulse
+    from core.market_regime import get_adaptive_params, map_status_to_regime
+
+    pulse = get_market_pulse()
+    regime = map_status_to_regime(pulse.get("status"))
+    display = {
+        "bull": ("🚀 进攻", "rose"),
+        "bear": ("🛡️ 严格防守", "emerald"),
+        "volatile": ("📊 分化/震荡", "amber"),
+    }[regime]
+    regime_info = {
+        "regime": regime,
+        "label": display[0],
+        "color": display[1],
+        "description": pulse.get("desc") or "市场状态数据不足",
+        "details": {
+            "indices": pulse.get("indices") or {},
+            "limit_down_count": pulse.get("limit_down_count"),
+            "trend_basis": pulse.get("trend_basis") or "双指数相对EMA20",
+        },
+        "source": "market_pulse_dual_index_ema20",
+    }
+    recommended = get_adaptive_params(regime, strategy_type)
     
     return {
         "regime": regime_info,
-        "recommended_params": recommended
+        "market_pulse": pulse,
+        "recommended_params": recommended,
     }
 
 

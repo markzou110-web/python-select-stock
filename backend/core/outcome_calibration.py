@@ -15,12 +15,20 @@ from core.risk_constants import (
     SOP_A_GRADE_POLICY_VERSION,
     SOP_A_GRADE_STRATEGIES,
     SOP_GRADE_EXECUTION_MODE,
+    TRADE_GATE_MIN_MATURE_SAMPLES_PER_REGIME,
+    TRADE_GATE_MIN_PROFIT_FACTOR,
+    TRADE_GATE_MIN_SCORE_CORRELATION,
+    TRADE_GATE_POLICY_VERSION,
 )
 
 
 HORIZONS = (1, 3, 5, 10)
 BOTTOM_FOLLOWUP_WINDOW_DAYS = 30
 INDEPENDENT_EVENT_RULE = "同代码同策略在前一事件5个交易日成熟前的重复信号只计一次"
+PRICE_ACTION_SHADOW_FIELDS = (
+    "pa_h2_state", "pa_follow_through_state", "pa_gap_type_v2", "pa_mtr_state",
+    "pa_structure_state", "pa_sr_confluence_grade", "pa_mtf_state",
+)
 
 
 def _as_list(value: Any) -> List[str]:
@@ -116,6 +124,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
                    COALESCE(json_extract(price_action_detail, '$.market_regime'), 'UNKNOWN') AS market_regime,
                    COALESCE(json_extract(price_action_detail, '$.score_model_version'), 'legacy') AS score_model_version,
                    COALESCE(json_extract(price_action_detail, '$.sop_grade_policy_version'), 'legacy') AS sop_grade_policy_version,
+                   COALESCE(json_extract(price_action_detail, '$.trade_gate_policy_version'), 'v1') AS trade_gate_policy_version,
                    CAST(json_extract(price_action_detail, '$.price_action_score') AS REAL) AS price_action_score,
                    CAST(json_extract(price_action_detail, '$.pct_5d') AS REAL) AS pct_5d,
                    sop_vetoes, price_action_detail, scanned_at
@@ -155,6 +164,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
                 COALESCE(s.price_action_detail->>'market_regime', 'UNKNOWN') AS market_regime,
                 COALESCE(s.price_action_detail->>'score_model_version', 'legacy') AS score_model_version,
                 COALESCE(s.price_action_detail->>'sop_grade_policy_version', 'legacy') AS sop_grade_policy_version,
+                COALESCE(s.price_action_detail->>'trade_gate_policy_version', 'v1') AS trade_gate_policy_version,
                 COALESCE(s.price_action_score, NULLIF(s.price_action_detail->>'price_action_score', '')::float) AS price_action_score,
                 NULLIF(s.price_action_detail->>'pct_5d', '')::float AS pct_5d,
                 s.sop_vetoes,
@@ -214,19 +224,21 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
     for horizon in HORIZONS:
         future_close = pd.to_numeric(df[f"close_{horizon}d"], errors="coerce")
         df[f"ret_{horizon}d"] = (future_close - signal_close) / signal_close * 100
-    mature_5d = pd.to_numeric(df["close_5d"], errors="coerce").notna()
-    df["mfe_5d"] = ((pd.to_numeric(df["high_5d"], errors="coerce") - signal_close) / signal_close * 100).where(mature_5d)
-    df["mae_5d"] = ((pd.to_numeric(df["low_5d"], errors="coerce") - signal_close) / signal_close * 100).where(mature_5d)
+    df["mature_5d"] = pd.to_numeric(df["close_5d"], errors="coerce").notna()
+    df["mfe_5d"] = ((pd.to_numeric(df["high_5d"], errors="coerce") - signal_close) / signal_close * 100).where(df["mature_5d"])
+    df["mae_5d"] = ((pd.to_numeric(df["low_5d"], errors="coerce") - signal_close) / signal_close * 100).where(df["mature_5d"])
 
     blockers: List[List[str]] = []
     extracted = {
         key: [] for key in (
             "grade_stage", "decision_lifecycle_state", "confirmation_event_state",
             "early_value_transition_state", "sector_phase", "bottom_discovery_stage",
+            *PRICE_ACTION_SHADOW_FIELDS,
         )
     }
     research_eligible: List[bool] = []
     opportunity_scores: List[Any] = []
+    final_trade_scores: List[Any] = []
     for _, row in df.iterrows():
         detail = _detail_dict(row.get("price_action_detail"))
         for key in extracted:
@@ -238,6 +250,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
             or str(research_value).strip().lower() == "true"
         )
         opportunity_scores.append(detail.get("trade_opportunity_score"))
+        final_trade_scores.append(detail.get("final_trade_score"))
         values: Iterable[str] = (
             _as_list(detail.get("trade_blockers"))
             + _as_list(row.get("sop_vetoes"))
@@ -249,6 +262,9 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
     df["research_eligible"] = pd.Series(research_eligible, index=df.index, dtype=bool)
     df["trade_opportunity_score"] = pd.to_numeric(
         pd.Series(opportunity_scores, index=df.index), errors="coerce"
+    )
+    df["final_trade_score"] = pd.to_numeric(
+        pd.Series(final_trade_scores, index=df.index), errors="coerce"
     )
     df["blockers"] = blockers
     return mark_independent_signal_events(df)
@@ -581,7 +597,25 @@ def _grade_monotonicity(by_grade: List[Dict[str, Any]], min_samples: int) -> Dic
         "min_samples": min_samples,
         "samples": sample_counts,
         "values": values,
-        "reason": "A级优于B级且B级优于C级" if passed else "Grade 与5日平均收益未形成单调关系",
+        "reason": "质量层级与5日平均收益保持单调" if passed else "质量分层与5日平均收益未形成单调关系",
+    }
+
+
+def build_price_action_shadow_calibration(df: pd.DataFrame, min_samples: int = 30) -> Dict[str, Any]:
+    """Measure new price-action states without allowing them to affect live eligibility."""
+    min_samples = max(1, int(min_samples))
+    independent = _independent_event_frame(df)
+    mature = int(pd.to_numeric(independent.get("ret_5d", pd.Series(dtype=float)), errors="coerce").notna().sum())
+    return {
+        "status": "READY_FOR_OOS_REVIEW" if mature >= min_samples else "INSUFFICIENT_DATA",
+        "production_effect": False,
+        "min_mature_samples": min_samples,
+        "mature_5d": mature,
+        "dimensions": {
+            field: _group_rows(independent, field)
+            for field in PRICE_ACTION_SHADOW_FIELDS
+        },
+        "promotion_rule": "累计足够成熟独立样本后，仍需滚动样本外验证；当前不自动调权。",
     }
 
 
@@ -602,6 +636,7 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
             "by_confirmation_event": [],
             "by_early_value_transition": [],
             "bottom_discovery_analysis": build_bottom_discovery_report(pd.DataFrame(), min_samples),
+            "price_action_shadow_calibration": build_price_action_shadow_calibration(pd.DataFrame(), min_samples),
             "grade_monotonicity": _grade_monotonicity([], min_samples),
             "a_grade_policy": build_a_grade_policy_report(pd.DataFrame(), min_samples),
             "grade_usage": {"mode": "SHADOW_ONLY", "production_effect": False, "reason": "暂无可校准样本"},
@@ -634,17 +669,19 @@ def build_calibration_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[st
         "by_market_regime": _group_rows(df, "market_regime"),
         "by_score_model_version": _group_rows(df, "score_model_version"),
         "by_sop_grade_policy_version": _group_rows(df, "sop_grade_policy_version"),
+        "by_trade_gate_policy_version": _group_rows(df, "trade_gate_policy_version"),
         "by_grade_stage": _group_rows(df, "grade_stage"),
         "by_lifecycle_state": _group_rows(df, "decision_lifecycle_state"),
         "by_confirmation_event": _group_rows(df, "confirmation_event_state"),
         "by_early_value_transition": _group_rows(df, "early_value_transition_state"),
         "bottom_discovery_analysis": build_bottom_discovery_report(raw_df, min_samples),
+        "price_action_shadow_calibration": build_price_action_shadow_calibration(raw_df, min_samples),
         "grade_monotonicity": grade_monotonicity,
         "a_grade_policy": a_grade_policy,
         "grade_usage": {
             "mode": "ACTIVE" if grade_active else "SHADOW_ONLY",
             "production_effect": grade_active,
-            "reason": "评级顺序与A级政策均通过成熟样本验证" if grade_active else "评级只作结构描述，不作为新增可交易资格证据",
+            "reason": "历史质量顺序通过成熟样本验证" if grade_active else "历史分层只作结构描述，不作为新增可交易资格证据",
             "configured_mode": SOP_GRADE_EXECUTION_MODE,
             "validation_passed": grade_validated,
         },
@@ -776,3 +813,117 @@ def build_feature_ablation_report(
             "direction": "POSITIVE" if correlation > 0 else "NEGATIVE" if correlation < 0 else "NONE",
         })
     return {"outcome": outcome, "samples": int(pd.to_numeric(df[outcome], errors="coerce").notna().sum()), "items": items}
+
+
+def build_trade_gate_readiness_report(df: pd.DataFrame, min_samples: int = 30) -> Dict[str, Any]:
+    """Validate trade-gate v2 against the agreed pre-production criteria.
+
+    检查项（用户确认的上线门槛）：
+      1. 每个市场状态至少 N 个成熟 TRADE 5日样本
+      2. TRADE 盈利因子 > 1.2
+      3. TRADE 5日平均收益高于 OBSERVE
+      4. 各评分维度与未来5日收益秩相关为正
+      5. 按政策版本(v1/v2)分组对照
+    """
+    if df.empty or "ret_5d" not in df.columns:
+        return {
+            "policy_version": TRADE_GATE_POLICY_VERSION,
+            "gates_ready": False,
+            "checks": [],
+            "notes": ["暂无成熟扫描样本，v2 需先积累样本再验证"],
+        }
+    version_col = df.get("trade_gate_policy_version", pd.Series("v1", index=df.index)).fillna("v1").astype(str)
+    checks: List[Dict[str, Any]] = []
+
+    for version in sorted(version_col.unique()):
+        version_df = _independent_event_frame(df[version_col == version])
+        trade = version_df[
+            version_df.get("trade_bucket", pd.Series("", index=version_df.index)).astype(str).str.upper().eq("TRADE")
+            & version_df.get("trade_eligible", pd.Series(False, index=version_df.index)).fillna(False).astype(bool)
+        ]
+        observe = version_df[
+            version_df.get("trade_bucket", pd.Series("", index=version_df.index)).astype(str).str.upper().eq("OBSERVE")
+        ]
+
+        # 1) 每个市场状态的成熟 TRADE 样本量
+        regime_col = version_df.get("market_regime", pd.Series("UNKNOWN", index=version_df.index)).astype(str)
+        mature_col = trade.get("mature_5d", pd.Series(False, index=trade.index)).fillna(False).astype(bool)
+        regime_col_trade = regime_col.reindex(trade.index, fill_value="UNKNOWN")
+        required_regimes = ("CRITICAL", "DEFENSIVE", "OFFENSIVE")
+        per_regime = {
+            regime: int(((regime_col_trade == regime) & mature_col).sum())
+            for regime in required_regimes
+        }
+        min_regime = min(per_regime.values()) if per_regime else 0
+        checks.append({
+            "version": version, "name": "regime_trade_samples",
+            "label": f"每个市场状态成熟TRADE样本≥{min_samples}",
+            "status": "PASS" if min_regime >= min_samples else "FAIL",
+            "detail": {"per_regime_mature_5d": per_regime},
+        })
+
+        # 2) TRADE 盈利因子
+        trade_metrics = _metric_summary(trade["ret_5d"])
+        pf = trade_metrics.get("profit_factor")
+        checks.append({
+            "version": version, "name": "trade_profit_factor",
+            "label": f"TRADE 盈利因子>{TRADE_GATE_MIN_PROFIT_FACTOR}",
+            "status": "PASS" if pf is not None and pf > TRADE_GATE_MIN_PROFIT_FACTOR else "FAIL",
+            "detail": trade_metrics,
+        })
+
+        # 3) TRADE 收益梯度高于 OBSERVE
+        observe_metrics = _metric_summary(observe["ret_5d"])
+        trade_avg = trade_metrics.get("avg_return")
+        observe_avg = observe_metrics.get("avg_return")
+        gradient_pass = (
+            trade_avg is not None and observe_avg is not None and trade_avg > observe_avg
+        )
+        checks.append({
+            "version": version, "name": "trade_beats_observe",
+            "label": "TRADE 5日平均收益高于OBSERVE",
+            "status": "PASS" if gradient_pass else "FAIL",
+            "detail": {"trade_5d": trade_metrics, "observe_5d": observe_metrics},
+        })
+
+        # 4) 评分与未来收益秩相关为正
+        correlations = {}
+        for feature in ("sop_quality_score", "trade_opportunity_score", "final_trade_score"):
+            if feature not in version_df.columns:
+                continue
+            pair = version_df[[feature, "ret_5d"]].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(pair) < min_samples:
+                correlations[feature] = {"samples": int(len(pair)), "rank_correlation": None}
+                continue
+            correlations[feature] = {
+                "samples": int(len(pair)),
+                "rank_correlation": round(float(pair[feature].rank().corr(pair["ret_5d"].rank())), 4),
+            }
+        corr_pass = all(
+            item.get("rank_correlation") is not None
+            and item["rank_correlation"] > TRADE_GATE_MIN_SCORE_CORRELATION
+            for item in correlations.values()
+        ) and bool(correlations)
+        checks.append({
+            "version": version, "name": "score_return_correlation",
+            "label": "评分与未来5日收益秩相关为正",
+            "status": "PASS" if corr_pass else "FAIL",
+            "detail": correlations,
+        })
+
+    v2_checks = [item for item in checks if item["version"] == TRADE_GATE_POLICY_VERSION]
+    notes = [
+        "v1 行为基线对照组；gates_ready 只由当前v2检查项决定。",
+        "初期 v2 样本不足属预期：门槛的目的就是先积累再放行。",
+        "样本外/滑点/手续费口径见 /api/review/strategy-calibration-report?executable=true。",
+    ]
+    if not v2_checks:
+        notes.append("当前v2策略版本暂无样本")
+    return {
+        "policy_version": TRADE_GATE_POLICY_VERSION,
+        "min_samples_per_regime": min_samples,
+        "min_profit_factor": TRADE_GATE_MIN_PROFIT_FACTOR,
+        "gates_ready": bool(v2_checks) and all(item["status"] == "PASS" for item in v2_checks),
+        "checks": checks,
+        "notes": notes,
+    }

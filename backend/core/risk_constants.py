@@ -22,7 +22,15 @@ TV_EXECUTION_TIER_RISK_UNITS = {"A": 1.0, "B": 0.6, "C": 0.25}
 TV_MA_ONLY_MIN_PA_SCORE = 60.0
 ZP_PROFIT_PROTECT_TRIGGER_PCT = 15.0
 
-# A级结构只授予 TV 或策略命中、没有SOP否决项、价格结构合格且未明显追高的候选。
+# ── 股票池基础过滤 ──
+# daily_k 的成交量统一为“手”；历史成交额缺失时用收盘价×成交量×100估算。
+UNIVERSE_LIQUIDITY_LOOKBACK_DAYS = 5
+UNIVERSE_MIN_AVG_AMOUNT_YUAN = 200_000_000.0
+UNIVERSE_NEW_ONE_PRICE_MAX_DAYS = 4
+MONTHLY_SECTOR_TOP_N = 5
+MONTHLY_SECTOR_LEADERS_PER_SECTOR = 2
+
+# 主要质量阈值用于执行门禁与连续质量分，不再生成字母评级。
 # 价格行为与5日涨幅门槛来自2022-2026全市场逐日K线回放（8429个独立事件）。
 # tv_dual 经白名单升格为可交易核心策略（与 tv_dual_strict 并列），但同等追高/否决硬门槛仍生效。
 # 质量分线从70受控降至65；价格行为、否决与执行确认硬门槛保持不变。
@@ -31,7 +39,7 @@ ZP_PROFIT_PROTECT_TRIGGER_PCT = 15.0
 #   - SOP_A_GRADE_MAX_5D_GAIN_PCT(10%) 为软起扣点：超过后每涨1%扣 quality_score；
 #   - SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT(25%) 为硬否决线：超过则不得评A。
 SOP_A_GRADE_MIN_SCORE = 65.0
-SOP_A_GRADE_STRATEGIES = ("tv_dual_strict", "tv_dual")
+SOP_A_GRADE_STRATEGIES = ("tv_dual_strict", "tv_dual", "tv_zp")
 SOP_A_GRADE_MIN_PRICE_ACTION_SCORE = 60.0
 SOP_A_GRADE_MAX_5D_GAIN_PCT = 10.0        # 软起扣点（与 score_calibration.extension_penalty 复用，保持口径一致）
 SOP_A_GRADE_HARD_MAX_5D_GAIN_PCT = 25.0   # 硬否决线（>此值不得评A）
@@ -42,8 +50,121 @@ SOP_A_GRADE_POLICY_VERSION = "kline-calibrated-v4-relaxed-score"
 SOP_GRADE_EXECUTION_MODE = "SHADOW_ONLY"
 SOP_A_GRADE_MIN_MATURE_SAMPLES = 30
 
-# ── A-受控试仓 ──
-# 正式A级标准保持不变；A-只为已完成价量确认的高质量B级提供小仓验证入口。
+# ── 交易门槛 v2（trade-gate-v2）──
+# 背景：v1 下 ~41 项硬拦截叠加导致全年 TRADE 成熟样本仅 4 个，无法统计验证；
+# 且 SOP 质量分与未来5日收益秩相关为负（-0.20 左右）。v2 把门槛收窄为
+# "核心策略 + 无硬阻断 + PA READY + 站上确认价 + 收盘稳定"，弱条件全部降级为
+# trade_cautions（扣分+缩仓），市场环境从一票否决改为仓位调节。
+# 硬阻断仅保留：数据异常 / PA结构明确失效 / 风险>20% / 严重公告 /
+# 确认价不可成交 / 板块明确退潮（强度不足不算退潮）。
+TRADE_GATE_POLICY_VERSION = "trade-gate-v2"
+TRADE_GATE_V2_ENABLED = True  # 一行回滚：False 恢复 v1 全拦截行为
+
+# 市场环境 → 仓位乘数（替换 market_blocked 一票否决）。
+# CRITICAL 默认 0（禁止新仓），是否允许极强结构验证仓由 CRITICAL_TRIAL_ENABLED 决定。
+REGIME_POSITION_MULTIPLIER = {"OFFENSIVE": 1.0, "DEFENSIVE": 0.5, "CRITICAL": 0.0}
+
+# ── 连错熔断（loss-streak-breaker-v1，《交易之路》：连错3次必须休息）──
+# 依据：模拟盘存在 9 笔亏损>=10% 的执行漏洞。最近连续亏损达 MAX_CONSECUTIVE_LOSSES
+# 且最后一笔平仓在冷却期内时，暂停签发新 execution_intents（只挡新增指令，不影响
+# 已签发意图的流转与平仓）。一行回滚：ENABLED=false。
+LOSS_STREAK_BREAKER_ENABLED = os.getenv("LOSS_STREAK_BREAKER_ENABLED", "true").lower() == "true"
+MAX_CONSECUTIVE_LOSSES = 3
+LOSS_STREAK_COOLDOWN_DAYS = 1
+LOSS_STREAK_POLICY_VERSION = "loss-streak-breaker-v1"
+
+# ── 波动率(振幅)闸门（amp20-gate-v1，《交易之路》波动率规则 + 本库90天分层验证）──
+# 近90天点内样本：20日均振幅>=6% 的信号 5日 -3.50%/胜率35.5%，而 2-4% 档 +0.40%。
+# 高波动=情绪过热/派发特征，仓位乘数下调（只缩不放，fail-open，数据缺失不惩罚）。
+AMP20_GATE_ENABLED = os.getenv("AMP20_GATE_ENABLED", "true").lower() == "true"
+AMP20_HIGH_THRESHOLD_PCT = 6.0
+AMP20_GATE_MULTIPLIER = 0.5
+AMP_GATE_POLICY_VERSION = "amp20-gate-v1"
+# 强势股振幅骤降 → 阴跌预警（软约束：进 trade_cautions，走既有 ×0.5 通道）
+AMP_COLLAPSE_DROP_RATIO = 0.6
+AMP_COLLAPSE_NEAR_HIGH_PCT = 0.9
+# 低振幅股骤增 → 变盘前兆观察（软约束）
+AMP_SPIKE_RATIO = 1.8
+AMP_SPIKE_BASE_MAX_PCT = 2.5
+# 中途半端买点：现价高出突破触发价超过该比例视为追价（软约束）
+ENTRY_CHASE_MAX_EXTENSION_PCT = 3.0
+
+# ── 道氏趋势阶段仓位约束（trend-phase-gate-v1）──
+# 道氏三阶段视角：衰竭段(CLIMAX/上轨过冲/楔形)与加速段属于公众参与后期/派发特征，
+# 高位追价期望为负。近 90 天点内样本：PA>=80 5日 -5.56%、SOP A 级 -7.47%、
+# 强多头趋势K -1.67%，而内包K/回踩企稳层为正。命中下列 pa_trend_phase 时仓位乘数
+# 下调（只缩不放，不禁止、不改 trade_eligible/trade_bucket）。
+# pa_trend_phase 缺失或其它阶段不惩罚（fail-open）。一行回滚：ENABLED=False。
+TREND_PHASE_POSITION_MULTIPLIER_ENABLED = os.getenv(
+    "TREND_PHASE_POSITION_MULTIPLIER_ENABLED", "true"
+).lower() == "true"
+TREND_PHASE_POSITION_MULTIPLIER = {
+    "衰竭段": 0.5,
+    "加速段": 0.5,
+}
+TREND_PHASE_GATE_POLICY_VERSION = "trend-phase-gate-v1"
+
+# 市场风控禁新仓时，推荐推送不再静默：降级为"参考版"（照常列出策略候选+被挡原因+
+# 市场概况，明确标注不可下单）。只影响 Bark 文案，不改变 trade_eligible/trade_bucket
+# 与执行侧闸门。一行回滚：False 恢复"无可交易候选即不推送"。
+REGIME_REFERENCE_PUSH_ENABLED = True
+REFERENCE_PUSH_MAX_STOCKS = 5
+
+# 板块资金结构降权（"势不对时形态失效"的板块级实现）：本可通过全部闸门的候选，
+# 若其行业主力资金5日净流出超过阈值（亿元），降级为观察。数据缺失（东财接口降级）
+# 时不降权（fail-open）。一行回滚：False 关闭该降权。
+SECTOR_FUND_OUTFLOW_DEMOTE_ENABLED = True
+SECTOR_FUND_OUTFLOW_5D_YI = -10.0
+
+# CRITICAL 验证仓：默认关闭，须先通过 /api/review/trade-gate-readiness 的
+# 独立样本验证（每市场状态≥30成熟样本、PF>1.2）再人工开启。
+CRITICAL_TRIAL_ENABLED = False
+CRITICAL_TRIAL_POLICY_VERSION = "critical-trial-v1"
+CRITICAL_TRIAL_POSITION_PCT = 2.5
+CRITICAL_TRIAL_PORTFOLIO_CAP_PCT = 6.0
+CRITICAL_TRIAL_MAX_POSITIONS = 3
+CRITICAL_TRIAL_MIN_QUALITY_SCORE = 75.0
+
+# 门槛就绪度报告的验证标准（用户确认的上线门槛）。
+TRADE_GATE_MIN_MATURE_SAMPLES_PER_REGIME = 30
+TRADE_GATE_MIN_PROFIT_FACTOR = 1.2
+TRADE_GATE_MIN_SCORE_CORRELATION = 0.0
+
+# 决策层硬编码阈值常量化（行为不变）。
+OPPORTUNITY_GATE_MIN_SCORE = 60.0
+SENTIMENT_STAGE_CAPS = {
+    "ICE": 15, "RETREAT": 10, "V_REPAIR": 30, "DIVERGENCE": 40,
+    "CLIMAX": 50, "ADVANCE": 70, "REPAIR": 40, "REPAIR_CRITICAL": 30,
+}
+
+# v2 软条件标记：阻断文本命中任一子串时降级为 trade_cautions（不拦截TRADE）。
+# 硬阻断（数据异常/结构失效/风险>20%/严重公告/不可成交/板块明确退潮）不在此列。
+TRADE_GATE_V2_SOFT_CONDITION_MARKERS = (
+    "ZP单信号",                      # 单信号类：由 TV 分层风险单元(0.25)缩仓而非禁入
+    "MA单信号仅进攻市场",            # 非进攻市场：由 regime 仓位乘数调节
+    "板块强度",                      # 强度不足≠明确退潮（50-70 与 <50 一并降级扣分）
+    "个股适配不足",
+    "强板块后排",
+    "板块联动",                      # 含 revival 的"板块联动不足"
+    "周线",                          # 周线中性/交易区间
+    "震荡观察胜率偏低",
+    "等待更优买点",                  # 结构风险 16-20% 档
+    "量能未确认",                    # 尚未完全放量（收盘稳定与站上确认价仍为硬条件）
+    "大市值低换手", "高市值换手不足", "小市值弹性票", "超大市值换手不足",
+    "资金流数据缺失", "主力资金流出",
+    "资本事件",                      # 定增/解禁/减持（严重公告类仍走地雷预警硬阻断）
+    "涨幅偏高且质量未确认",
+    "当日强度不足", "冲高回落风险", "未站稳历史/今日确认价", "交易区间上沿不追价",  # revival 确认类
+    "筹码峰迁移不利",
+)
+# 任一软条件存在时，把基础仓位降为一半；条件数量继续通过 final_trade_score 排序，
+# 避免多个相关提醒重复乘法把仓位压到不可执行。
+TRADE_CAUTION_POSITION_MULTIPLIER = 0.5
+# v2 下共振不再作为 TRADE 硬合取项，转为机会分加分。
+TRADE_GATE_RESONANCE_BONUS = 4.0
+
+# ── 受控试仓 ──
+# 仅为已完成价量确认的高质量候选提供小仓验证入口。
 A_MINUS_TRIAL_POLICY_VERSION = "a-minus-controlled-trial-v1"
 A_MINUS_TRIAL_MIN_QUALITY_SCORE = 60.0
 A_MINUS_TRIAL_MIN_PRICE_ACTION_SCORE = 70.0
@@ -56,7 +177,7 @@ A_MINUS_TRIAL_PROMOTION_MIN_AVG_RETURN = 0.8
 A_MINUS_TRIAL_PROMOTION_MIN_PROFIT_FACTOR = 1.3
 A_MINUS_TRIAL_ROUND_TRIP_COST_PCT = 0.15
 
-# ── A-EOD 校准受控通道 ──
+# ── 尾盘校准受控通道 ──
 # 2022-05-12~2026-08-04 全市场点时K线回放中，严格双共振 + PA>=60
 # + 5日涨幅<=10% 是唯一在开发/验证/研究三段均保持正平均收益和 PF>1 的门槛。
 # 该通道只软化重复的板块/周线执行阻断，不放宽确认价、追高、涨停和结构失效门禁。
@@ -99,6 +220,7 @@ PA_VOLUME_PULLBACK_CONFIRM_SCORE_DELTA = 8
 PA_VOLUME_PULLBACK_FORMING_SCORE_DELTA = 3
 PA_VOLUME_PULLBACK_WEAK_SCORE_DELTA = -3
 PA_VOLUME_PULLBACK_INVALID_SCORE_DELTA = -10
+PA_LONG_LOWER_WICK_MIN_REBOUND_PCT = 4.0
 
 # ── 强势例外影子验证与涨停可达性 ──
 # 只生成反事实样本，不提升生产交易权限。
@@ -163,6 +285,15 @@ TIER_HIGH_TRAIL_RATIO = 0.95  # 5% trail
 # 盈利超过 10%: 允许从最高点回落 8%
 TIER_MID_PROFIT_PCT = 10.0
 TIER_MID_TRAIL_RATIO = 0.92  # 8% trail
+
+# ── 书中规则回测对照（不直接改变生产持仓）──
+BACKTEST_STAGED_INITIAL_RATIO = 0.5
+BACKTEST_STAGED_ADD_MAX_DAYS = 2
+BACKTEST_HALF_PEAK_TRIGGER_PCT = 10.0
+BACKTEST_HALF_PEAK_RETAIN_RATIO = 0.5
+
+# 涨停次日若收盘涨幅不超过 1%，视为没有顺势确认，短期仓优先退出。
+LIMIT_UP_NEXT_DAY_MIN_FOLLOW_THROUGH_PCT = 1.0
 
 # ── 保本机制 (Capital Protection) ──
 # 曾经盈利超过此值后启动保本保护
@@ -290,3 +421,20 @@ FRESHNESS_WARN_THRESHOLD_MIN = 5    # 行情滞后超过此分钟数，Bark 推�
 # 图表、单股分析和全市场扫描必须使用同一段历史预热数据。TV-ZP 的
 # Alternate Signal 是有状态计算，历史起点不同会导致同一天的 long 标记不一致。
 TV_SIGNAL_WARMUP_DAYS = 1000
+
+# ── Price Action v9 结构阈值 ──
+# 回撤深度只参与质量分层；H2/L2 本身按第二次恢复趋势的价格尝试定义。
+PA_SECOND_ENTRY_NOISE_PCT = 0.0005
+PA_FOLLOW_THROUGH_FAIL_ATR = 0.10
+PA_FOLLOW_THROUGH_STRONG_ATR = 0.50
+PA_FOLLOW_THROUGH_FAILED_SCORE_DELTA = -12
+PA_FOLLOW_THROUGH_WEAK_SCORE_DELTA = -4
+PA_FOLLOW_THROUGH_STRONG_SCORE_DELTA = 8
+PA_SR_ZONE_ATR = 0.35
+PA_SR_ZONE_PRICE_PCT = 0.005
+PA_MTR_PRIOR_MOVE_ATR = 2.0
+PA_MTR_PRIOR_MOVE_PCT = 0.03
+PA_MTR_RETEST_ATR = 1.0
+PA_CLIMAX_EXTENSION_ATR = 2.8
+PA_CLIMAX_RANGE_MULTIPLIER = 1.8
+PA_INTRADAY_GAP_THRESHOLD_PCT = 0.3

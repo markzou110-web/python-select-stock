@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
     createChart,
     ColorType,
@@ -11,6 +11,30 @@ import {
 } from 'lightweight-charts';
 import { AlertTriangle, CheckCircle2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { selectTvStrictSignals, selectWaveDisplaySignals } from '@/lib/signalDisplay';
+import { buildRiskPriceLines, getEffectiveStopPrice } from '@/lib/tradingLevels';
+import { buildDowPhaseMarkers, buildProjectionScenarioMarkers, futureWhitespaceCandles, hintLevelStyle, projectionPriceLines, type ChartHint, type DowPhasePoint, type TradeProjection } from '@/lib/dowPhase';
+
+export interface ChipDistributionBar {
+    price: number;
+    weight: number;
+    profitable: boolean;
+}
+
+export interface ChipDistribution {
+    available: boolean;
+    as_of?: string;
+    peak_price?: number;
+    average_cost?: number;
+    profit_ratio?: number;
+    cost_70_low?: number;
+    cost_70_high?: number;
+    migration?: string;
+    buy_impact?: string;
+    holding_impact?: string;
+    score_delta?: number;
+    bars?: ChipDistributionBar[];
+}
 
 interface SplitKLineChartsProps {
     candles: any[];
@@ -23,8 +47,12 @@ interface SplitKLineChartsProps {
     strategySignalSets?: Record<string, any>;
     priceAction?: any;
     priceActionLines?: any[];
+    trendPhases?: DowPhasePoint[];
+    chartHints?: ChartHint[];
+    tradeProjection?: TradeProjection | null;
     paperLines?: { price: number; label: string; color: string; date?: string }[];
     riskLevels?: any;
+    chipDistribution?: ChipDistribution | null;
     height?: number;
     compact?: boolean;
 }
@@ -63,7 +91,10 @@ function normalizeLine(data: any[] | undefined, valueKey = 'value') {
 
 function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: string) {
     const markers: any[] = [];
-    (buySignals || []).forEach((sig) => {
+    const displayBuys = source === 'squeeze'
+        ? selectWaveDisplaySignals(buySignals, sellSignals)
+        : (buySignals || []).map((signal) => ({ signal, role: 'entry' as const }));
+    displayBuys.forEach(({ signal: sig, role }) => {
         if (!sig?.time) return;
         const reason = String(sig.reason || '');
         const isTv = source === 'tv_zp' || reason.includes('TV-ZP');
@@ -72,7 +103,7 @@ function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: st
             position: 'belowBar',
             color: isTv ? '#22c55e' : '#ef4444',
             shape: 'arrowUp',
-            text: isTv ? 'long' : 'B 共振',
+            text: isTv ? 'long' : (role === 'confirmation' ? '均线确认' : '均线买点'),
             source: source || (isTv ? 'tv_zp' : 'active'),
         });
     });
@@ -101,10 +132,16 @@ function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: st
 
 function getSignalMarkerTone(marker: any) {
     const text = String(marker?.text || '');
+    if (marker?.source === 'mtr_pullback_rebreak') return { badge: '回踩', label: '企稳突破·观察', color: '#0f766e' };
+    if (marker?.source === 'tv_strict') return marker.sameDay
+        ? { badge: 'TV', label: '同日强共振·观察', color: '#7c3aed' }
+        : { badge: 'TV', label: '3日双命中·待确认', color: '#d97706' };
     if (text.includes('Bark')) return { badge: 'Bark', label: '推荐日', color: '#0ea5e9' };
     if (text.toLowerCase().includes('long')) return { badge: 'B', label: 'long', color: '#22c55e' };
     if (text.toLowerCase().includes('short')) return { badge: 'S', label: 'short', color: '#ef4444' };
-    if (text.includes('共振')) return { badge: 'B', label: '共振', color: '#ef4444' };
+    if (text.includes('均线确认')) return { badge: '均线', label: '确认', color: '#f97316' };
+    if (text.includes('均线买点')) return { badge: '均线', label: '买点', color: '#ef4444' };
+    if (text.includes('共振')) return { badge: '均线', label: '买点', color: '#ef4444' };
     if (text.includes('破位')) return { badge: '破', label: '破位', color: '#a855f7' };
     if (text.includes('买入')) return { badge: 'B', label: '买入', color: '#4f46e5' };
     if (text.includes('买')) return { badge: 'B', label: '买点', color: '#ef4444' };
@@ -173,6 +210,12 @@ function buildPriceActionSummary(priceAction: any, priceActionLines?: any[]) {
     const volumePullbackStatus = String(priceAction?.pa_volume_pullback_status || 'NONE');
     const volumePullbackLabel = String(priceAction?.pa_volume_pullback_label || '');
     const volumePullbackConfirmation = String(priceAction?.pa_volume_pullback_confirmation_label || '');
+    const structureNote = priceAction?.pa_structure_state_label
+        ? `当前结构：${priceAction.pa_structure_state_label}；${priceAction.pa_structure_state_action || ''}。`
+        : '';
+    const intradayNote = priceAction?.pa_mtf_intraday?.label
+        ? `多周期：${priceAction.pa_mtf_intraday.label}。`
+        : '';
     const volumePullbackNote = volumePullbackStatus !== 'NONE' && volumePullbackLabel
         ? `当前突破回踩状态：${volumePullbackLabel}${volumePullbackConfirmation ? `（${volumePullbackConfirmation}）` : ''}。`
         : '';
@@ -185,7 +228,7 @@ function buildPriceActionSummary(priceAction: any, priceActionLines?: any[]) {
                 : '结构处在可观察区间，适合等待价格靠近入场线或失效线后再做决策。';
         return {
             title: `${regime || '价格行为'}${quality ? ` · ${quality}` : ''}`,
-            body: `${summary} ${volumePullbackNote} ${action}`,
+            body: `${summary} ${volumePullbackNote} ${structureNote} ${intradayNote} ${action}`,
             tone: score != null && score >= 70 ? 'positive' as const : score != null && score < 55 ? 'risk' as const : 'neutral' as const,
         };
     }
@@ -243,27 +286,6 @@ function sectorPhaseTone(phase?: string) {
         SECTOR_NEUTRAL: { label: '板块中性', bg: 'rgba(100, 116, 139, 0.04)', text: 'text-slate-500' },
     };
     return map[phase || ''] || map.SECTOR_NEUTRAL;
-}
-
-function buildRiskPriceLines(riskLevels: any, paperLines?: { price: number; label: string; color: string; date?: string }[]) {
-    const lines = [...(paperLines || [])];
-    const pushLine = (price: any, label: string, color: string) => {
-        const value = validNumber(price);
-        if (value == null || value <= 0) return;
-        if (lines.some((line) => Math.abs(Number(line.price) - value) < 0.001 && line.label === label)) return;
-        lines.push({ price: value, label, color });
-    };
-
-    pushLine(riskLevels?.buy_price, '成本线', '#4f46e5');
-    pushLine(riskLevels?.initial_stop_price, '主动止损线', '#dc2626');
-    pushLine(riskLevels?.structure_stop_price, '结构失效线', '#2563eb');
-    pushLine(riskLevels?.capital_protect_price || riskLevels?.reduce_price, '减仓线', '#d97706');
-    pushLine(riskLevels?.active_stop_price || riskLevels?.stop_price, '执行风控线', '#e11d48');
-    pushLine(riskLevels?.take_profit_price, '止盈线', '#059669');
-    (riskLevels?.operation_bands || []).forEach((band: any) => {
-        pushLine(band?.price, band?.label || '操作线', band?.color || '#64748b');
-    });
-    return lines;
 }
 
 function SummaryBox({
@@ -329,8 +351,12 @@ export default function SplitKLineCharts({
     strategySignalSets,
     priceAction,
     priceActionLines,
+    trendPhases,
+    chartHints,
+    tradeProjection,
     paperLines,
     riskLevels,
+    chipDistribution,
     height = 360,
     compact = false,
 }: SplitKLineChartsProps) {
@@ -340,21 +366,78 @@ export default function SplitKLineCharts({
     const priceActionOverlayRef = useRef<HTMLDivElement>(null);
     const strategyTooltipRef = useRef<HTMLDivElement>(null);
     const priceActionTooltipRef = useRef<HTMLDivElement>(null);
+    const chipOverlayRef = useRef<HTMLDivElement>(null);
     const strategyVisibleRangeRef = useRef<any>(null);
     const priceActionVisibleRangeRef = useRef<any>(null);
+    const [showChips, setShowChips] = useState(true);
 
     const sortedCandles = useMemo(() => normalizeCandles(candles), [candles]);
     const buyDate = normalizeDate(riskLevels?.entry_date || getPaperLineDate(paperLines, '买入'));
     const barkDate = normalizeDate(riskLevels?.bark_recommendation_date || riskLevels?.latest_scan_date || riskLevels?.entry_signal_date);
     const riskPriceLines = useMemo(() => buildRiskPriceLines(riskLevels, paperLines), [paperLines, riskLevels]);
     const sectorTone = useMemo(() => sectorPhaseTone(riskLevels?.sector_phase), [riskLevels]);
+    const chipProfile = useMemo(() => {
+        if (!chipDistribution?.available || !Array.isArray(chipDistribution?.bars)) return null;
+        const bars = chipDistribution.bars
+            .map((bar: ChipDistributionBar) => ({
+                price: validNumber(bar?.price),
+                weight: validNumber(bar?.weight),
+                profitable: Boolean(bar?.profitable),
+            }))
+            .filter((bar): bar is { price: number; weight: number; profitable: boolean } => (
+                bar.price != null && bar.weight != null && bar.weight > 0
+            ))
+            .sort((a, b) => a.price - b.price);
+        const maxWeight = Math.max(0, ...bars.map((bar) => bar.weight));
+        return bars.length > 0 && maxWeight > 0 ? { bars, maxWeight } : null;
+    }, [chipDistribution]);
+    const tvStrictSignals = useMemo(() => selectTvStrictSignals(
+        sortedCandles.map((candle) => candle.time),
+        strategySignalSets?.squeeze?.buy_signals,
+        strategySignalSets?.tv_zp?.buy_signals,
+    ), [sortedCandles, strategySignalSets]);
+    const latestTvStrictSignal = tvStrictSignals.at(-1);
+    const recentTvDates = sortedCandles.slice(-3).map((candle) => candle.time);
+    const currentTvStrictSignal = latestTvStrictSignal
+        && recentTvDates.some((date) => date === latestTvStrictSignal.time)
+        && recentTvDates.some((date) => (strategySignalSets?.squeeze?.buy_signals || []).some((signal: { time?: string }) => signal.time === date))
+        && recentTvDates.some((date) => (strategySignalSets?.tv_zp?.buy_signals || []).some((signal: { time?: string }) => signal.time === date))
+        && !(strategySignalSets?.tv_zp?.sell_signals || []).some((signal: { time?: string }) => (
+            signal.time && signal.time > latestTvStrictSignal.time
+        ))
+        ? latestTvStrictSignal
+        : null;
+    const currentPullbackRebreak = (markers || []).find((marker) => (
+        marker?.source === 'mtr_pullback_rebreak'
+        && marker?.time === sortedCandles.at(-1)?.time
+    ));
     const signalMarkers = useMemo(() => {
         const overlayMarkers = Object.entries(strategySignalSets || {}).flatMap(([strategy, set]) => (
             buildSignalMarkers(set?.buy_signals || [], set?.sell_signals || [], strategy)
         ));
+        const overlaySignalKeys = new Set(
+            Object.values(strategySignalSets || {}).flatMap((set) => [
+                ...(set?.buy_signals || []).map((signal: { time?: unknown }) => `${signal?.time}-belowBar`),
+                ...(set?.sell_signals || []).map((signal: { time?: unknown }) => `${signal?.time}-aboveBar`),
+            ]),
+        );
         const all = [
-            ...(markers || []),
+            ...(markers || []).filter((marker) => (
+                marker?.source === 'mtr_pullback_rebreak'
+                || !overlaySignalKeys.has(`${marker?.time}-${marker?.position}`)
+            )),
+            ...buildDowPhaseMarkers(trendPhases),
+            ...buildProjectionScenarioMarkers(tradeProjection, String(sortedCandles[sortedCandles.length - 1]?.time || '')),
             ...overlayMarkers,
+            ...tvStrictSignals.map((signal) => ({
+                time: signal.time,
+                position: 'aboveBar',
+                color: signal.sameDay ? '#7c3aed' : '#d97706',
+                shape: 'circle',
+                text: signal.sameDay ? '同日强共振·观察' : '3日双命中·待确认',
+                source: 'tv_strict',
+                sameDay: signal.sameDay,
+            })),
             ...(overlayMarkers.length === 0 ? buildSignalMarkers(buySignals, sellSignals) : []),
         ];
         if (buyDate && sortedCandles.some((c) => c.time === buyDate)) {
@@ -382,6 +465,7 @@ export default function SplitKLineCharts({
             .filter((marker) => (
                 marker?.time
                 && marker?.source !== 'eight_rule'
+                && marker?.source !== 'price_action_second_entry'
                 && !String(marker.text || marker.label || '').includes('冲高回落')
                 && !String(marker.text || '').startsWith('PA')
             ))
@@ -392,14 +476,17 @@ export default function SplitKLineCharts({
                 seen.add(key);
                 return true;
             });
-    }, [markers, buySignals, sellSignals, strategySignalSets, buyDate, barkDate, sortedCandles]);
+    }, [markers, buySignals, sellSignals, strategySignalSets, tvStrictSignals, buyDate, barkDate, sortedCandles, trendPhases, tradeProjection]);
     const priceActionMarkers = useMemo(() => {
         return (markers || [])
             .filter((marker) => (
                 marker?.time
                 && marker?.source !== 'eight_rule'
                 && !String(marker.text || marker.label || '').includes('冲高回落')
-                && String(marker.text || '').startsWith('PA')
+                && (
+                    marker?.source === 'price_action_second_entry'
+                    || String(marker.text || '').startsWith('PA')
+                )
             ))
             .sort((a, b) => String(a.time).localeCompare(String(b.time)));
     }, [markers]);
@@ -418,7 +505,8 @@ export default function SplitKLineCharts({
     );
     const priceRows = useMemo(() => {
         const latestTrailing = normalizeLine(trailingStops).at(-1)?.value;
-        const movingRisk = riskLevels ? validNumber(riskLevels?.moving_stop_price) : latestTrailing;
+        const movingRisk = validNumber(riskLevels?.moving_stop_price);
+        const effectiveStop = getEffectiveStopPrice(riskLevels);
         return [
             {
                 label: '买入日期',
@@ -426,32 +514,27 @@ export default function SplitKLineCharts({
                 color: 'text-slate-700',
             },
             {
-                label: '买入价',
+                label: '持仓成本',
                 value: validNumber(riskLevels?.buy_price) ?? getPaperLinePrice(paperLines, '买入') ?? validNumber(priceAction?.pa_entry_price),
                 color: 'text-indigo-700',
             },
             {
-                label: '初始止损',
+                label: '弱市止损参考',
                 value: validNumber(riskLevels?.initial_stop_price),
                 color: 'text-rose-700',
             },
             {
-                label: '结构失效',
-                value: validNumber(riskLevels?.structure_stop_price) ?? validNumber(priceAction?.pa_stop_price),
-                color: 'text-blue-700',
-            },
-            {
-                label: '移动风控',
-                value: movingRisk,
+                label: movingRisk != null ? '移动风控' : '策略回测风控',
+                value: movingRisk ?? latestTrailing,
                 color: 'text-orange-700',
             },
             {
-                label: '执行风控',
-                value: validNumber(riskLevels?.stop_price) ?? getPaperLinePrice(paperLines, '止损') ?? validNumber(priceAction?.pa_stop_price),
+                label: validNumber(riskLevels?.structure_stop_price) != null ? '执行风控/结构失效' : '执行风控',
+                value: effectiveStop ?? getPaperLinePrice(paperLines, '止损') ?? validNumber(priceAction?.pa_stop_price),
                 color: 'text-rose-700',
             },
             {
-                label: '止盈价',
+                label: '第一止盈目标',
                 value: validNumber(riskLevels?.take_profit_price) ?? getPaperLinePrice(paperLines, '止盈') ?? validNumber(priceAction?.pa_target_price),
                 color: 'text-emerald-700',
             },
@@ -502,7 +585,11 @@ export default function SplitKLineCharts({
             wickUpColor: '#ef4444',
             wickDownColor: '#22c55e',
         });
-        strategyCandles.setData(sortedCandles);
+        // 未来空白K线（仅 time）：为"执行策略投影"的箭头标记（回踩买点/目标位/失效离场）
+        // 留出可标注的未来区域；历史K线部分不受影响。
+        const lastChartCandle = sortedCandles[sortedCandles.length - 1];
+        const futureBars = futureWhitespaceCandles(String(lastChartCandle?.time || ''), 14);
+        strategyCandles.setData([...sortedCandles, ...futureBars]);
 
         const paCandles = paChart.addSeries(CandlestickSeries, {
             upColor: 'rgba(239, 68, 68, 0.42)',
@@ -511,14 +598,33 @@ export default function SplitKLineCharts({
             wickUpColor: 'rgba(239, 68, 68, 0.42)',
             wickDownColor: 'rgba(34, 197, 94, 0.42)',
         });
-        paCandles.setData(sortedCandles);
+        paCandles.setData([...sortedCandles, ...futureBars]);
+
+        if (showChips && chipProfile) {
+            [
+                { price: validNumber(chipDistribution?.peak_price), color: '#7c3aed', title: '筹码峰' },
+                { price: validNumber(chipDistribution?.average_cost), color: '#f59e0b', title: '筹码均价' },
+                { price: validNumber(chipDistribution?.cost_70_low), color: 'rgba(13, 148, 136, 0.65)', title: '70%成本下沿' },
+                { price: validNumber(chipDistribution?.cost_70_high), color: 'rgba(13, 148, 136, 0.65)', title: '70%成本上沿' },
+            ].forEach((line) => {
+                if (line.price == null || line.price <= 0) return;
+                paCandles.createPriceLine({
+                    price: line.price,
+                    color: line.color,
+                    lineWidth: line.title === '筹码峰' ? 2 : 1,
+                    lineStyle: 2,
+                    axisLabelVisible: line.title === '筹码峰' || line.title === '筹码均价',
+                    title: `${line.title} ${line.price.toFixed(2)}`,
+                });
+            });
+        }
 
         emaLines.forEach((line) => {
             const series = strategyChart.addSeries(LineSeries, {
                 color: line.color,
                 lineWidth: (line.width || 1) as any,
                 title: line.label,
-                lastValueVisible: false,
+                lastValueVisible: true,
                 priceLineVisible: false,
             });
             series.setData(normalizeLine(sortedCandles, line.key));
@@ -537,11 +643,11 @@ export default function SplitKLineCharts({
 
         if (trailingStops?.length) {
             const series = strategyChart.addSeries(LineSeries, {
-                color: '#f97316',
-                lineWidth: 2,
+                color: '#94a3b8',
+                lineWidth: 1,
                 lineStyle: 2,
-                title: '策略风控线',
-                lastValueVisible: false,
+                title: '策略回测风控（非持仓）',
+                lastValueVisible: true,
                 priceLineVisible: false,
             });
             series.setData(normalizeLine(trailingStops));
@@ -557,6 +663,20 @@ export default function SplitKLineCharts({
                 lineStyle: 2,
                 axisLabelVisible: true,
                 title: `${line.label} ${price.toFixed(2)}${line.label.includes('买入') && (line.date || buyDate) ? ` ${formatDateLabel(line.date || buyDate)}` : ''}`,
+            });
+        });
+
+        // 执行策略投影：关键价位右轴点线（未来走势改用箭头标记，见 signalMarkers）。
+        // 数据来自后端 build_trade_projection（PA 关键位的规则推演，非预测）。
+        projectionPriceLines(tradeProjection, riskPriceLines.map((line) => validNumber(line.price))).forEach((level) => {
+            strategyCandles.createPriceLine({
+                price: level.price,
+                color: level.label.includes('失效') || level.label.includes('止损') ? '#dc2626'
+                    : level.label.includes('目标') ? '#16a34a' : '#0d9488',
+                lineWidth: 1,
+                lineStyle: 3,
+                axisLabelVisible: true,
+                title: `${level.label} ${level.price.toFixed(2)}`,
             });
         });
 
@@ -602,10 +722,18 @@ export default function SplitKLineCharts({
         };
 
         (priceActionLines || []).forEach((line) => {
-            const points = (line.points || [])
-                .map((point: any) => ({ time: String(point.time), value: validNumber(point.value) }))
-                .filter((point: any) => point.time && point.value != null)
-                .sort((a: any, b: any) => a.time.localeCompare(b.time));
+            // 同一条结构线两端点可能落在同一天（如突破日即当天），须按时间去重，
+            // 否则 lightweight-charts 的 setData 严格升序断言会直接崩溃。
+            const pointMap = new Map<string, number>();
+            (line.points || []).forEach((point: any) => {
+                if (!point?.time) return;
+                const value = validNumber(point.value);
+                if (value == null) return;
+                pointMap.set(String(point.time), value);
+            });
+            const points = Array.from(pointMap.entries())
+                .map(([time, value]) => ({ time, value }))
+                .sort((a, b) => a.time.localeCompare(b.time));
             if (points.length < 2) return;
             const series = paChart.addSeries(LineSeries, {
                 color: line.color || '#2563eb',
@@ -700,6 +828,25 @@ export default function SplitKLineCharts({
             });
         };
 
+        const renderChipProfile = () => {
+            const overlay = chipOverlayRef.current;
+            if (!overlay) return;
+            overlay.innerHTML = '';
+            if (!showChips || !chipProfile) return;
+            chipProfile.bars.forEach((bar) => {
+                const y = paCandles.priceToCoordinate(bar.price);
+                if (y == null || y < 0 || y > height) return;
+                const width = Math.max(2, (bar.weight / chipProfile.maxWeight) * 104);
+                const item = document.createElement('div');
+                item.className = 'absolute h-[3px] rounded-l-sm opacity-65';
+                item.style.right = '58px';
+                item.style.top = `${y - 1.5}px`;
+                item.style.width = `${width}px`;
+                item.style.background = bar.profitable ? '#f43f5e' : '#6366f1';
+                overlay.appendChild(item);
+            });
+        };
+
         if (strategyVisibleRangeRef.current) {
             strategyChart.timeScale().setVisibleLogicalRange(strategyVisibleRangeRef.current);
         } else {
@@ -713,6 +860,7 @@ export default function SplitKLineCharts({
 
         renderTradeLabels();
         renderPriceActionLabels();
+        renderChipProfile();
 
         const handleStrategyRangeChange = (range: any) => {
             if (range) strategyVisibleRangeRef.current = range;
@@ -721,6 +869,7 @@ export default function SplitKLineCharts({
         const handlePriceActionRangeChange = (range: any) => {
             if (range) priceActionVisibleRangeRef.current = range;
             renderPriceActionLabels();
+            renderChipProfile();
         };
         strategyChart.timeScale().subscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
         paChart.timeScale().subscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
@@ -735,6 +884,7 @@ export default function SplitKLineCharts({
             if (priceActionRef.current) paChart.applyOptions({ width: priceActionRef.current.clientWidth });
             renderTradeLabels();
             renderPriceActionLabels();
+            renderChipProfile();
         };
         window.addEventListener('resize', handleResize);
 
@@ -747,7 +897,7 @@ export default function SplitKLineCharts({
             strategyChart.remove();
             paChart.remove();
         };
-    }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, riskPriceLines, barkDate, height, compact]);
+    }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, riskPriceLines, barkDate, height, compact, chipDistribution, chipProfile, showChips]);
 
     return (
         <div className="grid grid-cols-1 divide-y divide-slate-200">
@@ -765,6 +915,36 @@ export default function SplitKLineCharts({
                         <TrendingUp size={12} /> 均线共振 + TV long/short
                     </span>
                 </div>
+                {currentTvStrictSignal && (
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-100 bg-amber-50/70 px-4 py-1.5 text-[10px] font-bold text-slate-700">
+                        <span className={currentTvStrictSignal.sameDay ? 'text-violet-700' : 'text-amber-700'}>
+                            TV严格双信号：{currentTvStrictSignal.sameDay ? '同日强共振·观察' : '3日窗口双命中·待确认'}
+                        </span>
+                        {Number(priceAction?.pa_entry_price) > 0 && <span>价格行为触发参考 {Number(priceAction.pa_entry_price).toFixed(2)}</span>}
+                        {Number(priceAction?.pa_stop_price) > 0 && <span>结构失效参考 {Number(priceAction.pa_stop_price).toFixed(2)}</span>}
+                        <span>仅供研究观察，仍须按现有风控确认；不自动买入</span>
+                    </div>
+                )}
+                {currentPullbackRebreak && (
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-teal-100 bg-teal-50/70 px-4 py-1.5 text-[10px] font-bold text-teal-800">
+                        <span>向上反转后首次回踩企稳突破·观察</span>
+                        {Number(currentPullbackRebreak.trigger_price) > 0 && <span>突破参考 {Number(currentPullbackRebreak.trigger_price).toFixed(2)}</span>}
+                        {Number(currentPullbackRebreak.pullback_low) > 0 && <span>回踩低点 {Number(currentPullbackRebreak.pullback_low).toFixed(2)}</span>}
+                        <span>仅作结构提示，仍须按现有风控确认；不自动买入</span>
+                    </div>
+                )}
+                {chartHints && chartHints.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-100 bg-slate-50/70 px-4 py-1.5">
+                        {chartHints.map((hint, idx) => (
+                            <span
+                                key={idx}
+                                className={cn("rounded border px-1.5 py-0.5 text-[10px] font-bold", hintLevelStyle(hint?.level))}
+                            >
+                                {hint?.text}
+                            </span>
+                        ))}
+                    </div>
+                )}
                 <div className="relative w-full" style={{ height, background: sectorTone.bg }}>
                     {riskLevels?.sector_phase && (
                         <div className={cn("absolute left-3 top-3 z-10 rounded-md border border-white/70 bg-white/80 px-2 py-1 text-[10px] font-black shadow-sm", sectorTone.text)}>
@@ -784,16 +964,53 @@ export default function SplitKLineCharts({
             <div className="min-w-0">
                 <div className="px-4 py-2 border-b border-slate-100 flex items-center justify-between gap-3">
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">价格行为结构</span>
-                    <span className="text-[10px] font-bold text-blue-600">趋势线 / 回踩支撑 / 入场 / 失效</span>
+                    <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-bold text-blue-600">趋势线 / 回踩支撑 / 入场 / 失效</span>
+                        {chipProfile ? (
+                            <button
+                                type="button"
+                                onClick={() => setShowChips((visible) => !visible)}
+                                className={cn(
+                                    "rounded-md border px-2 py-1 text-[10px] font-black transition-colors",
+                                    showChips
+                                        ? "border-violet-200 bg-violet-50 text-violet-700"
+                                        : "border-slate-200 bg-white text-slate-400"
+                                )}
+                            >
+                                筹码峰 {showChips ? '开' : '关'}
+                            </button>
+                        ) : (
+                            <span className="text-[10px] font-bold text-slate-400">筹码数据不足</span>
+                        )}
+                    </div>
                 </div>
                 <div className="relative w-full" style={{ height }}>
                     <div ref={priceActionRef} className="absolute inset-0" />
+                    <div ref={chipOverlayRef} className="absolute inset-0 z-[5] overflow-hidden pointer-events-none" />
                     <div ref={priceActionOverlayRef} className="absolute inset-0 z-10 pointer-events-none" />
                     <div
                         ref={priceActionTooltipRef}
                         className="pointer-events-none absolute z-30 hidden rounded-md border border-slate-200 bg-white/95 px-3 py-2 text-xs shadow-lg ring-1 ring-slate-900/5"
                     />
                 </div>
+                {chipDistribution?.available && (
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-violet-100 bg-violet-50/50 px-4 py-2 text-[10px] font-bold text-slate-600">
+                        <span className="font-black text-violet-700">估算筹码成本</span>
+                        <span>峰值 {Number(chipDistribution.peak_price).toFixed(2)}</span>
+                        <span>均价 {Number(chipDistribution.average_cost).toFixed(2)}</span>
+                        <span>获利盘 {(Number(chipDistribution.profit_ratio) * 100).toFixed(1)}%</span>
+                        <span>70%区间 {Number(chipDistribution.cost_70_low).toFixed(2)}–{Number(chipDistribution.cost_70_high).toFixed(2)}</span>
+                        <span className={chipDistribution.migration === '筹码上移' ? 'text-rose-600' : chipDistribution.migration === '筹码下移' ? 'text-indigo-600' : 'text-slate-500'}>
+                            {chipDistribution.migration}
+                        </span>
+                        <span className={chipDistribution.buy_impact === '抑制买入' ? 'text-red-600' : 'text-emerald-600'}>
+                            买点：{chipDistribution.buy_impact}
+                        </span>
+                        <span>持仓：{chipDistribution.holding_impact}</span>
+                        <span>评分 {Number(chipDistribution.score_delta || 0) > 0 ? '+' : ''}{chipDistribution.score_delta || 0}</span>
+                        <span className="text-slate-400">截至 {chipDistribution.as_of} · 换手衰减估算，非主力成本</span>
+                    </div>
+                )}
                 <SummaryBox {...paSummary} />
             </div>
         </div>

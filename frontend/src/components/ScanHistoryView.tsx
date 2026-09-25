@@ -109,7 +109,7 @@ export default function ScanHistoryView({ availableDates }: ScanHistoryViewProps
                                         <th className="px-3 py-3">选出价</th>
                                         <th className="px-3 py-3">当前价</th>
                                         <th className="px-3 py-3 text-right">至今表现</th>
-                                        <th className="px-3 py-3 text-right">SOP 分数</th>
+                                        <th className="px-3 py-3 text-right">质量分</th>
                                     </tr>
                                 </thead>
                                 <tbody>

@@ -8,6 +8,7 @@ from core.risk_constants import (
     ATR_STOP_MULTIPLIER, ATR_STOP_MIN_PCT, ATR_STOP_MAX_PCT,
     BACKTEST_STOP_LOSS_PCT,
     MA_STRATEGY_TAKE_PROFIT_PCT,
+    LIMIT_UP_NEXT_DAY_MIN_FOLLOW_THROUGH_PCT,
     TV_EXECUTION_POLICY_VERSION,
     TV_EXECUTION_TIER_RISK_UNITS,
     ZP_PROFIT_PROTECT_TRIGGER_PCT,
@@ -19,9 +20,9 @@ from core.sequoia_research import (
     turtle_breakout_signal_mask,
 )
 
-STRATEGY_LOGIC_VERSION = "2026.08-tv-or-tiered-execution-v1"
-BACKTEST_ENGINE_VERSION = "v7.0-friction-trailing-time-stop"
-EXIT_RULE_VERSION = "tv-source-aware-next-open-v1"
+STRATEGY_LOGIC_VERSION = "2026.09-tv-or-tiered-execution-v2"
+BACKTEST_ENGINE_VERSION = "v8.1-daily-mark-causal-sizing"
+EXIT_RULE_VERSION = "tv-source-aware-next-open-v2-anomaly"
 RESEARCH_PATTERN_STRATEGIES = {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}
 
 
@@ -1040,6 +1041,7 @@ def _simulate_backtest(
         "expectancy": expectancy,
         "sample_warning": sample_warning,
         "signal_count": total_trades,
+        "win_count": wins,
         "avg_hold_days": avg_hold,
         "avg_return": avg_return,
         "max_drawdown": round(max_drawdown * 100, 2),
@@ -1908,6 +1910,39 @@ def evaluate_exit_signals(
     
     pl_pct = (curr_price - entry_price) / entry_price * 100
     max_pl_pct = (high_price - entry_price) / entry_price * 100
+    alerts = []
+
+    # 涨停后的次日必须继续确认；否则优先退出短期试探仓。
+    if close_confirmed and len(df) >= 3:
+        before_limit_close = float(df.iloc[-3].get("收盘", 0) or 0)
+        limit_close = float(df.iloc[-2].get("收盘", 0) or 0)
+        limit_threshold = 19.5 if str(code or "").startswith(("30", "688")) else 9.5
+        prior_rise_pct = (
+            (limit_close / before_limit_close - 1) * 100 if before_limit_close > 0 else 0
+        )
+        follow_through_pct = (
+            (curr_price / limit_close - 1) * 100 if limit_close > 0 else 0
+        )
+        if (
+            prior_rise_pct >= limit_threshold
+            and follow_through_pct <= LIMIT_UP_NEXT_DAY_MIN_FOLLOW_THROUGH_PCT
+        ):
+            return [{
+                "level": "warning",
+                "reason": "涨停次日未能顺势走高",
+                "suggestion": "短期仓优先退出观望；中期仓不加仓，等待重新确认",
+            }]
+
+        prior_window = df.iloc[max(0, len(df) - 22):-2]
+        if not prior_window.empty:
+            previous_peak = float(prior_window["最高"].max())
+            previous_close = float(df.iloc[-2].get("收盘", 0) or 0)
+            if previous_peak > 0 and previous_close >= previous_peak and curr_price < previous_peak:
+                alerts.append({
+                    "level": "warning",
+                    "reason": f"收盘跌回前波峰支撑 ¥{previous_peak:.2f} 下方",
+                    "suggestion": "突破支撑角色转换失败，短期仓优先退出观望",
+                })
 
     tv_sources = {
         str(source).strip().lower()
@@ -1955,9 +1990,8 @@ def evaluate_exit_signals(
                     "reason": "TV-ZP盈利保护触发EMA20破位",
                     "suggestion": "盈利曾达到+15%，EMA20破位已确认；下一交易日开盘退出",
                 }]
-        return []
+        return alerts
     
-    alerts = []
     risk = compute_paper_risk_levels_with_context(entry_price, high_price, curr_price, None, code)
     active_stop = risk.get("active_stop_price") or risk.get("stop_price") or 0
 

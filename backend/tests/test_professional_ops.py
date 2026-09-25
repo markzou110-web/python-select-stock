@@ -140,6 +140,28 @@ def test_scan_snapshot_detail_keeps_market_data_timestamp():
     }
 
 
+def test_scan_snapshot_preserves_ai_evidence_fields():
+    detail = json.loads(_price_action_detail_snapshot({
+        "mkt_cap_yi": 123.4,
+        "money_flow_status": "ok",
+        "money_flow": {
+            "main_net_inflow_yi": 1.25,
+            "main_net_ratio": 3.6,
+            "source": "eastmoney_akshare",
+        },
+        "回测统计": {
+            "profit_factor": 1.72,
+            "expectancy": 2.1,
+            "signal_count": 18,
+        },
+    }))
+
+    assert detail["mkt_cap_yi"] == 123.4
+    assert detail["money_flow"]["main_net_inflow_yi"] == 1.25
+    assert detail["money_flow_status"] == "ok"
+    assert detail["回测统计"]["expectancy"] == 2.1
+
+
 def test_result_group_migration_does_not_reclassify_explicit_formal_record():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)

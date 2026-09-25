@@ -107,11 +107,6 @@ def simulate_portfolio(
         (pd.Timestamp(row.date), str(row.code)): float(row.close)
         for row in prices.itertuples(index=False)
     }
-    volume_lookup = {
-        (pd.Timestamp(row.date), str(row.code)): float(row.volume)
-        for row in prices.itertuples(index=False)
-        if pd.notna(row.volume)
-    }
     dates = list(pd.DatetimeIndex(prices["date"].drop_duplicates()).sort_values())
     cash = float(initial_capital)
     open_positions: dict[str, dict[str, Any]] = {}
@@ -127,15 +122,21 @@ def simulate_portfolio(
     daily_halt_count = 0
     floating_halt_count = 0
     prior_floating_halt = False
+    prior_daily_halt = False
+    last_volume: dict[str, float] = {}
 
-    def marked_equity(day: pd.Timestamp) -> tuple[float, float, float]:
+    def marked_equity(day: pd.Timestamp, *, at_close: bool = False) -> tuple[float, float, float]:
         market_value = 0.0
         cost = 0.0
         unrealized = 0.0
         for position in open_positions.values():
             code = position["code"]
-            mark = close_lookup.get((day, code), last_close.get(code, position["entry_price"]))
-            last_close[code] = mark
+            mark = last_close.get(code, position["entry_price"])
+            if position["entry_date"] == day:
+                mark = position["entry_price"]
+            if at_close:
+                mark = close_lookup.get((day, code), mark)
+                last_close[code] = mark
             value = mark * position["shares"]
             market_value += value
             cost += position["entry_value"]
@@ -143,34 +144,21 @@ def simulate_portfolio(
         return cash + market_value, market_value, unrealized / cost * 100 if cost > 0 else 0.0
 
     for day in dates:
-        for code in list(open_positions):
-            position = open_positions[code]
+        scheduled_exit_pnl = 0.0
+        for position in open_positions.values():
             if pd.isna(position["exit_date"]) or position["exit_date"] != day:
                 continue
             exit_price = float(position["exit_price"] or 0)
             if exit_price <= 0:
                 continue
             sell_value = exit_price * position["shares"]
-            sell_fee = _sell_fee(sell_value)
-            cash += sell_value - sell_fee
-            pnl = sell_value - sell_fee - position["entry_value"] - position["buy_fee"]
-            position.update(
-                {
-                    "status": "CLOSED",
-                    "sell_fee": round(sell_fee, 2),
-                    "pnl": round(pnl, 2),
-                    "return_pct": round(pnl / (position["entry_value"] + position["buy_fee"]) * 100, 4),
-                }
+            scheduled_exit_pnl += (
+                sell_value
+                - _sell_fee(sell_value)
+                - position["entry_value"]
+                - position["buy_fee"]
             )
-            closed_pnls.append(pnl)
-            del open_positions[code]
-
-        day_realized = sum(
-            float(trade.get("pnl") or 0)
-            for trade in trades
-            if trade.get("status") == "CLOSED" and trade.get("exit_date") == day
-        )
-        daily_halt = day_realized < -abs(float(initial_capital)) * 0.05
+        daily_halt = scheduled_exit_pnl < -abs(float(initial_capital)) * 0.05
         if daily_halt:
             daily_halt_count += 1
 
@@ -190,7 +178,7 @@ def simulate_portfolio(
                     }
                 )
 
-            if daily_halt or prior_floating_halt:
+            if daily_halt or prior_daily_halt or prior_floating_halt:
                 reject("组合熔断暂停新增")
                 continue
             if code in open_positions:
@@ -249,9 +237,9 @@ def simulate_portfolio(
             minimum_shares = minimum_buy_shares(code)
             lot_size = 100
             shares = int(target_value / entry_price / lot_size) * lot_size
-            day_volume = volume_lookup.get((day, code))
-            if day_volume is not None and day_volume > 0:
-                capacity_shares = int(day_volume * 0.05 / lot_size) * lot_size
+            prior_volume = last_volume.get(code)
+            if prior_volume is not None and prior_volume >= 0:
+                capacity_shares = int(prior_volume * 0.05 / lot_size) * lot_size
                 shares = min(shares, capacity_shares)
             affordable = int(max(0.0, cash - 5.0) / entry_price / lot_size) * lot_size
             shares = min(shares, affordable)
@@ -290,7 +278,36 @@ def simulate_portfolio(
             trades.append(trade)
             open_positions[code] = trade
 
-        equity, market_value, floating_pct = marked_equity(day)
+        # ponytail: date-only exits have unknown intraday order. Settle them
+        # after entries; timestamped fills are needed to reuse same-day proceeds.
+        for code in list(open_positions):
+            position = open_positions[code]
+            if pd.isna(position["exit_date"]) or position["exit_date"] != day:
+                continue
+            exit_price = float(position["exit_price"] or 0)
+            if exit_price <= 0:
+                continue
+            sell_value = exit_price * position["shares"]
+            sell_fee = _sell_fee(sell_value)
+            cash += sell_value - sell_fee
+            pnl = sell_value - sell_fee - position["entry_value"] - position["buy_fee"]
+            position.update(
+                {
+                    "status": "CLOSED",
+                    "sell_fee": round(sell_fee, 2),
+                    "pnl": round(pnl, 2),
+                    "return_pct": round(pnl / (position["entry_value"] + position["buy_fee"]) * 100, 4),
+                }
+            )
+            closed_pnls.append(pnl)
+            del open_positions[code]
+
+        prior_daily_halt = daily_halt
+        for row in prices[prices["date"].eq(day)].itertuples(index=False):
+            if pd.notna(row.volume):
+                last_volume[str(row.code)] = float(row.volume)
+
+        equity, market_value, floating_pct = marked_equity(day, at_close=True)
         peak = max(peak, equity)
         drawdown = (peak - equity) / peak * 100 if peak > 0 else 0.0
         max_drawdown = max(max_drawdown, drawdown)
@@ -342,6 +359,8 @@ def simulate_portfolio(
     return {
         "status": "SHADOW_ONLY",
         "config": config.name,
+        "execution_assumption": "entries_before_date_only_exits_prior_close_sizing",
+        "liquidity_basis": "previous_available_volume_in_shares",
         "initial_capital": round(float(initial_capital), 2),
         "final_equity": round(float(final_equity), 2),
         "total_return_pct": round(total_return * 100, 4),

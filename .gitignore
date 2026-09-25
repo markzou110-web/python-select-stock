@@ -1,5 +1,24 @@
 *.db
 *.log
+*.pyo
+*.pyd
+*.orig
+*.rej
+*.tmp
+
+# TypeScript / Next.js build artifacts
+tsconfig.tsbuildinfo
+*.tsbuildinfo
+frontend/.next/
+frontend/next-env.d.ts
+
+# Runtime state
+backend/logs/
+backend/celerybeat-schedule.db
+backend/uvicorn.log
+backend/api.log
+backend/backend.log
+backend/test_scan.log
 
 # Environment variables (contain secrets)
 .env
@@ -47,8 +66,11 @@ frontend/*_restart.pid
 .agent/
 .celery_pid
 .serena/
+.zcode/
 .backend_pid
 .frontend_pid
+# Celery worker PID files (start.sh writes .celery_<queue>_pid, no .pid suffix)
+.celery_*_pid
 
 # Debug / temporary scripts
 diag.py

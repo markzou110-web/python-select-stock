@@ -1,11 +1,19 @@
+import json
+
 import pandas as pd
 
 from core.price_action import (
     _detect_breakout_volume_pullback,
     _evaluate_pullback_validity,
+    _mtr_first_pullback_rebreak,
     _trend_path_quality,
     analyze_price_action,
     build_price_action_annotations,
+)
+from core.price_action_advanced import (
+    breakout_follow_through,
+    classify_gap,
+    second_entry_state,
 )
 
 
@@ -91,12 +99,50 @@ def test_breakout_volume_pullback_requires_breakout_volume_depth_and_slow_rhythm
     assert result["rhythm_ratio"] < 1
     assert result["score_delta"] > 0
     assert result["pullback_sessions"] == 4
-    assert result["confirmation"] in {"REVERSAL_BAR", "MA_SUPPORT", "REBREAK"}
+    assert result["confirmation"] in {
+        "BULLISH_ENGULFING", "HALF_RECOVERY", "LONG_LOWER_WICK",
+        "TWO_DAY_REBOUND", "REVERSAL_BAR", "MA_SUPPORT", "REBREAK",
+    }
     assert result["confirmation_date"] == "2026-02-13"
     assert result["stop_price"] < result["breakout_price"]
     assert all(check["passed"] for check in result["checks"])
     assert analysis["pa_volume_pullback_score_delta"] == result["score_delta"]
     assert "缩量回踩企稳" in analysis["pa_decision_summary"]
+
+
+def test_breakout_pullback_recognises_half_body_recovery():
+    frame = _breakout_volume_pullback_df()
+    frame.loc[29, ["开盘", "最高", "最低", "收盘", "成交量"]] = [10.38, 10.45, 10.27, 10.42, 700_000]
+
+    result = _detect_breakout_volume_pullback(frame)
+
+    assert result["status"] == "CONFIRMED"
+    assert result["confirmation"] == "HALF_RECOVERY"
+    assert result["confirmation_label"] == "阳线收复前阴一半"
+
+
+def test_breakout_pullback_recognises_four_percent_lower_wick_rebound():
+    frame = _breakout_volume_pullback_df()
+    frame.loc[29, ["开盘", "最高", "最低", "收盘", "成交量"]] = [10.45, 10.58, 10.05, 10.52, 700_000]
+
+    result = _detect_breakout_volume_pullback(frame)
+
+    assert result["status"] == "CONFIRMED"
+    assert result["confirmation"] == "LONG_LOWER_WICK"
+    assert result["confirmation_label"] == "长下影反弹超过4%"
+
+
+def test_breakout_pullback_recognises_two_day_half_rebound():
+    frame = _breakout_volume_pullback_df()
+    frame.loc[27, ["开盘", "最高", "最低", "收盘"]] = [10.45, 10.48, 10.36, 10.40]
+    frame.loc[28, ["开盘", "最高", "最低", "收盘"]] = [10.55, 10.56, 10.27, 10.30]
+    frame.loc[29, ["开盘", "最高", "最低", "收盘", "成交量"]] = [10.29, 10.40, 10.28, 10.36, 700_000]
+
+    result = _detect_breakout_volume_pullback(frame)
+
+    assert result["status"] == "CONFIRMED"
+    assert result["confirmation"] == "TWO_DAY_REBOUND"
+    assert result["confirmation_label"] == "两日反弹收复跌幅一半"
 
 
 def test_breakout_volume_pullback_rejects_breakout_without_volume():
@@ -161,6 +207,46 @@ def test_price_action_annotations_show_breakout_and_pullback_markers():
     assert any(line.get("kind") == "pullback_stop" for line in annotations["lines"])
 
 
+def test_bull_mtr_first_pullback_rebreak_marks_only_after_close_confirmation(monkeypatch):
+    frame = _ohlc_from_closes([10.0] * 30)
+    frame["日期"] = pd.bdate_range("2026-01-05", periods=30)
+    follow_up = pd.DataFrame([
+        {"日期": pd.Timestamp("2026-02-16"), "开盘": 10.5, "最高": 11.4, "最低": 10.0, "收盘": 11.0, "成交量": 2_000_000},
+        {"日期": pd.Timestamp("2026-02-17"), "开盘": 10.9, "最高": 10.95, "最低": 10.2, "收盘": 10.5, "成交量": 800_000},
+        {"日期": pd.Timestamp("2026-02-18"), "开盘": 10.6, "最高": 11.3, "最低": 10.3, "收盘": 11.2, "成交量": 1_100_000},
+    ])
+    frame = pd.concat([frame, follow_up], ignore_index=True)
+
+    def fake_analysis(sub):
+        confirmed = len(sub) in (31, 33)
+        return {
+            "pa_mtr_state": "CONFIRMED" if confirmed else "NONE",
+            "pa_mtr_direction": "BULL_REVERSAL" if confirmed else "NONE",
+        }
+
+    monkeypatch.setattr("core.price_action.analyze_price_action", fake_analysis)
+    assert _mtr_first_pullback_rebreak(frame, 30, 31) is None
+    assert _mtr_first_pullback_rebreak(frame, 30, 32) == {"trigger_price": 11.0, "pullback_low": 10.2}
+    assert not any(marker.get("source") == "mtr_pullback_rebreak" for marker in build_price_action_annotations(frame.iloc[:32])["markers"])
+    markers = build_price_action_annotations(frame)["markers"]
+    assert [(marker["time"], marker["trigger_price"]) for marker in markers if marker.get("source") == "mtr_pullback_rebreak"] == [
+        ("2026-02-18", 11.0),
+    ]
+
+    frame.loc[31, "成交量"] = 2_000_000
+    assert _mtr_first_pullback_rebreak(frame, 30, 32) is None
+    frame.loc[31, "成交量"] = 800_000
+    frame.loc[31, "最低"] = 9.9
+    assert _mtr_first_pullback_rebreak(frame, 30, 32) is None
+    frame.loc[31, "最低"] = 10.2
+
+    monkeypatch.setattr("core.price_action.analyze_price_action", lambda sub: {
+        "pa_mtr_state": "CONFIRMED" if len(sub) == 31 else "NONE",
+        "pa_mtr_direction": "BEAR_REVERSAL",
+    })
+    assert not any(marker.get("source") == "mtr_pullback_rebreak" for marker in build_price_action_annotations(frame)["markers"])
+
+
 def test_price_action_handles_short_data():
     result = analyze_price_action(_ohlc_from_closes([10, 10.1, 10.2]))
 
@@ -194,8 +280,18 @@ def test_price_action_detects_h2_two_legged_pullback():
     df.loc[df.index[-1], "收盘"] = 16.35
     df.loc[df.index[-1], "最高"] = 16.45
     df.loc[df.index[-1], "最低"] = 15.75
+    df.loc[df.index[-5], "最高"] = 16.40
+    df.loc[df.index[-4], "最高"] = 16.05
+    df.loc[df.index[-3], "最高"] = 16.20
+    df.loc[df.index[-2], "最高"] = 16.00
+    df["日期"] = pd.bdate_range("2026-01-05", periods=len(df))
 
     result = analyze_price_action(df)
+    annotations = build_price_action_annotations(df)
+    marker = next(
+        item for item in annotations["markers"]
+        if item["time"] == df["日期"].iloc[-1].strftime("%Y-%m-%d") and item["text"] == "H2"
+    )
 
     assert result["pa_pullback_structure"] == "双腿回调"
     assert result["pa_pullback_legs"] >= 2
@@ -206,6 +302,9 @@ def test_price_action_detects_h2_two_legged_pullback():
     assert result["pa_trade_plan"]["action"] in {"READY", "WATCH"}
     assert result["pa_pullback_status"] in {"WAITING_PULLBACK", "PENDING_CONFIRMATION", "CONFIRMED", "INVALIDATED"}
     assert result["pa_pullback_validity"]["checks"]
+    assert marker["source"] == "price_action_second_entry"
+    assert marker["position"] == "belowBar"
+    assert marker["shape"] == "arrowUp"
 
 
 def test_pullback_validity_confirms_only_after_price_and_volume_confirmation():
@@ -266,14 +365,27 @@ def test_price_action_detects_bear_l2_as_avoid_context():
     df.loc[df.index[-1], "收盘"] = 13.45
     df.loc[df.index[-1], "最高"] = 14.1
     df.loc[df.index[-1], "最低"] = 13.35
+    df.loc[df.index[-5], "最低"] = 13.60
+    df.loc[df.index[-4], "最低"] = 13.90
+    df.loc[df.index[-3], "最低"] = 13.70
+    df.loc[df.index[-2], "最低"] = 13.95
+    df["日期"] = pd.bdate_range("2026-01-05", periods=len(df))
 
     result = analyze_price_action(df)
+    annotations = build_price_action_annotations(df)
+    marker = next(
+        item for item in annotations["markers"]
+        if item["time"] == df["日期"].iloc[-1].strftime("%Y-%m-%d") and item["text"] == "L2"
+    )
 
     assert result["pa_pullback_structure"] == "双腿回调"
     assert result["pa_pullback_legs"] >= 2
     assert "L2" in result["pa_tags"] or result["price_action_pattern"] == "L2二次做空信号"
     assert result["pa_failure_risk"] >= 45
     assert result["pa_trade_plan"]["action"] == "AVOID"
+    assert marker["source"] == "price_action_second_entry"
+    assert marker["position"] == "aboveBar"
+    assert marker["shape"] == "arrowDown"
 
 
 def test_price_action_classifies_range_failed_breakout_type_and_trap_risk():
@@ -320,7 +432,7 @@ def test_price_action_detects_trend_damage_after_bull_context():
     result = analyze_price_action(df)
 
     assert result["pa_trend_damage"] in {"跌破EMA20", "跌破EMA60", "短线低点破坏"}
-    assert result["pa_position_strategy"] == "减仓或等待二次确认"
+    assert result["pa_position_strategy"] in {"减仓或等待二次确认", "主要趋势反转确认，退出原多头计划"}
     assert any("趋势结构" in reason for reason in result["pa_trade_plan"]["avoid_reasons"])
 
 
@@ -344,6 +456,12 @@ def test_price_action_outputs_multitimeframe_volume_range_phase_and_summary():
     assert isinstance(result["pa_range_center_risk"], int)
     assert isinstance(result["pa_range_failed_breakout_count"], int)
     assert result["pa_trend_phase"]
+    assert result["pa_structure_state"] in {
+        "CLIMAX", "BREAKOUT_MODE", "TRADING_RANGE", "TIGHT_CHANNEL", "BROAD_CHANNEL", "TRANSITION",
+    }
+    assert isinstance(result["pa_support_resistance_zones"], list)
+    assert result["pa_sr_confluence_grade"] in {"NONE", "WEAK", "MEDIUM", "STRONG"}
+    assert result["pa_follow_through_state"] in {"NONE", "WAITING", "STRONG", "WEAK", "FAILED"}
     assert result["pa_trend_phase_action"]
     assert result["pa_decision_summary"]
     assert result["pa_breakout_volume_threshold"] >= 1.2
@@ -358,9 +476,9 @@ def test_price_action_uses_calendar_weeks_when_dates_are_available():
     result = analyze_price_action(df)
 
     assert result["pa_weekly_context"] != "周线数据不足"
-    assert result["price_action_version"] == "price-action-v7"
+    assert result["price_action_version"] == "price-action-v9"
     assert result["target_model_version"] == "structure-target-v2"
-    assert result["score_model_version"] == "pa-three-score-v3-confirmed-pullback"
+    assert result["score_model_version"] == "pa-three-score-v5-market-structure"
     assert result["pa_path_research_score_delta"] == 3
 
 
@@ -425,12 +543,14 @@ def test_price_action_annotations_include_summary_and_lines():
     assert annotations["summary"]["price_action_score"] > 0
     assert isinstance(annotations["markers"], list)
     assert any(line["kind"] in {"entry", "stop"} for line in annotations["lines"])
+    assert any(line["kind"] in {"support_zone", "resistance_zone"} for line in annotations["lines"])
+    json.dumps(annotations, ensure_ascii=False)
 
 
 # ── Brooks 深化修复测试 ──
 
-def test_count_pullback_legs_brooks_fib():
-    """修复1: Fibonacci 回调带检测。构造交替推力（回调在 38-62%）→ 2 腿。"""
+def test_count_pullback_legs_uses_price_attempts_not_fibonacci_gate():
+    """H2/L2按第二次恢复趋势尝试定义，回撤深度只用于质量评价。"""
     from core.price_action import _count_pullback_legs
 
     # 构造 L→H→L→H→L 的 swing 结构（bull 方向，回调在 Fib 带）
@@ -438,20 +558,66 @@ def test_count_pullback_legs_brooks_fib():
     # 推力2: 11→13 (幅度2), 回调2: 13→12 (幅度1, 50%回撤 ✓)
     closes = [10, 10.5, 11, 11.5, 12, 11.7, 11.4, 11.1, 11, 11.5, 12, 12.5, 13, 12.7, 12.4, 12.1, 12]
     df = _ohlc_from_closes(closes)
-    legs = _count_pullback_legs(df, "bull")
-    assert legs >= 1, f"Fibonacci回调应检测到至少1腿，实际{legs}"
+    state = second_entry_state(df, "bull")
+    assert state["retracement_quality"] == "BALANCED"
 
 
-def test_count_pullback_legs_noise_filtered():
-    """修复1: 噪音回调（<38%）不应计数。"""
+def test_shallow_pullback_is_still_a_valid_first_entry_attempt():
+    """浅回调可以形成H1；它不再因为低于38.2%被直接删除。"""
     from core.price_action import _count_pullback_legs
 
     # 推力: 10→15 (幅度5), 回调: 15→14.8 (幅度0.2, 仅4%回撤 — 太浅，噪音)
     closes = [10, 11, 12, 13, 14, 15, 14.9, 14.8, 14.9, 15, 15.5, 16]
     df = _ohlc_from_closes(closes)
-    legs = _count_pullback_legs(df, "bull")
-    # 噪音回调不应计数（<38%）
-    assert legs == 0, f"噪音回调(4%)不应计数，实际{legs}"
+    state = second_entry_state(df, "bull")
+    assert state["retracement_quality"] == "SHALLOW"
+
+
+def test_second_entry_state_detects_h2_without_retracement_gate():
+    frame = pd.DataFrame([
+        {"开盘": 10.0, "最高": 10.2, "最低": 9.9, "收盘": 10.1},
+        {"开盘": 10.1, "最高": 11.2, "最低": 10.0, "收盘": 11.0},
+        {"开盘": 11.0, "最高": 11.0, "最低": 10.7, "收盘": 10.8},
+        {"开盘": 10.8, "最高": 11.05, "最低": 10.75, "收盘": 11.0},
+        {"开盘": 11.0, "最高": 10.98, "最低": 10.72, "收盘": 10.8},
+        {"开盘": 10.8, "最高": 11.08, "最低": 10.78, "收盘": 11.05},
+    ])
+
+    state = second_entry_state(frame, "bull")
+
+    assert state["state"] == "H2_TRIGGERED"
+    assert state["attempts"] == 2
+    assert state["retracement_quality"] in {"SHALLOW", "BALANCED", "DEEP"}
+
+
+def test_gap_classification_distinguishes_full_and_opening_gap():
+    full_gap = pd.DataFrame([
+        {"开盘": 10.0, "最高": 10.4, "最低": 9.8, "收盘": 10.2},
+        {"开盘": 10.8, "最高": 11.2, "最低": 10.6, "收盘": 11.1},
+    ])
+    opening_gap = full_gap.copy()
+    opening_gap.loc[1, ["最低", "收盘"]] = [10.1, 10.25]
+
+    assert classify_gap(full_gap)["type"] == "FULL_UP"
+    assert classify_gap(opening_gap)["type"] == "OPENING_UP"
+    assert classify_gap(opening_gap)["filled"] is True
+
+
+def test_breakout_follow_through_reports_strong_and_failed_states():
+    rows = [
+        {"开盘": 9.8, "最高": 10.0, "最低": 9.7, "收盘": 9.9}
+        for _ in range(20)
+    ]
+    rows.extend([
+        {"开盘": 9.95, "最高": 10.6, "最低": 9.9, "收盘": 10.5},
+        {"开盘": 10.45, "最高": 11.0, "最低": 10.4, "收盘": 10.9},
+    ])
+    strong = breakout_follow_through(pd.DataFrame(rows))
+    rows[-1] = {"开盘": 10.45, "最高": 10.5, "最低": 9.6, "收盘": 9.7}
+    failed = breakout_follow_through(pd.DataFrame(rows))
+
+    assert strong["state"] == "STRONG"
+    assert failed["state"] == "FAILED"
 
 
 def test_stop_price_uses_signal_bar_low():

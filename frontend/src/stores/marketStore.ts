@@ -20,7 +20,16 @@ export interface SyncProgress {
 export interface MarketRegimeData {
     status: string;
     desc: string;
-    indices: Record<string, any>;
+    indices: Record<string, {
+        close?: number;
+        ema20?: number;
+        trend?: string;
+        trend_label?: string;
+        ema20_gap_pct?: number;
+        chg_pct?: number;
+    }>;
+    baseline_label?: string;
+    trend_basis?: string;
     updated_at: string;
 }
 

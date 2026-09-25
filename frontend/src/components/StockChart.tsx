@@ -86,6 +86,28 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     {priceAction.pa_h2_quality && priceAction.pa_h2_quality !== '不适用' && (
                         <span className="font-bold text-blue-700">H2 {priceAction.pa_h2_quality}</span>
                     )}
+                    {priceAction.pa_h2_state && priceAction.pa_h2_state !== 'NONE' && (
+                        <span className="font-bold text-emerald-700">{priceAction.pa_h2_state}</span>
+                    )}
+                    {priceAction.pa_follow_through_state && priceAction.pa_follow_through_state !== 'NONE' && (
+                        <span className={priceAction.pa_follow_through_state === 'FAILED' ? 'font-bold text-rose-600' : 'font-bold text-emerald-700'}>
+                            突破跟进 {priceAction.pa_follow_through_state}
+                        </span>
+                    )}
+                    {priceAction.pa_structure_state_label && (
+                        <span className="font-bold text-violet-700">结构 {priceAction.pa_structure_state_label}</span>
+                    )}
+                    {priceAction.pa_mtr_state && priceAction.pa_mtr_state !== 'NONE' && (
+                        <span className="font-bold text-violet-700">MTR {priceAction.pa_mtr_state}</span>
+                    )}
+                    {priceAction.pa_sr_confluence_grade && priceAction.pa_sr_confluence_grade !== 'NONE' && (
+                        <span className="font-bold text-teal-700">支撑共振 {priceAction.pa_sr_confluence_grade}</span>
+                    )}
+                    {priceAction.pa_mtf_state && priceAction.pa_mtf_state !== 'UNAVAILABLE' && (
+                        <span className={priceAction.pa_mtf_state === 'CONFLICT' ? 'font-bold text-rose-600' : 'font-bold text-indigo-700'}>
+                            日/60分/5分 {priceAction.pa_mtf_state}
+                        </span>
+                    )}
                     {priceAction.pa_failed_breakout_type && (
                         <span className="font-bold text-rose-600">{priceAction.pa_failed_breakout_type}</span>
                     )}
@@ -105,7 +127,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                         <span className="font-bold text-emerald-700">{priceAction.pa_volume_pattern}</span>
                     )}
                     {priceAction.pa_gap_type && priceAction.pa_gap_type !== '无缺口' && (
-                        <span className="font-bold text-amber-700">{priceAction.pa_gap_type}</span>
+                        <span className="font-bold text-amber-700">{priceAction.pa_gap_type} · {priceAction.pa_opening_behavior}</span>
                     )}
                     <span className="font-bold text-slate-400">评分 {priceAction.price_action_score ?? '--'}</span>
                 </div>
@@ -119,6 +141,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     strategySignalSets={chartData.strategy_sets || {}}
                     priceAction={chartData.price_action || null}
                     priceActionLines={chartData.price_action_lines || []}
+                    chipDistribution={chartData.chip_distribution || null}
                     riskLevels={chartData.chart_context || {}}
                     height={400}
                 />

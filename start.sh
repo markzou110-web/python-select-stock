@@ -68,6 +68,11 @@ else
     echo "⚠️ 提示: 未找到本地 Redis 服务，系统将自动切入单机免依赖模式！"
 fi
 
+# 日志清理：删除 30 天前的历史日志，避免磁盘被日志占满（应用日志已启用每日轮转）
+if [ -d "backend/logs" ]; then
+    find backend/logs -type f -name 'alphavision*' -mtime +30 -delete 2>/dev/null || true
+fi
+
 # 启动后端
 echo ""
 echo "🚀 启动后端 (FastAPI)..."

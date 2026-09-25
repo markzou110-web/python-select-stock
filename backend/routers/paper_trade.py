@@ -11,10 +11,11 @@ import json
 import pandas as pd
 
 from core.logging_config import logger
-from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db, get_setting
-from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache, is_snapshot_stale
+from core.db import get_db_engine, validate_stock_code, save_failure_sample, load_from_db, get_setting, save_setting
+from core.data import get_cached_data, get_market_snapshot, get_sector_map, get_stale_cache, is_snapshot_stale, ensure_turnover_history
 from core.indicators import calculate_indicators
 from core.price_action import analyze_price_action
+from core.chip_distribution import build_chip_distribution
 from core.analytics import (
     calculate_pnl_attribution, calculate_risk_metrics, calculate_rolling_performance,
     compute_equity_curve_drawdown, compute_profit_factor, run_monte_carlo,
@@ -389,8 +390,15 @@ def _local_price_action_summary(engine, code: str) -> Dict[str, Any]:
         df = load_from_db(code, start_date, engine)
         if df.empty:
             return {}
+        df = ensure_turnover_history(code, df, engine)
         with_indicators = calculate_indicators(df, periods=[5, 10, 20, 60])
         summary = analyze_price_action(with_indicators)
+        chip = build_chip_distribution(df)
+        if chip.get("available"):
+            summary["chip_distribution"] = chip
+            summary["chip_buy_impact"] = chip.get("buy_impact")
+            summary["chip_holding_impact"] = chip.get("holding_impact")
+            summary["chip_score_delta"] = chip.get("score_delta", 0)
         # 计算 ATR 列已在 calculate_indicators 中产出（true_range.rolling(14).mean()）。
         # 若列存在且非空，把最新值附加到摘要里，供风控引擎收紧初始止损。
         if "ATR" in with_indicators.columns and not with_indicators.empty:
@@ -469,18 +477,57 @@ _real_stop_alert_state: Dict[str, int] = {}
 _REAL_STOP_ALERT_DATE: Dict[str, str] = {}  # 记录推送日期，跨日重置
 _REAL_STOP_ALERT_PHASE: Dict[str, str] = {}
 _operation_trigger_state: Dict[str, Dict[str, str]] = {}
+_OPERATION_TRIGGER_STATE_KEY_PREFIX = "operation_trigger_state:"
+_OPERATION_TRIGGER_COOLDOWN_MINUTES = 30
 
 
-def _operation_trigger_transition(identity: str, trading_date: str, kind: str) -> bool:
-    """同一持仓的操作区间仅在首次进入或状态改变时通知。"""
-    previous = _operation_trigger_state.get(identity)
-    if not previous or previous.get("date") != trading_date:
-        _operation_trigger_state[identity] = {"date": trading_date, "kind": kind}
-        return kind != "HOLD"
-    if previous.get("kind") == kind:
+def _load_operation_trigger_state(identity: str) -> Dict[str, str]:
+    raw = get_setting(f"{_OPERATION_TRIGGER_STATE_KEY_PREFIX}{identity}", "")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+        if isinstance(value, dict):
+            return value
+    except (TypeError, json.JSONDecodeError):
+        pass
+    return _operation_trigger_state.get(identity, {})
+
+
+def _operation_trigger_transition(
+    identity: str,
+    trading_date: str,
+    kind: str,
+    now: datetime | None = None,
+) -> bool:
+    """同一持仓只在状态改变时通知，同类信号重入另加冷却。"""
+    now = now or datetime.now()
+    previous = _load_operation_trigger_state(identity)
+    if previous.get("date") == trading_date and previous.get("kind") == kind:
         return False
-    _operation_trigger_state[identity] = {"date": trading_date, "kind": kind}
-    return kind != "HOLD"
+    should_notify = kind != "HOLD"
+    if should_notify and previous.get("date") == trading_date and previous.get("last_notified_kind") == kind:
+        try:
+            notified_at = datetime.fromisoformat(str(previous.get("last_notified_at") or ""))
+            should_notify = now - notified_at >= timedelta(minutes=_OPERATION_TRIGGER_COOLDOWN_MINUTES)
+        except (TypeError, ValueError):
+            pass
+    state = {
+        "date": trading_date,
+        "kind": kind,
+        "updated_at": now.isoformat(timespec="seconds"),
+        "last_notified_kind": previous.get("last_notified_kind") if previous.get("date") == trading_date else None,
+        "last_notified_at": previous.get("last_notified_at") if previous.get("date") == trading_date else None,
+    }
+    if should_notify:
+        state["last_notified_kind"] = kind
+        state["last_notified_at"] = now.isoformat(timespec="seconds")
+    _operation_trigger_state[identity] = state
+    save_setting(
+        f"{_OPERATION_TRIGGER_STATE_KEY_PREFIX}{identity}",
+        json.dumps(state, ensure_ascii=False),
+    )
+    return should_notify
 
 
 def _real_stop_alert_transition(
@@ -971,7 +1018,8 @@ def get_open_trade_plans() -> Dict[str, Any]:
                 current,
                 row.get("entry_date"),
             )
-            risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, str(row.get("code") or "")), str(row.get("code") or ""))
+            pa_summary = _local_price_action_summary(engine, str(row.get("code") or ""))
+            risk = compute_paper_risk_levels_with_context(entry, high, current, pa_summary, str(row.get("code") or ""))
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
             items.append({
                 "id": int(row["id"]),
@@ -982,6 +1030,21 @@ def get_open_trade_plans() -> Dict[str, Any]:
                 "signal_sources": _normalize_signal_sources(row.get("signal_sources")),
                 "execution_tier": row.get("execution_tier"),
                 "risk_unit": _optional_value(row.get("risk_unit")),
+                "price_action": {
+                    "h2_state": pa_summary.get("pa_h2_state"),
+                    "follow_through_state": pa_summary.get("pa_follow_through_state"),
+                    "structure_state_label": pa_summary.get("pa_structure_state_label"),
+                    "mtr_state": pa_summary.get("pa_mtr_state"),
+                    "mtr_direction": pa_summary.get("pa_mtr_direction"),
+                    "sr_confluence_grade": pa_summary.get("pa_sr_confluence_grade"),
+                    "nearest_support": pa_summary.get("pa_nearest_support_zone"),
+                    "nearest_resistance": pa_summary.get("pa_nearest_resistance_zone"),
+                    "chip_buy_impact": pa_summary.get("chip_buy_impact"),
+                    "chip_holding_impact": pa_summary.get("chip_holding_impact"),
+                    "chip_score_delta": pa_summary.get("chip_score_delta", 0),
+                    "chip_buy_reason": (pa_summary.get("chip_distribution") or {}).get("buy_reason"),
+                    "chip_holding_reason": (pa_summary.get("chip_distribution") or {}).get("holding_reason"),
+                },
                 "plan": plan,
             })
         return {"items": items}
@@ -1057,8 +1120,12 @@ def check_operation_triggers(notify: bool = True, trade_mode: str = "REAL") -> D
                 "high_since_entry": round(high, 2),
                 "updated_at": datetime.now(),
             })
-            risk = compute_paper_risk_levels_with_context(entry, high, current, _local_price_action_summary(engine, code), code)
+            pa_summary = _local_price_action_summary(engine, code)
+            risk = compute_paper_risk_levels_with_context(entry, high, current, pa_summary, code)
             plan = _build_trade_plan(row.to_dict(), current, high, risk)
+            if pa_summary.get("chip_holding_impact"):
+                plan["chip_holding_impact"] = pa_summary["chip_holding_impact"]
+                plan["chip_holding_reason"] = (pa_summary.get("chip_distribution") or {}).get("holding_reason")
             trigger = evaluate_operation_trigger(current, plan)
             should_notify = False
             if notify:

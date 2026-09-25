@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 from core.logging_config import logger
-from core.db import get_db_engine
+from core.db import get_db_engine, validate_stock_code
 from core.operation_plan import operation_bands, safe_num
 from core.risk_constants import TV_SIGNAL_WARMUP_DAYS
 from sqlalchemy import text
@@ -17,6 +17,9 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
     获取单只股票的 K 线数据，并根据当前选股策略计算前端图表所需的指标与买卖点标记。
     """
     logger.info(f"Fetching kline data for {code} over {days} days with strategy: {strategy_type}")
+    if not validate_stock_code(code):
+        raise HTTPException(status_code=400, detail="Invalid stock code format")
+    days = max(60, min(int(days), 800))
     try:
         engine = get_db_engine()
         
@@ -27,8 +30,9 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         ).strftime("%Y-%m-%d")
         
         query = text("""
-            SELECT date as "日期", close as "收盘", open as "开盘", 
-                   high as "最高", low as "最低", vol as "成交量"
+            SELECT date as "日期", close as "收盘", open as "开盘",
+                   high as "最高", low as "最低", vol as "成交量",
+                   turnover as "换手率"
             FROM daily_k
             WHERE code = :code AND date >= :start_date
             ORDER BY date ASC
@@ -39,9 +43,21 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             
         if df.empty:
             raise HTTPException(status_code=404, detail="No historical data found for this stock.")
-            
+
+        # 当日 bar 校正：daily_k 当日行可能是午间半日部分数据，用实时快照覆盖最后一根，
+        # 使 K线/指标/价格行为与头部实时价一致（快照不可用时保持原样，fail-open）
+        from core.data import apply_snapshot_bar_to_frame, get_snapshot_daily_bar
+        if apply_snapshot_bar_to_frame(df, get_snapshot_daily_bar(code)):
+            logger.info(f"Applied live snapshot bar to today's candle for {code}")
+
+        from core.chip_distribution import build_chip_distribution
+        from core.data import ensure_turnover_history
+
+        chip_frame = ensure_turnover_history(code, df, engine=engine)
+        chip_distribution = build_chip_distribution(chip_frame)
+
         from core.indicators import calculate_indicators
-        from core.price_action import build_price_action_annotations
+        from core.price_action import build_price_action_annotations, build_chart_hints, build_trade_projection
         # Calculate all indicators including Pine Script indicators (Range Filter, QQE)
         df = calculate_indicators(df, enable_pine_indicators=True)
         
@@ -133,6 +149,20 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
 
         # 4. Al Brooks-style price action annotations
         price_action = build_price_action_annotations(df)
+        try:
+            from core.hot_stocks import get_hot_stock_chart
+            from core.price_action_timeframes import build_intraday_price_action_context
+
+            minute_chart = get_hot_stock_chart(code, period="minute")
+            intraday_context = build_intraday_price_action_context(
+                price_action.get("summary", {}),
+                minute_chart.get("points", []),
+                minute_chart.get("previous_close"),
+            )
+            price_action["summary"]["pa_mtf_state"] = intraday_context["state"]
+            price_action["summary"]["pa_mtf_intraday"] = intraday_context
+        except Exception as exc:
+            logger.warning(f"Intraday price-action context for {code} failed: {exc}")
         for marker in price_action.get("markers", []):
             if str(marker.get("time", "")) >= display_start_date:
                 markers_data.append(marker)
@@ -212,7 +242,14 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
             "strategy_sets": strategy_sets,
             "price_action": price_action.get("summary", {}),
             "price_action_lines": price_action.get("lines", []),
+            "trend_phases": price_action.get("phase_timeline", []),
+            "chart_hints": build_chart_hints(price_action.get("summary", {})),
+            "trade_projection": build_trade_projection(
+                price_action.get("summary", {}),
+                last_close=(candlestick_data[-1]["close"] if candlestick_data else None),
+            ),
             "chart_context": chart_context,
+            "chip_distribution": chip_distribution,
         }
         
     except Exception as e:

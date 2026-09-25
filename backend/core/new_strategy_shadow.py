@@ -108,7 +108,6 @@ def classify_shadow_candidates(
         candidate = dict(source)
         code = str(candidate.get("代码") or candidate.get("code") or "")
         data_date = str(candidate.get("data_date") or date.today().isoformat())[:10]
-        pct_5d = _number(candidate.get("pct_5d"))
         pa_score = _number(candidate.get("price_action_score"))
         action = str(
             (candidate.get("pa_trade_plan") or {}).get("action")
@@ -127,19 +126,6 @@ def classify_shadow_candidates(
             state = "WAIT_STRICT_DUAL"
             instruction = "仅发现观察；等待均线B与TV-ZP同时命中"
             hard_blockers.append("未形成严格双策略共振")
-        elif pct_5d > 15:
-            route = "B"
-            state = "OVEREXTENDED_WATCH"
-            instruction = "等待1～3日回踩确认；禁止立即追价"
-            hard_blockers.append("5日涨幅>15%，禁止立即追价")
-            if market_context.get("route_b_permission") != "SHADOW_PULLBACK":
-                hard_blockers.append("市场双轴未进入路线B影子回踩状态")
-            if action == "AVOID":
-                hard_blockers.append("PA行动为AVOID")
-                state = "BLOCKED_SHADOW"
-            if entry <= 0 or stop <= 0 or stop >= entry:
-                hard_blockers.append("确认价或止损价无效")
-                state = "BLOCKED_SHADOW"
         else:
             route = "A"
             state = "A_CONFIRMATION_WATCH"

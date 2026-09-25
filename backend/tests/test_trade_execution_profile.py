@@ -25,13 +25,6 @@ from core.scanner import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _validated_grade_mode_for_non_calibration_tests(monkeypatch):
-    """Keep existing execution-profile tests focused on their own gate."""
-    from core import scanner
-    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "ACTIVE")
-
-
 def test_confirmation_tolerance_accepts_one_tick_rounding_gap():
     assert _confirmation_price_reached(85.99, 86.00) is True
     assert _confirmation_price_reached(85.80, 86.00) is False
@@ -234,7 +227,7 @@ def test_ready_candidate_enters_trade_bucket():
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "A"
+    assert "sop_grade" not in result
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
     assert result["trade_execution_policy"] == "BARK_CONFIRMED_TRADE"
@@ -292,15 +285,14 @@ def test_confirmed_quality_between_60_and_65_enters_controlled_a_minus_trial():
     _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     assert 60 <= candidate["sop_quality_score"] < 65
-    assert candidate["sop_grade"] == "B"
+    assert "sop_grade" not in candidate
     assert candidate["a_minus_trial"] is True
-    assert candidate["a_minus_trial_grade"] == "A-"
     assert candidate["trade_eligible"] is True
     assert candidate["trade_bucket"] == "TRADE"
     assert candidate["trade_execution_policy"] == "A_MINUS_CONTROLLED_TRIAL"
 
 
-def test_calibrated_a_eod_trial_softens_only_sector_and_weekly_blockers():
+def test_v2_softens_sector_and_weekly_conditions_for_confirmed_trade():
     candidate = _base_candidate(
         strategy_type="tv_dual",
         sector_momentum_score=65,
@@ -315,16 +307,16 @@ def test_calibrated_a_eod_trial_softens_only_sector_and_weekly_blockers():
 
     _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    assert candidate["sop_grade"] == "B"
+    assert "sop_grade" not in candidate
     assert candidate["a_eod_controlled_trial"] is True
     assert candidate["trade_eligible"] is True
     assert candidate["trade_bucket"] == "TRADE"
     assert candidate["trade_execution_policy"] == "A_EOD_CONTROLLED_TRIAL"
     assert candidate["trade_blockers"] == []
-    assert candidate["a_eod_trade_cautions"] == [
-        "板块强度不足，降级观察",
-        "板块联动<70，降级观察",
-        "周线中性，降级观察",
+    assert candidate["trade_cautions"] == [
+        "板块强度不足，降低仓位优先级",
+        "板块联动<70，降低仓位优先级",
+        "周线中性，降低仓位优先级",
     ]
 
 
@@ -405,7 +397,7 @@ def test_calibrated_a_eod_trial_does_not_soften_fatal_sector_blocker():
     assert "板块下跌" in candidate["sop_vetoes"]
 
 
-def test_confirmed_quality_between_65_and_70_reaches_relaxed_a_grade():
+def test_confirmed_quality_between_65_and_70_uses_continuous_score():
     candidate = _base_candidate(
         历史胜率="50%",
         回测统计={"profit_factor": 1.5, "expectancy": 0},
@@ -419,7 +411,7 @@ def test_confirmed_quality_between_65_and_70_reaches_relaxed_a_grade():
     _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     assert 65 <= candidate["sop_quality_score"] < 70
-    assert candidate["sop_grade"] == "A"
+    assert "sop_grade" not in candidate
     assert candidate["trade_eligible"] is True
     assert candidate.get("a_minus_trial") is not True
 
@@ -451,14 +443,13 @@ def test_a_minus_trial_requires_volume_risk_reward_and_live_health():
 
 
 def test_plain_tv_dual_is_now_core_trade_strategy():
-    # tv_dual 已从发现层升格为核心交易策略，与 tv_dual_strict 同样可评A且可交易。
+    # tv_dual 已从发现层升格为核心交易策略，与 tv_dual_strict 同样可交易。
     results = [_base_candidate(strategy_type="tv_dual")]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "A"
-    assert result["sop_a_grade_eligible"] is True
+    assert "sop_grade" not in result
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
     assert result["trade_execution_policy"] == "BARK_CONFIRMED_TRADE"
@@ -467,7 +458,7 @@ def test_plain_tv_dual_is_now_core_trade_strategy():
     assert "普通tv_dual仅用于发现，需严格双策略确认" not in result["trade_blockers"]
 
 
-def test_soft_veto_caps_high_quality_candidate_at_b():
+def test_soft_veto_blocks_high_quality_candidate_without_letter_grade():
     candidate = _base_candidate(
         Score=120,
         raw_score=120,
@@ -482,9 +473,9 @@ def test_soft_veto_caps_high_quality_candidate_at_b():
     _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     assert candidate["sop_quality_score"] >= 70
-    assert candidate["sop_grade"] == "B"
-    assert candidate["sop_a_grade_eligible"] is False
-    assert "存在SOP否决项" in candidate["sop_a_grade_gate_reasons"]
+    assert "sop_grade" not in candidate
+    assert candidate["trade_eligible"] is False
+    assert "市值<30亿" in candidate["sop_vetoes"]
 
 
 def test_avoid_action_is_blocked_even_with_good_scores():
@@ -493,7 +484,7 @@ def test_avoid_action_is_blocked_even_with_good_scores():
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "D"
+    assert "sop_grade" not in result
     assert result["trade_eligible"] is False
     assert result["trade_bucket"] == "BLOCK"
     assert "价格行为回避" in result["sop_vetoes"]
@@ -505,7 +496,7 @@ def test_low_quality_setup_is_blocked():
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "D"
+    assert "sop_grade" not in result
     assert result["trade_bucket"] == "BLOCK"
     assert any("外包K" in blocker for blocker in result["trade_blockers"])
 
@@ -520,17 +511,17 @@ def test_pine_candidate_gets_short_term_management_hint():
     assert "1-2" in result["exit_hint"]
 
 
-def test_strong_daily_mover_keeps_quality_grade_but_is_observe_only():
+def test_strong_daily_mover_keeps_quality_score_but_is_observe_only():
     results = [_base_candidate(**{"涨幅%": 8.2, "pa_volume_confirmed": False, "price_action_signal": "普通突破"})]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "A"
+    assert "sop_grade" not in result
     assert "涨幅>7%" not in result["sop_vetoes"]
     assert result["trade_eligible"] is False
     assert result["trade_bucket"] == "OBSERVE"
-    assert "涨幅偏高且质量未确认，等待回踩/次日确认" in result["trade_blockers"]
+    assert "涨幅偏高且质量未确认，等待回踩/次日确认" in result["trade_cautions"]
 
 
 def test_high_quality_right_side_mover_can_stay_trade_eligible():
@@ -539,7 +530,7 @@ def test_high_quality_right_side_mover_can_stay_trade_eligible():
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "A"
+    assert "sop_grade" not in result
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
     assert not any("涨幅偏高" in blocker for blocker in result["trade_blockers"])
@@ -569,15 +560,15 @@ def test_h1_first_entry_can_trade_when_mainline_volume_confirmed():
     assert not any("H1首次入场" in blocker for blocker in result["trade_blockers"])
 
 
-def test_weak_sector_alignment_blocks_real_trade():
+def test_weak_sector_alignment_is_caution_in_v2():
     results = [_base_candidate(sector_alignment_score=45)]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["trade_eligible"] is False
-    assert result["trade_bucket"] == "BLOCK"
-    assert "弱板块联动，禁止实盘" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert result["trade_bucket"] == "TRADE"
+    assert "弱板块联动，降低仓位优先级" in result["trade_cautions"]
     assert "弱板块联动胜率偏低" in result["sop_risks"]
 
 
@@ -613,12 +604,12 @@ def test_strong_stock_in_weak_sector_is_watch_not_trade():
 
     result = results[0]
     assert result["trade_eligible"] is False
-    assert result["trade_bucket"] == "BLOCK"
-    assert "板块强度弱，禁止实盘" in result["trade_blockers"]
+    assert result["trade_bucket"] == "OBSERVE"
+    assert "板块强度弱，降低仓位优先级" in result["trade_cautions"]
     assert "板块强度弱，个股强势不直接交易" in result["sop_risks"]
 
 
-def test_strong_sector_weak_stock_fit_uses_a_eod_controlled_trade():
+def test_strong_sector_weak_stock_fit_is_v2_trade_caution():
     results = [_base_candidate(
         sector_strength_score=82,
         stock_sector_fit_score=42,
@@ -630,12 +621,12 @@ def test_strong_sector_weak_stock_fit_uses_a_eod_controlled_trade():
     result = results[0]
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
-    assert result["a_eod_controlled_trial"] is True
-    assert "强板块但个股适配不足，降级观察" in result["a_eod_trade_cautions"]
+    assert result.get("a_eod_controlled_trial") is not True
+    assert "强板块但个股适配不足，降低仓位优先级" in result["trade_cautions"]
     assert "板块强但个股适配不足，偏补涨观察" in result["sop_risks"]
 
 
-def test_strong_sector_rear_role_uses_a_eod_controlled_trade():
+def test_strong_sector_rear_role_is_v2_trade_caution():
     results = [_base_candidate(
         sector_strength_score=82,
         stock_sector_fit_score=68,
@@ -650,8 +641,8 @@ def test_strong_sector_rear_role_uses_a_eod_controlled_trade():
     assert result["sector_core_role_label"] == "强板块后排观察"
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
-    assert result["a_eod_controlled_trial"] is True
-    assert "强板块后排角色，等待转强为核心股" in result["a_eod_trade_cautions"]
+    assert result.get("a_eod_controlled_trial") is not True
+    assert "强板块后排角色，等待转强为核心股" in result["trade_cautions"]
     assert "强板块后排角色，等待转强为核心股" in result["sop_risks"]
 
 
@@ -725,7 +716,7 @@ def test_trade_setup_quality_helper_classifies_raw_and_tradable_shapes():
     assert _trade_setup_quality(h1_tradable, "H1首次入场", 90, 82) == "H1_TRADABLE"
 
 
-def test_neutral_weekly_range_uses_a_eod_controlled_trade():
+def test_neutral_weekly_range_is_v2_trade_caution():
     results = [_base_candidate(pa_weekly_context="周线交易区间")]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
@@ -733,8 +724,8 @@ def test_neutral_weekly_range_uses_a_eod_controlled_trade():
     result = results[0]
     assert result["trade_eligible"] is True
     assert result["trade_bucket"] == "TRADE"
-    assert result["a_eod_controlled_trial"] is True
-    assert "周线交易区间，降级观察" in result["a_eod_trade_cautions"]
+    assert result.get("a_eod_controlled_trial") is not True
+    assert "周线交易区间，降低仓位优先级" in result["trade_cautions"]
     assert "周线交易区间，等待右侧确认" in result["sop_risks"]
 
 
@@ -802,62 +793,55 @@ def test_near_limit_threshold_respects_board_limit():
 
     assert "涨停/近涨停，等待隔日确认" in main["trade_blockers"]
     assert "涨停/近涨停，等待隔日确认" not in chinext["trade_blockers"]
-    assert "涨幅偏高且质量未确认，等待回踩/次日确认" in chinext["trade_blockers"]
+    assert "涨幅偏高且质量未确认，等待回踩/次日确认" in chinext["trade_cautions"]
 
 
-def test_five_day_surge_is_ranking_risk_not_sop_veto():
-    # pct_5d=16% 落在软起扣(10%)与硬否决(25%)之间：走递减扣分，不硬否决A级。
+def test_five_day_surge_has_no_standalone_15pct_gate():
+    # pct_5d=16% 走递减扣分，不再映射字母等级。
     normal = _base_candidate()
     surged = _base_candidate(**{"pct_5d": 16.0, "pa_volume_confirmed": False, "price_action_signal": "普通突破"})
 
     _apply_sop_filter([normal, surged], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    # 16%不再硬否决：gate_reasons 不应出现"5日涨幅超过25%"
-    assert "5日涨幅超过25%" not in surged["sop_a_grade_gate_reasons"]
+    assert "sop_grade" not in surged
     assert "5日涨>15%" not in surged["sop_vetoes"]
     # 递减扣分文案应出现在 risks（每超1%扣0.5分，16-10=6，扣3分）
     assert any("超10%起扣线" in r for r in surged["sop_risks"])
-    # 15%以上的排序风险标注仍保留
-    assert "5日涨幅>15%，排序扣分" in surged["sop_risks"]
-    # 量能未确认+涨幅偏高仍产生 blocker（但不是因为5日涨幅硬否决）
+    # 不再保留15%这一档的独立排序风险或交易阻断。
+    assert "5日涨幅>15%，排序扣分" not in surged["sop_risks"]
     assert surged["trade_eligible"] is False
-    assert "5日涨幅偏高且质量未确认" in surged["trade_blockers"]
+    assert "5日涨幅偏高且质量未确认" not in surged["trade_blockers"]
 
 
-def test_a_grade_requires_kline_calibrated_price_action_score():
+def test_price_action_score_still_controls_execution_without_letter_grade():
     candidate = _base_candidate(price_action_score=59)
 
     _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    assert candidate["sop_grade"] == "B"
-    assert candidate["sop_a_grade_eligible"] is False
-    assert "价格行为评分低于60" in candidate["sop_a_grade_gate_reasons"]
+    assert "sop_grade" not in candidate
+    assert candidate["trade_eligible"] is False
 
 
-def test_a_grade_allows_moderate_5d_gain_with_penalty():
-    # pct_5d=20% 落在软起扣(10%)与硬否决(25%)之间：应评A，但质量分被扣5分。
+def test_moderate_5d_gain_reduces_continuous_quality_score():
     baseline = _base_candidate(pct_5d=4.0)
     moderate = _base_candidate(pct_5d=20.0)
 
     _apply_sop_filter([baseline, moderate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    assert moderate["sop_grade"] == "A"
-    assert moderate["sop_a_grade_eligible"] is True
+    assert "sop_grade" not in moderate
     # 20-10=10，每超1%扣0.5 → 扣5分
     assert baseline["sop_quality_score"] - moderate["sop_quality_score"] == 5.0
     # 扣分文案应记录在 risks
     assert any("超10%起扣线" in r for r in moderate["sop_risks"])
 
 
-def test_a_grade_hard_blocks_excessive_5d_gain():
-    # pct_5d=26% 超过硬否决线(25%)：不得评A，gate_reasons 含"5日涨幅超过25%"。
+def test_excessive_5d_gain_remains_non_executable_without_letter_grade():
     excessive = _base_candidate(pct_5d=26.0)
 
     _apply_sop_filter([excessive], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    assert excessive["sop_grade"] == "B"
-    assert excessive["sop_a_grade_eligible"] is False
-    assert "5日涨幅超过25%" in excessive["sop_a_grade_gate_reasons"]
+    assert "sop_grade" not in excessive
+    assert excessive["trade_eligible"] is False
 
 
 def test_watch_action_is_observe_not_executable():
@@ -891,7 +875,6 @@ def test_near_entry_price_is_not_stable_confirmation():
     assert result["trade_eligible"] is False
     assert "未站上确认价，等待突破确认" in result["trade_blockers"]
     assert result["trade_bucket"] == "EARLY"
-    assert result["early_trade_grade"] == "A-"
     assert "距确认价<0.8%" in result["early_trade_reason"]
 
 
@@ -914,7 +897,7 @@ def test_price_above_entry_still_requires_volume_confirmation():
 
     result = results[0]
     assert result["trade_eligible"] is False
-    assert "站上确认价但量能未确认" in result["trade_blockers"]
+    assert "站上确认价但量能未确认" in result["trade_cautions"]
 
 
 def test_price_and_volume_still_require_stable_close_confirmation():
@@ -927,15 +910,15 @@ def test_price_and_volume_still_require_stable_close_confirmation():
     assert "冲高回落，站稳未确认" in result["trade_blockers"]
 
 
-def test_small_cap_requires_stronger_mainline_confirmation():
+def test_small_cap_without_strong_mainline_is_v2_trade_caution():
     results = [_base_candidate(mkt_cap_yi=42, sector_alignment_score=80)]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
     assert result["mkt_cap_bucket"] == "SMALL"
-    assert result["trade_eligible"] is False
-    assert "小市值弹性票，需主线强联动和价量确认" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert "小市值弹性票，需主线强联动和价量确认" in result["trade_cautions"]
     assert "小市值需主线强联动" in result["sop_risks"]
 
 
@@ -960,15 +943,15 @@ def test_mainline_h2_continuation_gets_bonus_but_still_needs_confirmation():
     assert result["final_trade_score"] > result["final_rank_score"]
 
 
-def test_mega_cap_requires_turnover_confirmation():
+def test_mega_cap_low_turnover_is_v2_trade_caution():
     results = [_base_candidate(mkt_cap_yi=800, turnover=0.8, 换手率=0.8)]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
     assert result["mkt_cap_bucket"] == "MEGA"
-    assert result["trade_eligible"] is False
-    assert "超大市值换手不足，等待机构资金确认" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert "超大市值换手不足，等待机构资金确认" in result["trade_cautions"]
 
 
 def test_historical_revival_like_002440_waits_for_next_day_confirmation():
@@ -1151,7 +1134,7 @@ def test_momentum_acceleration_candidate_is_observe_only():
 
     _apply_sop_filter([candidate], {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
-    assert candidate["sop_grade"] == "M"
+    assert "sop_grade" not in candidate
     assert candidate["trade_eligible"] is False
     assert "强趋势加速观察，次日确认后小仓复核" in candidate["trade_blockers"]
 
@@ -1168,24 +1151,24 @@ def test_wide_structure_risk_blocks_execution():
     assert "结构风险>20%，禁止实盘" in result["trade_blockers"]
 
 
-def test_large_cap_low_turnover_requires_volume_confirmation():
+def test_large_cap_low_turnover_is_v2_trade_caution():
     results = [_base_candidate(mkt_cap_yi=350, turnover=0.8)]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["trade_eligible"] is False
-    assert "大市值低换手，右侧弹性不足" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert "大市值低换手，右侧弹性不足" in result["trade_cautions"]
 
 
-def test_missing_money_flow_downgrades_real_trade():
+def test_missing_money_flow_is_v2_trade_caution():
     results = [_base_candidate(money_flow_status="missing")]
 
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["trade_eligible"] is False
-    assert "资金流数据缺失，降级观察" in result["trade_blockers"]
+    assert result["trade_eligible"] is True
+    assert "资金流数据缺失，降低仓位优先级" in result["trade_cautions"]
 
 
 def test_capital_event_risk_is_not_trade_eligible():
@@ -1194,10 +1177,10 @@ def test_capital_event_risk_is_not_trade_eligible():
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
 
     result = results[0]
-    assert result["sop_grade"] == "D"
+    assert "sop_grade" not in result
     assert result["trade_eligible"] is False
     assert "地雷预警" in result["sop_vetoes"]
-    assert "近期资本事件利好兑现，等待二次确认" in result["trade_blockers"]
+    assert "近期资本事件利好兑现，等待二次确认" in result["trade_cautions"]
 
 
 def test_single_stock_task_rejects_abnormal_price_jump():
@@ -1229,86 +1212,55 @@ def test_single_stock_task_rejects_abnormal_price_jump():
     assert result["reason"].startswith("异常价格跳变")
 
 
-# ── 调整3：实盘信号门槛（仅 A 级 + 多重共振可交易）──
-
-def test_a_grade_with_resonance_stays_shadow_while_grade_calibration_is_invalid(monkeypatch):
-    """评级校准未通过时，A 级本身不能新增实盘资格。"""
-    from core import scanner
-    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "SHADOW_ONLY")
-    results = [_base_candidate()]  # base 已含 共振=🔥核心热点
-    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
-    assert results[0]["sop_grade"] == "A"
-    assert results[0]["trade_eligible"] is False
-    assert results[0]["grade_execution_mode"] == "SHADOW_ONLY"
-    assert results[0]["grade_execution_shadow_eligible"] is True
-
-
-def test_a_grade_formal_route_can_be_reenabled_only_after_validation(monkeypatch):
-    from core import scanner
-    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "ACTIVE")
+def test_confirmed_strategy_route_is_independent_of_letter_grades():
     results = [_base_candidate()]
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+    assert "sop_grade" not in results[0]
     assert results[0]["trade_eligible"] is True
     assert results[0]["trade_bucket"] == "TRADE"
 
 
-def test_strict_gate_a_grade_without_resonance_not_trade_eligible():
-    """严格门槛下：A 级但无多重共振（独苗）→ 降为观察，不推\"可交易\"。
-
-    模拟 000958 场景的本质：即使评级不错，但缺乏多重共振确认，
-    对上班族（无暇盯盘纠错）风险过高，宁缺毋滥。
-    """
-    # A 级 + 无共振（独苗）
+def test_v2_without_resonance_can_trade_when_other_confirmations_pass():
     cand = _base_candidate(Score=75, 共振="独苗")
     results = [cand]
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
-    assert results[0]["sop_grade"] == "A"
-    # 严格门槛：A 级但无 🔥核心热点 → 不可交易
-    assert results[0]["trade_eligible"] is False
-    assert results[0]["trade_bucket"] != "TRADE"
-
-
-def test_strict_gate_off_a_grade_without_resonance_eligible(monkeypatch):
-    """STRICT_REAL_SIGNAL_GATE=False 时回退：A 级（无论共振）均可交易。"""
-    from core import scanner
-    monkeypatch.setattr(scanner, "STRICT_REAL_SIGNAL_GATE", False)
-    cand = _base_candidate(Score=75, 共振="独苗")  # A 级 + 无共振
-    results = [cand]
-    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
-    # 回退模式下 A 级（无共振）仍可交易
+    assert "sop_grade" not in results[0]
     assert results[0]["trade_eligible"] is True
     assert results[0]["trade_bucket"] == "TRADE"
 
 
-# ── 强信号分级加权（raw_score≥95 参与分级，避免信号强度与分级脱节）──
+def test_strict_gate_off_without_resonance_eligible(monkeypatch):
+    """STRICT_REAL_SIGNAL_GATE=False 时按其他确定性条件判断。"""
+    from core import scanner
+    monkeypatch.setattr(scanner, "STRICT_REAL_SIGNAL_GATE", False)
+    cand = _base_candidate(Score=75, 共振="独苗")
+    results = [cand]
+    _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
+    assert results[0]["trade_eligible"] is True
+    assert results[0]["trade_bucket"] == "TRADE"
 
-def test_strong_signal_boosted_to_at_least_b():
-    """raw_score≥95 的强信号，即使历史胜率不足（checks 少），至少保底 B 级。
 
-    模拟木林森场景：raw_score=103.6（极强信号）但胜率<50%（少1个check），
-    原逻辑会判 C，加权后应至少 B。
-    """
+def test_strong_signal_retains_continuous_quality_score():
     results = [_base_candidate(
-        Score=81.8, raw_score=103.6,  # 强信号
-        历史胜率="40%",  # 胜率<50% → 少1个check（原会降到C）
+        Score=81.8, raw_score=103.6,
+        历史胜率="40%",
         共振="🔥 核心热点",
     )]
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
-    assert results[0]["sop_grade"] in ("A", "B"), f"强信号应≥B，实际{results[0]['sop_grade']}"
+    assert "sop_grade" not in results[0]
+    assert results[0]["sop_quality_score"] > 0
 
 
-def test_strong_signal_can_reach_a_with_resonance():
-    """raw_score≥95 + 共振 + 多bonus → 可达 A 级。"""
+def test_strong_signal_with_resonance_can_trade_when_confirmed():
     results = [_base_candidate(raw_score=103.6)]  # base 含共振+高bonus
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
-    assert results[0]["sop_grade"] == "A"
+    assert results[0]["trade_eligible"] is True
 
 
-def test_weak_signal_not_boosted():
-    """raw_score<95 的弱信号不享受分级加权（保持原逻辑，不强升）。"""
+def test_weak_signal_still_has_continuous_quality_score():
     results = [_base_candidate(
         raw_score=70.0, 历史胜率="40%", 共振="🔥 核心热点",
     )]
     _apply_sop_filter(results, {"status": "OFFENSIVE"}, {"小金属": {"trend": "LEAD"}})
-    # 弱信号不应被强信号保底逻辑误升到 A
-    assert results[0]["sop_grade"] in ("A", "B", "C")
+    assert "sop_grade" not in results[0]
+    assert 0 <= results[0]["sop_quality_score"] <= 100

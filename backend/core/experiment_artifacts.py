@@ -17,7 +17,8 @@ SAFE_REQUEST_KEYS = {
     "code", "codes", "strategy_type", "start_date", "end_date", "days", "threshold",
     "vol_multiplier", "rsi_min", "pine_min_signals", "stop_loss_pct", "max_hold_days",
     "trailing_multiplier", "time_stop_days", "capital", "entry_mode", "max_open_gap_pct",
-    "limit_up_gap_pct", "slippage_bps", "position_pct", "lot_size", "skip_adjustment_gaps",
+    "limit_up_gap_pct", "slippage_bps", "position_pct", "position_mode", "profit_exit_mode",
+    "lot_size", "skip_adjustment_gaps",
     "adjustment_gap_pct", "train_ratio", "train_size", "validation_size", "test_size",
     "step_size", "window_unit", "params_frozen", "requested",
 }

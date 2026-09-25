@@ -7,45 +7,44 @@ from core.decision_semantics import apply_decision_semantics
 from core.strategy_health import apply_strategy_health_controls
 
 
-def test_a_grade_semantics_distinguish_structure_early_and_trade():
+def test_decision_semantics_distinguish_structure_early_and_trade():
     rows = [
-        {"sop_grade": "A", "trade_bucket": "OBSERVE", "trade_eligible": False},
-        {"sop_grade": "A", "trade_bucket": "EARLY", "trade_eligible": False},
-        {"sop_grade": "A", "trade_bucket": "TRADE", "trade_eligible": True},
+        {"trade_bucket": "OBSERVE", "trade_eligible": False},
+        {"trade_bucket": "EARLY", "trade_eligible": False},
+        {"trade_bucket": "TRADE", "trade_eligible": True},
     ]
 
     apply_decision_semantics(rows)
 
-    assert [row["grade_stage"] for row in rows] == ["A-STRUCTURE", "A-EARLY", "A-TRADE"]
-    assert rows[0]["confirmation_event_state"] == "WAIT_PRICE_CONFIRMATION"
+    assert [row["decision_stage"] for row in rows] == ["OBSERVE", "EARLY-REVIEW", "TRADE"]
+    assert [row["decision_label"] for row in rows] == ["结构观察", "提前复核", "可交易候选"]
+    assert rows[0]["confirmation_event_state"] == "NOT_READY"
     assert rows[2]["decision_lifecycle_state"] == "ENTRY_CONFIRMED"
 
 
-def test_a_minus_trial_has_explicit_trade_label_without_changing_sop_grade():
+def test_a_minus_trial_has_explicit_trade_label_without_letter_grade():
     rows = [{
-        "sop_grade": "B", "trade_bucket": "TRADE", "trade_eligible": True,
-        "a_minus_trial": True, "a_minus_trial_grade": "A-",
+        "trade_bucket": "TRADE", "trade_eligible": True,
+        "a_minus_trial": True,
     }]
 
     apply_decision_semantics(rows)
 
-    assert rows[0]["sop_grade"] == "B"
-    assert rows[0]["grade_stage"] == "A--TRIAL"
-    assert rows[0]["grade_label"] == "A-级受控试仓"
+    assert rows[0]["decision_stage"] == "EARLY-CONTROLLED-TRIAL"
+    assert rows[0]["decision_label"] == "早期受控试仓"
     assert rows[0]["decision_lifecycle_state"] == "ENTRY_CONFIRMED"
 
 
-def test_a_eod_trial_has_explicit_trade_label_without_changing_sop_grade():
+def test_a_eod_trial_has_explicit_trade_label_without_letter_grade():
     rows = [{
-        "sop_grade": "B", "trade_bucket": "TRADE", "trade_eligible": True,
+        "trade_bucket": "TRADE", "trade_eligible": True,
         "a_eod_controlled_trial": True,
     }]
 
     apply_decision_semantics(rows)
 
-    assert rows[0]["sop_grade"] == "B"
-    assert rows[0]["grade_stage"] == "A-EOD-TRIAL"
-    assert rows[0]["grade_label"] == "A-EOD级受控交易"
+    assert rows[0]["decision_stage"] == "EOD-CONTROLLED-TRIAL"
+    assert rows[0]["decision_label"] == "尾盘受控试仓"
     assert rows[0]["decision_lifecycle_state"] == "ENTRY_CONFIRMED"
 
 

@@ -18,6 +18,8 @@ interface BacktestTrade {
     net_pnl: number;
     entry_mode?: string;
     open_gap_pct?: number | null;
+    add_date?: string | null;
+    add_price?: number | null;
 }
 
 interface BacktestResult {
@@ -35,6 +37,9 @@ interface BacktestResult {
         skipped_high_open?: number;
         skipped_limit_up?: number;
         entry_mode?: string;
+        position_mode?: string;
+        profit_exit_mode?: string;
+        added_position_count?: number;
     };
     trades: BacktestTrade[];
     equity_curve: Array<{ date: string; equity: number }>;
@@ -69,6 +74,8 @@ export default function BacktestLab() {
     const [pineMinSignals, setPineMinSignals] = useState(3);
     const [entryMode, setEntryMode] = useState('next_open_confirm');
     const [maxOpenGapPct, setMaxOpenGapPct] = useState(3);
+    const [positionMode, setPositionMode] = useState('single');
+    const [profitExitMode, setProfitExitMode] = useState('atr');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [result, setResult] = useState<BacktestResult | null>(null);
@@ -88,6 +95,8 @@ export default function BacktestLab() {
                 pine_min_signals: pineMinSignals,
                 entry_mode: entryMode,
                 max_open_gap_pct: maxOpenGapPct,
+                position_mode: positionMode,
+                profit_exit_mode: profitExitMode,
             }, { timeout: 20000 });
             setResult(res.data);
         } catch (err) {
@@ -108,6 +117,7 @@ export default function BacktestLab() {
                 stop_loss_pct: stopLossPct, max_hold_days: maxHoldDays,
                 pine_min_signals: pineMinSignals, entry_mode: entryMode,
                 max_open_gap_pct: maxOpenGapPct,
+                position_mode: positionMode, profit_exit_mode: profitExitMode,
             }, { timeout: 60000 });
             setRollingResult(res.data);
         } catch (err) {
@@ -145,7 +155,7 @@ export default function BacktestLab() {
             </div>
 
             <section className="glass-card p-5">
-                <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-8 gap-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-10 gap-3">
                     <Field label="股票代码">
                         <input value={code} onChange={event => setCode(event.target.value)} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20" />
                     </Field>
@@ -179,6 +189,18 @@ export default function BacktestLab() {
                     </Field>
                     <Field label="高开过滤%">
                         <input type="number" value={maxOpenGapPct} onChange={event => setMaxOpenGapPct(Number(event.target.value))} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20" />
+                    </Field>
+                    <Field label="仓位方案">
+                        <select value={positionMode} onChange={event => setPositionMode(event.target.value)} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20">
+                            <option value="single">现行单次仓位</option>
+                            <option value="two_stage_50_50">50%试仓＋50%确认</option>
+                        </select>
+                    </Field>
+                    <Field label="止盈方案">
+                        <select value={profitExitMode} onChange={event => setProfitExitMode(event.target.value)} className="w-full rounded-xl border border-slate-100 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700 outline-none focus:bg-white focus:ring-2 focus:ring-blue-500/20">
+                            <option value="atr">现行ATR移动止盈</option>
+                            <option value="half_peak_giveback">峰值利润回撤一半</option>
+                        </select>
                     </Field>
                 </div>
                 {error && <div className="mt-4 rounded-xl border border-rose-100 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{error}</div>}
@@ -220,6 +242,8 @@ export default function BacktestLab() {
                                 <Tiny label="最终权益" value={Math.round(result.summary.final_equity)} />
                                 <Tiny label="高开跳过" value={result.summary.skipped_high_open || 0} />
                                 <Tiny label="涨停跳过" value={result.summary.skipped_limit_up || 0} />
+                                <Tiny label="确认加仓" value={result.summary.added_position_count || 0} />
+                                <Tiny label="仓位方案" value={result.summary.position_mode === 'two_stage_50_50' ? '双仓50/50' : '现行'} />
                             </div>
                             {result.reason && <p className="text-xs font-bold text-slate-400">{result.reason}</p>}
                             {result.meta && (
@@ -268,7 +292,10 @@ export default function BacktestLab() {
                                         <tr><td colSpan={7} className="px-3 py-8 text-center text-slate-400 font-bold">暂无成交记录</td></tr>
                                     ) : result.trades.map((trade, idx) => (
                                         <tr key={`${trade.entry_date}-${idx}`}>
-                                            <td className="px-3 py-2 font-mono">{trade.entry_date}</td>
+                                            <td className="px-3 py-2 font-mono">
+                                                {trade.entry_date}
+                                                {trade.add_date && <span className="block text-[10px] text-blue-500">加仓 {trade.add_date}</span>}
+                                            </td>
                                             <td className="px-3 py-2 font-mono">
                                                 {trade.signal_date || trade.entry_date}
                                                 {trade.open_gap_pct != null && <span className="ml-1 text-slate-400">({trade.open_gap_pct >= 0 ? '+' : ''}{trade.open_gap_pct}%)</span>}

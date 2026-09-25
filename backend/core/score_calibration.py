@@ -124,8 +124,26 @@ def calibrate_scan_scores(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             price_action_composite = round(structure * 0.4 + execution * 0.35 + safety * 0.25, 1)
             historical_win_rate = _parse_win_rate(row)
             backtest_stats = row.get("回测统计") or {}
-            trials = int(backtest_stats.get("signal_count") or backtest_stats.get("total_signals") or 0)
-            probability = beta_binomial_probability(historical_win_rate / 100 * trials, trials)
+            # The Wilson bound is a ranking penalty, not an observed success rate.
+            raw_rate = backtest_stats.get("win_rate")
+            try:
+                raw_rate = float(raw_rate)
+                count = float(backtest_stats.get("signal_count") or backtest_stats.get("total_signals") or 0)
+                raw_wins = float(backtest_stats.get("win_count")) if backtest_stats.get("win_count") is not None else None
+                valid = (math.isfinite(raw_rate) and 0 <= raw_rate <= 100
+                         and math.isfinite(count) and count > 0 and count.is_integer())
+                if raw_wins is not None:
+                    valid = valid and math.isfinite(raw_wins) and 0 <= raw_wins <= count
+                trials = int(count) if valid else 0
+            except (TypeError, ValueError, OverflowError):
+                raw_wins = None
+                trials = 0
+            # New summaries provide exact win counts; legacy summaries only expose
+            # a rounded rate, so use the fractional equivalent as a fallback.
+            wins = raw_wins if trials and raw_wins is not None else (raw_rate / 100 * trials if trials else 0)
+            probability = beta_binomial_probability(wins, trials)
+            probability["evidence_source"] = "raw_backtest_win_rate" if trials else "prior_only"
+            probability["model_version"] = "beta-binomial-raw-rate-v2"
             components = {
                 "strategy_percentile": percentile,
                 "price_action": price_action_composite,

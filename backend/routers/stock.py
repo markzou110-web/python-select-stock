@@ -18,7 +18,7 @@ from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code, load_from_db, save_to_db
 from core.indicators import calculate_indicators, calculate_pine_indicators
 from core.strategy import get_signal_details, run_optimization_grid
-from core.price_action import build_price_action_annotations
+from core.price_action import build_price_action_annotations, build_chart_hints, build_trade_projection
 from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_levels_with_context, safe_float, track_high_since_entry
 from core.risk_constants import FIXED_STOP_LOSS_PCT, TV_SIGNAL_WARMUP_DAYS  # 实盘硬止损，与回测同源
 from core.operation_plan import build_position_decision_snapshot, operation_bands, price_instruction
@@ -30,6 +30,23 @@ from core.candidate_evidence import build_candidate_evidence
 from core.models import ResearchThesis
 
 router = APIRouter(prefix="/api/stock", tags=["stock"])
+
+
+def _attach_intraday_price_action(code: str, price_action: dict) -> None:
+    try:
+        from core.hot_stocks import get_hot_stock_chart
+        from core.price_action_timeframes import build_intraday_price_action_context
+
+        minute_chart = get_hot_stock_chart(code, period="minute")
+        context = build_intraday_price_action_context(
+            price_action.get("summary", {}),
+            minute_chart.get("points", []),
+            minute_chart.get("previous_close"),
+        )
+        price_action["summary"]["pa_mtf_state"] = context["state"]
+        price_action["summary"]["pa_mtf_intraday"] = context
+    except Exception as exc:
+        logger.warning(f"Intraday price-action context for {code} failed: {exc}")
 
 
 class SerenityResearchSnapshot(BaseModel):
@@ -117,7 +134,8 @@ def _load_scan_candidate(code: str, signal_date: date | None) -> dict | None:
     with engine.connect() as conn:
         row = conn.execute(text(f"""
             SELECT code, name, COALESCE(data_date, date) AS signal_date, price, pct,
-                   industry, resonance, strategy_type, sop_grade, pa_entry_price,
+                   industry, resonance, strategy_type, roe, net_profit_yoy,
+                   win_rate, signal_count, pa_entry_price,
                    pa_stop_price, pa_target_price, pa_risk_reward, pa_trade_action,
                    pa_trade_setup, pa_risk_pct, price_action_score, price_action_regime,
                    price_action_signal, price_action_pattern, price_action_detail
@@ -141,7 +159,9 @@ def _load_scan_candidate(code: str, signal_date: date | None) -> dict | None:
         "data_date": str(record.get("signal_date"))[:10], "现价": record.get("price"),
         "涨幅%": record.get("pct"), "行业": record.get("industry"),
         "共振": record.get("resonance"), "strategy_type": record.get("strategy_type"),
-        "sop_grade": record.get("sop_grade"), "pa_entry_price": record.get("pa_entry_price"),
+        "ROE": record.get("roe"), "净利YOY": record.get("net_profit_yoy"),
+        "历史胜率": record.get("win_rate"), "信号次数": record.get("signal_count"),
+        "pa_entry_price": record.get("pa_entry_price"),
         "pa_stop_price": record.get("pa_stop_price"), "pa_target_price": record.get("pa_target_price"),
         "pa_risk_reward": record.get("pa_risk_reward"), "pa_trade_action": record.get("pa_trade_action"),
         "pa_trade_setup": record.get("pa_trade_setup"), "pa_risk_pct": record.get("pa_risk_pct"),
@@ -314,7 +334,7 @@ async def get_stock_kline(code: str, local_only: bool = False):
     }
 
 
-def fetch_stock_data_with_indicators(code: str):
+def fetch_stock_data_with_indicators(code: str, live_bar_provider=None):
     engine = get_db_engine()
     target_date = datetime.now()
     start_db = (target_date - timedelta(days=TV_SIGNAL_WARMUP_DAYS)).strftime("%Y-%m-%d")
@@ -345,6 +365,34 @@ def fetch_stock_data_with_indicators(code: str):
 
     if df.empty:
         return df
+
+    from core.data import ensure_turnover_history
+
+    df = ensure_turnover_history(code, df, engine=engine)
+    price_columns = ["开盘", "最高", "最低", "收盘"]
+    present_price_columns = [column for column in price_columns if column in df.columns]
+    for column in [*present_price_columns, "成交量"]:
+        if column not in df.columns:
+            continue
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    if "成交量" in df.columns:
+        df["成交量"] = df["成交量"].fillna(0.0)
+    df = df.dropna(subset=present_price_columns)
+    if df.empty:
+        logger.warning(f"K-line data for {code} contains no valid numeric price rows")
+        return df
+
+    # 当日 bar 校正：daily_k 的当日行可能是午间半日部分数据（收盘最终化同步错过时），
+    # 用实时快照覆盖后再算指标，保证 EMA/RSI/价格行为与头部实时价一致（fail-open）。
+    # live_bar_provider 由调用方注入（详情页传 get_snapshot_daily_bar）；
+    # 默认 None = 不校正（测试与其他调用方无网络依赖）。
+    if live_bar_provider is not None:
+        try:
+            from core.data import apply_snapshot_bar_to_frame
+            if apply_snapshot_bar_to_frame(df, live_bar_provider(code)):
+                logger.info(f"Applied live snapshot bar to today's candle for {code}")
+        except Exception as exc:
+            logger.debug(f"live snapshot bar patch skipped (fail-open): {exc}")
 
     df = calculate_indicators(df, periods=[5, 10, 20, 60])
     return df
@@ -431,6 +479,10 @@ def get_stock_detail(code: str):
         engine = get_db_engine()
         from core.strategy import check_strategy, calculate_historical_win_rate
         price_action = build_price_action_annotations(df)
+        _attach_intraday_price_action(code, price_action)
+        from core.chip_distribution import build_chip_distribution
+
+        chip_distribution = build_chip_distribution(df)
         
         is_paper_trade = False
         buy_price = 0.0
@@ -507,6 +559,8 @@ def get_stock_detail(code: str):
         low = float(df.iloc[-1]['最低'])
         close = float(df.iloc[-1]['收盘'])
         open_p = float(df.iloc[-1]['开盘'])
+        previous_close = float(df.iloc[-2]['收盘']) if len(df) > 1 else 0.0
+        change_pct = ((close - previous_close) / previous_close * 100) if previous_close else 0.0
         shadow_ratio = round((high - max(close, open_p)) / (high - low) if (high - low) > 0 else 0.0, 2)
         
         stock_info = {
@@ -514,7 +568,7 @@ def get_stock_detail(code: str):
             "名称": name,
             "行业": industry,
             "现价": round(close, 2),
-            "涨幅%": round(float((df.iloc[-1]['收盘'] - df.iloc[-2]['收盘']) / df.iloc[-2]['收盘'] * 100), 2) if len(df) > 1 else 0.0,
+            "涨幅%": round(change_pct, 2),
             "Score": round(float(stats.get('Score', 50.0)), 1),
             "RSI": round(float(df.iloc[-1].get('RSI', 50.0)), 1),
             "DIF": round(float(df.iloc[-1].get('MACD_DIF', 0.0)), 3),
@@ -567,6 +621,8 @@ def get_stock_detail(code: str):
             "stock_info": stock_info,
             "price_action": price_action.get("summary", {}),
             "price_action_lines": price_action.get("lines", []),
+            "trend_phases": price_action.get("phase_timeline", []),
+            "chip_distribution": chip_distribution,
             "indicators": {
                 "rsi": float(df.iloc[-1].get('RSI', 0)),
                 "dif": float(df.iloc[-1].get('MACD_DIF', 0)),
@@ -743,6 +799,7 @@ def _compute_risk_assessment(df, code: str, financials: dict) -> dict:
             from core.data import get_market_regime
             regime = get_market_regime()
             risk["market_regime"] = regime.get("status", "UNKNOWN")
+            risk["market_regime_detail"] = regime  # 复用给图表提示，避免二次网络请求
             if regime.get("status") == "CRITICAL":
                 risk["warnings"].append("大盘处于严格防守模式，系统性风险较高")
         except Exception:
@@ -1075,7 +1132,8 @@ def get_stock_full_analysis(code: str):
 
     try:
         # 1. K线数据 + 技术指标
-        df = fetch_stock_data_with_indicators(code)
+        from core.data import get_snapshot_daily_bar
+        df = fetch_stock_data_with_indicators(code, live_bar_provider=get_snapshot_daily_bar)
         if df.empty:
             raise HTTPException(status_code=404, detail="未找到该股票的历史数据")
 
@@ -1106,6 +1164,10 @@ def get_stock_full_analysis(code: str):
         engine = get_db_engine()
         from core.strategy import check_strategy, calculate_historical_win_rate
         price_action = build_price_action_annotations(df)
+        _attach_intraday_price_action(code, price_action)
+        from core.chip_distribution import build_chip_distribution
+
+        chip_distribution = build_chip_distribution(df)
         chart_strategy = _resolve_chart_strategy(code, engine)
         signal_strategy = "pine" if chart_strategy == "both" else chart_strategy
         if chart_strategy in ["pine", "both", "tv_zp"] and 'RF_Upward' not in df.columns:
@@ -1486,7 +1548,21 @@ def get_stock_full_analysis(code: str):
             "kline": kline_records,
             "signals": signals,
             "price_action": price_action.get("summary", {}),
+            "price_action_markers": [
+                marker for marker in price_action.get("markers", [])
+                if marker.get("source") == "mtr_pullback_rebreak"
+            ],
             "price_action_lines": price_action.get("lines", []),
+            "trend_phases": price_action.get("phase_timeline", []),
+            "chart_hints": build_chart_hints(
+                price_action.get("summary", {}),
+                risk_assessment.get("market_regime_detail") or None,
+            ),
+            "trade_projection": build_trade_projection(
+                price_action.get("summary", {}),
+                last_close=(kline_records[-1]["close"] if kline_records else None),
+            ),
+            "chip_distribution": chip_distribution,
             "stock_info": stock_info,
             "concepts": concepts,
             "financials": financials,

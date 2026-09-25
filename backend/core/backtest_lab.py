@@ -3,6 +3,13 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 
+from core.risk_constants import (
+    BACKTEST_HALF_PEAK_RETAIN_RATIO,
+    BACKTEST_HALF_PEAK_TRIGGER_PCT,
+    BACKTEST_STAGED_ADD_MAX_DAYS,
+    BACKTEST_STAGED_INITIAL_RATIO,
+)
+
 from core.strategy import (
     BACKTEST_ENGINE_VERSION,
     EXIT_RULE_VERSION,
@@ -138,6 +145,12 @@ def run_single_stock_backtest(
     time_stop_days = int(time_stop_days) if time_stop_days else None
     slippage_bps = max(0.0, float(params.get("slippage_bps", 5.0)))
     position_pct = min(1.0, max(0.05, float(params.get("position_pct", 1.0))))
+    position_mode = str(params.get("position_mode") or "single")
+    if position_mode not in {"single", "two_stage_50_50"}:
+        position_mode = "single"
+    profit_exit_mode = str(params.get("profit_exit_mode") or "atr")
+    if profit_exit_mode not in {"atr", "half_peak_giveback"}:
+        profit_exit_mode = "atr"
     lot_size = max(1, int(params.get("lot_size", 100)))
     skip_adjustment_gaps = bool(params.get("skip_adjustment_gaps", True))
     adjustment_gap_pct = max(10.0, float(params.get("adjustment_gap_pct", 20.0)))
@@ -172,14 +185,15 @@ def run_single_stock_backtest(
 
     equity = initial_capital
     trades: List[Dict[str, Any]] = []
-    equity_curve = [{"date": dates[0], "equity": round(equity, 2)}]
+    daily_equity = np.full(len(df), initial_capital, dtype=float)
+    equity_cursor = 0
     next_allowed_idx = 0
-    max_equity = initial_capital
     max_drawdown = 0.0
     skipped_high_open = 0
     skipped_limit_up = 0
     skipped_adjustment_gap = 0
     skipped_capital = 0
+    added_position_count = 0
 
     for idx in raw_signals:
         if idx < next_allowed_idx:
@@ -221,7 +235,8 @@ def run_single_stock_backtest(
             next_allowed_idx = entry_idx + 1
             continue
 
-        atr = atr_vals[entry_idx] if atr_vals is not None and not np.isnan(atr_vals[entry_idx]) else entry_price * 0.03
+        atr_idx = idx if entry_mode == "next_open_confirm" else entry_idx
+        atr = atr_vals[atr_idx] if atr_vals is not None and not np.isnan(atr_vals[atr_idx]) else entry_price * 0.03
         stop_ratio = stop_loss_pct / 100.0
         max_close_since_entry = entry_price
         exit_price = entry_price
@@ -230,6 +245,8 @@ def run_single_stock_backtest(
         hit_stop = False
         time_stopped = False
         invalid_adjustment_gap = False
+        add_idx = None
+        add_price = None
 
         for day in range(1, max_hold_days + 1):
             future_idx = entry_idx + day
@@ -268,11 +285,33 @@ def run_single_stock_backtest(
                 break
 
             max_close_since_entry = max(max_close_since_entry, day_close)
-            trailing_stop = max_close_since_entry - atr * trailing_multiplier
-            if day_close < trailing_stop:
-                exit_price = day_close
-                exit_reason = "ATR移动止盈"
-                break
+            if profit_exit_mode == "half_peak_giveback":
+                peak_profit_pct = (max_close_since_entry / entry_price - 1) * 100
+                protected_profit_pct = peak_profit_pct * BACKTEST_HALF_PEAK_RETAIN_RATIO
+                protected_price = entry_price * (1 + protected_profit_pct / 100)
+                if (
+                    peak_profit_pct > BACKTEST_HALF_PEAK_TRIGGER_PCT
+                    and day_close <= protected_price
+                ):
+                    exit_price = day_close
+                    exit_reason = "峰值利润回撤一半"
+                    break
+            else:
+                trailing_stop = max_close_since_entry - atr * trailing_multiplier
+                if day_close < trailing_stop:
+                    exit_price = day_close
+                    exit_reason = "ATR移动止盈"
+                    break
+
+            if (
+                position_mode == "two_stage_50_50"
+                and add_idx is None
+                and day <= BACKTEST_STAGED_ADD_MAX_DAYS
+                and day_close > entry_price
+                and day_close > close_vals[future_idx - 1]
+            ):
+                add_idx = future_idx
+                add_price = day_close
 
             current_return = (day_close - entry_price) / entry_price
             if time_stop_days and day >= time_stop_days and current_return <= 0:
@@ -290,33 +329,56 @@ def run_single_stock_backtest(
         exit_idx = min(entry_idx + hold_days, len(df) - 1)
         entry_exec_price = entry_price * (1 + slippage_bps / 10000)
         exit_exec_price = exit_price * (1 - slippage_bps / 10000)
-        cash_to_use = equity * position_pct
-        shares = int(cash_to_use / entry_exec_price / lot_size) * lot_size
-        if shares <= 0:
+        initial_ratio = BACKTEST_STAGED_INITIAL_RATIO if position_mode == "two_stage_50_50" else 1.0
+        initial_cash = equity * position_pct * initial_ratio
+        initial_shares = int(initial_cash / entry_exec_price / lot_size) * lot_size
+        add_exec_price = None
+        add_shares = 0
+        if add_idx is not None and add_price is not None and add_idx < exit_idx:
+            add_exec_price = add_price * (1 + slippage_bps / 10000)
+            add_cash = equity * position_pct * (1 - BACKTEST_STAGED_INITIAL_RATIO)
+            add_shares = int(add_cash / add_exec_price / lot_size) * lot_size
+        shares = initial_shares + add_shares
+        if shares <= 0 or initial_shares <= 0:
             skipped_capital += 1
             next_allowed_idx = exit_idx + 1
             continue
 
-        buy_cost = entry_exec_price * shares
+        initial_buy_cost = entry_exec_price * initial_shares
+        add_buy_cost = (add_exec_price or 0) * add_shares
+        buy_cost = initial_buy_cost + add_buy_cost
         sell_cost = exit_exec_price * shares
-        buy_commission = max(buy_cost * commission_rate, commission_min)
+        buy_commission = max(initial_buy_cost * commission_rate, commission_min)
+        if add_shares > 0:
+            buy_commission += max(add_buy_cost * commission_rate, commission_min)
+            added_position_count += 1
         sell_commission = max(sell_cost * commission_rate, commission_min)
         stamp_tax = sell_cost * stamp_tax_rate
         gross_pnl = sell_cost - buy_cost
         net_pnl = gross_pnl - buy_commission - sell_commission - stamp_tax
         return_pct = net_pnl / buy_cost * 100 if buy_cost > 0 else 0
+        daily_equity[equity_cursor:entry_idx] = equity
+        initial_fee = max(initial_buy_cost * commission_rate, commission_min)
+        cash_after_entry = equity - initial_buy_cost - initial_fee
+        daily_equity[entry_idx:exit_idx] = (
+            cash_after_entry + close_vals[entry_idx:exit_idx] * initial_shares
+        )
+        if add_shares > 0:
+            add_fee = max(add_buy_cost * commission_rate, commission_min)
+            daily_equity[add_idx:exit_idx] += (
+                close_vals[add_idx:exit_idx] * add_shares - add_buy_cost - add_fee
+            )
         equity += net_pnl
-        max_equity = max(max_equity, equity)
-        drawdown = (equity - max_equity) / max_equity * 100 if max_equity > 0 else 0
-        max_drawdown = min(max_drawdown, drawdown)
+        daily_equity[exit_idx] = equity
+        equity_cursor = exit_idx + 1
 
         trades.append({
             "signal_date": dates[idx],
             "entry_date": dates[entry_idx],
             "exit_date": dates[exit_idx],
-            "entry_price": round(float(entry_exec_price), 2),
+            "entry_price": round(float(buy_cost / shares), 2),
             "exit_price": round(float(exit_exec_price), 2),
-            "raw_entry_price": round(float(entry_price), 2),
+            "raw_entry_price": round(float((entry_price * initial_shares + (add_price or 0) * add_shares) / shares), 2),
             "raw_exit_price": round(float(exit_price), 2),
             "shares": int(shares),
             "return_pct": round(float(return_pct), 2),
@@ -330,8 +392,13 @@ def run_single_stock_backtest(
             "open_gap_pct": round(float(open_gap_pct), 2) if open_gap_pct is not None else None,
             "slippage_bps": slippage_bps,
             "position_pct": position_pct,
+            "position_mode": position_mode,
+            "profit_exit_mode": profit_exit_mode,
+            "initial_shares": int(initial_shares),
+            "add_shares": int(add_shares),
+            "add_date": dates[add_idx] if add_shares > 0 and add_idx is not None else None,
+            "add_price": round(float(add_exec_price), 2) if add_shares > 0 and add_exec_price else None,
         })
-        equity_curve.append({"date": dates[exit_idx], "equity": round(float(equity), 2)})
         next_allowed_idx = exit_idx + 1
 
     if not trades:
@@ -346,6 +413,9 @@ def run_single_stock_backtest(
             "entry_mode": entry_mode,
             "slippage_bps": slippage_bps,
             "position_pct": position_pct,
+            "position_mode": position_mode,
+            "profit_exit_mode": profit_exit_mode,
+            "added_position_count": added_position_count,
             "lot_size": lot_size,
             "benchmark_return": _br,
             "alpha": _al,
@@ -353,11 +423,21 @@ def run_single_stock_backtest(
         })
         return result
 
+    daily_equity[equity_cursor:] = equity
+    # Include starting cash as a peak even when the first bar is an entry day.
+    peaks = np.maximum.accumulate(np.r_[initial_capital, daily_equity])[1:]
+    drawdowns = np.divide(daily_equity - peaks, peaks, out=np.zeros_like(peaks), where=peaks > 0)
+    max_drawdown = float(drawdowns.min() * 100)
+    equity_curve = [
+        {"date": day, "equity": round(float(value), 2)}
+        for day, value in zip(dates, daily_equity)
+    ]
     returns = [trade["return_pct"] for trade in trades]
     # 改动 #13：profit_factor / win_rate 改调规范 helper（毛额口径，cap 99）
     from core.analytics import compute_profit_factor, compute_win_rate
     profit_factor = compute_profit_factor(returns, cap=99.0)
     win_rate = compute_win_rate(returns, ndigits=1)
+    win_count = sum(1 for value in returns if value > 0)
 
     # 改动 #15：基准 alpha / CAGR（沪深300）。无 bench_df 时为 None，前端兜底为 "-"。
     strategy_total_return = (equity - initial_capital) / initial_capital * 100
@@ -368,9 +448,11 @@ def run_single_stock_backtest(
     return {
         "summary": {
             "signal_count": len(trades),
+            "win_count": win_count,
             "win_rate": win_rate,
             "avg_return": round(float(np.mean(returns)), 2),
             "max_drawdown": round(float(max_drawdown), 2),
+            "equity_curve_basis": "daily_close_mark_to_market",
             "profit_factor": profit_factor,
             "avg_hold_days": round(float(np.mean([trade["hold_days"] for trade in trades])), 1),
             "total_return": round((equity - initial_capital) / initial_capital * 100, 2),
@@ -384,6 +466,9 @@ def run_single_stock_backtest(
             "entry_mode": entry_mode,
             "slippage_bps": slippage_bps,
             "position_pct": position_pct,
+            "position_mode": position_mode,
+            "profit_exit_mode": profit_exit_mode,
+            "added_position_count": added_position_count,
             "lot_size": lot_size,
             "benchmark_return": benchmark_return,
             "alpha": alpha,

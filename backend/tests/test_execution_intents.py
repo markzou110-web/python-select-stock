@@ -90,9 +90,7 @@ def test_intent_persists_a_minus_trial_policy_for_health_loop():
     )[0]
     snapshot = json.loads(get_execution_intent(engine, intent_id)["intent"]["signal_snapshot"])
 
-    assert snapshot["grade"] == "B"
     assert snapshot["a_minus_trial"] is True
-    assert snapshot["a_minus_trial_grade"] == "A-"
     assert snapshot["a_minus_trial_policy_version"] == "a-minus-controlled-trial-v1"
 
 

@@ -45,6 +45,9 @@ celery_app.conf.update(
     task_default_queue='maintenance',
     task_routes={
         'tasks.check_realtime_alerts': {'queue': 'realtime'},
+        'tasks.check_position_operation_alerts': {'queue': 'realtime'},
+        'tasks.send_premarket_position_advice': {'queue': 'realtime'},
+        'tasks.send_position_status_summary': {'queue': 'realtime'},
         'tasks.retry_pending_notifications': {'queue': 'realtime'},
         'tasks.collect_limit_up_leadership': {'queue': 'realtime'},
         'tasks.collect_candidate_minute_bars': {'queue': 'realtime'},
@@ -62,6 +65,7 @@ celery_app.conf.update(
         'tasks.discover_event_catalysts': {'queue': 'maintenance'},
         'tasks.expire_execution_intents': {'queue': 'maintenance'},
         'tasks.weekly_entry_timing_report': {'queue': 'maintenance'},
+        'tasks.send_daily_ai_review': {'queue': 'maintenance'},
     },
     # 定时任务配置 (Beat)
     beat_schedule={
@@ -69,6 +73,28 @@ celery_app.conf.update(
             'task': 'tasks.check_realtime_alerts',
             'schedule': crontab(minute='*/5', hour='9-11,13-14', day_of_week='1-5'),
             'options': {'expires': 240},
+        },
+        'check-position-operation-alerts-every-5-minutes': {
+            'task': 'tasks.check_position_operation_alerts',
+            'schedule': crontab(minute='2-57/5', hour='9-11,13-14', day_of_week='1-5'),
+            'options': {'expires': 240},
+        },
+        'premarket-position-advice-0845': {
+            'task': 'tasks.send_premarket_position_advice',
+            'schedule': crontab(hour=8, minute=45, day_of_week='1-5'),
+            'options': {'expires': 900},
+        },
+        'position-status-summary-1125': {
+            'task': 'tasks.send_position_status_summary',
+            'schedule': crontab(hour=11, minute=25, day_of_week='1-5'),
+            'kwargs': {'slot': 'morning'},
+            'options': {'expires': 600},
+        },
+        'position-status-summary-1450': {
+            'task': 'tasks.send_position_status_summary',
+            'schedule': crontab(hour=14, minute=50, day_of_week='1-5'),
+            'kwargs': {'slot': 'late'},
+            'options': {'expires': 300},
         },
         'retry-pending-notifications-every-5-minutes': {
             'task': 'tasks.retry_pending_notifications',
@@ -173,6 +199,11 @@ celery_app.conf.update(
             'task': 'tasks.discover_event_catalysts',
             'schedule': crontab(hour=16, minute=30, day_of_week='1-5'),
         },
+        # 收盘AI复核：18:00全市场同步完成后，复核当日头部候选并随日报推送Bark
+        'daily-ai-review-1810': {
+            'task': 'tasks.send_daily_ai_review',
+            'schedule': crontab(hour=18, minute=10, day_of_week='1-5'),
+        },
         'database-backup-2030': {
             'task': 'tasks.database_backup',
             'schedule': crontab(hour=20, minute=30),
@@ -240,7 +271,7 @@ def _task_result_summary(retval) -> str:
         "next_day_reviewed", "next_day_confirmed", "next_day_confirmation_bark",
         "daily_report_push", "bark_self_check", "codes", "bars", "sent", "failed",
         "snapshot_bars", "eastmoney_bars", "errors", "source_paused", "sealed", "broken", "saved",
-        "notification", "count", "bark",
+        "notification", "count", "bark", "live_refreshed",
     )
     compact = {}
     for key in keep_keys:

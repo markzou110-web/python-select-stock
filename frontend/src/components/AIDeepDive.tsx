@@ -11,12 +11,13 @@ import {
     BarChart3,
     Loader2,
     Plus,
-    AlertTriangle
+    AlertTriangle,
+    Bot
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
 import { useTradeStore } from '@/stores/tradeStore';
-import SplitKLineCharts from './SplitKLineCharts';
+import SplitKLineCharts, { ChipDistribution } from './SplitKLineCharts';
 
 interface AIDeepDiveProps {
     stock: any;
@@ -62,7 +63,10 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
     const [stockInfo, setStockInfo] = useState<any>(null);
     const [priceAction, setPriceAction] = useState<any>(null);
     const [priceActionLines, setPriceActionLines] = useState<any[]>([]);
+    const [chipDistribution, setChipDistribution] = useState<ChipDistribution | null>(null);
     const [loadedCode, setLoadedCode] = useState<string | null>(null);
+    const [aiVerdict, setAiVerdict] = useState<any>(null);
+    const [aiLoading, setAiLoading] = useState(false);
 
     // Simulated trading addition states
     const [showRemarkModal, setShowRemarkModal] = useState(false);
@@ -86,6 +90,8 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
             setStockInfo(null);
             setPriceAction(null);
             setPriceActionLines([]);
+            setChipDistribution(null);
+            setAiVerdict(null);
             try {
                 const res = await api.get(`/api/stock/detail?code=${stock.代码}`);
                 if (cancelled) return;
@@ -93,6 +99,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                 setChartData(data);
                 setPriceAction(res.data.price_action || null);
                 setPriceActionLines(res.data.price_action_lines || []);
+                setChipDistribution(res.data.chip_distribution || null);
 
                 // Detail data supplies current measurements. Strategy scan fields stay tied to
                 // the selected scan row so a generic detail fallback cannot masquerade as a signal.
@@ -193,6 +200,27 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
             : `资金：主力 5 日净额 ${moneyFlow5d >= 0 ? '+' : ''}${moneyFlow5d.toFixed(2)} 亿元${facts.money_flow_bias ? `，方向为${facts.money_flow_bias}` : ''}。`,
     ];
 
+    const runStockAIAnalysis = async () => {
+        setAiLoading(true);
+        try {
+            const res = await api.post('/api/ai/analyze-stock', {
+                code: stock.代码,
+                date: facts.latest_scan_date || stock.data_date || stock.scan_date || stock.date || stock.日期,
+            });
+            if (res.data?.status === 'success' && res.data.analysis) {
+                setAiVerdict(res.data.analysis);
+                showToast(res.data.message || 'AI研判完成');
+            } else {
+                showToast(res.data?.message || 'AI研判暂不可用', 'error');
+            }
+        } catch (err: unknown) {
+            const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+            showToast(detail || 'AI研判请求失败，原策略结果不受影响', 'error');
+        } finally {
+            setAiLoading(false);
+        }
+    };
+
     const handleAddToWatchlist = async (force: boolean = false, customRemark?: string, mode?: 'SIMULATED' | 'REAL') => {
         const selectedMode = mode || addTradeMode;
         setIsAdding(true);
@@ -264,6 +292,90 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
 
             {/* Scrollable Content */}
             <div className="flex-1 overflow-y-auto p-6 space-y-8 scrollbar-none">
+                {/* AI 单股深度研判 */}
+                <div className="rounded-2xl border border-indigo-100 bg-gradient-to-br from-indigo-50/70 to-white p-4 space-y-3 shadow-sm">
+                    <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                            <Bot size={16} className="text-indigo-500" />
+                            <span className="text-xs font-black text-slate-700">AI 个股研判</span>
+                            <span className="text-[9px] font-bold text-slate-400">基于策略快照+研究数据，不构成投资建议</span>
+                        </div>
+                        <button
+                            onClick={runStockAIAnalysis}
+                            disabled={aiLoading}
+                            className="flex items-center gap-1.5 rounded-xl bg-indigo-500 px-3 py-1.5 text-xs font-black text-white shadow-md shadow-indigo-200 transition-all hover:bg-indigo-600 disabled:opacity-60"
+                        >
+                            {aiLoading ? <Loader2 size={14} className="animate-spin" /> : <Bot size={14} />}
+                            {aiLoading ? '研判中…' : aiVerdict ? '重新研判' : '生成研判'}
+                        </button>
+                    </div>
+                    {aiVerdict && (
+                        <div className="space-y-3">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span className={cn(
+                                    "rounded-lg px-2.5 py-1 text-xs font-black shadow-sm border",
+                                    aiVerdict.action === 'BUY' ? 'bg-emerald-50 border-emerald-100 text-emerald-600'
+                                    : aiVerdict.action === 'AVOID' ? 'bg-rose-50 border-rose-100 text-rose-600'
+                                    : 'bg-amber-50 border-amber-100 text-amber-600'
+                                )}>
+                                    {aiVerdict.action}
+                                </span>
+                                <span className="text-xs font-black text-slate-500">置信度 {aiVerdict.confidence ?? 0}/100</span>
+                                {aiVerdict.trend_view && (
+                                    <span className="rounded-lg bg-white px-2 py-1 text-[10px] font-black text-slate-500 border border-slate-100">{aiVerdict.trend_view}</span>
+                                )}
+                                {aiVerdict.guardrail_adjusted && (
+                                    <span className="rounded-lg bg-orange-50 px-2 py-1 text-[10px] font-black text-orange-500 border border-orange-100">风控护栏已降级</span>
+                                )}
+                            </div>
+                            <p className="text-xs font-bold leading-relaxed text-slate-700">{aiVerdict.summary}</p>
+                            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                {aiVerdict.positive_factors?.length > 0 && (
+                                    <div className="rounded-xl bg-white/80 border border-emerald-50 p-2.5">
+                                        <p className="mb-1 text-[9px] font-black uppercase tracking-widest text-emerald-500">支持因素</p>
+                                        <ul className="space-y-1">
+                                            {aiVerdict.positive_factors.map((item: string, idx: number) => (
+                                                <li key={idx} className="text-[11px] font-bold text-slate-600">+ {item}</li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
+                                {aiVerdict.risk_factors?.length > 0 && (
+                                    <div className="rounded-xl bg-white/80 border border-rose-50 p-2.5">
+                                        <p className="mb-1 text-[9px] font-black uppercase tracking-widest text-rose-500">风险因素</p>
+                                        <ul className="space-y-1">
+                                            {aiVerdict.risk_factors.map((item: string, idx: number) => (
+                                                <li key={idx} className="text-[11px] font-bold text-slate-600">- {item}</li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
+                            </div>
+                            {aiVerdict.catalysts?.length > 0 && (
+                                <div className="rounded-xl bg-white/80 border border-indigo-50 p-2.5">
+                                    <p className="mb-1 text-[9px] font-black uppercase tracking-widest text-indigo-400">近期事件（研究快照）</p>
+                                    <ul className="space-y-1">
+                                        {aiVerdict.catalysts.map((item: string, idx: number) => (
+                                            <li key={idx} className="text-[11px] font-bold text-slate-600">· {item}</li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
+                            {aiVerdict.key_levels && (
+                                <div className="rounded-xl bg-white/80 border border-slate-100 p-2.5">
+                                    <p className="mb-1 text-[9px] font-black uppercase tracking-widest text-slate-400">关键价位应对</p>
+                                    <p className="text-[11px] font-bold leading-relaxed text-slate-600">{aiVerdict.key_levels}</p>
+                                </div>
+                            )}
+                            {aiVerdict.data_limitations?.length > 0 && (
+                                <p className="text-[10px] font-bold leading-relaxed text-slate-400">
+                                    数据局限：{aiVerdict.data_limitations.join('；')}
+                                </p>
+                            )}
+                        </div>
+                    )}
+                </div>
+
                 {/* Simulated Trading Position Dashboard */}
                 {stockInfo?.is_paper_trade && (
                     <div className="glass-card p-5 bg-gradient-to-br from-indigo-50/70 to-purple-50/30 border border-indigo-100 rounded-3xl space-y-4 shadow-lg shadow-indigo-50/50 animate-in fade-in zoom-in-95 duration-300">
@@ -444,6 +556,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                                 ]}
                                 priceAction={currentPriceAction}
                                 priceActionLines={hasCurrentDetail ? priceActionLines : []}
+                                chipDistribution={hasCurrentDetail ? chipDistribution : null}
                                 riskLevels={stockInfo}
                                 paperLines={stockInfo?.is_paper_trade ? [
                                     { price: stockInfo.buy_price, label: '买入价', color: '#6366f1', date: stockInfo.entry_date },

@@ -127,9 +127,9 @@ def test_shadow_classification_keeps_routes_independent_and_never_tradable():
 
     assert by_code["000001"]["shadow_route"] == "A"
     assert by_code["000001"]["shadow_state"] == "A_CONFIRMATION_WATCH"
-    assert by_code["000002"]["shadow_route"] == "B"
-    assert by_code["000002"]["shadow_state"] == "OVEREXTENDED_WATCH"
-    assert "禁止立即追价" in "；".join(by_code["000002"]["shadow_blockers"])
+    assert by_code["000002"]["shadow_route"] == "A"
+    assert by_code["000002"]["shadow_state"] == "A_CONFIRMATION_WATCH"
+    assert "5日涨幅>15%" not in "；".join(by_code["000002"]["shadow_blockers"])
     assert by_code["000003"]["shadow_route"] == "DISCOVERY"
     assert by_code["000003"]["shadow_state"] == "WAIT_STRICT_DUAL"
 

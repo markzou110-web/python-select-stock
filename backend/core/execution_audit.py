@@ -89,11 +89,10 @@ def load_recent_push_counts(
 
 
 def assess_persistent_b_shadow(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    """Evaluate a repeated high-quality B signal without granting trade permission."""
+    """Evaluate a repeated high-quality signal without granting trade permission."""
     groups = classify_trade_blockers(candidate.get("trade_blockers") or [])
     checks = {
         "strict_strategy": str(candidate.get("strategy_type") or "") == "tv_dual_strict",
-        "grade_b": str(candidate.get("sop_grade") or "") == "B",
         "quality": float(candidate.get("sop_quality_score") or 0) >= PERSISTENT_B_SHADOW_MIN_QUALITY_SCORE,
         "repeated_push": int(candidate.get("recent_push_days") or 0) >= PERSISTENT_B_SHADOW_MIN_PUSH_DAYS,
         "opportunity": float(candidate.get("trade_opportunity_score") or 0) >= STRONG_EXCEPTION_MIN_OPPORTUNITY_SCORE,
@@ -115,6 +114,6 @@ def assess_persistent_b_shadow(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "wait_blockers": groups["wait"],
         "soft_blockers": groups["soft"] + groups["other"],
         "instruction": "影子等待回踩，不可交易" if eligible and entry_mode == "WAIT_PULLBACK" else (
-            "影子验证，不可交易" if eligible else "未进入持续B级影子队列"
+            "影子验证，不可交易" if eligible else "未进入持续高质量影子队列"
         ),
     }

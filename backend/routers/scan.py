@@ -4,7 +4,7 @@ Scan router - market scanning and strategy analysis endpoints.
 Extracted from api.py. Preserves all original logic exactly.
 """
 from fastapi import APIRouter, HTTPException
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Literal
 from datetime import datetime, timedelta, date
 import time
 import re
@@ -40,7 +40,49 @@ from core.trading_calendar import is_a_share_intraday_session
 
 router = APIRouter(prefix="/api", tags=["scan"])
 
-MANUAL_LIVE_TV_STRATEGIES = {PRIMARY_TV_STRATEGY, "tv_dual_strict"}
+MANUAL_LIVE_TV_STRATEGIES = {PRIMARY_TV_STRATEGY, "tv_dual_strict", "tv_zp", "h2"}
+
+
+def _selected_strategy_types(strategy_type: str, strategy_types: Optional[str]) -> List[str]:
+    values = [item.strip() for item in str(strategy_types or "").split(",") if item.strip()]
+    if not values:
+        values = [strategy_type]
+    return list(dict.fromkeys(values))
+
+
+def _merge_strategy_results(
+    results: List[Dict[str, Any]], selected_strategies: Optional[List[str]] = None,
+    match_mode: str = "any",
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in results:
+        raw_code = str(item.get("代码") or item.get("code") or "")
+        if not raw_code:
+            continue
+        code = raw_code.zfill(6)
+        strategy = str(item.get("strategy_type") or "")
+        if code not in merged:
+            merged[code] = dict(item)
+            merged[code]["matched_strategies"] = [strategy] if strategy else []
+            continue
+        existing = merged[code]
+        matches = existing["matched_strategies"]
+        if strategy and strategy not in matches:
+            matches.append(strategy)
+        existing_rank = (
+            bool(existing.get("trade_eligible")),
+            float(existing.get("display_trade_score") or existing.get("final_trade_score") or existing.get("Score") or 0),
+        )
+        item_rank = (
+            bool(item.get("trade_eligible")),
+            float(item.get("display_trade_score") or item.get("final_trade_score") or item.get("Score") or 0),
+        )
+        if item_rank > existing_rank:
+            merged[code] = {**item, "matched_strategies": matches}
+    if match_mode == "all" and selected_strategies:
+        required = set(selected_strategies)
+        return [item for item in merged.values() if required.issubset(item["matched_strategies"])]
+    return list(merged.values())
 
 
 def manual_scan_requires_live_snapshot(
@@ -69,6 +111,11 @@ def scan_preflight(
         min_history_days=min_history_days,
     )
 
+
+@router.get("/scan/capabilities")
+def scan_capabilities():
+    return {"match_modes": ["any", "all"]}
+
 @celery_app.task(name="scan.run_market_scan_task")
 def run_market_scan_task(
     threshold: float = 0.12,
@@ -91,39 +138,58 @@ def run_market_scan_task(
     stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
     require_live_snapshot: bool = False,
     include_scan_metadata: bool = False,
+    strategy_types: Optional[str] = None,
+    match_mode: str = "any",
 ):
     from core.scanner import perform_market_scan
+    selected_strategies = _selected_strategy_types(strategy_type, strategy_types)
+    combined_all = match_mode == "all" and len(selected_strategies) > 1
     scan_metadata = {
         "data_date": data_date,
         "data_mode": None,
         "as_of": None,
+        "strategy_types": selected_strategies,
+        "match_mode": match_mode,
     }
-    results = perform_market_scan(
-        threshold=threshold,
-        vol_multiplier=vol_multiplier,
-        rsi_min=rsi_min,
-        use_macd_filter=use_macd_filter,
-        use_bb_sqz=use_bb_sqz,
-        sqz_lookback=sqz_lookback,
-        use_weekly=use_weekly,
-        market_range=market_range,
-        turnover_min=turnover_min,
-        mkt_cap_min=mkt_cap_min,
-        use_rs_filter=use_rs_filter,
-        local_only=local_only,
-        data_date=data_date,
-        strategy_type=strategy_type,
-        pine_min_signals=pine_min_signals,
-        min_data_days=min_data_days,
-        weekly_ma_period=weekly_ma_period,
-        stop_loss_pct=stop_loss_pct,
-        require_live_snapshot=require_live_snapshot,
-        scan_context=scan_metadata,
-    )
-    if strategy_type == PRIMARY_TV_STRATEGY and results:
+    all_results: List[Dict[str, Any]] = []
+    primary_results: List[Dict[str, Any]] = []
+    for current_strategy in selected_strategies:
+        current_metadata: Dict[str, Any] = {}
+        current_results = perform_market_scan(
+            threshold=threshold,
+            vol_multiplier=vol_multiplier,
+            rsi_min=rsi_min,
+            use_macd_filter=use_macd_filter,
+            use_bb_sqz=use_bb_sqz,
+            sqz_lookback=sqz_lookback,
+            use_weekly=use_weekly,
+            market_range=market_range,
+            turnover_min=turnover_min,
+            mkt_cap_min=mkt_cap_min,
+            use_rs_filter=use_rs_filter,
+            local_only=local_only,
+            data_date=data_date,
+            strategy_type=current_strategy,
+            pine_min_signals=pine_min_signals,
+            min_data_days=min_data_days,
+            weekly_ma_period=weekly_ma_period,
+            stop_loss_pct=stop_loss_pct,
+            require_live_snapshot=require_live_snapshot,
+            scan_context=current_metadata,
+            publish_to_sentinel=current_strategy == PRIMARY_TV_STRATEGY and not combined_all,
+        )
+        all_results.extend(current_results or [])
+        if current_strategy == PRIMARY_TV_STRATEGY:
+            primary_results = current_results or []
+        for key in ("data_date", "data_mode", "as_of"):
+            if current_metadata.get(key) is not None:
+                scan_metadata[key] = current_metadata[key]
+
+    results = _merge_strategy_results(all_results, selected_strategies, match_mode)
+    if primary_results and not combined_all:
         try:
             from core.sentinel import send_after_close_watchlist
-            send_after_close_watchlist(results, scan_date=results[0].get("data_date"))
+            send_after_close_watchlist(primary_results, scan_date=primary_results[0].get("data_date"))
         except Exception as exc:
             logger.warning(f"After-close watchlist push skipped: {exc}")
     for item in results or []:
@@ -134,7 +200,10 @@ def run_market_scan_task(
             name=item.get("名称") or item.get("name"),
             strategy_type=item.get("strategy_type") or strategy_type,
             theme=item.get("题材") or item.get("行业") or item.get("industry"),
-            payload={"score": item.get("Score") or item.get("score")},
+            payload={
+                "score": item.get("Score") or item.get("score"),
+                "matched_strategies": item.get("matched_strategies") or [],
+            },
         )
     safe_results = _json_safe(results)
     if include_scan_metadata:
@@ -160,26 +229,34 @@ def scan_market(
     pine_min_signals: int = 3,
     min_data_days: Optional[int] = None,
     weekly_ma_period: int = 20,  # 周线均线周期
-    stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT
+    stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
+    strategy_types: Optional[str] = None,
+    match_mode: Literal["any", "all"] = "any",
 ):
     """
     API Endpoint for market scan (Asynchronous via Celery)
     """
     data_date = data_date.strip() if data_date and data_date.strip() else None
-    require_live_snapshot = manual_scan_requires_live_snapshot(strategy_type, data_date)
+    selected_strategies = _selected_strategy_types(strategy_type, strategy_types)
+    strategy_type = selected_strategies[0]
+    strategy_types = ",".join(selected_strategies)
+    require_live_snapshot = any(
+        manual_scan_requires_live_snapshot(item, data_date)
+        for item in selected_strategies
+    )
     if require_live_snapshot:
         local_only = False
         logger.info(
             "[SCAN API] Intraday TV scan forced to live snapshot; historical fallback disabled."
         )
-    logger.info(f"[SCAN API] Submitting task: strategy_type={strategy_type}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}, stop_loss_pct={stop_loss_pct}")
+    logger.info(f"[SCAN API] Submitting task: strategy_types={strategy_types}, match_mode={match_mode}, pine_min_signals={pine_min_signals}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}, stop_loss_pct={stop_loss_pct}")
     
     # 异步发送任务给 Celery Queue
     task = run_market_scan_task.delay(
         threshold, vol_multiplier, rsi_min, use_macd_filter,
         use_bb_sqz, sqz_lookback, use_weekly, market_range,
         turnover_min, mkt_cap_min, use_rs_filter, local_only, data_date, strategy_type, pine_min_signals, min_data_days,
-        weekly_ma_period, stop_loss_pct, require_live_snapshot, True
+        weekly_ma_period, stop_loss_pct, require_live_snapshot, True, strategy_types, match_mode
     )
     
     # 无 Redis 的兜底处理：任务已同步完成，直接把结果交给前端 (前端的 fallback 机制接收)

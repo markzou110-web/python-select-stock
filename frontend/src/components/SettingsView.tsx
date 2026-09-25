@@ -65,11 +65,40 @@ interface StrategyReleaseState {
     updated_at?: string;
 }
 
+interface AIStatus {
+    enabled?: boolean;
+    configured?: boolean;
+    model?: string | null;
+    provider?: string;
+    max_candidates?: number;
+}
+
+interface BarkStrategyOption {
+    value: string;
+    label: string;
+    description: string;
+}
+
+interface AppSettings {
+    sentinel_schedule_times: string;
+    market_sync_schedule_times: string;
+    bark_key: string;
+    bark_scan_strategy: string;
+    bark_scan_strategy_options?: BarkStrategyOption[];
+}
+
+const DEFAULT_BARK_STRATEGY_OPTIONS: BarkStrategyOption[] = [
+    { value: 'tv_zp', label: 'TV-ZP趋势信号', description: 'Range Filter 主导，Volume/QQE 确认' },
+    { value: 'tv_dual', label: 'TV 宽松观察池', description: '均线B共振或 TV-ZP 趋势信号' },
+    { value: 'tv_dual_strict', label: 'TV+ 强确认精选', description: '均线B共振且 TV-ZP 趋势信号' },
+];
+
 export default function SettingsView() {
-    const [settings, setSettings] = useState({
+    const [settings, setSettings] = useState<AppSettings>({
         sentinel_schedule_times: "09:30,10:00,10:30,11:00,13:00,13:30,14:00,14:30",
         market_sync_schedule_times: "08:30,12:10,18:00",
-        bark_key: ""
+        bark_key: "",
+        bark_scan_strategy: "tv_zp",
     });
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -82,6 +111,7 @@ export default function SettingsView() {
     const [apiTokenActive, setApiTokenActive] = useState(false);
     const [retryingNotifications, setRetryingNotifications] = useState(false);
     const [notificationRetryMessage, setNotificationRetryMessage] = useState('');
+    const [aiStatus, setAIStatus] = useState<AIStatus | null>(null);
 
     useEffect(() => {
         setApiTokenActive(hasSessionApiToken());
@@ -94,13 +124,15 @@ export default function SettingsView() {
                 api.get('/api/system/health'),
                 api.get('/api/system/operational-metrics'),
                 api.get('/api/system/point-in-time-coverage'),
-                api.get('/api/system/strategy-release/states')
+                api.get('/api/system/strategy-release/states'),
+                api.get('/api/ai/status')
         ]);
         if (results[0].status === 'fulfilled') setSettings(results[0].value.data);
         if (results[1].status === 'fulfilled') setSystemHealth(results[1].value.data);
         if (results[2].status === 'fulfilled') setOperationalMetrics(results[2].value.data);
         if (results[3].status === 'fulfilled') setPointInTimeCoverage(results[3].value.data);
         if (results[4].status === 'fulfilled') setStrategyStates(results[4].value.data);
+        if (results[5].status === 'fulfilled') setAIStatus(results[5].value.data);
         results.forEach(result => {
             if (result.status === 'rejected') console.error("Fetch Settings Diagnostic Error:", result.reason);
         });
@@ -143,6 +175,13 @@ export default function SettingsView() {
             </div>
         );
     }
+
+    const barkStrategyOptions = settings.bark_scan_strategy_options?.length
+        ? settings.bark_scan_strategy_options
+        : DEFAULT_BARK_STRATEGY_OPTIONS;
+    const selectedBarkStrategy = barkStrategyOptions.find(
+        option => option.value === settings.bark_scan_strategy
+    );
 
     return (
         <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -243,6 +282,17 @@ export default function SettingsView() {
                                 提示：请确保程序在此时间段处于运行状态。建议设置在下午 14:00 - 15:00 之间，以获得最准的确诊信号。
                             </div>
                         </div>
+                        <div className="rounded-2xl border border-violet-100 bg-violet-50/70 p-4">
+                            <div className="flex items-center gap-2 text-sm font-black text-violet-800">
+                                <Cpu size={16} /> AI 二次选股复核
+                            </div>
+                            <p className="mt-2 text-[10px] font-bold text-violet-700">
+                                状态：{aiStatus?.configured ? '已配置' : '未配置'}{aiStatus?.model ? ` · ${aiStatus.model}` : ''}
+                            </p>
+                            <p className="mt-1 text-[10px] leading-relaxed text-slate-500">
+                                在扫描结果点击“AI二次分析”。密钥只从后端环境变量读取，不会写入浏览器或数据库；单次最多复核 {aiStatus?.max_candidates || 10} 只。
+                            </p>
+                        </div>
                     </div>
                 </div>
 
@@ -254,6 +304,26 @@ export default function SettingsView() {
                     </div>
 
                     <div className="glass-card p-6 space-y-6">
+                        <div className="space-y-3">
+                            <label htmlFor="bark-scan-strategy" className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                                <Bell size={16} className="text-violet-500" />
+                                Bark 选股策略
+                            </label>
+                            <select
+                                id="bark-scan-strategy"
+                                value={settings.bark_scan_strategy || "tv_zp"}
+                                onChange={(e) => setSettings({ ...settings, bark_scan_strategy: e.target.value })}
+                                className="w-full bg-slate-50 border border-slate-100 text-slate-700 font-bold rounded-xl px-4 py-3 outline-none focus:ring-4 focus:ring-violet-500/10 focus:bg-white transition-all"
+                            >
+                                {barkStrategyOptions.map(option => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
+                            </select>
+                            <p className="text-[10px] text-slate-400 font-medium leading-relaxed">
+                                {selectedBarkStrategy?.description || '选择 Bark 定时扫描使用的选股策略。'}保存后下一次扫描立即生效，仍需通过统一风控与可交易门槛才会推送。
+                            </p>
+                        </div>
+
                         <div className="space-y-3">
                             <label className="flex items-center gap-2 text-sm font-bold text-slate-700">
                                 <ShieldCheck size={16} className="text-indigo-500" />

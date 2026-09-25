@@ -9,8 +9,11 @@ declare module 'axios' {
 
 const api = axios.create({
     baseURL: process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000',
-    timeout: 600000,  // 增加到10分钟
+    // 全市场扫描等长任务需要较长时间，可用 NEXT_PUBLIC_API_TIMEOUT_MS 覆盖
+    timeout: Number(process.env.NEXT_PUBLIC_API_TIMEOUT_MS) || 600000,
 });
+
+const isDev = process.env.NODE_ENV === 'development';
 
 const SESSION_TOKEN_KEY = 'alphavision_api_token';
 
@@ -37,8 +40,10 @@ api.interceptors.request.use((config) => {
 // 响应拦截器 - 记录耗时
 api.interceptors.response.use(
     (response) => {
-        const duration = Date.now() - (response.config.metadata?.startTime || 0);
-        console.log(`API ${response.config.url?.split('?')[0]} completed in ${duration}ms`);
+        if (isDev) {
+            const duration = Date.now() - (response.config.metadata?.startTime || 0);
+            console.log(`API ${response.config.url?.split('?')[0]} completed in ${duration}ms`);
+        }
         return response;
     },
     (error) => {
@@ -49,8 +54,10 @@ api.interceptors.response.use(
                 error.message === 'Network Error' &&
                 (url.startsWith('/api/scan/status/') || url === '/api/sync/status')
             );
-            const log = isPollingNetworkError ? console.warn : console.error;
-            log(`API ${url} failed after ${duration}ms:`, error.message);
+            if (isDev || !isPollingNetworkError) {
+                const log = isPollingNetworkError ? console.warn : console.error;
+                log(`API ${url} failed after ${duration}ms:`, error.message);
+            }
         }
         if (typeof window !== 'undefined' && error.response?.status === 401) {
             window.dispatchEvent(new CustomEvent('alphavision:auth-required'));
@@ -58,8 +65,6 @@ api.interceptors.response.use(
         return Promise.reject(error);
     }
 );
-
-console.log("API Base URL:", api.defaults.baseURL);
 
 export const marketApi = {
     checkHealth: () => api.get('/api/health'),

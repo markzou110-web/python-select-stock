@@ -17,8 +17,31 @@ from core.sync_state import sync_progress, sync_progress_lock
 from core.trading_calendar import is_a_share_trading_day
 
 
-SYNC_SCHEDULE_DEFAULT = "08:30,12:10,18:00"
+# 收盘后调度槽：15:10 用于当日 K 线最终化（午间同步写入的是半日部分数据）
+SYNC_SCHEDULE_DEFAULT = "08:30,12:10,15:10,18:00"
 _LOCK_KEY = "market_sync_lock_until"
+LAST_SYNC_KEY = "last_market_sync_at"
+POST_CLOSE_READY_TIME = "15:05"
+
+
+def needs_post_close_catch_up(
+    now: datetime,
+    last_sync_at: Optional[datetime],
+    is_trading_day: bool,
+) -> bool:
+    """启动时是否需要补跑收盘后同步。
+
+    调度器只在精确到分钟的计划时刻触发，错过（进程未运行/重启跨过时刻）不会补，
+    会导致当日 daily_k 停留在午间半日数据。此函数判断是否需要立即补一次。
+    """
+    if not is_trading_day:
+        return False
+    current_hm = now.strftime("%H:%M")
+    if current_hm < POST_CLOSE_READY_TIME:
+        return False
+    if last_sync_at and last_sync_at.date() == now.date() and last_sync_at.strftime("%H:%M") >= POST_CLOSE_READY_TIME:
+        return False
+    return True
 
 
 def _parse_lock_until(value: Optional[str]) -> Optional[datetime]:
@@ -70,6 +93,26 @@ class MarketSyncScheduler:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         logger.info("Market sync scheduler started.")
+        self._maybe_catch_up_after_close()
+
+    def _maybe_catch_up_after_close(self) -> None:
+        """启动补跑：错过的收盘后同步（进程未运行/重启跨过计划时刻）在启动时补一次。
+
+        背景：调度器只在精确到分钟的计划时刻触发，2026-09-21 实例中 API 进程
+        21:32 才启动，导致 18:00 的收盘最终化同步未执行，当日 daily_k 停留在
+        12:10 写入的半日部分数据，图表与实时价不一致。
+        """
+        try:
+            now = datetime.now()
+            last_sync_at = _parse_lock_until(get_setting(LAST_SYNC_KEY, ""))
+            if not needs_post_close_catch_up(now, last_sync_at, is_a_share_trading_day(now)):
+                return
+            logger.info("Post-close catch-up sync triggered at startup (missed scheduled slot).")
+            threading.Thread(
+                target=self._run_scheduled_sync, args=("catch-up",), daemon=True,
+            ).start()
+        except Exception as exc:
+            logger.warning(f"Post-close catch-up check failed (ignored): {exc}")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -111,6 +154,7 @@ class MarketSyncScheduler:
 
         try:
             logger.info(f"Starting scheduled market data sync at {trigger_time}.")
+            save_setting(LAST_SYNC_KEY, datetime.now().isoformat(timespec="seconds"))
             from routers.sync import background_sync_task
 
             background_sync_task()

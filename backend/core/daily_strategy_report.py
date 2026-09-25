@@ -1,6 +1,9 @@
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
+from core.industry_prosperity import build_industry_prosperity, prosperity_text
+from core.logic_chain import build_capital_evidence_line, build_logic_chain_line
+
 
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -46,11 +49,44 @@ def _stock_digest(stock: Dict[str, Any]) -> Dict[str, Any]:
         "code": str(stock.get("代码") or stock.get("code") or "").zfill(6),
         "name": stock.get("名称") or stock.get("name") or "",
         "industry": stock.get("行业") or stock.get("industry") or "",
-        "grade": stock.get("early_trade_grade") or stock.get("sop_grade") or "?",
         "bucket": _bucket(stock),
         "score": round(_display_score(stock), 2),
         "action": _action_label(stock),
         "blockers": blockers[:2],
+        "logic": build_logic_chain_line(stock),
+        "capital": build_capital_evidence_line(stock),
+    }
+
+
+def _ai_review_section(ai_review: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not ai_review or not ai_review.get("analyses"):
+        return {"status": "none"}
+    analyses = ai_review["analyses"]
+    counts = Counter(str(item.get("action") or "WAIT") for item in analyses)
+    buy_analyses = [item for item in analyses if str(item.get("action") or "").upper() == "BUY"]
+    return {
+        "status": "available",
+        "model": ai_review.get("model"),
+        "source": ai_review.get("source"),
+        "market_summary": ai_review.get("market_summary"),
+        "counts": dict(counts),
+        "top_analyses": [
+            {
+                "code": item.get("code"),
+                "name": item.get("name"),
+                "action": item.get("action"),
+                "confidence": item.get("confidence"),
+                "summary": item.get("summary"),
+                "strategy_rank": item.get("strategy_rank"),
+                "ai_rank": item.get("ai_rank"),
+                "positive_factors": (
+                    list(item.get("positive_factors") or [])[:3]
+                    if isinstance(item.get("positive_factors"), list)
+                    else []
+                ),
+            }
+            for item in buy_analyses[:3]
+        ],
     }
 
 
@@ -62,11 +98,11 @@ def build_daily_strategy_report(
     bark_push_count: int = 0,
     watchlist_count: int = 0,
     real_position_count: int = 0,
+    ai_review: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a compact after-close strategy report from one day's scan snapshot."""
     results = scan_results or []
     bucket_counts = Counter(_bucket(stock) for stock in results)
-    grade_counts = Counter(str(stock.get("sop_grade") or "?") for stock in results)
     strategy_counts = Counter(str(stock.get("strategy_type") or "UNKNOWN") for stock in results)
     industry_counts = Counter(str(stock.get("行业") or stock.get("industry") or "UNKNOWN") for stock in results)
 
@@ -82,7 +118,7 @@ def build_daily_strategy_report(
     if trade:
         stance = "有可交易候选，仍需按确认价/量能小仓复核"
     elif early:
-        stance = "无正式买点，有A-提前复核候选，严禁追高"
+        stance = "无正式买点，有提前复核候选，严禁追高"
     elif observe:
         stance = "以观察为主，等待确认价和量能"
     else:
@@ -92,13 +128,17 @@ def build_daily_strategy_report(
     if trade:
         next_actions.append("TRADE候选只在站稳确认价且量能确认时小仓复核")
     if early:
-        next_actions.append("A-候选次日高开不追，优先等回踩/尾盘确认")
+        next_actions.append("提前复核候选次日高开不追，优先等回踩/尾盘确认")
     if sector_gaps:
         next_actions.append("热门板块先看未推原因，后排/高位票不追")
     if block:
         next_actions.append("BLOCK候选仅复盘，不作为买入清单")
 
     top_candidates = sorted(trade + early + observe, key=_rank_score, reverse=True)[:8]
+    prosperity_map = build_industry_prosperity(results)
+    top_prosperity = sorted(
+        prosperity_map.items(), key=lambda item: item[1].get("prosperity_score", 0), reverse=True
+    )[:5]
     return {
         "scan_date": scan_date,
         "summary": {
@@ -113,12 +153,15 @@ def build_daily_strategy_report(
             "stance": stance,
         },
         "bucket_counts": dict(bucket_counts),
-        "grade_counts": dict(grade_counts),
         "strategy_counts": dict(strategy_counts.most_common(8)),
         "top_industries": [{"industry": k, "count": v} for k, v in industry_counts.most_common(8)],
+        "industry_prosperity": [
+            {"industry": industry, **data} for industry, data in top_prosperity
+        ],
         "top_candidates": [_stock_digest(stock) for stock in top_candidates],
         "sector_push_gaps": sector_gaps[:5],
         "next_actions": next_actions,
+        "ai_review": _ai_review_section(ai_review),
     }
 
 
@@ -142,9 +185,40 @@ def build_daily_strategy_report_body(report: Dict[str, Any]) -> str:
         lines.append("热门板块未推：")
         for item in gaps[:3]:
             lines.append(f"{item.get('industry', '--')}：{item.get('primary_reason_label', '继续观察')}")
+    prosperity = report.get("industry_prosperity") or []
+    if prosperity:
+        lines.append("")
+        lines.append("行业景气（候选池基本面聚合）：")
+        for item in prosperity[:3]:
+            lines.append(f"{item.get('industry', '--')}｜{prosperity_text(item)}")
     actions = report.get("next_actions") or []
     if actions:
         lines.append("")
         lines.append("明日动作：")
         lines.extend(f"- {action}" for action in actions[:4])
+    ai = report.get("ai_review") or {}
+    if ai.get("status") == "available":
+        lines.append("")
+        counts = ai.get("counts") or {}
+        lines.append(
+            f"AI复核（{ai.get('model') or '--'}）BUY {counts.get('BUY', 0)} / "
+            f"WAIT {counts.get('WAIT', 0)} / AVOID {counts.get('AVOID', 0)}"
+        )
+        if ai.get("market_summary"):
+            lines.append(str(ai["market_summary"])[:160])
+        for item in (ai.get("top_analyses") or [])[:3]:
+            strategy_rank = item.get("strategy_rank") or "--"
+            ai_rank = item.get("ai_rank") or "--"
+            lines.append(
+                f"BUY {item.get('name') or item.get('code')}({item.get('code') or '--'})"
+                f"｜策略#{strategy_rank} → AI#{ai_rank}｜{item.get('confidence') or 0}分"
+            )
+            factors = [str(value) for value in (item.get("positive_factors") or [])[:3] if value]
+            lines.append(f"依据：{'；'.join(factors) if factors else item.get('summary') or '--'}")
+        wait_count = counts.get("WAIT", 0)
+        avoid_count = counts.get("AVOID", 0)
+        if wait_count or avoid_count:
+            lines.append(
+                f"WAIT {wait_count}只、AVOID {avoid_count}只仅留档观察，不作为本次推送标的"
+            )
     return "\n".join(lines)

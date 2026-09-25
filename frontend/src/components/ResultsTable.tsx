@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
     Target,
     Map as MapIcon,
@@ -18,8 +18,9 @@ import {
     Plus,
     Calculator as CalcIcon,
     Settings2,
-    Shield,
-    Eye
+    Eye,
+    Loader2,
+    Sparkles
 } from 'lucide-react';
 import { clampScore, cn } from '@/lib/utils';
 import api from '@/lib/api';
@@ -28,6 +29,30 @@ const StockChart = dynamic(() => import('./StockChart'), { ssr: false, loading: 
 import PositionSizer from './PositionSizer';
 import HeatmapOptimizer from './HeatmapOptimizer';
 import { ScanResult } from '@/stores/scanStore';
+
+type AIReview = {
+    code: string;
+    name: string;
+    action: 'BUY' | 'WAIT' | 'AVOID';
+    confidence: number;
+    summary: string;
+    positive_factors: string[];
+    risk_factors: string[];
+    data_limitations: string[];
+    guardrail_adjusted?: boolean;
+    system_levels?: { entry_price?: number; stop_price?: number; target_price?: number };
+};
+type AIPerformance = {
+    status: 'available' | 'none';
+    horizons?: {
+        '5d'?: {
+            all_reviewed?: { signals: number; win_rate: number; avg_return: number };
+            buy?: { signals: number; win_rate: number; avg_return: number };
+            buy_lift?: { win_rate_pct_points?: number | null; avg_return_pct_points?: number | null };
+        };
+    };
+    sample_warning?: string | null;
+};
 export default function ResultsTable({
     results,
     onSelectStock,
@@ -47,7 +72,10 @@ export default function ResultsTable({
     const [groupBySector, setGroupBySector] = useState(false);
     const [sectorSortKey, setSectorSortKey] = useState<'count' | 'avgScore'>('count');
     const [collapsedSectors, setCollapsedSectors] = useState<Set<string>>(new Set());
-    const [sopFilterOnly, setSopFilterOnly] = useState(false);
+    const [aiReviews, setAIReviews] = useState<Record<string, AIReview>>({});
+    const [aiSummary, setAISummary] = useState('');
+    const [aiLoading, setAILoading] = useState(false);
+    const [aiPerformance, setAIPerformance] = useState<AIPerformance | null>(null);
     const [brooksFilter, setBrooksFilter] = useState<'ALL' | 'READY' | 'NO_AVOID' | 'LOW_RISK' | 'PULLBACK' | 'LOW_FAILURE' | 'H2_STRONG' | 'STRONG_TREND'>('ALL');
     const [timeline, setTimeline] = useState<any>(null);
     const [timelineLoading, setTimelineLoading] = useState(false);
@@ -93,12 +121,14 @@ export default function ResultsTable({
         return rows;
     };
 
-    // SOP 过滤: 仅显示 A/B 级
-    const filteredResults = applyBrooksFilter(
-        sopFilterOnly
-            ? results.filter(r => r.sop_grade === 'A' || r.sop_grade === 'B')
-            : results
-    );
+    const filteredResults = applyBrooksFilter(results);
+    const aiFiveDayPerformance = aiPerformance?.horizons?.['5d'];
+
+    useEffect(() => {
+        setAIReviews({});
+        setAISummary('');
+        setAIPerformance(null);
+    }, [results]);
 
     // ── Sector grouping logic ──
     const sectorGroups = useMemo(() => {
@@ -194,14 +224,15 @@ export default function ResultsTable({
     };
 
     const handleExport = () => {
-        const headers = ['代码', '名称', '行业', '现价', '涨幅%', '信号强度(0-100)', '结构质量(0-100)', '机会分(0-100)', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', 'TV均线', 'TV-ZP', 'TV命中', '影线比', 'strategy_type'];
+        const headers = ['代码', '名称', '行业', '现价', '涨幅%', '信号强度(0-100)', '结构质量(0-100)', '机会分(0-100)', 'AI建议', 'AI置信度', 'AI结论', 'RSI', 'DIF', 'BB', '粘合度', 'ROE', '净利YOY', '历史胜率', '信号次数', '北向', '共振', 'TV均线', 'TV-ZP', 'TV命中', '影线比', 'strategy_type', 'matched_strategies'];
         const rows = results.map(r => [
             r.代码, r.名称, r.行业, r.现价, r['涨幅%'], clampScore(r.display_signal_score ?? r.Score),
             r.sop_quality_score == null ? '' : clampScore(r.display_quality_score ?? r.sop_quality_score),
-            r.trade_opportunity_score == null ? '' : clampScore(r.display_opportunity_score ?? r.trade_opportunity_score), r.RSI, r.DIF, r.BB,
+            r.trade_opportunity_score == null ? '' : clampScore(r.display_opportunity_score ?? r.trade_opportunity_score),
+            aiReviews[r.代码]?.action || '', aiReviews[r.代码]?.confidence ?? '', aiReviews[r.代码]?.summary || '', r.RSI, r.DIF, r.BB,
             r.粘合度, r.ROE || '', r.净利YOY || '', r.历史胜率, r.信号次数, r.北向 || '', r.共振 || '',
             r.tv_ma_signal || '', r.tv_zp_signal || '', r.tv_match || '',
-            r.影线比 || '', r.strategy_type || ''
+            r.影线比 || '', r.strategy_type || '', (r.matched_strategies || []).join('|')
         ]);
 
         // BOM for Excel UTF-8 compatibility
@@ -222,6 +253,60 @@ export default function ResultsTable({
         a.download = `AlphaVision_选股_${date}.csv`;
         a.click();
         URL.revokeObjectURL(url);
+    };
+
+    const runAIReview = async () => {
+        setAILoading(true);
+        try {
+            const candidates = filteredResults.slice(0, 10).map(stock => ({
+                code: stock.代码, name: stock.名称, industry: stock.行业,
+                strategy_type: stock.strategy_type, matched_strategies: stock.matched_strategies,
+                data_date: stock.data_date || stock.date || stock.日期,
+                as_of: stock.as_of, price: stock.现价, pct_chg: stock['涨幅%'],
+                display_signal_score: stock.display_signal_score ?? stock.Score,
+                display_quality_score: stock.display_quality_score ?? stock.sop_quality_score,
+                display_opportunity_score: stock.display_opportunity_score ?? stock.trade_opportunity_score,
+                trade_bucket: stock.trade_bucket, trade_eligible: stock.trade_eligible,
+                trade_state: stock.trade_state, trade_blockers: stock.trade_blockers,
+                trade_cautions: stock.trade_cautions,
+                pa_trade_plan: stock.pa_trade_plan, pa_entry_price: stock.pa_entry_price,
+                pa_stop_price: stock.pa_stop_price, pa_target_price: stock.pa_target_price,
+                pa_risk_reward: stock.pa_risk_reward, pa_failure_risk: stock.pa_failure_risk,
+                pa_volume_confirmed: stock.pa_volume_confirmed, pa_trend_damage: stock.pa_trend_damage,
+                pa_decision_summary: stock.pa_decision_summary, price_action_risks: stock.price_action_risks,
+                signal: stock.signal, tv_match: stock.tv_match, tv_ma_signal: stock.tv_ma_signal,
+                tv_zp_signal: stock.tv_zp_signal, sector_phase: stock.sector_phase,
+                sector_mainline: stock.sector_mainline, sector_role: stock.sector_role,
+                sector_alignment_score: stock.sector_alignment_score, ROE: stock.ROE,
+                净利YOY: stock.净利YOY, mkt_cap_yi: stock.mkt_cap_yi,
+                money_flow: stock.money_flow, money_flow_status: stock.money_flow_status,
+                历史胜率: stock.历史胜率, 信号次数: stock.信号次数, 回测统计: stock.回测统计,
+                sop_risks: stock.sop_risks,
+            }));
+            const response = await api.post('/api/ai/analyze-candidates', { candidates });
+            if (response.data?.status !== 'success') {
+                setAISummary(response.data?.message || 'AI分析暂不可用');
+                showToast(response.data?.message || 'AI分析暂不可用', 'error');
+                return;
+            }
+            const reviews = (response.data.analyses || []) as AIReview[];
+            setAIReviews(Object.fromEntries(reviews.map(item => [item.code, item])));
+            setAISummary(response.data.market_summary || response.data.message || 'AI复核完成');
+            try {
+                const performance = await api.get('/api/ai/performance?days=365');
+                setAIPerformance(performance.data as AIPerformance);
+            } catch {
+                setAIPerformance(null);
+            }
+            showToast(response.data.message || 'AI复核完成');
+        } catch (error: unknown) {
+            const detail = (error as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+            const message = detail || 'AI分析请求失败，原策略结果不受影响';
+            setAISummary(message);
+            showToast(message, 'error');
+        } finally {
+            setAILoading(false);
+        }
     };
 
     const addToWatchlist = async (stock: ScanResult, remark?: string, mode: 'SIMULATED' | 'REAL' = 'SIMULATED') => {
@@ -298,8 +383,8 @@ export default function ResultsTable({
 
     // ── Render a single stock row (shared between flat & grouped modes) ──
     const renderStockRow = (res: ScanResult, index: number) => {
-        const isVetoed = res.sop_grade === 'D';
-        const sopHint = buildSopUpgradeHint(res);
+        const aiReview = aiReviews[res.代码];
+        const isBlocked = res.trade_bucket === 'BLOCK';
         const rowKey = getRowKey(res, index);
         const signalDisplayScore = clampScore(res.display_signal_score ?? res.Score);
         const qualityDisplayScore = clampScore(res.display_quality_score ?? res.sop_quality_score);
@@ -317,8 +402,7 @@ export default function ResultsTable({
                 className={cn(
                     "group transition-all cursor-pointer border-b border-slate-50",
                     expandedRow === rowKey ? "bg-indigo-50/50" : "hover:bg-indigo-50/20",
-                    selectedCode === res.代码 && "bg-indigo-50/50 ring-1 ring-inset ring-indigo-100",
-                    isVetoed && "opacity-40"
+                    selectedCode === res.代码 && "bg-indigo-50/50 ring-1 ring-inset ring-indigo-100"
                 )}
             >
                 <td className="px-4 py-5">
@@ -328,7 +412,7 @@ export default function ResultsTable({
                         </div>
                         <div className="flex flex-col">
                             <div className="flex items-center gap-1.5">
-                                <span className={cn("font-extrabold text-slate-700", isVetoed && "line-through")}>{res.名称}</span>
+                                <span className={cn("font-extrabold text-slate-700", isBlocked && "line-through")}>{res.名称}</span>
                                 {res.warnings && res.warnings.length > 0 && (
                                     <div className="flex gap-1">
                                         {res.warnings.includes("📅 财报") && <Calendar size={10} className="text-amber-500 animate-pulse" />}
@@ -337,7 +421,16 @@ export default function ResultsTable({
                                     </div>
                                 )}
                             </div>
-                            <span className={cn("text-[10px] font-mono font-bold text-slate-400 tracking-tighter", isVetoed && "line-through")}>{res.代码}</span>
+                            <span className={cn("text-[10px] font-mono font-bold text-slate-400 tracking-tighter", isBlocked && "line-through")}>{res.代码}</span>
+                            {(res.matched_strategies || []).length > 0 && (
+                                <div className="mt-1 flex flex-wrap gap-1" aria-label="命中策略">
+                                    {(res.matched_strategies || []).map(strategy => (
+                                        <span key={strategy} className="rounded border border-indigo-100 bg-indigo-50 px-1.5 py-0.5 text-[8px] font-black text-indigo-700">
+                                            命中 {strategy === 'h2' ? 'H2' : strategy}
+                                        </span>
+                                    ))}
+                                </div>
+                            )}
                             {(res.strategy_type === 'tv_dual' || res.strategy_type === 'tv_dual_strict' || res.strategy_type === 'sector_watch' || res.strategy_type === 'bottom_discovery') && (
                                 <div className="mt-1 flex flex-wrap gap-1">
                                     <span className="rounded border border-rose-100 bg-rose-50 px-1.5 py-0.5 text-[8px] font-black text-rose-600">
@@ -387,33 +480,16 @@ export default function ResultsTable({
                     </div>
                 </td>
 
-                {/* SOP 等级列 */}
+                {/* AI 二次复核列 */}
                 <td className="px-3 py-5">
                     <div className="flex flex-col items-center gap-1">
-                        <SopGradeBadge grade={res.sop_grade} detail={buildSopDetail(res)} />
+                        <AIReviewBadge review={aiReview} />
                         {res.sop_quality_score != null && (
                             <span className="text-[8px] font-black text-slate-400">质量分 {qualityDisplayScore.toFixed(0)}/100</span>
                         )}
-                        {isVetoed && res.sop_vetoes && res.sop_vetoes.length > 0 && (
+                        {res.sop_vetoes && res.sop_vetoes.length > 0 && (
                             <span className="text-[8px] text-rose-400 font-bold text-center leading-tight max-w-[60px]">
                                 {res.sop_vetoes[0]}
-                            </span>
-                        )}
-                        {res.sop_grade === 'A' && res.sop_bonuses && res.sop_bonuses.length > 0 && (
-                            <span className="text-[8px] text-amber-500 font-bold">⭐{res.sop_bonuses.length}</span>
-                        )}
-                        {sopHint && (
-                            <span
-                                title={sopHint.detail}
-                                className={cn(
-                                    "max-w-[84px] rounded-md px-1.5 py-0.5 text-center text-[8px] font-black leading-tight cursor-help",
-                                    sopHint.tone === 'rose' ? "bg-rose-50 text-rose-600 border border-rose-100" :
-                                        sopHint.tone === 'amber' ? "bg-amber-50 text-amber-700 border border-amber-100" :
-                                            sopHint.tone === 'emerald' ? "bg-emerald-50 text-emerald-700 border border-emerald-100" :
-                                                "bg-slate-50 text-slate-500 border border-slate-100"
-                                )}
-                            >
-                                {sopHint.label}
                             </span>
                         )}
                     </div>
@@ -474,6 +550,15 @@ export default function ResultsTable({
                         {res.price_action_pattern && (
                             <span className="text-[10px] font-bold text-slate-600 max-w-[130px] truncate">{res.price_action_pattern}</span>
                         )}
+                        {res.pa_monthly_trend && res.pa_monthly_state !== 'UNAVAILABLE' && (
+                            <span className="text-[10px] font-bold text-indigo-600" title={`月线截至 ${res.pa_monthly_as_of || '未知'}；仅作研究标签`}>{res.pa_monthly_trend}</span>
+                        )}
+                        {res.pa_weekly_position && res.pa_weekly_position_state !== 'UNAVAILABLE' && (
+                            <span className="text-[10px] font-bold text-amber-700" title={`周线截至 ${res.pa_weekly_position_as_of || '未知'}；仅作研究标签`}>{res.pa_weekly_position}</span>
+                        )}
+                        {res.pa_weekly_pattern_signals?.map((signal) => (
+                            <span key={signal} className="text-[10px] font-bold text-amber-700" title={`周线截至 ${res.pa_weekly_position_as_of || '未知'}；观察标签，非买入信号`}>{signal}</span>
+                        ))}
                         <div className="flex items-center gap-1">
                             <span className="text-[10px] font-bold text-slate-300">上影比</span>
                             <span className={cn(
@@ -652,7 +737,7 @@ export default function ResultsTable({
                 <tr className="bg-slate-50/30 animate-in fade-in slide-in-from-top-2 duration-300">
                     <td colSpan={10} className="px-8 py-6">
                         <div className="flex flex-col gap-4">
-                            {/* SOP 操作建议卡片 */}
+                            {/* 系统操作建议卡片 */}
                             {res.entry_price && (
                                 <div className="flex flex-wrap gap-3">
                                     <div className="flex-1 min-w-[200px] p-4 bg-gradient-to-br from-indigo-50 to-blue-50 rounded-2xl border border-indigo-100">
@@ -664,20 +749,27 @@ export default function ResultsTable({
                                             <div><span className="text-slate-400 text-xs">流通市值</span><div className="font-bold text-slate-600">{res.mkt_cap_yi ? `${res.mkt_cap_yi}亿` : '---'}</div></div>
                                         </div>
                                     </div>
-                                    {hasSopDetail(res) && (
+                                    {hasQualityDetail(res) && (
                                         <div className="flex-1 min-w-[200px] p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                                            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">SOP 评级原因</div>
-                                            {sopHint && (
-                                                <div className="mb-2 rounded-lg bg-white px-3 py-2 text-xs font-bold text-slate-600 border border-slate-100">
-                                                    {sopHint.detail}
-                                                </div>
-                                            )}
+                                            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">质量与风控依据</div>
                                             <div className="flex flex-wrap gap-1.5">
                                                 {res.sop_checks?.map((c, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-emerald-50 text-emerald-600 rounded-full font-bold border border-emerald-100">✅ {c}</span>)}
                                                 {res.sop_bonuses?.map((b, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-amber-50 text-amber-600 rounded-full font-bold border border-amber-100">⭐ {b}</span>)}
                                                 {res.sop_risks?.map((r, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-orange-50 text-orange-600 rounded-full font-bold border border-orange-100">⚠️ {r}</span>)}
                                                 {res.sop_vetoes?.map((v, i) => <span key={i} className="text-[10px] px-2 py-0.5 bg-rose-50 text-rose-500 rounded-full font-bold border border-rose-100">❌ {v}</span>)}
                                             </div>
+                                        </div>
+                                    )}
+                                    {aiReview && (
+                                        <div className="flex-[2] min-w-[320px] p-4 bg-violet-50 rounded-2xl border border-violet-100">
+                                            <div className="flex items-center justify-between gap-3">
+                                                <div className="text-[10px] font-bold text-violet-500 uppercase tracking-widest">AI 二次复核</div>
+                                                <AIReviewBadge review={aiReview} />
+                                            </div>
+                                            <p className="mt-2 text-sm font-bold text-slate-700 leading-relaxed">{aiReview.summary}</p>
+                                            {!!aiReview.positive_factors?.length && <p className="mt-2 text-[11px] text-emerald-700">支持：{aiReview.positive_factors.join('；')}</p>}
+                                            {!!aiReview.risk_factors?.length && <p className="mt-1 text-[11px] text-rose-600">风险：{aiReview.risk_factors.join('；')}</p>}
+                                            {!!aiReview.data_limitations?.length && <p className="mt-1 text-[10px] text-slate-400">数据限制：{aiReview.data_limitations.join('；')}</p>}
                                         </div>
                                     )}
                                     {res.price_action_summary && (
@@ -746,6 +838,11 @@ export default function ResultsTable({
                                                         <BrooksInfo label="量能行为" value={res.pa_volume_pattern || '--'} note={res.pa_volume_confirmed ? '量能确认' : (res.pa_volume_risk || '等待确认')} tone={res.pa_volume_confirmed ? "emerald" : "slate"} />
                                                         <BrooksInfo label="缺口行为" value={res.pa_gap_type || '--'} note={res.pa_gap_risk != null ? `风险 ${res.pa_gap_risk}%` : '无明显缺口'} tone={(res.pa_gap_risk || 0) >= 70 ? "rose" : "slate"} />
                                                         <BrooksInfo label="趋势阶段" value={res.pa_trend_phase || '--'} note={res.pa_trend_phase_action || '等待结构确认'} />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 lg:grid-cols-3 gap-2 text-xs">
+                                                        <BrooksInfo label="月线方向·研究" value={res.pa_monthly_trend || '--'} note={res.pa_monthly_as_of ? `已完成月线截至 ${res.pa_monthly_as_of}` : '历史数据不足'} tone={res.pa_monthly_state === 'DOWN' ? "rose" : "slate"} />
+                                                        <BrooksInfo label="周线位置·研究" value={res.pa_weekly_position || '--'} note={res.pa_weekly_position_as_of ? `已完成周线截至 ${res.pa_weekly_position_as_of}` : '历史数据不足'} tone={res.pa_weekly_position_state === 'EXTENDED' || res.pa_weekly_position_state === 'WEAK' ? "rose" : "slate"} />
+                                                        <BrooksInfo label="日线买点路径·研究" value={res.pa_swing_entry_route === 'BREAKOUT' ? '放量突破' : res.pa_swing_entry_route === 'PULLBACK' ? '回调转强' : '等待新触发'} note="不改变当前交易分类与退出规则" />
                                                     </div>
                                                     <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
                                                         <BrooksInfo label="失败二次入场" value={res.pa_failed_second_entry || '--'} note={res.pa_second_entry_risk ? `风险 ${res.pa_second_entry_risk}%` : '未触发'} tone={res.pa_failed_second_entry === '失败H2' ? "rose" : "slate"} />
@@ -941,7 +1038,7 @@ export default function ResultsTable({
                             <div className="space-y-3">
                                 {(timeline?.items || []).map((item: any, index: number) => (
                                     <div key={`${item.scanned_at}-${index}`} className="rounded-xl border border-slate-100 bg-slate-50 p-3">
-                                        <div className="flex justify-between text-xs font-black text-slate-700"><span>{item.data_date} · {item.strategy_type}</span><span>{item.grade || '--'} / {item.trade_bucket || '--'}</span></div>
+                                        <div className="flex justify-between text-xs font-black text-slate-700"><span>{item.data_date} · {item.strategy_type}</span><span>{item.trade_bucket || '--'}</span></div>
                                         <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] text-slate-500">
                                             <span>现价 {item.price ?? '--'}</span><span>确认 {item.confirmation_price ?? '--'}</span><span>止损 {item.stop_price ?? '--'}</span><span>目标 {item.target_price ?? '--'}</span>
                                         </div>
@@ -989,18 +1086,13 @@ export default function ResultsTable({
                             {sectorSortKey === 'count' ? '按数量排序' : '按均分排序'}
                         </button>
                     )}
-                    {/* SOP 过滤开关 */}
                     <button
-                        onClick={() => setSopFilterOnly(!sopFilterOnly)}
-                        className={cn(
-                            "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all border-2",
-                            sopFilterOnly
-                                ? "bg-emerald-50 border-emerald-200 text-emerald-600 shadow-sm shadow-emerald-100"
-                                : "bg-slate-50 border-transparent text-slate-500 hover:bg-slate-100"
-                        )}
+                        onClick={runAIReview}
+                        disabled={aiLoading || filteredResults.length === 0}
+                        className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold transition-all border-2 bg-violet-50 border-violet-200 text-violet-700 hover:bg-violet-100 disabled:opacity-50"
                     >
-                        <Shield size={16} />
-                        仅看 A/B 级
+                        {aiLoading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+                        {aiLoading ? 'AI分析中' : 'AI二次分析'}
                     </button>
                     <select
                         value={brooksFilter}
@@ -1027,12 +1119,28 @@ export default function ResultsTable({
                 </div>
             </div>
 
+            {aiSummary && (
+                <div className="mx-8 mt-4 rounded-xl border border-violet-100 bg-violet-50 px-4 py-3 text-xs font-bold text-violet-800">
+                    <span className="mr-2">AI复核摘要：</span>{aiSummary}
+                    {aiPerformance?.status === 'available'
+                        && (aiFiveDayPerformance?.buy?.signals ?? 0) > 0 && (
+                        <div className="mt-2 border-t border-violet-100 pt-2 text-[11px] text-violet-600">
+                            历史5日验证：AI BUY {aiFiveDayPerformance?.buy?.signals} 笔，
+                            胜率 {aiFiveDayPerformance?.buy?.win_rate}% / 原候选池 {aiFiveDayPerformance?.all_reviewed?.win_rate ?? 0}%
+                            {aiFiveDayPerformance?.buy_lift?.win_rate_pct_points != null
+                                ? `，提升 ${aiFiveDayPerformance.buy_lift.win_rate_pct_points} 个百分点`
+                                : ''}
+                            {aiPerformance.sample_warning ? `。${aiPerformance.sample_warning}` : ''}
+                        </div>
+                    )}
+                </div>
+            )}
             <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                     <thead>
                         <tr className="bg-slate-50/50">
                             <th className="px-4 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest">股票信息</th>
-                            <th className="px-3 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">SOP</th>
+                            <th className="px-3 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">AI复核</th>
                             <th className="px-4 py-4 text-[10px] font-extrabold text-slate-400 uppercase tracking-widest text-center">
                                 <div className="flex items-center justify-center gap-1 group/tooltip cursor-help relative">
                                     综合强度
@@ -1069,7 +1177,7 @@ export default function ResultsTable({
                         {sectorGroups ? (
                             /* ── Grouped mode ── */
                             sectorGroups.map(([sector, stocks]) => {
-                                const displayStocks = sopFilterOnly ? stocks.filter(r => r.sop_grade === 'A' || r.sop_grade === 'B') : stocks;
+                                const displayStocks = stocks;
                                 return (
                                 <React.Fragment key={`group-${sector}`}>
                                     {renderSectorHeader(sector, displayStocks)}
@@ -1194,103 +1302,23 @@ function ConfidenceBadge({ score }: { score: number }) {
     return <span className="text-[9px] font-bold text-slate-400 bg-slate-100 px-2 rounded-md mt-1">🔍 持续观察</span>;
 }
 
-// 汇总 SOP 判定明细（veto/risk/check/bonus）为 tooltip 文本，让用户 hover 评级徽章即可看"为什么是这个评级"
-function buildSopDetail(res: ScanResult): string | undefined {
-    const parts: string[] = [];
-    if (res.sop_vetoes?.length) parts.push(`❌ 否决: ${res.sop_vetoes.join('、')}`);
-    if (res.sop_risks?.length) parts.push(`⚠️ 风险: ${res.sop_risks.join('、')}`);
-    if (res.sop_checks?.length) parts.push(`🔍 待确认: ${res.sop_checks.join('、')}`);
-    if (res.sop_bonuses?.length) parts.push(`⭐ 加分: ${res.sop_bonuses.join('、')}`);
-    if (res.sop_quality_score != null) parts.push(`质量分: ${res.sop_quality_score}`);
-    return parts.length ? parts.join('\n') : undefined;
-}
-
-function hasSopDetail(res: ScanResult): boolean {
+function hasQualityDetail(res: ScanResult): boolean {
     return Boolean(res.sop_vetoes?.length || res.sop_risks?.length || res.sop_checks?.length || res.sop_bonuses?.length);
 }
 
-function buildSopUpgradeHint(res: ScanResult): { label: string; detail: string; tone: 'rose' | 'amber' | 'emerald' | 'slate' } | null {
-    if (res.sop_grade === 'A') {
-        if (!res.sop_bonuses?.length) return null;
-        return {
-            label: 'A级确认',
-            detail: `A级条件已满足；加分项：${res.sop_bonuses.join('、')}`,
-            tone: 'emerald',
-        };
-    }
-
-    if (res.sop_vetoes?.length) {
-        return {
-            label: `未达A：${res.sop_vetoes[0]}`,
-            detail: `当前首要阻碍是“${res.sop_vetoes[0]}”。升级到 A 级需要先消除否决项，再重新确认风险和买点。`,
-            tone: 'rose',
-        };
-    }
-
-    if (res.sop_risks?.length) {
-        return {
-            label: `控风险：${res.sop_risks[0]}`,
-            detail: `当前主要风险是“${res.sop_risks[0]}”。升级到 A 级需要风险收敛，且失效价/仓位计划可执行。`,
-            tone: 'amber',
-        };
-    }
-
-    if (res.sop_checks?.length) {
-        return {
-            label: `等确认：${res.sop_checks[0]}`,
-            detail: `当前不是否决，而是等待确认：“${res.sop_checks[0]}”。完成待确认项后，可重新评估是否升到 A/B 级。`,
-            tone: 'slate',
-        };
-    }
-
-    if (res.sop_grade) {
-        return {
-            label: '未达A：强度不足',
-            detail: '当前没有明确否决项，但综合质量分、板块联动、买点成熟度或风险收益比尚未达到 A 级。',
-            tone: 'slate',
-        };
-    }
-
-    return null;
-}
-
-function SopGradeBadge({ grade, detail }: { grade?: string; detail?: string }) {
-    // detail: 汇总的 SOP 判定明细（veto/risk/check/bonus），hover 时展示"为什么是这个评级"
-    const tooltipProps = detail ? { title: detail } : {};
-    switch (grade) {
-        case 'A':
-            return (
-                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-lg shadow-sm shadow-emerald-200 font-black text-xs cursor-help">
-                    🟢 A
-                </div>
-            );
-        case 'B':
-            return (
-                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-gradient-to-r from-blue-500 to-indigo-500 text-white rounded-lg shadow-sm shadow-blue-200 font-black text-xs cursor-help">
-                    🔵 B
-                </div>
-            );
-        case 'M':
-            return (
-                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-orange-100 text-orange-600 rounded-lg font-black text-xs border border-orange-200 cursor-help">
-                    🟠 M
-                </div>
-            );
-        case 'C':
-            return (
-                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-slate-200 text-slate-500 rounded-lg font-black text-xs cursor-help">
-                    ⚪ C
-                </div>
-            );
-        case 'D':
-            return (
-                <div {...tooltipProps} className="flex items-center gap-1 px-2.5 py-1 bg-rose-100 text-rose-500 rounded-lg font-black text-xs border border-rose-200 cursor-help">
-                    🔴 D
-                </div>
-            );
-        default:
-            return <span className="text-[10px] text-slate-300">—</span>;
-    }
+function AIReviewBadge({ review }: { review?: AIReview }) {
+    if (!review) return <span className="text-[9px] font-bold text-slate-400">待分析</span>;
+    const style = review.action === 'BUY'
+        ? 'bg-emerald-100 text-emerald-700 border-emerald-200'
+        : review.action === 'AVOID'
+            ? 'bg-rose-100 text-rose-700 border-rose-200'
+            : 'bg-amber-100 text-amber-700 border-amber-200';
+    const label = review.action === 'BUY' ? '复核买入' : review.action === 'AVOID' ? '回避' : '等待';
+    return (
+        <span title={review.summary} className={cn('rounded-lg border px-2 py-1 text-[10px] font-black', style)}>
+            {label} {review.confidence}%
+        </span>
+    );
 }
 
 function BrooksInfo({

@@ -7,9 +7,75 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.strategy_portfolio_replay import (
     PORTFOLIO_CONFIGS,
+    PortfolioConfig,
     compare_portfolio_configs,
     simulate_portfolio,
 )
+
+
+def test_entry_size_does_not_use_entry_day_close_or_volume():
+    events = pd.DataFrame([
+        {"code": "A", "entry_date": "2026-01-02", "entry_price": 10,
+         "exit_date": None, "exit_price": None, "stop_price": 9, "score": 100},
+        {"code": "B", "entry_date": "2026-01-05", "entry_price": 10,
+         "exit_date": None, "exit_price": None, "stop_price": 9, "score": 90},
+    ])
+    config = PortfolioConfig("test", 1, 20, 20, 80, 100)
+    shares = []
+    final_equities = []
+    for close, volume in [(9, 1000), (11, 1000000)]:
+        prices = pd.DataFrame([
+            {"date": "2026-01-02", "code": "A", "close": 10, "volume": 1000000},
+            {"date": "2026-01-02", "code": "B", "close": 10, "volume": 1000000},
+            {"date": "2026-01-05", "code": "A", "close": close, "volume": volume},
+            {"date": "2026-01-05", "code": "B", "close": 10, "volume": volume},
+        ])
+        result = simulate_portfolio(events, prices, config)
+        shares.append(result["trades"][1]["shares"])
+        final_equities.append(result["final_equity"])
+    assert shares[0] == shares[1]
+    assert final_equities[0] != final_equities[1]
+
+
+def test_entry_cannot_spend_proceeds_from_an_unknown_time_exit_that_day():
+    events = pd.DataFrame([
+        {"code": "A", "entry_date": "2026-01-02", "entry_price": 10,
+         "exit_date": "2026-01-05", "exit_price": 11, "stop_price": 9},
+        {"code": "B", "entry_date": "2026-01-05", "entry_price": 10,
+         "exit_date": None, "exit_price": None, "stop_price": 9},
+    ])
+    prices = pd.DataFrame([
+        {"date": day, "code": code, "close": 10}
+        for day in ["2026-01-02", "2026-01-05"] for code in ["A", "B"]
+    ])
+    result = simulate_portfolio(
+        events, prices, PortfolioConfig("test", 10, 100, 100, 90, 100),
+        initial_capital=100000,
+    )
+    assert result["trades"][0]["status"] == "CLOSED"
+    assert result["trades"][1]["entry_value"] < 10000
+
+
+def test_known_same_day_loss_halts_new_entries_before_exit_settlement():
+    events = pd.DataFrame([
+        {"code": "A", "entry_date": "2026-01-02", "entry_price": 10,
+         "exit_date": "2026-01-05", "exit_price": 1, "stop_price": 9},
+        {"code": "B", "entry_date": "2026-01-05", "entry_price": 10,
+         "exit_date": None, "exit_price": None, "stop_price": 9},
+    ])
+    prices = pd.DataFrame([
+        {"date": day, "code": code, "close": 10, "volume": 1000000}
+        for day in ["2026-01-02", "2026-01-05"] for code in ["A", "B"]
+    ])
+    config = PortfolioConfig("test", 100, 100, 100, 100, 100)
+
+    result = simulate_portfolio(events, prices, config, initial_capital=100000)
+
+    assert result["daily_loss_halt_days"] == 1
+    assert result["trades"][0]["status"] == "CLOSED"
+    assert result["unfilled"] == [{
+        "code": "B", "entry_date": "2026-01-05", "reason": "组合熔断暂停新增",
+    }]
 
 
 def _prices() -> pd.DataFrame:

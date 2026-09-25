@@ -2,7 +2,6 @@ import os
 import sys
 
 import pandas as pd
-import pytest
 from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -14,12 +13,6 @@ from core.execution_replay import (
     build_operation_advice_validation,
     run_historical_execution_replay,
 )
-
-
-@pytest.fixture(autouse=True)
-def _validated_grade_mode_for_replay_unit_tests(monkeypatch):
-    from core import scanner
-    monkeypatch.setattr(scanner, "SOP_GRADE_EXECUTION_MODE", "ACTIVE")
 
 
 def _candidate(code: str, blockers_ready: bool = True):
@@ -78,7 +71,7 @@ def test_replay_selects_only_current_double_gate_and_keeps_future_outcome_separa
     assert report["verdict"] == "NOT_VALIDATED"
 
 
-def test_replay_reports_negative_hard_only_shadow_without_changing_current_policy():
+def test_replay_v2_keeps_missing_volume_as_cautious_current_candidate():
     candidate = _candidate("000002", blockers_ready=False)
     candidates = pd.DataFrame([candidate])
     outcomes = pd.DataFrame([{
@@ -87,7 +80,8 @@ def test_replay_reports_negative_hard_only_shadow_without_changing_current_polic
     }])
     report = build_execution_replay_report(candidates, outcomes)
     current = next(item for item in report["policies"] if item["policy"] == "current_policy")
-    assert current["selected"] == 0
+    assert current["selected"] == 1
+    assert current["metrics_5d"]["avg_return"] == -8.0
     assert report["summary"]["point_in_time_candidates"] == 1
 
 

@@ -700,7 +700,7 @@ def build_route_a_protocol_report(
 
 
 def prepare_route_a_portfolio_events(selected_events: pd.DataFrame) -> pd.DataFrame:
-    """Map scalable A-EOD executions into the shared portfolio replay contract."""
+    """Map scalable EOD controlled executions into the shared portfolio replay contract."""
     if selected_events is None or selected_events.empty:
         return pd.DataFrame()
     required = {

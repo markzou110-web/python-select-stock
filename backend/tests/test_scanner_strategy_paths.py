@@ -162,6 +162,63 @@ def test_strategy_registry_includes_early_value():
     assert item["name"] == "早期性价比追踪"
 
 
+def test_h2_strategy_returns_existing_price_action_signal(monkeypatch):
+    frame = _make_early_value_df()
+    monkeypatch.setattr(scanner, "analyze_price_action", lambda _df: {
+        "price_action_pattern": "H2二次入场",
+        "price_action_score": 68,
+        "pa_tags": ["H2"],
+        "pa_h2_quality": "中",
+        "pa_entry_price": 11.6,
+        "pa_stop_price": 10.9,
+        "pa_trade_plan": {"action": "WATCH"},
+        "price_action_summary": "多头趋势双腿回调后向上突破",
+    })
+
+    result = scanner.single_stock_task(
+        "000001", "H2样本", price=11.5, vol=125000, open_price=11.4,
+        threshold=0.12, vol_multiplier=1.5, rsi_min=55,
+        use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10,
+        use_weekly=False, preloaded_df=frame, strategy_type="h2",
+        min_data_days=20,
+    )
+
+    assert result["strategy_type"] == "h2"
+    assert result["signal"] == "H2二次入场"
+    assert result["h2_watch_only"] is True
+    assert result["pa_h2_quality"] == "中"
+    assert result["Score"] == 68
+
+
+def test_h2_strategy_rejects_non_h2_price_action(monkeypatch):
+    frame = _make_early_value_df()
+    monkeypatch.setattr(scanner, "analyze_price_action", lambda _df: {
+        "price_action_pattern": "H1首次入场",
+        "price_action_score": 65,
+        "pa_tags": ["H1"],
+    })
+
+    result = scanner.single_stock_task(
+        "000001", "非H2样本", price=11.5, vol=125000, open_price=11.4,
+        threshold=0.12, vol_multiplier=1.5, rsi_min=55,
+        use_macd_filter=True, use_bb_sqz=False, sqz_lookback=10,
+        use_weekly=False, preloaded_df=frame, strategy_type="h2",
+        min_data_days=20,
+    )
+
+    assert result == {"reason": "未形成H2二次入场"}
+
+
+def test_strategy_registry_includes_h2():
+    from core.strategy_registry import get_strategy
+
+    item = get_strategy("h2")
+
+    assert item["supports_scan"] is True
+    assert item["supports_backtest"] is False
+    assert item["name"] == "H2二次入场"
+
+
 def _make_bottom_discovery_df(*, reversing: bool = True, new_low: bool = False) -> pd.DataFrame:
     n = 100
     close = np.full(n, 10.4)
@@ -237,7 +294,7 @@ def test_bottom_discovery_sop_remains_observation_only_even_with_high_score():
 
     scanner._apply_sop_filter(rows, {"status": "OFFENSIVE"}, {})
 
-    assert rows[0]["sop_grade"] == "C"
+    assert "sop_grade" not in rows[0]
     assert rows[0]["trade_eligible"] is False
     assert rows[0]["trade_bucket"] == "OBSERVE"
     assert any("底部起涨发现仅供观察" in item for item in rows[0]["trade_blockers"])
@@ -287,6 +344,55 @@ def test_strong_sector_watch_prefers_not_extended_leader(monkeypatch):
     assert [row["代码"] for row in rows] == ["000002"]
     assert rows[0]["sector_watch_only"] is True
     assert rows[0]["strategy_type"] == "sector_watch"
+
+
+def test_strong_sector_watch_keeps_candidates_outside_prev_month_top5(monkeypatch):
+    """月度板块强弱只做标注：非上月前5板块的当日强势板块仍可产出观察候选。"""
+    monkeypatch.setattr(scanner, "classify_sector_role", lambda *args, **kwargs: "LEADER")
+    monkeypatch.setattr(
+        scanner,
+        "analyze_price_action",
+        lambda df: {"pa_trade_plan": {"action": "WATCH"}, "pa_entry_price": 11.0},
+    )
+    monkeypatch.setattr(
+        scanner,
+        "compute_paper_risk_levels",
+        lambda *args, **kwargs: {
+            "active_stop_price": 9.5,
+            "initial_stop_price": 9.5,
+            "structure_stop_price": 9.4,
+            "take_profit_price": 13.0,
+            "risk_reward": 2.0,
+            "risk_notes": [],
+        },
+    )
+    hist = pd.DataFrame({
+        "收盘": [10.0, 10.1, 10.2, 10.3, 10.5, 10.8],
+        "最高": [10.2, 10.3, 10.4, 10.5, 10.7, 11.0],
+        "RSI": [55] * 6,
+        "DIF": [0.1] * 6,
+        "BB": [0.05] * 6,
+        "粘合度": [0.08] * 6,
+    })
+    candidates = pd.DataFrame([
+        {"code": "000002", "name": "早期核心", "pct_chg": 4.5, "price": 10.8},
+    ])
+
+    rows = scanner._build_sector_watch_candidates(
+        candidates,
+        set(),
+        {"000002": hist},
+        {"000002": "冷门月板块"},
+        {"冷门月板块": {
+            "sector_phase": "SECTOR_CONFIRM",
+            "sector_avg_pct": 3.0,
+            "sector_prev_month_top5": False,
+        }},
+        max_per_sector=2,
+    )
+
+    assert [row["代码"] for row in rows] == ["000002"]
+    assert rows[0]["sector_watch_only"] is True
 
 
 def test_early_value_keeps_pending_candidates_when_sector_not_started():
@@ -682,8 +788,8 @@ def test_failure_pattern_strategy_dimension_no_cross_strategy_veto():
     assert results_same[0]["recent_failure_count"] == 3, "同策略应命中"
 
 
-def test_failure_pattern_vetoes_recurring_loss_stock():
-    """_apply_sop_filter 中 recent_failure_count >= 阈值 → veto，sop_grade 降为 D。
+def test_failure_pattern_becomes_visible_soft_caution_in_v2():
+    """v2 中 recent_failure_count >= 阈值 → 软提醒并缩仓，不覆盖当前结构。
 
     改动 A4：阈值从 2 提到 3。
     """
@@ -695,9 +801,11 @@ def test_failure_pattern_vetoes_recurring_loss_stock():
         "recent_failure_count": scanner.FAILURE_VETO_MIN_COUNT,  # = 阈值（3）
     }]
     scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
-    # recent_failure_count 达阈值 → 一票否决 → D 级
-    assert results[0].get("sop_grade") == "D"
-    assert any("失败模式" in v for v in results[0].get("sop_vetoes", []))
+    # 输入缺少交易计划所以仍为 BLOCK；历史失败本身只作为软提醒。
+    assert results[0].get("trade_bucket") == "BLOCK"
+    assert not any("失败模式" in v for v in results[0].get("sop_vetoes", []))
+    assert any("失败模式" in v for v in results[0].get("sop_soft_vetoes", []))
+    assert any("失败模式" in v for v in results[0].get("trade_cautions", []))
 
 
 def test_failure_pattern_below_threshold_not_vetoed():
@@ -715,8 +823,8 @@ def test_failure_pattern_below_threshold_not_vetoed():
     assert results[0].get("sop_grade") != "D"
 
 
-def test_sop_explains_base_grade_to_revival_final_grade():
-    """质量评分与执行语义分开：A级结构因次日确认要求降为B时必须说明原因。"""
+def test_revival_does_not_emit_letter_grade_fields():
+    """历史复活只保留执行状态，不再生成字母评级。"""
     from core import scanner
 
     results = [{
@@ -731,15 +839,13 @@ def test_sop_explains_base_grade_to_revival_final_grade():
 
     scanner._apply_sop_filter(results, {"status": "OFFENSIVE"}, {})
 
-    assert results[0]["sop_base_grade"] == "A"
-    assert results[0]["sop_grade"] == "B"
-    assert results[0]["sop_quality_gap_to_a"] == 0
-    assert "基础A→最终B" in results[0]["sop_grade_reason"]
-    assert "历史信号复活" in results[0]["sop_grade_transition_reasons"][0]
+    assert "sop_base_grade" not in results[0]
+    assert "sop_grade" not in results[0]
+    assert results[0]["trade_bucket"] in {"OBSERVE", "EARLY", "BLOCK"}
 
 
-def test_sop_explains_momentum_watch_grade_without_making_it_tradable():
-    """强势异动可以进入M观察，但解释字段不能把观察态误写成可交易。"""
+def test_momentum_watch_does_not_emit_letter_grade_fields():
+    """强势异动只进入观察态，不再生成字母评级。"""
     from core import scanner
 
     results = [{
@@ -752,11 +858,10 @@ def test_sop_explains_momentum_watch_grade_without_making_it_tradable():
 
     scanner._apply_sop_filter(results, {"status": "DEFENSIVE"}, {})
 
-    assert results[0]["sop_base_grade"] == "C"
-    assert results[0]["sop_grade"] == "M"
+    assert "sop_base_grade" not in results[0]
+    assert "sop_grade" not in results[0]
     assert results[0]["trade_eligible"] is False
-    assert "基础C→最终M" in results[0]["sop_grade_reason"]
-    assert "禁止追高" in results[0]["sop_grade_transition_reasons"][0]
+    assert results[0]["trade_bucket"] in {"OBSERVE", "BLOCK"}
 
 
 # ── 破位反抽陷阱多维评分（调整2 v2，上班族 Bark 场景）──

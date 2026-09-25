@@ -63,6 +63,7 @@ def _parse_rate(rate_str: str) -> Tuple[int, float]:
         "second": 1,
         "minute": 60,
         "hour": 3600,
+        "day": 86400,
     }.get(period.strip().lower(), 60)
 
     refill_rate = count / period_seconds

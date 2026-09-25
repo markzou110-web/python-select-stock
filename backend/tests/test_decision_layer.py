@@ -100,6 +100,20 @@ def test_decision_layer_creates_opportunity_position_and_state():
     assert "9.80" in result["execution_instruction"]
 
 
+def test_tv_zp_candidate_uses_same_risk_gate_as_other_executable_tv_strategies():
+    stocks = [_stock(strategy_type="tv_zp")]
+
+    apply_decision_layer(
+        stocks,
+        _snapshot([6, 5, 4, 3, 2, 1, -1]),
+        {"status": "OFFENSIVE"},
+    )
+
+    result = stocks[0]
+    assert result["opportunity_gate_applicable"] is True
+    assert result["position_plan"]["initial_position_pct"] > 0
+
+
 def test_tv_execution_risk_unit_scales_position_plan():
     a_tier = _stock(tv_execution_tier="A", tv_execution_risk_unit=1.0)
     b_tier = _stock(code="000002", tv_execution_tier="B", tv_execution_risk_unit=0.6)
@@ -119,6 +133,22 @@ def test_tv_execution_risk_unit_scales_position_plan():
     assert b_tier["position_plan"]["tv_execution_risk_unit"] == 0.6
 
 
+def test_trade_cautions_reduce_position_without_revoking_trade_permission():
+    clean = _stock()
+    cautious = _stock(代码="000002", trade_cautions=["板块联动<70，降级观察"])
+
+    apply_decision_layer(
+        [clean, cautious],
+        _snapshot([6, 5, 4, 3, 2, 1, -1]),
+        {"status": "OFFENSIVE"},
+    )
+
+    assert cautious["trade_bucket"] == "TRADE"
+    assert cautious["trade_eligible"] is True
+    assert cautious["position_plan"]["initial_position_pct"] < clean["position_plan"]["initial_position_pct"]
+    assert cautious["position_plan"]["trade_caution_position_multiplier"] == 0.5
+
+
 def test_a_minus_trial_position_is_capped_at_five_percent():
     stocks = [_stock(a_minus_trial=True, a_minus_trial_grade="A-")]
 
@@ -130,7 +160,7 @@ def test_a_minus_trial_position_is_capped_at_five_percent():
     assert result["position_plan"]["max_position_pct"] <= 5
     assert result["position_plan"]["a_minus_portfolio_cap_pct"] == 10
     assert result["a_minus_portfolio_cap_pct"] == 10
-    assert "A-受控试仓" in result["execution_instruction"]
+    assert "受控试仓" in result["execution_instruction"]
 
 
 def test_a_eod_trial_position_is_capped_at_five_and_portfolio_fifteen_percent():
@@ -149,7 +179,7 @@ def test_a_eod_trial_position_is_capped_at_five_and_portfolio_fifteen_percent():
     assert result["position_plan"]["portfolio_position_cap_pct"] <= 15
     assert result["position_plan"]["a_eod_max_positions"] == 3
     assert result["a_eod_portfolio_cap_pct"] == 15
-    assert "A-EOD受控小仓" in result["execution_instruction"]
+    assert "尾盘受控小仓" in result["execution_instruction"]
 
 
 def test_bottom_discovery_is_not_judged_by_strict_strategy_opportunity_gate():
@@ -334,6 +364,52 @@ def test_retreat_overrides_trade_permission():
     assert result["trade_bucket"] == "OBSERVE"
     assert result["trade_state"] == "BLOCKED"
     assert result["position_plan"]["initial_position_pct"] == 0
+    # v2：市场否决按 regime（CRITICAL）判定，不再按 RETREAT/ICE 情绪阶段
+    assert "CRITICAL市场默认禁止新仓，等待环境修复" in result["trade_blockers"]
+
+
+def test_v2_defensive_regime_halves_position_without_veto():
+    """v2：DEFENSIVE 市场不再一票否决，改为仓位×0.5。"""
+    stocks = [_stock()]
+
+    apply_decision_layer(stocks, _snapshot([-9, -7, -6, -5, -3, 1]), {"status": "DEFENSIVE"})
+    result = stocks[0]
+
+    assert result["trade_bucket"] == "TRADE"
+    assert result["trade_state"] != "BLOCKED"
+    plan = result["position_plan"]
+    assert 0 < plan["initial_position_pct"]
+    assert plan.get("regime_position_multiplier") == 0.5
+    assert "市场退潮" not in " ".join(result.get("trade_blockers") or [])
+    assert "CRITICAL市场默认禁止新仓" not in " ".join(result.get("trade_blockers") or [])
+
+
+def test_v2_critical_defensive_sector_degrades_to_defensive_sizing():
+    """v2：CRITICAL 下防御性板块降格为 DEFENSIVE 处理（×0.5），不再一刀切。"""
+    stocks = [_stock(行业="银行")]
+
+    apply_decision_layer(stocks, _snapshot([-9, -7, -6, -5, -3, 1]), {"status": "CRITICAL"})
+    result = stocks[0]
+
+    assert result.get("defensive_rotation") is True
+    assert result["trade_state"] != "BLOCKED"
+    assert result["position_plan"].get("regime_position_multiplier") == 0.5
+
+
+def test_v1_flag_restores_retreat_stage_veto(monkeypatch):
+    """回滚开关：TRADE_GATE_V2_ENABLED=False 恢复 v1 的 RETREAT/ICE 阶段否决。"""
+    import core.decision_layer as decision_layer
+
+    monkeypatch.setattr(decision_layer, "TRADE_GATE_V2_ENABLED", False)
+    stocks = [_stock()]
+
+    decision_layer.apply_decision_layer(
+        stocks, _snapshot([-9, -7, -6, -5, -3, 1]), {"status": "DEFENSIVE"},
+    )
+    result = stocks[0]
+
+    assert result["trade_eligible"] is False
+    assert result["trade_bucket"] == "OBSERVE"
     assert "市场退潮，暂停新增仓位" in result["trade_blockers"]
 
 
@@ -532,3 +608,44 @@ def test_apply_decision_layer_accepts_data_date():
     sig = inspect.signature(apply_decision_layer)
     assert "data_date" in sig.parameters, "apply_decision_layer 应有 data_date 参数"
     assert sig.parameters["data_date"].default is None
+
+
+def test_sector_fund_outflow_demotes_trade_to_observe():
+    """板块主力5日净流出超阈值：本可通过闸门的候选降级观察（势不对时形态失效）。"""
+    stock = _stock(sector_main_net_inflow_5d_yi=-15.2)
+
+    apply_decision_layer([stock], _snapshot([1, 2, 3, 1, 2, 1]), {"status": "OFFENSIVE"})
+
+    assert stock["trade_bucket"] == "OBSERVE"
+    assert stock["trade_eligible"] is False
+    assert "板块主力5日净流出，技术信号降级观察" in stock["trade_blockers"]
+
+
+def test_sector_fund_inflow_keeps_trade_eligible():
+    stock = _stock(sector_main_net_inflow_5d_yi=8.0)
+
+    apply_decision_layer([stock], _snapshot([1, 2, 3, 1, 2, 1]), {"status": "OFFENSIVE"})
+
+    assert stock["trade_bucket"] == "TRADE"
+    assert stock["trade_eligible"] is True
+
+
+def test_sector_fund_missing_data_does_not_demote():
+    """资金流接口降级（字段缺失）时 fail-open，不降权。"""
+    stock = _stock()
+
+    apply_decision_layer([stock], _snapshot([1, 2, 3, 1, 2, 1]), {"status": "OFFENSIVE"})
+
+    assert stock["trade_bucket"] == "TRADE"
+    assert stock["trade_eligible"] is True
+
+
+def test_sector_fund_demote_disabled_rolls_back(monkeypatch):
+    from core import decision_layer
+
+    monkeypatch.setattr(decision_layer, "SECTOR_FUND_OUTFLOW_DEMOTE_ENABLED", False)
+    stock = _stock(sector_main_net_inflow_5d_yi=-15.2)
+
+    apply_decision_layer([stock], _snapshot([1, 2, 3, 1, 2, 1]), {"status": "OFFENSIVE"})
+
+    assert stock["trade_bucket"] == "TRADE"

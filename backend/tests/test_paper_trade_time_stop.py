@@ -604,21 +604,36 @@ def test_real_stop_alert_confirms_once_near_close_and_resets_next_day():
     assert next_day["count"] == 1
 
 
-def test_operation_trigger_only_notifies_on_state_change():
+def test_operation_trigger_only_notifies_on_state_change(monkeypatch):
     """同一操作区间保持命中时静默，回到 HOLD 后再次跌破才重发。"""
+    from routers import paper_trade
     from routers.paper_trade import _operation_trigger_state
 
+    settings = {}
+    monkeypatch.setattr(paper_trade, "get_setting", lambda key, default=None: settings.get(key, default))
+    monkeypatch.setattr(
+        paper_trade,
+        "save_setting",
+        lambda key, value: settings.update({key: value}) or True,
+    )
     _operation_trigger_state.clear()
     identity = "1:600075"
     day = "2026-09-04"
+    first = datetime(2026, 9, 4, 9, 35)
 
-    assert _operation_trigger_transition(identity, day, "CANCEL_ADD") is True
-    assert _operation_trigger_transition(identity, day, "CANCEL_ADD") is False
-    assert _operation_trigger_transition(identity, day, "HOLD") is False
-    assert _operation_trigger_transition(identity, day, "CANCEL_ADD") is True
-    assert _operation_trigger_transition(identity, day, "REDUCE") is True
-    assert _operation_trigger_transition(identity, day, "REDUCE") is False
-    assert _operation_trigger_transition(identity, "2026-09-07", "REDUCE") is True
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD", first) is True
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD", first + timedelta(minutes=1)) is False
+    assert _operation_trigger_transition(identity, day, "HOLD", first + timedelta(minutes=2)) is False
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD", first + timedelta(minutes=3)) is False
+    assert _operation_trigger_transition(identity, day, "HOLD", first + timedelta(minutes=31)) is False
+    assert _operation_trigger_transition(identity, day, "CANCEL_ADD", first + timedelta(minutes=32)) is True
+    assert _operation_trigger_transition(identity, day, "REDUCE", first + timedelta(minutes=33)) is True
+    assert _operation_trigger_transition(identity, day, "REDUCE", first + timedelta(minutes=34)) is False
+    assert _operation_trigger_transition(identity, "2026-09-07", "REDUCE", datetime(2026, 9, 7, 9, 35)) is True
+
+    # 模拟另一个 Celery 进程：内存为空时仍能从数据库状态去重。
+    _operation_trigger_state.clear()
+    assert _operation_trigger_transition(identity, "2026-09-07", "REDUCE", datetime(2026, 9, 7, 9, 36)) is False
 
 
 # ── 保本移动止损决策（改动 #14）：operation_plan 对"保本移动"档返回 REDUCE ──

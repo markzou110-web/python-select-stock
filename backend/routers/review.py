@@ -8,11 +8,13 @@ import pandas as pd
 
 from core.db import get_db_engine, validate_stock_code
 from core.db import get_scan_dates, get_scan_history_by_date
+from core.db import get_latest_ai_candidate_reviews
 from core.daily_strategy_report import build_daily_strategy_report, build_daily_strategy_report_body
 from core.logging_config import logger
 from core.outcome_calibration import (
     build_blocker_report, build_calibration_report, build_execution_cohort_report,
-    build_feature_ablation_report, build_opportunity_threshold_report, load_scan_outcomes,
+    build_feature_ablation_report, build_opportunity_threshold_report,
+    build_trade_gate_readiness_report, load_scan_outcomes,
 )
 from core.execution_labels import build_executable_labels
 from core.execution_replay import run_historical_execution_replay
@@ -22,6 +24,7 @@ from core.pro_workflow import classify_strategy_health
 from core.research_context import build_ai_research_context, get_global_market_context
 from core.research_radar import build_candidate_research_radar
 from core.strategy_health import build_strategy_health
+from core.timeframe_context import build_timeframe_shadow_report
 from core.data import get_index_data
 
 router = APIRouter(prefix="/api/review", tags=["review"])
@@ -83,6 +86,7 @@ def _empty_response() -> Dict[str, Any]:
         "by_pa_volume_pattern": [],
         "by_pa_trend_phase": [],
         "by_pa_weekly_context": [],
+        "timeframe_shadow": build_timeframe_shadow_report(pd.DataFrame()),
         "by_pa_trap_risk": [],
         "by_trade_bucket": [],
         "execution_summary": {},
@@ -141,6 +145,9 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 COALESCE(price_action_detail->>'pa_volume_pattern', '未知') AS pa_volume_pattern,
                 COALESCE(price_action_detail->>'pa_trend_phase', '未知') AS pa_trend_phase,
                 COALESCE(price_action_detail->>'pa_weekly_context', '未知') AS pa_weekly_context,
+                price_action_detail->>'pa_monthly_state' AS pa_monthly_state,
+                price_action_detail->>'pa_weekly_position_state' AS pa_weekly_position_state,
+                price_action_detail->>'pa_swing_entry_route' AS pa_swing_entry_route,
                 COALESCE(price_action_detail->>'trade_bucket', 'UNKNOWN') AS trade_bucket,
                 COALESCE(price_action_detail->>'trade_eligible', 'false') AS trade_eligible,
                 COALESCE((price_action_detail->>'early_trade_candidate')::boolean, false) AS early_trade_candidate,
@@ -196,6 +203,9 @@ def _load_scan_performance_df(days: int) -> pd.DataFrame:
                 s.pa_volume_pattern,
                 s.pa_trend_phase,
                 s.pa_weekly_context,
+                s.pa_monthly_state,
+                s.pa_weekly_position_state,
+                s.pa_swing_entry_route,
                 s.trade_bucket,
                 s.trade_eligible,
                 s.early_trade_candidate,
@@ -403,7 +413,7 @@ def _build_profitability_layers(scan_df: pd.DataFrame, event_df: pd.DataFrame | 
     layers = [
         _profitability_layer_row("scan_all", "全量有效扫描", df),
         _profitability_layer_row("trade_a", "A/正式买点", df[df["trade_bucket"].eq("TRADE") | trade_eligible]),
-        _profitability_layer_row("early_a_minus", "A-提前复核", df[early_candidate]),
+        _profitability_layer_row("early_a_minus", "提前复核", df[early_candidate]),
         _profitability_layer_row("observe", "观察池", df[df["trade_bucket"].eq("OBSERVE")]),
         _profitability_layer_row("block", "禁止/过滤", df[df["trade_bucket"].eq("BLOCK")]),
         _profitability_layer_row("tv_dual_strict", "严格双策略", df[df["strategy_type"].eq("tv_dual_strict")]),
@@ -1232,6 +1242,7 @@ def get_daily_strategy_report(date: str = "", limit: int = 8) -> Dict[str, Any]:
             scan_date=scan_date,
             sector_gap_analysis=sector_gaps,
             bark_push_count=_count_recommendation_events_for_date(scan_date),
+            ai_review=get_latest_ai_candidate_reviews(scan_date),
         )
         return {
             **report,
@@ -1281,7 +1292,7 @@ def get_profitability_dashboard(days: int = 120) -> Dict[str, Any]:
         }
         notes = [
             "5日收益是主要判断口径；1/3日用于看买点效率，10日用于看持有延展。",
-            "A-提前复核为新规则，历史样本可能不足；下一个交易日开始重点观察。",
+            "提前复核为新规则，历史样本可能不足；下一个交易日开始重点观察。",
             "回测统计不等于未来收益，仍需结合仓位、滑点和实际执行纪律。",
         ]
         return {
@@ -1422,6 +1433,25 @@ def get_execution_science_report(days: int = 120) -> Dict[str, Any]:
     }
 
 
+@router.get("/trade-gate-readiness")
+def get_trade_gate_readiness(days: int = 365, min_samples: int = 30) -> Dict[str, Any]:
+    """Validate trade-gate v2 samples against the agreed pre-production criteria."""
+    days = max(1, min(int(days), 3650))
+    min_samples = max(1, min(int(min_samples), 200))
+    engine = get_db_engine()
+    if not engine:
+        return build_trade_gate_readiness_report(pd.DataFrame(), min_samples=min_samples)
+    try:
+        outcomes = load_scan_outcomes(engine, days=days)
+    except Exception as exc:
+        logger.error(f"Trade gate readiness error: {exc}")
+        return {**build_trade_gate_readiness_report(pd.DataFrame(), min_samples=min_samples), "error": str(exc)}
+    report = build_trade_gate_readiness_report(outcomes, min_samples=min_samples)
+    report["days"] = days
+    report["production_logic_changed"] = False
+    return report
+
+
 @router.get("/execution-policy-replay")
 def get_execution_policy_replay(days: int = 120) -> Dict[str, Any]:
     """Replay the current execution policy against persisted point-in-time candidates."""
@@ -1433,6 +1463,18 @@ def get_execution_policy_replay(days: int = 120) -> Dict[str, Any]:
     except Exception as exc:
         logger.error(f"Execution policy replay error: {exc}")
         return {"verdict": "ERROR", "days": int(days), "error": str(exc)}
+
+
+@router.get("/multi-timeframe-shadow")
+def get_multi_timeframe_shadow(days: int = 120) -> Dict[str, Any]:
+    """Research-only comparison; no candidate filtering or trading policy changes."""
+    days = max(1, min(int(days), 3650))
+    try:
+        report = build_timeframe_shadow_report(_load_scan_performance_df(days))
+    except Exception as exc:
+        logger.error(f"Multi-timeframe shadow error: {exc}")
+        return {"mode": "SHADOW_ONLY", "days": days, "arms": [], "error": str(exc)}
+    return {**report, "days": days, "production_logic_changed": False}
 
 
 @router.get("/execution-policy-replay/rolling")
@@ -1454,7 +1496,7 @@ def get_execution_plan_timeline(code: str, limit: int = 30) -> Dict[str, Any]:
         return {"code": code, "items": []}
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT COALESCE(data_date, date) AS data_date, scanned_at, strategy_type, sop_grade,
+            SELECT COALESCE(data_date, date) AS data_date, scanned_at, strategy_type,
                    price, pa_entry_price, pa_stop_price, pa_target_price, price_action_detail
             FROM scan_history WHERE code = :code
             ORDER BY COALESCE(scanned_at, date::timestamp) DESC LIMIT :limit
@@ -1464,7 +1506,7 @@ def get_execution_plan_timeline(code: str, limit: int = 30) -> Dict[str, Any]:
         detail = row.get("price_action_detail") or {}
         items.append({
             "data_date": row.get("data_date"), "scanned_at": row.get("scanned_at"),
-            "strategy_type": row.get("strategy_type"), "grade": row.get("sop_grade"),
+            "strategy_type": row.get("strategy_type"),
             "price": row.get("price"), "confirmation_price": row.get("pa_entry_price"),
             "stop_price": row.get("pa_stop_price"), "target_price": row.get("pa_target_price"),
             "trade_bucket": detail.get("trade_bucket"), "trade_eligible": detail.get("trade_eligible"),
@@ -1750,6 +1792,7 @@ def get_scan_performance(days: int = 120) -> Dict[str, Any]:
             "by_pa_volume_pattern": by_pa_volume_pattern,
             "by_pa_trend_phase": by_pa_trend_phase,
             "by_pa_weekly_context": by_pa_weekly_context,
+            "timeframe_shadow": build_timeframe_shadow_report(df),
             "by_pa_trap_risk": by_pa_trap_risk,
             "by_trade_bucket": by_trade_bucket,
             "by_market_regime": by_market_regime,

@@ -52,6 +52,8 @@ def run_batch_experiment(engine, codes: List[str], strategy_type: str, payload: 
         "max_open_gap_pct": payload.get("max_open_gap_pct", 3.0),
         "slippage_bps": payload.get("slippage_bps", 5.0),
         "position_pct": payload.get("position_pct", 1.0),
+        "position_mode": payload.get("position_mode", "single"),
+        "profit_exit_mode": payload.get("profit_exit_mode", "atr"),
     }
     rows = []
     for code in codes:
@@ -71,6 +73,7 @@ def run_batch_experiment(engine, codes: List[str], strategy_type: str, payload: 
             "code": code,
             "status": "OK",
             "signal_count": summary["signal_count"],
+            "win_count": summary.get("win_count", 0),
             "win_rate": summary["win_rate"],
             "avg_return": summary["avg_return"],
             "total_return": summary["total_return"],
@@ -143,6 +146,8 @@ def run_walk_forward_experiment(engine, codes: List[str], strategy_type: str, pa
         "max_open_gap_pct": payload.get("max_open_gap_pct", 3.0),
         "slippage_bps": payload.get("slippage_bps", 5.0),
         "position_pct": payload.get("position_pct", 1.0),
+        "position_mode": payload.get("position_mode", "single"),
+        "profit_exit_mode": payload.get("profit_exit_mode", "atr"),
     }
 
     items = []
@@ -236,6 +241,8 @@ def run_rolling_walk_forward_experiment(engine, codes: List[str], strategy_type:
         "max_open_gap_pct": payload.get("max_open_gap_pct", 3.0),
         "slippage_bps": payload.get("slippage_bps", 5.0),
         "position_pct": payload.get("position_pct", 1.0),
+        "position_mode": payload.get("position_mode", "single"),
+        "profit_exit_mode": payload.get("profit_exit_mode", "atr"),
     }
     items = []
     all_tests = []

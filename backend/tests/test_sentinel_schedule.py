@@ -25,6 +25,10 @@ def test_default_schedule_scans_every_30_minutes_during_trading_sessions():
     assert DEFAULT_SENTINEL_SCHEDULE_TIMES.split(",") == EXPECTED_TIMES
 
 
+def test_five_day_gain_alone_does_not_trigger_no_chase_rule():
+    assert sentinel_mod._is_high_extension({"pct_5d": 20.0, "涨幅%": 2.0}) is False
+
+
 def test_legacy_single_scan_schedule_migrates_once(monkeypatch):
     values = {
         "sentinel_schedule_times": "14:20",
@@ -62,6 +66,30 @@ def test_settings_api_uses_half_hour_schedule_as_fallback(monkeypatch):
     payload = settings_router.get_settings_api()
 
     assert payload["sentinel_schedule_times"].split(",") == EXPECTED_TIMES
+    assert payload["bark_scan_strategy"] == "tv_zp"
+    assert {item["value"] for item in payload["bark_scan_strategy_options"]} == {
+        "tv_zp", "tv_dual", "tv_dual_strict",
+    }
+
+
+def test_settings_api_saves_valid_bark_strategy(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(
+        settings_router,
+        "save_setting",
+        lambda key, value: saved.update({key: value}) or True,
+    )
+
+    settings_router.save_settings_api({"bark_scan_strategy": "tv_dual_strict"})
+
+    assert saved["bark_scan_strategy"] == "tv_dual_strict"
+
+
+def test_settings_api_rejects_unknown_bark_strategy():
+    with pytest.raises(HTTPException) as exc:
+        settings_router.save_settings_api({"bark_scan_strategy": "pine"})
+
+    assert exc.value.status_code == 400
 
 
 def test_blank_schedule_is_rejected():
@@ -102,6 +130,10 @@ def test_half_hour_scan_is_queued_with_a_unique_slot(monkeypatch):
 
 def test_periodic_slot_runs_formal_tv_scan(monkeypatch):
     calls = []
+    monkeypatch.setattr(
+        "core.bark_scan_selection.get_setting",
+        lambda key, default="": default,
+    )
     monkeypatch.setattr(tasks, "is_a_share_intraday_session", lambda now=None: True)
     monkeypatch.setattr(
         "routers.watchlist.check_watchlist_triggers",
@@ -121,7 +153,7 @@ def test_periodic_slot_runs_formal_tv_scan(monkeypatch):
     result = tasks.intraday_monitor_checkpoint(slot="strategy_scan_0930")
 
     assert calls[0][0] == "scan"
-    assert calls[0][1]["strategy_type"] == "tv_dual"
+    assert calls[0][1]["strategy_type"] == "tv_zp"
     assert calls[1][0] == "push"
     assert result["formal_scan_completed"] == 1
 
