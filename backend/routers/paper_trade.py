@@ -5,7 +5,7 @@ Extracted from api.py.
 """
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 import pandas as pd
@@ -476,6 +476,34 @@ _tier_alert_sent: Dict[str, str] = {}
 _real_stop_alert_state: Dict[str, int] = {}
 _REAL_STOP_ALERT_DATE: Dict[str, str] = {}  # 记录推送日期，跨日重置
 _REAL_STOP_ALERT_PHASE: Dict[str, str] = {}
+_REAL_STOP_LAST_NOTIFY: Dict[str, datetime] = {}  # CLOSE_CONFIRMED 升级提醒计时
+# 实盘确认失守后的升级重复提醒间隔（该常量是提醒节奏而非风控阈值，留在本文件）
+_REAL_STOP_ESCALATION_SECONDS = 30 * 60
+
+# 组合浮亏熔断的推送去重（此前 alerts 只进返回值、从不推送——系统性下跌日
+# 最重要的组合级风险事件对用户静默）。进程内按日去重，与 _REAL_STOP_* 同一
+# 模式；进程重启最多多发一条，可接受。
+_FLOATING_CB_ALERT_DATE: Dict[str, str] = {}
+
+
+def _push_floating_cb_alert_once_per_day(message: str, now: Optional[datetime] = None) -> bool:
+    """组合浮亏熔断告警按交易日推送一次；返回是否真正发送。
+
+    去重日期只在发送成功后记录——若 Bark 抖动导致发送异常，当日下个
+    风控 tick 会重试，而不是静默丢失一整天。"""
+    now = now or datetime.now()
+    trading_date = now.strftime("%Y-%m-%d")
+    if _FLOATING_CB_ALERT_DATE.get("floating_cb") == trading_date:
+        return False
+    try:
+        send_paper_trade_notification("🔴【组合浮亏熔断】暂停加仓", message)
+    except Exception as exc:
+        from core.logging_config import logger
+
+        logger.warning(f"Floating CB bark push failed (will retry next tick): {exc}")
+        return False
+    _FLOATING_CB_ALERT_DATE["floating_cb"] = trading_date
+    return True
 _operation_trigger_state: Dict[str, Dict[str, str]] = {}
 _OPERATION_TRIGGER_STATE_KEY_PREFIX = "operation_trigger_state:"
 _OPERATION_TRIGGER_COOLDOWN_MINUTES = 30
@@ -542,7 +570,9 @@ def _real_stop_alert_transition(
     """返回本 tick 是否需要发送实盘止损提醒。
 
     首次观察到击穿会立即提醒；现价收回止损线后保持静默；再次跌破或
-    14:50 后仍在止损线下时各提醒一次。计数表示当日实际推送次数。
+    14:50 后仍在止损线下时各提醒一次；确认失守（CLOSE_CONFIRMED）后
+    每 _REAL_STOP_ESCALATION_SECONDS 升级重复提醒一次，避免用户忽略
+    首次推送后当日永久静默。计数表示当日实际推送次数。
     """
     alert_key = f"{code}:real_stop"
     if _REAL_STOP_ALERT_DATE.get(alert_key) != trading_date:
@@ -558,10 +588,18 @@ def _real_stop_alert_transition(
 
     below_stop = current_price <= stop_price
     near_close = (now.hour, now.minute) >= (14, 50)
+    last_notify = _REAL_STOP_LAST_NOTIFY.get(alert_key)
     if below_stop and near_close:
         phase = "CLOSE_CONFIRMED"
-        notify = previous_phase != phase
-        event = "CLOSE_CONFIRMED" if notify else None
+        # 已确认失守后不再是一次性静默：每 30 分钟升级重复提醒，
+        # 防止"用户忽略了第一次推送 → 实盘持续下探 → 当日再无任何提示"
+        notify = previous_phase != phase or (
+            last_notify is not None
+            and (now - last_notify).total_seconds() >= _REAL_STOP_ESCALATION_SECONDS
+        )
+        event = None
+        if notify:
+            event = "CLOSE_CONFIRMED" if previous_phase != phase else "CLOSE_CONFIRMED_ESCALATED"
     elif below_stop:
         phase = "ACTIVE"
         notify = previous_phase in {"CLEAR", "RECOVERED"}
@@ -575,6 +613,7 @@ def _real_stop_alert_transition(
     if notify:
         count += 1
         _real_stop_alert_state[alert_key] = count
+        _REAL_STOP_LAST_NOTIFY[alert_key] = now
     return {"notify": notify, "phase": phase, "event": event, "count": count}
 
 
@@ -857,6 +896,19 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                 "daily_loss_limit_pct": loss_breaker.get("daily_loss_limit_pct"),
             }
 
+        # Elder《以交易为生》6% 法则：当月累计亏损+持仓风险达月度上限时硬熔断新开仓
+        # （月度慢熔断，同样不可被 force 绕过；一行回滚：risk_constants 月度 ENABLED=false）。
+        from core.portfolio_risk import evaluate_monthly_risk_budget
+        monthly_breaker = evaluate_monthly_risk_budget(engine)
+        if monthly_breaker.get("halted"):
+            return {
+                "status": "halt",
+                "detail": monthly_breaker.get("message", "月度风险熔断，本月暂停新开仓"),
+                "monthly_risk_used_pct": monthly_breaker.get("monthly_risk_used_pct"),
+                "monthly_risk_limit_pct": monthly_breaker.get("monthly_risk_limit_pct"),
+                "policy_version": monthly_breaker.get("policy_version"),
+            }
+
         # --- 行业集中度控制 (Sector Exposure Control) ---
         MAX_SECTOR_POSITIONS = 2  # 同行业最多 2 个持仓
         sector_map = get_sector_map()
@@ -907,7 +959,7 @@ def add_paper_trade(trade: PaperTradeCreate) -> Dict[str, Any]:
                     'UNVERIFIED', :planned_entry_price, :actual_entry_price, :entry_slippage_pct,
                     :position_pct, :shares, :capital_used, :execution_note, :plan_adherence, :watchlist_id
                 )
-                ON CONFLICT (code, entry_date) DO NOTHING
+                ON CONFLICT (code, entry_date) WHERE status = 'OPEN' DO NOTHING
                 RETURNING id
             '''), {
                 "code": trade.code,
@@ -1674,6 +1726,32 @@ def close_paper_trade(id: int, data: PaperTradeClose) -> Dict[str, Any]:
                     "updated_at": datetime.now(),
                     "id": id,
                 })
+                # 已卖出部分拆一行 CLOSED 落账：三个熔断器（日内/月度/连错）都只读
+                # status='CLOSED' 的已实现盈亏，不落账则手动部分卖出成为绕过熔断
+                # 口径的通道。写法对齐风控减仓路径（close_source 区分来源）。
+                conn.execute(text("""
+                    INSERT INTO paper_trading
+                        (code, name, entry_price, entry_date, current_price, high_since_entry,
+                         status, close_price, close_date, close_source, closed_by,
+                         strategy_type, trade_mode, shares, capital_used, remark, updated_at)
+                    VALUES
+                        (:code, :name, :entry_price, :entry_date, :close_price, :entry_price,
+                         'CLOSED', :close_price, :close_date, 'manual_partial', 'user',
+                         :strategy_type, :trade_mode, :close_shares, :close_capital_used, :remark, :updated_at)
+                """), {
+                    "code": code,
+                    "name": name,
+                    "entry_price": entry_price,
+                    "entry_date": t_map.get("entry_date"),
+                    "close_price": float(close_price),
+                    "close_date": datetime.now().strftime("%Y-%m-%d"),
+                    "strategy_type": t_map.get("strategy_type") or "",
+                    "trade_mode": trade_mode,
+                    "close_shares": int(close_shares),
+                    "close_capital_used": round(entry_price * int(close_shares), 2),
+                    "remark": f"手动部分卖出：{partial_note}",
+                    "updated_at": datetime.now(),
+                })
                 conn.commit()
 
                 pl_pct = 0.0 if entry_price <= 0 else (float(close_price) - entry_price) / entry_price * 100
@@ -1808,8 +1886,14 @@ def run_wind_control() -> Dict[str, Any]:
         df = pd.read_sql(text("SELECT * FROM paper_trading WHERE status = :status"), engine, params={"status": "OPEN"})
         if df.empty: return {"status": "success", "closed_count": 0}
         
-        from core.data import get_market_snapshot
-        snapshot = get_market_snapshot()
+        from core.data import get_fast_quotes, get_market_snapshot, FAST_QUOTE_MAX_CODES
+        open_codes = df["code"].astype(str).unique().tolist()
+        if len(open_codes) <= FAST_QUOTE_MAX_CODES:
+            # 持仓小名单：直连秒级快报价（一次批量 GET），免得每轮风控 tick 都拉
+            # 全市场快照；源故障时 get_fast_quotes 内部自动降级到全市场快照。
+            snapshot = get_fast_quotes(open_codes)
+        else:
+            snapshot = get_market_snapshot()
         if snapshot.empty: return {"status": "error", "detail": "市场行情不可用"}
         if is_snapshot_stale(snapshot):
             return {"status": "error", "detail": "实时行情已过期，风控暂停，避免使用过时行情。"}
@@ -1843,6 +1927,7 @@ def run_wind_control() -> Dict[str, Any]:
         floating_cb = evaluate_floating_loss_circuit_breaker(engine, snapshot)
         if floating_cb.get("halted"):
             alerts.append(f"🔴【组合浮亏熔断】{floating_cb['message']}，暂停加仓")
+            _push_floating_cb_alert_once_per_day(floating_cb["message"])
 
         for _, row in df.iterrows():
             code = row['code']
@@ -2174,6 +2259,9 @@ def run_wind_control() -> Dict[str, Any]:
                             reduce_updates.append({
                                 "orig_id": int(row['id']),
                                 "remaining_shares": remaining_shares,
+                                # 减仓后原行资金必须同步缩减，否则已落袋部分既算已实现
+                                # 盈亏又按原全额计入持仓资金风险，月度熔断额度被重复计提
+                                "remaining_capital_used": round(float(entry_price) * remaining_shares, 2),
                                 "orig_remark": f"{existing_remark}；{FIRST_PROFIT_TAKE_MARK}({close_date_str})".strip("；"),
                                 # 新 CLOSED 行复制原行关键字段，shares 为减仓部分
                                 # 改动 B1：减仓成交价同样用保守口径（盘中击穿时按 low）
@@ -2275,11 +2363,13 @@ def run_wind_control() -> Dict[str, Any]:
                     conn.execute(text("""
                         UPDATE paper_trading
                         SET shares = :remaining_shares,
+                            capital_used = :remaining_capital_used,
                             remark = :orig_remark,
                             updated_at = :u
                         WHERE id = :orig_id
                     """), {
                         "remaining_shares": r["remaining_shares"],
+                        "remaining_capital_used": r["remaining_capital_used"],
                         "orig_remark": r["orig_remark"],
                         "u": r["u"],
                         "orig_id": r["orig_id"],
@@ -2289,11 +2379,11 @@ def run_wind_control() -> Dict[str, Any]:
                         INSERT INTO paper_trading
                             (code, name, entry_price, entry_date, current_price, high_since_entry,
                              status, close_price, close_date, close_source, closed_by,
-                             strategy_type, trade_mode, shares, remark, updated_at)
+                             strategy_type, trade_mode, shares, capital_used, remark, updated_at)
                         VALUES
                             (:code, :name, :entry_price, :entry_date, :close_price, :entry_price,
                              'CLOSED', :close_price, :close_date, 'wind_control_partial', 'system',
-                             :strategy_type, :trade_mode, :close_shares, :remark, :u)
+                             :strategy_type, :trade_mode, :close_shares, :close_capital_used, :remark, :u)
                     """), {
                         "code": r["code"],
                         "name": r["name"],
@@ -2304,6 +2394,7 @@ def run_wind_control() -> Dict[str, Any]:
                         "strategy_type": r["strategy_type"],
                         "trade_mode": r["trade_mode"],
                         "close_shares": r["close_shares"],
+                        "close_capital_used": round(float(r["entry_price"]) * int(r["close_shares"]), 2),
                         "remark": r["remark"],
                         "u": r["u"],
                     })

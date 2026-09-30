@@ -74,6 +74,14 @@ async def lifespan(app: FastAPI):
 
 
 # --- FastAPI App ---
+# 生产环境强制鉴权：写端点（平仓/改配置/触发同步）默认零鉴权是事故级暴露面，
+# ENVIRONMENT=production 且未启用 ENABLE_AUTH 时拒绝启动（fail-fast），只影响
+# 显式声明生产环境的部署，本地开发/测试不受影响。
+if config.ENVIRONMENT == "production" and not config.ENABLE_AUTH:
+    raise RuntimeError(
+        "ENVIRONMENT=production 要求启用 API 鉴权：请设置 ENABLE_AUTH=true 与 API_TOKEN 后再启动"
+    )
+
 app = FastAPI(title="Alpha Vision API", version="5.2.0", lifespan=lifespan)
 
 app.add_middleware(
@@ -85,10 +93,19 @@ app.add_middleware(
 )
 
 
+# 副作用型 GET：触发全市场扫描 / 发送真实推送。此前鉴权中间件只拦
+# POST/PUT/PATCH/DELETE，这两个 GET 即使开启鉴权也可被匿名触发（且可被
+# 预取/CSRF 引爆）。
+_SIDE_EFFECT_GET_PATHS = {"/api/scan", "/api/settings/test/push"}
+
+
 @app.middleware("http")
 async def security_headers_and_write_auth(request: Request, call_next):
     """Protect state-changing APIs when ENABLE_AUTH is enabled and add browser hardening."""
-    if config.ENABLE_AUTH and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+    requires_auth = request.method in {"POST", "PUT", "PATCH", "DELETE"} or (
+        request.method == "GET" and request.url.path in _SIDE_EFFECT_GET_PATHS
+    )
+    if config.ENABLE_AUTH and requires_auth:
         authorization = request.headers.get("Authorization", "")
         supplied = authorization[7:] if authorization.startswith("Bearer ") else request.headers.get("X-API-Key", "")
         expected = config.API_TOKEN or ""

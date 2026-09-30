@@ -409,4 +409,5 @@ def optimize_parameters(data: dict) -> Dict[str, Any]:
         param_x_values=data.get("param_x_values"),
         param_y=data.get("param_y", "stop_loss_pct"),
         param_y_values=data.get("param_y_values"),
+        code=code,
     )

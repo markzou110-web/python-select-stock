@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from typing import Dict, Any, List
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from core.logging_config import logger
 from core.db import get_db_engine, validate_stock_code
@@ -11,22 +11,78 @@ from sqlalchemy import text
 
 router = APIRouter(prefix="/api", tags=["kline"])
 
+
+def _build_timeframe_confluence_markers(daily_buys, weekly_buys, weekly_sells, display_start_date):
+    """Mark the first daily buy while a confirmed weekly buy remains active."""
+    weekly_events = {}
+    for signal in weekly_sells:
+        weekly_events.setdefault(str(signal["time"])[:10], []).append((0, "sell"))
+    for signal in weekly_buys:
+        weekly_events.setdefault(str(signal["time"])[:10], []).append((1, "buy"))
+    daily_events = {}
+    for signal in daily_buys:
+        daily_events.setdefault(str(signal["time"])[:10], []).append(signal)
+
+    markers = []
+    active_week = False
+    marked_this_week = False
+    for day in sorted(weekly_events.keys() | daily_events.keys()):
+        for _order, event in sorted(weekly_events.get(day, [])):
+            if event == "sell":
+                active_week = False
+                marked_this_week = False
+            else:
+                active_week = True
+                marked_this_week = False
+        if active_week and not marked_this_week and day >= display_start_date:
+            if daily_events.get(day):
+                markers.append({
+                    "time": day,
+                    "position": "belowBar",
+                    "color": "#7c3aed",
+                    "shape": "square",
+                    "text": "D+W",
+                    "source": "timeframe_confluence",
+                })
+                marked_this_week = True
+    return markers
+
+
+def _latest_week_is_complete(last_bar_date, now: datetime | None = None) -> bool:
+    now = now or datetime.now()
+    latest = pd.Timestamp(last_bar_date)
+    if latest.date() == now.date() and now.weekday() == 4 and now.time() < time(15, 5):
+        return False
+    from core.trading_calendar import shift_a_share_trading_date
+
+    next_trade_date = pd.Timestamp(shift_a_share_trading_date(latest.strftime("%Y-%m-%d"), 1))
+    return next_trade_date.isocalendar()[:2] != latest.isocalendar()[:2]
+
+
 @router.get("/kline/{code}")
-def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
+def get_kline_data(
+    code: str,
+    days: int = 400,
+    strategy_type: str = "squeeze",
+    timeframe: str = "day",
+):
     """
     获取单只股票的 K 线数据，并根据当前选股策略计算前端图表所需的指标与买卖点标记。
     """
     logger.info(f"Fetching kline data for {code} over {days} days with strategy: {strategy_type}")
     if not validate_stock_code(code):
         raise HTTPException(status_code=400, detail="Invalid stock code format")
+    if timeframe not in {"day", "week"}:
+        raise HTTPException(status_code=400, detail="timeframe must be 'day' or 'week'")
     days = max(60, min(int(days), 800))
     try:
         engine = get_db_engine()
         
         # 信号计算预热窗口与全市场扫描一致；图表展示范围仍由 days 控制。
         display_start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        query_days = max(days, TV_SIGNAL_WARMUP_DAYS, 3500 if timeframe == "week" else 0)
         start_date = (
-            datetime.now() - timedelta(days=max(days, TV_SIGNAL_WARMUP_DAYS))
+            datetime.now() - timedelta(days=query_days)
         ).strftime("%Y-%m-%d")
         
         query = text("""
@@ -49,12 +105,22 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         from core.data import apply_snapshot_bar_to_frame, get_snapshot_daily_bar
         if apply_snapshot_bar_to_frame(df, get_snapshot_daily_bar(code)):
             logger.info(f"Applied live snapshot bar to today's candle for {code}")
+        daily_source_df = df.copy() if timeframe == "day" else None
 
         from core.chip_distribution import build_chip_distribution
         from core.data import ensure_turnover_history
 
         chip_frame = ensure_turnover_history(code, df, engine=engine)
         chip_distribution = build_chip_distribution(chip_frame)
+
+        weekly_complete = True
+        if timeframe == "week":
+            from core.price_action import aggregate_weekly_bars
+
+            df = aggregate_weekly_bars(df)
+            if df.empty:
+                raise HTTPException(status_code=404, detail="No complete weekly data found for this stock.")
+            weekly_complete = _latest_week_is_complete(df["日期"].iloc[-1])
 
         from core.indicators import calculate_indicators
         from core.price_action import build_price_action_annotations, build_chart_hints, build_trade_projection
@@ -65,13 +131,16 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
         df['日期'] = pd.to_datetime(df['日期'])
         df = df.drop_duplicates(subset=['日期']).sort_values('日期').reset_index(drop=True)
         df['日期'] = df['日期'].dt.strftime("%Y-%m-%d")
+        signal_df = df if timeframe == "day" or weekly_complete or len(df) < 2 else df.iloc[:-1].copy()
         
         # Prepare data for lightweight-charts
         candlestick_data = []
         rf_filter_data = []
         markers_data = []
         
-        display_df = df[df["日期"] >= display_start_date]
+        display_df = df.tail(200) if timeframe == "week" else df[df["日期"] >= display_start_date]
+        if timeframe == "week" and not display_df.empty:
+            display_start_date = str(display_df["日期"].iloc[0])
         for index, row in display_df.iterrows():
             date_str = str(row['日期'])
             
@@ -93,12 +162,36 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
 
         # 3. 动态加载策略特有的买卖点明细 (均线粘合、多指标共振或Azul共识突破)
         from core.strategy import get_signal_details
-        signals = get_signal_details(df, strategy_type=strategy_type)
+        signal_strategy_type = "pine" if strategy_type == "both" else strategy_type
+        signals = get_signal_details(signal_df, strategy_type=signal_strategy_type)
+        signals["buy_count"] = len(signals.get("buy_signals", []))
+        signals["sell_count"] = len(signals.get("sell_signals", []))
+
+        if daily_source_df is not None:
+            from core.price_action import aggregate_weekly_bars
+
+            weekly_df = aggregate_weekly_bars(daily_source_df)
+            if not weekly_df.empty:
+                latest_week_complete = _latest_week_is_complete(weekly_df["日期"].iloc[-1])
+                if not latest_week_complete:
+                    weekly_df = weekly_df.iloc[:-1].copy()
+                if len(weekly_df) >= 120:
+                    weekly_df = calculate_indicators(weekly_df, enable_pine_indicators=True)
+                    weekly_df["日期"] = pd.to_datetime(weekly_df["日期"]).dt.strftime("%Y-%m-%d")
+                    weekly_signals = get_signal_details(weekly_df, strategy_type=signal_strategy_type)
+                    markers_data.extend(
+                        _build_timeframe_confluence_markers(
+                            signals.get("buy_signals", []),
+                            weekly_signals.get("buy_signals", []),
+                            weekly_signals.get("sell_signals", []),
+                            display_start_date,
+                        )
+                    )
 
         strategy_sets = {}
         for overlay_strategy in ("squeeze", "tv_zp"):
             try:
-                overlay_signals = get_signal_details(df, strategy_type=overlay_strategy)
+                overlay_signals = get_signal_details(signal_df, strategy_type=overlay_strategy)
                 overlay_signals["buy_count"] = len(overlay_signals.get("buy_signals", []))
                 overlay_signals["sell_count"] = len(overlay_signals.get("sell_signals", []))
                 overlay_signals["strategy_type"] = overlay_strategy
@@ -148,7 +241,17 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
                 added_dates.add(time_str)
 
         # 4. Al Brooks-style price action annotations
-        price_action = build_price_action_annotations(df)
+        price_action = build_price_action_annotations(signal_df)
+        from core.sequoia_research import build_123_2b_markers, build_trader_vic_2b_markers
+
+        markers_data.extend(
+            marker for marker in build_trader_vic_2b_markers(signal_df)
+            if marker["time"] >= display_start_date
+        )
+        markers_data.extend(
+            marker for marker in build_123_2b_markers(signal_df)
+            if marker["time"] >= display_start_date
+        )
         try:
             from core.hot_stocks import get_hot_stock_chart
             from core.price_action_timeframes import build_intraday_price_action_context
@@ -235,7 +338,16 @@ def get_kline_data(code: str, days: int = 400, strategy_type: str = "squeeze"):
 
         return {
             "code": code,
+            "timeframe": timeframe,
+            "strategy_type": strategy_type,
+            "timeframe_complete": weekly_complete,
+            "timeframe_note": (
+                "周线信号仅按已收盘周K计算；本周未收盘，当前周K仅展示、不生成确认信号。"
+                if timeframe == "week" and not weekly_complete else
+                "买卖点按周K重新计算，持有周期单位为周。" if timeframe == "week" else None
+            ),
             "candlestick": candlestick_data,
+            "signals": signals,
             "rf_filter": rf_filter_data,
             "markers": markers_data,
             "trailing_stops": trailing_stops_data,

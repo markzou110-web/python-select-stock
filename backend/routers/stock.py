@@ -1164,6 +1164,9 @@ def get_stock_full_analysis(code: str):
         engine = get_db_engine()
         from core.strategy import check_strategy, calculate_historical_win_rate
         price_action = build_price_action_annotations(df)
+        from core.sequoia_research import build_trader_vic_2b_markers
+
+        trader_vic_2b_markers = build_trader_vic_2b_markers(df)
         _attach_intraday_price_action(code, price_action)
         from core.chip_distribution import build_chip_distribution
 
@@ -1551,7 +1554,7 @@ def get_stock_full_analysis(code: str):
             "price_action_markers": [
                 marker for marker in price_action.get("markers", [])
                 if marker.get("source") == "mtr_pullback_rebreak"
-            ],
+            ] + trader_vic_2b_markers,
             "price_action_lines": price_action.get("lines", []),
             "trend_phases": price_action.get("phase_timeline", []),
             "chart_hints": build_chart_hints(
