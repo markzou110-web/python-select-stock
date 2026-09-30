@@ -36,6 +36,7 @@ stop_pid_file() {
 
 stop_pid_file ".backend_pid" "后端" "api.py"
 stop_pid_file ".celery_realtime_pid" "Celery 实时队列" "celery"
+stop_pid_file ".celery_collector_pid" "Celery 采集队列" "celery"
 stop_pid_file ".celery_scan_pid" "Celery 扫描队列" "celery"
 stop_pid_file ".celery_maintenance_pid" "Celery 维护队列" "celery"
 stop_pid_file ".celery_beat_pid" "Celery 调度器" "celery"

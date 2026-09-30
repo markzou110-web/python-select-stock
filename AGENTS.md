@@ -30,8 +30,9 @@
 - **一键启停（推荐）**：项目根目录 `./start.sh` / `./stop.sh`（自动拉起 Redis → Celery 三队列 + Beat → 后端 → 前端）
 - **本地开发**：
   - 后端 API：`cd backend && source venv_new/bin/activate && python3 api.py`（或 `uvicorn api:app --reload`；**入口是 `api.py`，不是 `main.py`**）
-  - Celery 队列（需 Redis；与 `start.sh` 保持三队列划分，避免全市场扫描阻塞实时告警）：
+  - Celery 队列（需 Redis；与 `start.sh` 保持四队列划分，避免全市场扫描/分钟级采集阻塞实时告警）：
     - `celery -A core.celery_app.celery_app worker -Q realtime -n realtime@%h --loglevel=info`
+    - `celery -A core.celery_app.celery_app worker -Q collector -n collector@%h --loglevel=info`
     - `celery -A core.celery_app.celery_app worker -Q scan -n scan@%h --loglevel=info`
     - `celery -A core.celery_app.celery_app worker -Q maintenance,celery -n maintenance@%h --loglevel=info`
     - `celery -A core.celery_app.celery_app beat --loglevel=info`

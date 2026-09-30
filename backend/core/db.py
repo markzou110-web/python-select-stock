@@ -6,7 +6,7 @@ import uuid
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from .logging_config import logger
 from .models import Base, StockBasic, DailyK, ScanHistory, PaperTrading, SystemSetting, StockFundamental
@@ -236,7 +236,7 @@ def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
         try:
             from .config import config as app_config
             url = app_config.get_database_url()
-            _engine = create_engine(url, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600)
+            _engine = create_engine(url, pool_size=16, max_overflow=32, pool_pre_ping=True, pool_recycle=3600)
             SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
             logger.info("Database engine created from environment config.")
             return _engine
@@ -246,7 +246,7 @@ def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
 
     try:
         url = f"postgresql://{db_config['user']}:{db_config['pwd']}@{db_config['host']}:{db_config['port']}/{db_config['db']}"
-        _engine = create_engine(url, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600)
+        _engine = create_engine(url, pool_size=16, max_overflow=32, pool_pre_ping=True, pool_recycle=3600)
         
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
         
@@ -257,6 +257,21 @@ def get_db_engine(db_config: Optional[Dict[str, Any]] = None):
     except Exception as e:
         logger.error(f"Error creating engine: {e}")
         return None
+
+def _ensure_columns(conn, engine, table: str, columns: dict) -> None:
+    """双方言 ADD COLUMN IF NOT EXISTS：PG 用原生语法，SQLite 逐列 PRAGMA 检查。
+
+    统一入口防止手写分支漂移（此前 trade_mode / entry_source 等块只有 PG 语法，
+    SQLite 上抛错被 debug 吞掉，schema 在测试环境静默漂移）。"""
+    if engine.dialect.name == "sqlite":
+        existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+    else:
+        clauses = ", ".join(f"ADD COLUMN IF NOT EXISTS {name} {ddl}" for name, ddl in columns.items())
+        conn.execute(text(f"ALTER TABLE {table} {clauses}"))
+
 
 def init_db(engine=None):
     """初始化数据库表"""
@@ -349,7 +364,7 @@ def init_db(engine=None):
                     conn.execute(text(f"ALTER TABLE scan_audit_log {clauses}"))
                 logger.info("Migration: scan audit point-in-time metadata ensured.")
             except Exception as e:
-                logger.debug(f"scan audit metadata migration skipped: {e}")
+                logger.warning(f"scan audit metadata migration skipped: {e}")
 
             # Additive only: old snapshot rows remain readable and simply have NULL quotes.
             try:
@@ -371,32 +386,31 @@ def init_db(engine=None):
                     conn.execute(text(f"ALTER TABLE point_in_time_stock_snapshots {clauses}"))
                 logger.info("Migration: point-in-time snapshot quote columns ensured.")
             except Exception as e:
-                logger.debug(f"point-in-time snapshot quote migration skipped: {e}")
+                logger.warning(f"point-in-time snapshot quote migration skipped: {e}")
 
             # --- Migration: add trade_mode column if missing ---
             try:
-                conn.execute(text("""
-                    ALTER TABLE paper_trading ADD COLUMN IF NOT EXISTS trade_mode VARCHAR(20) DEFAULT 'SIMULATED' NOT NULL
-                """))
+                _ensure_columns(conn, engine, "paper_trading", {
+                    "trade_mode": "VARCHAR(20) DEFAULT 'SIMULATED'",
+                })
                 conn.execute(text("""
                     UPDATE paper_trading SET trade_mode = 'SIMULATED' WHERE trade_mode IS NULL
                 """))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_paper_trading_mode ON paper_trading(trade_mode);"))
                 logger.info("Migration: trade_mode column ensured.")
             except Exception as e:
-                logger.debug(f"trade_mode migration skipped (may already exist): {e}")
+                logger.warning(f"trade_mode migration FAILED: {e}")
 
             # --- Migration: paper trading entry source metadata ---
             try:
-                conn.execute(text("""
-                    ALTER TABLE paper_trading
-                    ADD COLUMN IF NOT EXISTS entry_source VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS entry_signal_date DATE,
-                    ADD COLUMN IF NOT EXISTS entry_reason_snapshot TEXT
-                """))
+                _ensure_columns(conn, engine, "paper_trading", {
+                    "entry_source": "VARCHAR(50)",
+                    "entry_signal_date": "DATE",
+                    "entry_reason_snapshot": "TEXT",
+                })
                 logger.info("Migration: paper trading entry metadata columns ensured.")
             except Exception as e:
-                logger.debug(f"paper trading entry metadata migration skipped: {e}")
+                logger.warning(f"paper trading entry metadata migration FAILED: {e}")
 
             # Additive only: preserves all existing positions and leaves legacy rows nullable.
             try:
@@ -421,7 +435,7 @@ def init_db(engine=None):
                     conn.execute(text(f"ALTER TABLE paper_trading {clauses}"))
                 logger.info("Migration: TV execution state columns ensured.")
             except Exception as e:
-                logger.debug(f"TV execution state migration skipped: {e}")
+                logger.warning(f"TV execution state migration skipped: {e}")
 
             # --- Migration: stock theme and rise logic ---
             try:
@@ -448,7 +462,7 @@ def init_db(engine=None):
                     """))
                 logger.info("Migration: stock theme and rise logic columns ensured.")
             except Exception as e:
-                logger.debug(f"stock theme and rise logic migration skipped: {e}")
+                logger.warning(f"stock theme and rise logic migration skipped: {e}")
 
             # --- Migration: P1 lifecycle, logic status, and execution audit ---
             try:
@@ -486,7 +500,7 @@ def init_db(engine=None):
                 conn.execute(text("UPDATE paper_trading SET plan_adherence = 'UNKNOWN' WHERE plan_adherence IS NULL"))
                 logger.info("Migration: P1 lifecycle and execution audit columns ensured.")
             except Exception as e:
-                logger.debug(f"P1 lifecycle migration skipped: {e}")
+                logger.warning(f"P1 lifecycle migration skipped: {e}")
 
             # --- Migration: paper trading close audit metadata ---
             try:
@@ -498,7 +512,7 @@ def init_db(engine=None):
                 """))
                 logger.info("Migration: paper trading close audit columns ensured.")
             except Exception as e:
-                logger.debug(f"paper trading close audit migration skipped: {e}")
+                logger.warning(f"paper trading close audit migration skipped: {e}")
 
             # --- Migration: price action P0 fields ---
             try:
@@ -521,7 +535,7 @@ def init_db(engine=None):
                 """))
                 logger.info("Migration: price action columns ensured.")
             except Exception as e:
-                logger.debug(f"price action migration skipped (may already exist): {e}")
+                logger.warning(f"price action migration skipped (may already exist): {e}")
 
             # --- Migration: SOP grade snapshots for historical review ---
             try:
@@ -558,7 +572,7 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_sop_grade ON scan_history(sop_grade);"))
                 logger.info("Migration: SOP grade snapshot columns ensured.")
             except Exception as e:
-                logger.debug(f"SOP grade snapshot migration skipped: {e}")
+                logger.warning(f"SOP grade snapshot migration skipped: {e}")
 
             # --- Migration: stable scan result grouping ---
             try:
@@ -600,7 +614,7 @@ def init_db(engine=None):
                     """))
                 logger.info("Migration: scan result grouping ensured.")
             except Exception as e:
-                logger.debug(f"scan result grouping migration skipped: {e}")
+                logger.warning(f"scan result grouping migration skipped: {e}")
 
             # --- Migration: lossless scan signal identity and data-date semantics ---
             try:
@@ -643,7 +657,7 @@ def init_db(engine=None):
                     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_data_date ON scan_history(data_date DESC)"))
                 logger.info("Migration: scan signal identity and data_date ensured.")
             except Exception as e:
-                logger.debug(f"scan signal identity migration skipped: {e}")
+                logger.warning(f"scan signal identity migration skipped: {e}")
 
             # --- Migration: Brooks trade-plan snapshots ---
             try:
@@ -671,7 +685,7 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_pa_action ON watchlist(pa_trade_action);"))
                 logger.info("Migration: Brooks trade-plan snapshot columns ensured.")
             except Exception as e:
-                logger.debug(f"Brooks trade-plan migration skipped: {e}")
+                logger.warning(f"Brooks trade-plan migration skipped: {e}")
 
             # --- Recommendation event log for Bark/scan lifecycle review ---
             try:
@@ -757,7 +771,7 @@ def init_db(engine=None):
                     conn.execute(text(f"ALTER TABLE recommendation_events {clauses}"))
                 logger.info("Migration: recommendation event log ensured.")
             except Exception as e:
-                logger.debug(f"recommendation event migration skipped: {e}")
+                logger.warning(f"recommendation event migration skipped: {e}")
 
             # --- AI candidate review persistence (manual + scheduled batches) ---
             try:
@@ -789,7 +803,7 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ai_candidate_reviews_date ON ai_candidate_reviews(review_date DESC, id DESC);"))
                 logger.info("Migration: ai_candidate_reviews ensured.")
             except Exception as e:
-                logger.debug(f"ai_candidate_reviews migration skipped: {e}")
+                logger.warning(f"ai_candidate_reviews migration skipped: {e}")
 
             # --- Intraday limit-up / broken-board leadership evidence ---
             try:
@@ -837,7 +851,7 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_intraday_minute_bars_code_time ON intraday_minute_bars(code, bar_time DESC);"))
                 logger.info("Migration: limit-up leadership events ensured.")
             except Exception as e:
-                logger.debug(f"limit-up event migration skipped: {e}")
+                logger.warning(f"limit-up event migration skipped: {e}")
 
             # ── breadth_history：盘中实时聚合的市场/板块宽度历史 ──
             # 修复 6/22 节后首日 bug：原 build_sector_history_context / load_market_cycle_history
@@ -855,6 +869,9 @@ def init_db(engine=None):
                         weak_ratio FLOAT,
                         avg_return FLOAT,
                         limit_up_ratio FLOAT,
+                        nh_count INTEGER,
+                        nl_count INTEGER,
+                        pct_above_ma50 FLOAT,
                         total_count INTEGER,
                         updated_at TIMESTAMP,
                         UNIQUE(bar_date, scope, industry)
@@ -864,18 +881,124 @@ def init_db(engine=None):
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_breadth_history_industry_date ON breadth_history(industry, bar_date DESC);"))
                 logger.info("Migration: breadth_history table ensured.")
             except Exception as e:
-                logger.debug(f"breadth_history migration skipped: {e}")
+                logger.warning(f"breadth_history migration skipped: {e}")
+
+            # Elder NH-NL 宽度指标（Elder 宽度扩展）：breadth_history 增加新高/新低家数
+            # 与 MA50 上方占比三列。仅 ADD COLUMN 附带 NULL，旧行不变，向下兼容。
+            try:
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(breadth_history)"))}
+                    for column, ddl in (("nh_count", "INTEGER"), ("nl_count", "INTEGER"), ("pct_above_ma50", "FLOAT")):
+                        if column not in existing:
+                            conn.execute(text(f"ALTER TABLE breadth_history ADD COLUMN {column} {ddl}"))
+                else:
+                    conn.execute(text("ALTER TABLE breadth_history ADD COLUMN IF NOT EXISTS nh_count INTEGER"))
+                    conn.execute(text("ALTER TABLE breadth_history ADD COLUMN IF NOT EXISTS nl_count INTEGER"))
+                    conn.execute(text("ALTER TABLE breadth_history ADD COLUMN IF NOT EXISTS pct_above_ma50 FLOAT"))
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-26-breadth-nh-nl-v1', CURRENT_TIMESTAMP, 'Elder NH-NL breadth columns for breadth_history')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: breadth_history NH-NL columns ensured.")
+            except Exception as e:
+                logger.warning(f"breadth_history NH-NL migration skipped: {e}")
+
+            # 涨停情绪周期 + 板块资金流（借鉴 easy-stock）：breadth_history 再加 7 列。
+            # zt_* 五列由 record_limit_up_sentiment 写 MARKET 行；fund_flow_rank /
+            # main_force_net 由 save_sector_fund_flow_rank 写 SECTOR 行。仅 ADD COLUMN
+            # 附带 NULL，旧行不变，向下兼容。
+            try:
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(breadth_history)"))}
+                    for column, ddl in (
+                        ("zt_sealed_count", "INTEGER"), ("zt_broken_count", "INTEGER"),
+                        ("zt_max_streak", "INTEGER"), ("zt_promotion_rate", "FLOAT"),
+                        ("zt_broken_rate", "FLOAT"),
+                        ("fund_flow_rank", "INTEGER"), ("main_force_net", "FLOAT"),
+                    ):
+                        if column not in existing:
+                            conn.execute(text(f"ALTER TABLE breadth_history ADD COLUMN {column} {ddl}"))
+                else:
+                    for column, ddl in (
+                        ("zt_sealed_count", "INTEGER"), ("zt_broken_count", "INTEGER"),
+                        ("zt_max_streak", "INTEGER"), ("zt_promotion_rate", "FLOAT"),
+                        ("zt_broken_rate", "FLOAT"),
+                        ("fund_flow_rank", "INTEGER"), ("main_force_net", "FLOAT"),
+                    ):
+                        conn.execute(text(f"ALTER TABLE breadth_history ADD COLUMN IF NOT EXISTS {column} {ddl}"))
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-28-zt-sentiment-fund-flow-v1', CURRENT_TIMESTAMP, 'Limit-up sentiment and sector fund flow columns for breadth_history')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: breadth_history ZT sentiment / fund flow columns ensured.")
+            except Exception as e:
+                logger.warning(f"breadth_history ZT sentiment migration skipped: {e}")
+
+            # 龙虎榜日度记录（借鉴 easy-stock 行情总览）：ReviewCenter 只读参考，
+            # 不进策略判定。同一股票同日可因多个原因上榜，唯一键含上榜原因。
+            try:
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS lhb_records (
+                        id {id_type},
+                        event_date DATE NOT NULL,
+                        code VARCHAR(20) NOT NULL,
+                        name VARCHAR(80),
+                        reason VARCHAR(200),
+                        net_buy_wan FLOAT,
+                        buy_wan FLOAT,
+                        sell_wan FLOAT,
+                        pct_chg FLOAT,
+                        created_at TIMESTAMP,
+                        UNIQUE(event_date, code, reason)
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lhb_records_date ON lhb_records(event_date DESC);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_lhb_records_code_date ON lhb_records(code, event_date DESC);"))
+                logger.info("Migration: lhb_records ensured.")
+            except Exception as e:
+                logger.warning(f"lhb_records migration skipped: {e}")
 
             # 修复 R3-2: paper_trading 的 ON CONFLICT (code, entry_date) 需要唯一约束。
-            # 原来只在测试中建了这个索引，生产 PG 上缺约束→运行时报错。
+            # v2（2026-09-29）：改为部分唯一索引（仅 status='OPEN' 行）。原全量唯一
+            # 索引会让风控减仓/手动部分卖出的"拆行 CLOSED"INSERT 与原 OPEN 行撞键
+            # （同 code 同 entry_date），IntegrityError 会让整轮 wind_control 失败；
+            # 同日多次部分平仓本就是合法状态。OPEN 行的唯一性仍由部分索引保证，
+            # add_paper_trade 的冲突目标同步加 WHERE 谓词。
+            try:
+                conn.execute(text("DROP INDEX IF EXISTS uq_paper_trade_code_date"))
+                conn.execute(text("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_code_date_open
+                    ON paper_trading (code, entry_date)
+                    WHERE status = 'OPEN'
+                """))
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-29-paper-trade-partial-open-unique-v2', CURRENT_TIMESTAMP, 'Partial unique index for OPEN paper_trading rows to allow split-row partial closes')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: paper_trading partial OPEN unique index ensured.")
+            except Exception as e:
+                logger.warning(f"paper_trading partial unique index migration FAILED: {e}")
+
+            # 点时快照 failover 查询索引（批 4-2）：load_recent_point_in_time_snapshot
+            # 的 GROUP BY dataset_version + ORDER BY as_of 此前无任何二级索引，
+            # 表增长（~5万行/日）后降级路径全表聚合越来越慢——恰在数据源故障的
+            # 最坏时刻。CREATE INDEX IF NOT EXISTS 幂等，双方言通用。
             try:
                 conn.execute(text("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_trade_code_date
-                    ON paper_trading (code, entry_date)
+                    CREATE INDEX IF NOT EXISTS idx_pit_snapshots_version_asof
+                    ON point_in_time_stock_snapshots (dataset_version, as_of)
                 """))
-                logger.info("Migration: paper_trading unique index (code, entry_date) ensured.")
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-30-capacity-indexes-v1', CURRENT_TIMESTAMP, 'point_in_time snapshot failover query index')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: point-in-time snapshot index ensured.")
             except Exception as e:
-                logger.debug(f"paper_trading unique index migration skipped: {e}")
+                logger.warning(f"point-in-time snapshot index migration skipped: {e}")
 
             # 筹码分布需要历史换手率。仅增加可空列，旧行情与交易记录保持不变。
             try:
@@ -892,7 +1015,7 @@ def init_db(engine=None):
                 """))
                 logger.info("Migration: daily_k turnover column ensured.")
             except Exception as e:
-                logger.debug(f"daily_k turnover migration skipped: {e}")
+                logger.warning(f"daily_k turnover migration skipped: {e}")
 
             conn.commit()
     except Exception as e:
@@ -1316,6 +1439,257 @@ def record_breadth_snapshot(
         logger.warning(f"record_breadth_snapshot failed (scan continues): {exc}")
 
 
+def record_breadth_extremes(stats: Dict[str, Any], engine=None) -> bool:
+    """把 Elder NH-NL 宽度统计 upsert 进 breadth_history 的当日 MARKET 行。
+
+    stats 需含 bar_date/nh_count/nl_count/pct_above_ma50/total_count（由
+    market_regime.compute_market_breadth_extremes 产出）。盘中扫描的
+    record_breadth_snapshot 可能已写入当日 MARKET 行（涨跌占比等），本函数
+    ON CONFLICT 时只更新新增的三列，不覆盖盘中聚合。安全契约同上：失败只
+    log 不抛。
+
+    Args:
+        stats: 宽度统计字典；total_count 缺失或为 0 时不写（避免脏数据）
+        engine: DB engine；为空时静默跳过
+    """
+    if engine is None or not stats or not stats.get("total_count"):
+        return False
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO breadth_history
+                    (bar_date, scope, industry, nh_count, nl_count, pct_above_ma50,
+                     total_count, updated_at)
+                VALUES
+                    (:bar_date, 'MARKET', '__MARKET__', :nh_count, :nl_count,
+                     :pct_above_ma50, :total_count, :updated_at)
+                ON CONFLICT(bar_date, scope, industry) DO UPDATE SET
+                    nh_count=EXCLUDED.nh_count,
+                    nl_count=EXCLUDED.nl_count,
+                    pct_above_ma50=EXCLUDED.pct_above_ma50,
+                    updated_at=EXCLUDED.updated_at
+            """), {
+                "bar_date": stats.get("bar_date"),
+                "nh_count": int(stats.get("nh_count") or 0),
+                "nl_count": int(stats.get("nl_count") or 0),
+                "pct_above_ma50": round(float(stats.get("pct_above_ma50") or 0), 2),
+                "total_count": int(stats.get("total_count")),
+                "updated_at": datetime.now(),
+            })
+        logger.debug(
+            f"breadth NH-NL updated for {stats.get('bar_date')}: "
+            f"nh={stats.get('nh_count')} nl={stats.get('nl_count')} ma50={stats.get('pct_above_ma50')}%"
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"record_breadth_extremes failed (non-blocking): {exc}")
+        return False
+
+
+def record_limit_up_sentiment(stats: Dict[str, Any], engine=None) -> bool:
+    """把涨停情绪统计 upsert 进 breadth_history 的当日 MARKET 行。
+
+    stats 需含 bar_date/sealed_count/broken_count/max_streak/promotion_rate/
+    broken_rate（由 market_regime.compute_limit_up_sentiment 产出）。与
+    record_breadth_extremes 同一安全契约：ON CONFLICT 只更新 zt_* 五列，
+    不覆盖盘中聚合与 NH-NL 列；失败只 log 不抛；涨停+炸板均为 0 时不写
+    （避免停采日写脏数据）。
+    """
+    if engine is None or not stats or not stats.get("bar_date"):
+        return False
+    sealed = int(stats.get("sealed_count") or 0)
+    broken = int(stats.get("broken_count") or 0)
+    if sealed + broken <= 0:
+        return False
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO breadth_history
+                    (bar_date, scope, industry, zt_sealed_count, zt_broken_count,
+                     zt_max_streak, zt_promotion_rate, zt_broken_rate, updated_at)
+                VALUES
+                    (:bar_date, 'MARKET', '__MARKET__', :sealed, :broken,
+                     :max_streak, :promotion_rate, :broken_rate, :updated_at)
+                ON CONFLICT(bar_date, scope, industry) DO UPDATE SET
+                    zt_sealed_count=EXCLUDED.zt_sealed_count,
+                    zt_broken_count=EXCLUDED.zt_broken_count,
+                    zt_max_streak=EXCLUDED.zt_max_streak,
+                    zt_promotion_rate=EXCLUDED.zt_promotion_rate,
+                    zt_broken_rate=EXCLUDED.zt_broken_rate,
+                    updated_at=EXCLUDED.updated_at
+            """), {
+                "bar_date": stats.get("bar_date"),
+                "sealed": sealed,
+                "broken": broken,
+                "max_streak": int(stats.get("max_streak") or 0),
+                "promotion_rate": stats.get("promotion_rate"),
+                "broken_rate": stats.get("broken_rate"),
+                "updated_at": datetime.now(),
+            })
+        logger.debug(
+            f"limit-up sentiment updated for {stats.get('bar_date')}: "
+            f"sealed={sealed} broken={broken} max_streak={stats.get('max_streak')}"
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"record_limit_up_sentiment failed (non-blocking): {exc}")
+        return False
+
+
+def save_sector_fund_flow_rank(
+    rows: List[Dict[str, Any]], engine=None, bar_date: Optional[str] = None,
+) -> int:
+    """把行业资金流排名 upsert 进 breadth_history 的当日 SECTOR 行。
+
+    rows: [{industry, rank, main_force_net}]（由 core.sector_fund_flow 采集归一）。
+    ON CONFLICT 只更新 fund_flow_rank / main_force_net，不覆盖盘中宽度聚合列。
+    安全契约同上：失败只 log 不抛。
+    """
+    rows = [row for row in rows or [] if row.get("industry")]
+    if engine is None or not rows:
+        return 0
+    bar_date = bar_date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO breadth_history
+                    (bar_date, scope, industry, fund_flow_rank, main_force_net, updated_at)
+                VALUES
+                    (:bar_date, 'SECTOR', :industry, :rank, :main_force_net, :updated_at)
+                ON CONFLICT(bar_date, scope, industry) DO UPDATE SET
+                    fund_flow_rank=EXCLUDED.fund_flow_rank,
+                    main_force_net=EXCLUDED.main_force_net,
+                    updated_at=EXCLUDED.updated_at
+            """), [
+                {
+                    "bar_date": bar_date,
+                    "industry": str(row["industry"]),
+                    "rank": int(row["rank"]) if row.get("rank") is not None else None,
+                    "main_force_net": float(row["main_force_net"]) if row.get("main_force_net") is not None else None,
+                    "updated_at": datetime.now(),
+                }
+                for row in rows
+            ])
+        return len(rows)
+    except Exception as exc:
+        logger.warning(f"save_sector_fund_flow_rank failed (non-blocking): {exc}")
+        return 0
+
+
+def load_sector_fund_flow_map(engine=None, bar_date: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """读最近一个有资金流排名的交易日（≤ bar_date）的行业→排名映射。
+
+    返回 {industry: {rank, main_force_net, bar_date}}；表空/引擎缺失时返回 {}，
+    调用方（证据门）fail-open。
+    """
+    if engine is None:
+        return {}
+    try:
+        with engine.connect() as conn:
+            params: Dict[str, Any] = {}
+            where = ""
+            if bar_date:
+                where = " AND bar_date <= :bar_date"
+                params["bar_date"] = bar_date
+            latest = conn.execute(text(
+                f"SELECT MAX(bar_date) FROM breadth_history WHERE scope='SECTOR' AND fund_flow_rank IS NOT NULL{where}"
+            ), params).scalar()
+            if latest is None:
+                return {}
+            rows = conn.execute(text("""
+                SELECT bar_date, industry, fund_flow_rank, main_force_net
+                FROM breadth_history
+                WHERE scope='SECTOR' AND fund_flow_rank IS NOT NULL AND bar_date = :latest
+            """), {"latest": latest}).mappings().all()
+        return {
+            str(row["industry"]): {
+                "rank": int(row["fund_flow_rank"]) if row["fund_flow_rank"] is not None else None,
+                "main_force_net": float(row["main_force_net"]) if row["main_force_net"] is not None else None,
+                "bar_date": str(row["bar_date"]),
+            }
+            for row in rows
+        }
+    except Exception as exc:
+        logger.warning(f"load_sector_fund_flow_map failed (non-blocking): {exc}")
+        return {}
+
+
+def _normalize_lhb_reason(value: Any) -> str:
+    """龙虎榜上榜原因归一为可入唯一键的字符串。
+
+    NULL reason 撞不上 ON CONFLICT(event_date, code, reason)（PG/SQLite 中
+    NULL 互不相等），重复采集会每天累积重复行——空原因一律落空串。超长原因
+    截断时附内容哈希后缀，避免"不同长原因前 200 字符相同"互相覆盖。"""
+    import hashlib
+
+    text = str(value or "").strip()
+    if len(text) > 200:
+        return text[:191] + "-" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return text
+
+
+def save_lhb_records(rows: List[Dict[str, Any]], engine=None) -> int:
+    """把龙虎榜日度记录 upsert 进 lhb_records（ReviewCenter 只读参考）。"""
+    rows = [row for row in rows or [] if row.get("code") and row.get("event_date")]
+    if engine is None or not rows:
+        return 0
+    date_expr = ":event_date" if engine.dialect.name == "sqlite" else "CAST(:event_date AS DATE)"
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"""
+                INSERT INTO lhb_records
+                    (event_date, code, name, reason, net_buy_wan, buy_wan, sell_wan, pct_chg, created_at)
+                VALUES
+                    ({date_expr}, :code, :name, :reason, :net_buy_wan, :buy_wan, :sell_wan, :pct_chg, :created_at)
+                ON CONFLICT(event_date, code, reason) DO UPDATE SET
+                    name=EXCLUDED.name,
+                    net_buy_wan=EXCLUDED.net_buy_wan,
+                    buy_wan=EXCLUDED.buy_wan,
+                    sell_wan=EXCLUDED.sell_wan,
+                    pct_chg=EXCLUDED.pct_chg
+            """), [
+                {
+                    "event_date": row["event_date"],
+                    "code": str(row["code"]).zfill(6),
+                    "name": row.get("name"),
+                    "reason": _normalize_lhb_reason(row.get("reason")),
+                    "net_buy_wan": float(row["net_buy_wan"]) if row.get("net_buy_wan") is not None else None,
+                    "buy_wan": float(row["buy_wan"]) if row.get("buy_wan") is not None else None,
+                    "sell_wan": float(row["sell_wan"]) if row.get("sell_wan") is not None else None,
+                    "pct_chg": float(row["pct_chg"]) if row.get("pct_chg") is not None else None,
+                    "created_at": datetime.now(),
+                }
+                for row in rows
+            ])
+        return len(rows)
+    except Exception as exc:
+        logger.warning(f"save_lhb_records failed (non-blocking): {exc}")
+        return 0
+
+
+def load_lhb_records(engine=None, days: int = 3, codes: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """读最近 N 个自然日的龙虎榜记录；codes 给定时只返回这些股票的记录。
+
+    记录量级很小（全市场每日几十条），codes 过滤在内存做，省去 text() 的
+    expanding IN 绑定。
+    """
+    if engine is None:
+        return []
+    try:
+        rows = pd.read_sql(
+            text("SELECT * FROM lhb_records WHERE event_date >= :start ORDER BY event_date DESC, net_buy_wan DESC"),
+            engine,
+            params={"start": (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d")},
+        )
+    except Exception as exc:
+        logger.warning(f"load_lhb_records failed (non-blocking): {exc}")
+        return []
+    if codes:
+        wanted = {str(code).zfill(6) for code in codes}
+        rows = rows[rows["code"].astype(str).str.zfill(6).isin(wanted)]
+    return rows.to_dict("records")
+
+
 def save_recommendation_events(
     results: List[Dict[str, Any]],
     engine=None,
@@ -1705,7 +2079,7 @@ def save_scan_results(
                 conn.execute(
                     text("""
                         DELETE FROM scan_history
-                        WHERE COALESCE(data_date, date) = :data_date
+                        WHERE (data_date = :data_date OR (data_date IS NULL AND date = :data_date))
                           AND COALESCE(strategy_type, 'squeeze') = :strategy_type
                     """),
                     {"data_date": data_date, "strategy_type": strategy_type},
@@ -1847,7 +2221,12 @@ def get_scan_history_by_date(date_str: str, engine=None) -> List[Dict[str, Any]]
 
     try:
         # 使用参数化查询防止 SQL 注入
-        query = text("SELECT * FROM scan_history WHERE COALESCE(data_date, date) = :date ORDER BY score DESC")
+        # OR 形式等价于 COALESCE 但可走 idx_scan_history_data_date / date 索引
+        query = text(
+            "SELECT * FROM scan_history "
+            "WHERE (data_date = :date OR (data_date IS NULL AND date = :date)) "
+            "ORDER BY score DESC"
+        )
         df = pd.read_sql(query, engine, params={"date": date_str})
         if df.empty:
             return []
@@ -1954,7 +2333,14 @@ def get_scan_dates(engine=None) -> List[str]:
 
     try:
         with engine.connect() as conn:
-            res = conn.execute(text("SELECT DISTINCT COALESCE(data_date, date) AS signal_date FROM scan_history ORDER BY signal_date DESC"))
+            # OR 形式等价于 COALESCE，但两支各可命中 data_date / date 索引
+            res = conn.execute(text("""
+                SELECT DISTINCT signal_date FROM (
+                    SELECT data_date AS signal_date FROM scan_history WHERE data_date IS NOT NULL
+                    UNION
+                    SELECT date AS signal_date FROM scan_history WHERE data_date IS NULL
+                ) sub ORDER BY signal_date DESC
+            """))
             return [str(row[0]) for row in res]
     except Exception as e:
         logger.error(f"Error getting scan dates: {e}")
@@ -1977,15 +2363,22 @@ def get_available_dates(engine=None) -> List[Dict[str, Any]]:
 
     try:
         with engine.connect() as conn:
+            # 限定近 120 个自然日：原全表 GROUP BY 随历史（1.3M 行/年）线性变慢，
+            # 前端日期选择器只需要近期窗口（LIMIT 30 决定 120 日足够覆盖）
             query = text("""
                 SELECT date, COUNT(DISTINCT code) as stock_count
                 FROM daily_k
+                WHERE date >= :recent_cutoff
                 GROUP BY date
                 HAVING COUNT(DISTINCT code) >= 500
                 ORDER BY date DESC
                 LIMIT 30
             """)
-            result = conn.execute(query)
+            from datetime import timedelta as _timedelta
+
+            result = conn.execute(query, {
+                "recent_cutoff": (datetime.now() - _timedelta(days=120)).strftime("%Y-%m-%d"),
+            })
             return [{"date": str(row[0]), "stock_count": int(row[1])} for row in result.fetchall()]
     except Exception as e:
         logger.error(f"Error getting available dates: {e}")
@@ -2122,3 +2515,82 @@ def save_setting(key: str, value: Any, engine=None) -> bool:
     except Exception as e:
         logger.error(f"Error saving setting {key}: {e}")
         return False
+
+
+# ── 每周数据维护（capacity-maintenance-v1，批 4-2）─────────────────────────────
+# 全库高增长表此前零清理（量化审查 2026-09-30）：point_in_time_stock_snapshots
+# ~5 万行/日、审计类 append-only、outbox 终态行堆积。本函数按保留窗口分批
+# DELETE（每批 5000 行防长事务锁表），单类失败只 log 不阻断（安全契约）。
+# 绝不触碰业务数据（paper_trades/daily_k/scan_history 等）——白名单之外一律不动。
+
+_MAINTENANCE_BATCH = 5000
+
+
+def _purge_in_batches(conn, table: str, where_sql: str, params: dict, pk: str = "id") -> int:
+    """分批 DELETE，返回总删除行数；WHERE 必须带日期/版本下限保护。
+
+    pk 按表传：task_run_audits 的主键是 task_id（VARCHAR），其余为 id。"""
+    deleted = 0
+    while True:
+        result = conn.execute(text(
+            f"DELETE FROM {table} WHERE {pk} IN ("
+            f" SELECT {pk} FROM {table} WHERE {where_sql} LIMIT {_MAINTENANCE_BATCH})"
+        ), params)
+        deleted += int(result.rowcount or 0)
+        if int(result.rowcount or 0) < _MAINTENANCE_BATCH:
+            return deleted
+
+
+def purge_expired_data(engine=None) -> Dict[str, Any]:
+    """按保留窗口清理非业务高增长表。返回各类删除行数。"""
+    engine = engine or get_db_engine()
+    if not engine:
+        return {"status": "skipped", "reason": "no_db"}
+    now = datetime.now()
+    report: Dict[str, Any] = {"status": "ok", "purged": {}}
+
+    def _days(n: int) -> str:
+        return (now - timedelta(days=n)).strftime("%Y-%m-%d")
+
+    # (表, 时间列, 保留天数)；id 列存在性由建表保证（均为自增主键）
+    table_plans = [
+        ("notification_outbox", "created_at", 30, "id"),
+        ("task_run_audits", "started_at", 90, "task_id"),  # 表无 created_at，任务开始时间即清理锚点
+        ("notification_audits", "created_at", 90, "id"),
+        ("scan_audit_log", "created_at", 90, "id"),
+        ("lifecycle_events", "created_at", 180, "id"),
+        ("intraday_minute_bars", "bar_time", 60, "id"),  # bar_time 为 VARCHAR 'YYYY-MM-DD ...'
+    ]
+    for table, column, retention, pk in table_plans:
+        try:
+            with engine.begin() as conn:
+                cutoff = _days(retention)
+                if column == "bar_time":
+                    cutoff = f"{cutoff} 00:00:00"
+                deleted = _purge_in_batches(conn, table, f"{column} < :cutoff", {"cutoff": cutoff}, pk=pk)
+            if deleted:
+                report["purged"][table] = deleted
+        except Exception as exc:
+            logger.warning(f"purge {table} skipped (non-blocking): {exc}")
+
+    # point_in_time_stock_snapshots：保留最近 20 个 dataset_version
+    try:
+        with engine.begin() as conn:
+            versions = [row[0] for row in conn.execute(text(
+                "SELECT DISTINCT dataset_version FROM point_in_time_stock_snapshots "
+                "ORDER BY dataset_version DESC LIMIT 21"
+            )).fetchall()]
+            if len(versions) > 20:
+                # 第 20 新为保留边界（版本串为 mode:timestamp，同前缀下字典序即时间序）
+                boundary = versions[19]
+                deleted = _purge_in_batches(
+                    conn, "point_in_time_stock_snapshots",
+                    "dataset_version < :boundary", {"boundary": boundary},
+                )
+                if deleted:
+                    report["purged"]["point_in_time_stock_snapshots"] = deleted
+    except Exception as exc:
+        logger.warning(f"purge point_in_time_stock_snapshots skipped (non-blocking): {exc}")
+
+    logger.info(f"Weekly data maintenance done: {report['purged']}")
+    return report

@@ -49,8 +49,11 @@ celery_app.conf.update(
         'tasks.send_premarket_position_advice': {'queue': 'realtime'},
         'tasks.send_position_status_summary': {'queue': 'realtime'},
         'tasks.retry_pending_notifications': {'queue': 'realtime'},
-        'tasks.collect_limit_up_leadership': {'queue': 'realtime'},
-        'tasks.collect_candidate_minute_bars': {'queue': 'realtime'},
+        # 分钟级采集（每分钟涨停池 + 每5分钟分钟K，逐票外部调用可达 30-60s）从
+        # realtime 拆到独立 collector 队列：macOS solo 单 worker 下它们会把
+        # 风控/告警推送排队阻塞，还会挤掉下一分钟任务（expires=50 静默丢弃）。
+        'tasks.collect_limit_up_leadership': {'queue': 'collector'},
+        'tasks.collect_candidate_minute_bars': {'queue': 'collector'},
         'tasks.theme_momentum_watch': {'queue': 'realtime'},
         # Checkpoints can run a full-market primary TV scan; keeping them on the
         # realtime queue would still block price/risk alerts for 1-2 minutes.
@@ -109,6 +112,30 @@ celery_app.conf.update(
         'collect-limit-up-leadership-after-close': {
             'task': 'tasks.collect_limit_up_leadership',
             'schedule': crontab(hour=15, minute=1, day_of_week='1-5'),
+            'options': {'expires': 240},
+        },
+        # 涨停情绪聚合须在 15:01 最终涨停/炸板采集之后跑
+        'update-limit-up-sentiment-1506': {
+            'task': 'tasks.update_limit_up_sentiment',
+            'schedule': crontab(hour=15, minute=6, day_of_week='1-5'),
+            'options': {'expires': 600},
+        },
+        # 行业资金流排名：午间一次盘中快照 + 盘后最终值，供证据门当日实时参考
+        'update-sector-fund-flow-1140': {
+            'task': 'tasks.update_sector_fund_flow',
+            'schedule': crontab(hour=11, minute=40, day_of_week='1-5'),
+            'options': {'expires': 600},
+        },
+        'update-sector-fund-flow-1505': {
+            'task': 'tasks.update_sector_fund_flow',
+            'schedule': crontab(hour=15, minute=5, day_of_week='1-5'),
+            'options': {'expires': 600},
+        },
+        # 龙虎榜收盘后由交易所披露（约 17:00 前后），17:05 拉近 3 个交易日
+        'update-lhb-records-1705': {
+            'task': 'tasks.update_lhb_records',
+            'schedule': crontab(hour=17, minute=5, day_of_week='1-5'),
+            'options': {'expires': 1800},
         },
         'collect-candidate-minute-bars-every-5-minutes': {
             'task': 'tasks.collect_candidate_minute_bars',
@@ -124,26 +151,31 @@ celery_app.conf.update(
         'theme-momentum-watch-0935': {
             'task': 'tasks.theme_momentum_watch',
             'schedule': crontab(hour=9, minute=35, day_of_week='1-5'),
+            'options': {'expires': 300},
             'kwargs': {'slot': '09:35'},
         },
         'theme-momentum-watch-0945': {
             'task': 'tasks.theme_momentum_watch',
             'schedule': crontab(hour=9, minute=45, day_of_week='1-5'),
+            'options': {'expires': 300},
             'kwargs': {'slot': '09:45'},
         },
         'theme-momentum-watch-1000': {
             'task': 'tasks.theme_momentum_watch',
             'schedule': crontab(hour=10, minute=0, day_of_week='1-5'),
+            'options': {'expires': 300},
             'kwargs': {'slot': '10:00'},
         },
         'theme-momentum-watch-1310': {
             'task': 'tasks.theme_momentum_watch',
             'schedule': crontab(hour=13, minute=10, day_of_week='1-5'),
+            'options': {'expires': 300},
             'kwargs': {'slot': '13:10'},
         },
         'theme-momentum-watch-1400': {
             'task': 'tasks.theme_momentum_watch',
             'schedule': crontab(hour=14, minute=0, day_of_week='1-5'),
+            'options': {'expires': 300},
             'kwargs': {'slot': '14:00'},
         },
         'intraday-morning-confirm-1030': {
@@ -155,6 +187,7 @@ celery_app.conf.update(
         'noon-sync-1135': {
             'task': 'tasks.noon_sync_scan_review',
             'schedule': crontab(hour=11, minute=35, day_of_week='1-5'),
+            'options': {'expires': 900},
             'kwargs': {'sync_first': True, 'run_review': False},
         },
         'early-value-independent-scan-1315': {
@@ -194,24 +227,67 @@ celery_app.conf.update(
         'expire-execution-intents-1510': {
             'task': 'tasks.expire_execution_intents',
             'schedule': crontab(hour=15, minute=10, day_of_week='1-5'),
+            'options': {'expires': 600},
         },
         'event-catalyst-discovery-1630': {
             'task': 'tasks.discover_event_catalysts',
             'schedule': crontab(hour=16, minute=30, day_of_week='1-5'),
+            'options': {'expires': 3600},
         },
         # 收盘AI复核：18:00全市场同步完成后，复核当日头部候选并随日报推送Bark
         'daily-ai-review-1810': {
             'task': 'tasks.send_daily_ai_review',
             'schedule': crontab(hour=18, minute=10, day_of_week='1-5'),
+            'options': {'expires': 3600},
         },
         'database-backup-2030': {
             'task': 'tasks.database_backup',
             'schedule': crontab(hour=20, minute=30),
+            'options': {'expires': 3600},
+        },
+        # 备份补跑：20:30 错过（停机/beat 未跑）后 21:30 再试一次；任务幂等
+        # （当日已有备份即跳过），不会重复备份
+        'database-backup-retry-2130': {
+            'task': 'tasks.database_backup',
+            'schedule': crontab(hour=21, minute=30),
+            'options': {'expires': 3600},
         },
         # 买入时点周报：每周一 09:00，对比尾盘买 vs 次日开盘买的胜率
         'weekly-entry-timing-report-monday-0900': {
             'task': 'tasks.weekly_entry_timing_report',
             'schedule': crontab(hour=9, minute=0, day_of_week='1'),
+            'options': {'expires': 3600},
+        },
+        # Elder NH-NL 宽度指标：盘后 17:30 统计全市场 250 日新高/新低 + MA50 上方占比
+        'market-breadth-extremes-1730': {
+            'task': 'tasks.update_market_breadth_extremes',
+            'schedule': crontab(hour=17, minute=30, day_of_week='1-5'),
+            'options': {'expires': 3600},
+        },
+        # Elder 退出后回顾：每月 1 日 20:40 回顾两个月前平仓的交易并写交易日志
+        'post-exit-monthly-review-1st-2040': {
+            'task': 'tasks.post_exit_monthly_review',
+            'schedule': crontab(hour=20, minute=40, day_of_month='1'),
+            'options': {'expires': 3600},
+        },
+        # 数据新鲜度看门狗：盘后 19:35 交叉比对各数据链路最新日期，断流即 Bark
+        'data-freshness-watchdog-1935': {
+            'task': 'tasks.check_data_freshness',
+            'schedule': crontab(hour=19, minute=35, day_of_week='1-5'),
+            'options': {'expires': 1800},
+        },
+        # 每周数据维护：周六 04:00 清理审计/点时快照/分钟bar 类高增长表
+        'weekly-data-maintenance-saturday-0400': {
+            'task': 'tasks.weekly_data_maintenance',
+            'schedule': crontab(hour=4, minute=0, day_of_week='6'),
+            'options': {'expires': 7200},
+        },
+        # Redis 健康看门：每 5 分钟探测，状态翻转推 Bark（eager 只在 import 时
+        # 判定一次，Redis 运行中宕机 = 定时任务静默丢失，必须分钟级可知）
+        'redis-health-watch-5min': {
+            'task': 'tasks.redis_health_watch',
+            'schedule': crontab(minute='*/5', hour='7-23'),
+            'options': {'expires': 240},
         },
         # Full-market sync is owned by MarketSyncScheduler in the API process so
         # progress is observable and it cannot race an embedded Celery beat.

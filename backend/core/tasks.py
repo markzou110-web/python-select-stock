@@ -14,7 +14,8 @@ import json
 import pandas as pd
 import re
 import time
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
+from typing import Any, Dict, Optional
 from sqlalchemy import text
 
 # 收盘AI复核前的个股研究快照预热预算（新闻/公告等15个数据源，纯增量缓存）
@@ -172,6 +173,69 @@ def build_position_status_summary(
     }
 
 
+def _latest_breadth_line(engine) -> str | None:
+    """读 breadth_history 最近一条有 NH-NL 数据的 MARKET 行，拼 Elder 宽度功课行。
+
+    忽略尚无 NH-NL 统计的更近盘中快照行（盘前看昨天/前天的宽度是常态，
+    Elder 功课表本就用上一交易日数据）；行内带日期标签表明数据新鲜度。"""
+    try:
+        row = pd.read_sql(text("""
+            SELECT bar_date, nh_count, nl_count, pct_above_ma50
+            FROM breadth_history
+            WHERE scope = 'MARKET' AND nh_count IS NOT NULL
+            ORDER BY bar_date DESC LIMIT 1
+        """), engine)
+    except Exception:
+        return None
+    if row.empty:
+        return None
+    record = row.iloc[0]
+    nh, nl = int(record["nh_count"] or 0), int(record["nl_count"] or 0)
+    parts = [f"Elder宽度({pd.Timestamp(record['bar_date']).strftime('%m-%d')}): 52周新高{nh}家/新低{nl}家"]
+    if pd.notna(record.get("pct_above_ma50")):
+        parts.append(f"MA50上占比{float(record['pct_above_ma50']):.0f}%")
+    return " ".join(parts)
+
+
+def _latest_limit_up_sentiment_line(engine) -> str | None:
+    """读 breadth_history 最近一条有涨停情绪的 MARKET 行，拼盘前功课行。
+
+    与宽度行同一策略：忽略尚无统计的更近盘中快照行，行内带日期标签表明
+    数据新鲜度；炸板率达到退潮阈值时追加"降暴露"提示（仅 advisory，
+    ZT_EBB_BROKEN_RATE_PCT 常量化于 risk_constants）。"""
+    try:
+        from core.market_regime import limit_up_sentiment_ebb
+
+        row = pd.read_sql(text("""
+            SELECT bar_date, zt_sealed_count, zt_broken_count, zt_max_streak,
+                   zt_promotion_rate, zt_broken_rate
+            FROM breadth_history
+            WHERE scope = 'MARKET' AND zt_sealed_count IS NOT NULL
+            ORDER BY bar_date DESC LIMIT 1
+        """), engine)
+    except Exception:
+        return None
+    if row.empty:
+        return None
+    record = row.iloc[0]
+    stats = {
+        "broken_rate": record.get("zt_broken_rate"),
+    }
+    parts = [
+        f"涨停情绪({pd.Timestamp(record['bar_date']).strftime('%m-%d')}): "
+        f"涨停{int(record['zt_sealed_count'] or 0)}家/炸板{int(record['zt_broken_count'] or 0)}家"
+    ]
+    if record.get("zt_max_streak"):
+        parts.append(f"最高{int(record['zt_max_streak'])}板")
+    if pd.notna(record.get("zt_promotion_rate")):
+        parts.append(f"晋级率{float(record['zt_promotion_rate']):.0f}%")
+    if pd.notna(record.get("zt_broken_rate")):
+        parts.append(f"炸板率{float(record['zt_broken_rate']):.0f}%")
+    if limit_up_sentiment_ebb(stats):
+        parts.append("⚠️退潮警示，考虑降暴露")
+    return " ".join(parts)
+
+
 @celery_app.task(name="tasks.send_premarket_position_advice")
 @daily_task_slot("premarket-position-advice", timeout_minutes=30)
 def send_premarket_position_advice():
@@ -196,6 +260,20 @@ def send_premarket_position_advice():
             logger.warning(f"Premarket regime unavailable: {exc}")
             market = None
         message = build_premarket_position_advice(positions, market=market, now=now)
+        # Elder 每日功课第 11 项：盘前看一眼市场宽度（NH-NL/MA50 占比），只追加不改动原正文
+        try:
+            breadth_line = _latest_breadth_line(get_db_engine())
+            if breadth_line:
+                message["body"] = f"{message['body']}\n{breadth_line}"
+        except Exception as exc:
+            logger.debug(f"Premarket breadth line unavailable: {exc}")
+        # 第 12 项：盘前看一眼涨停情绪（涨停/炸板/晋级率，退潮期提示降暴露）
+        try:
+            sentiment_line = _latest_limit_up_sentiment_line(get_db_engine())
+            if sentiment_line:
+                message["body"] = f"{message['body']}\n{sentiment_line}"
+        except Exception as exc:
+            logger.debug(f"Premarket sentiment line unavailable: {exc}")
         delivery = asyncio.run(notifier.send(
             message["title"],
             message["body"],
@@ -408,11 +486,29 @@ def discover_event_catalysts():
 @celery_app.task(name="tasks.database_backup")
 @daily_task_slot("database-backup", timeout_minutes=60)
 def database_backup():
+    """数据库备份：当日已有成功备份则跳过（幂等），失败推 Bark，支持第二副本目录。
+
+    幂等性使备份可以在错过 20:30 调度后的任何时刻安全补跑（加一个 beat
+    条目或手动触发均可），修复"错过单点调度 = 当日无备份"的单点问题。"""
     try:
-        from core.database_backup import create_database_backup
-        return {"status": "ok", **create_database_backup(retention=14)}
+        from core.database_backup import create_database_backup, today_backup_exists
+
+        if today_backup_exists():
+            logger.info("Database backup skipped: today's backup already exists.")
+            return {"status": "ok", "skipped": True, "reason": "already_backed_up_today"}
+        result = create_database_backup(retention=14)
+        logger.info(f"Database backup done: {result.get('path')}")
+        return {"status": "ok", **result}
     except Exception as exc:
         logger.error(f"Database backup failed: {exc}")
+        try:
+            asyncio.run(notifier.send(
+                "🔴数据库备份失败",
+                f"pg_dump 备份失败：{str(exc)[:300]}\n请检查 pg_dump 可用性/磁盘空间，业务数据当前无当日备份。",
+                channels=["bark"], group="AlphaVision_Data",
+            ))
+        except Exception as push_exc:
+            logger.warning(f"Backup failure bark push failed: {push_exc}")
         return {"status": "error", "error": str(exc)}
 
 
@@ -658,13 +754,15 @@ def check_realtime_alerts():
         if df_paper.empty:
             return "No open positions"
 
-        # 2. 获取全市场快照（为了拿到最新价）
-        snapshot = get_market_snapshot()
+        # 2. 获取行情（持仓小名单走直连快报价，超限才退全市场快照）
+        codes = df_paper['code'].unique().tolist()
+        from core.data import get_fast_quotes, FAST_QUOTE_MAX_CODES
+        snapshot = get_fast_quotes(codes) if len(codes) <= FAST_QUOTE_MAX_CODES else get_market_snapshot()
         if snapshot.empty:
             return "Failed to fetch snapshot"
         if is_snapshot_stale(snapshot):
             return "Failed to fetch fresh snapshot"
-            
+
         snapshot_map = snapshot.set_index('code')['price'].to_dict()
         snapshot_high_map = snapshot.set_index('code')['high'].to_dict() if 'high' in snapshot.columns else {}
 
@@ -672,7 +770,6 @@ def check_realtime_alerts():
         from core.data import get_index_hist
         bench_df = get_index_hist("000001")
 
-        codes = df_paper['code'].unique().tolist()
         alerts_triggered = []
 
         for _, row in df_paper.iterrows():
@@ -1284,3 +1381,395 @@ def weekly_entry_timing_report():
     except Exception as e:
         logger.error(f"Error in weekly_entry_timing_report task: {e}")
         return {"bark": False, "error": str(e)}
+
+
+def _collect_post_exit_review_items(
+    engine,
+    now=None,
+    min_days_closed: int = 60,
+    max_items: int = 20,
+) -> list:
+    """取平仓超过 min_days_closed 天且尚未写过退出后回顾日志的平仓交易。
+
+    Elder《以交易为生》：每笔交易退出两个月后重新审视，检验退出决策。
+    去重依据：trade_journal_events 中 source='post_exit_review' 且 trade_id 匹配。
+    """
+    cutoff = (pd.Timestamp(now or datetime.now()) - pd.Timedelta(days=int(min_days_closed))).strftime("%Y-%m-%d")
+    closed = pd.read_sql(
+        text("""
+            SELECT id, code, name, entry_price, close_price, shares, entry_date, close_date, strategy_type
+            FROM paper_trading
+            WHERE status = 'CLOSED' AND close_date <= :cutoff
+            ORDER BY close_date DESC LIMIT :max_items
+        """),
+        engine,
+        params={"cutoff": cutoff, "max_items": int(max_items)},
+    )
+    if closed.empty:
+        return []
+    reviewed = pd.read_sql(
+        text("SELECT DISTINCT trade_id FROM trade_journal_events WHERE source = 'post_exit_review'"),
+        engine,
+    )
+    reviewed_ids = set(pd.to_numeric(reviewed["trade_id"], errors="coerce").dropna().astype(int)) if not reviewed.empty else set()
+    return [row for row in closed.to_dict("records") if int(row["id"]) not in reviewed_ids]
+
+
+@celery_app.task(name="tasks.post_exit_monthly_review")
+def post_exit_monthly_review():
+    """Elder 退出后月度回顾：回顾两个月前平仓的交易，写交易日志并推送 Bark 摘要。"""
+    try:
+        from routers.paper_trade import _ensure_trade_journal_table
+
+        engine = get_db_engine()
+        if not engine:
+            return {"reviewed": 0, "reason": "no_db"}
+        _ensure_trade_journal_table(engine)
+        items = _collect_post_exit_review_items(engine)
+        if not items:
+            return {"reviewed": 0, "reason": "nothing_to_review"}
+
+        now = datetime.now()
+        lines = []
+        with engine.begin() as conn:
+            for row in items:
+                entry_price = float(row.get("entry_price") or 0)
+                close_price = float(row.get("close_price") or 0)
+                pnl_pct = ((close_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+                hold_days = ""
+                close_date = pd.to_datetime(row.get("close_date"), errors="coerce")
+                entry_date = pd.to_datetime(row.get("entry_date"), errors="coerce")
+                if pd.notna(close_date) and pd.notna(entry_date):
+                    hold_days = f"，持有 {(close_date - entry_date).days} 天"
+                note = f"收益 {pnl_pct:+.1f}%{hold_days}"
+                lines.append(f"{row.get('code')} {row.get('name') or ''} {note}")
+                conn.execute(
+                    text("""
+                        INSERT INTO trade_journal_events
+                            (event_time, source, code, name, trade_id, advice, action_taken, result_note)
+                        VALUES
+                            (:event_time, 'post_exit_review', :code, :name, :trade_id,
+                             :advice, :action_taken, :result_note)
+                    """),
+                    {
+                        "event_time": now,
+                        "code": str(row.get("code") or ""),
+                        "name": row.get("name"),
+                        "trade_id": int(row["id"]),
+                        "advice": "退出后回顾：当时退出是否正确？若继续持有会怎样？",
+                        "action_taken": f"策略 {row.get('strategy_type') or 'unknown'} 已平仓复盘",
+                        "result_note": note,
+                    },
+                )
+
+        title = f"Alpha Vision 退出后回顾 {now.strftime('%Y-%m')}"
+        body = "平仓满两个月，重新审视退出决策（Elder 月度功课）：\n" + "\n".join(lines)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        delivery = loop.run_until_complete(notifier.send(title, body, channels=["bark"], group="AlphaVision_Report"))
+        logger.info(f"Post-exit monthly review processed {len(items)} trades, bark={bool(delivery.get('bark'))}")
+        return {"reviewed": len(items), "bark": bool(delivery.get("bark"))}
+    except Exception as e:
+        logger.error(f"Error in post_exit_monthly_review task: {e}")
+        return {"reviewed": 0, "error": str(e)}
+
+
+@celery_app.task(name="tasks.update_market_breadth_extremes")
+def update_market_breadth_extremes():
+    """Elder NH-NL 宽度指标（盘后）：全市场 250 日新高/新低家数 + MA50 上方占比。
+
+    直接读 daily_k 逐票滚动统计，以数据实际最后交易日为基准（未同步到今日时
+    不会错标今日），upsert 进 breadth_history 当日 MARKET 行。
+    """
+    try:
+        from core.db import get_db_engine, record_breadth_extremes
+        from core.market_regime import compute_market_breadth_extremes
+
+        engine = get_db_engine()
+        if not engine:
+            return {"written": False, "reason": "no_db"}
+        stats = compute_market_breadth_extremes(engine)
+        written = record_breadth_extremes(stats, engine)
+        summary = {k: stats.get(k) for k in ("bar_date", "nh_count", "nl_count", "pct_above_ma50", "total_count")}
+        logger.info(f"Market breadth extremes task done: {summary}")
+        return {"written": written, "stats": summary}
+    except Exception as e:
+        logger.error(f"Error in update_market_breadth_extremes task: {e}")
+        return {"written": False, "error": str(e)}
+
+
+@celery_app.task(name="tasks.update_limit_up_sentiment")
+def update_limit_up_sentiment():
+    """涨停情绪周期（盘后）：从 limit_up_events 聚合涨停/炸板/晋级率/炸板率。
+
+    依赖 15:01 collect_limit_up_leadership 先写入当日最终事件；聚合结果 upsert
+    进 breadth_history 当日 MARKET 行。炸板率达到退潮阈值时打 warning 日志供
+    排查（盘前功课行会带"降暴露"提示；当前仅 advisory，不改仓位）。
+    """
+    try:
+        from core.db import get_db_engine, record_limit_up_sentiment
+        from core.market_regime import compute_limit_up_sentiment, limit_up_sentiment_ebb
+
+        engine = get_db_engine()
+        if not engine:
+            return {"written": False, "reason": "no_db"}
+        stats = compute_limit_up_sentiment(engine)
+        written = record_limit_up_sentiment(stats, engine)
+        ebb = limit_up_sentiment_ebb(stats)
+        if ebb:
+            logger.warning(
+                f"涨停情绪退潮警示: 炸板率 {stats.get('broken_rate')}% >= 阈值 "
+                f"(bar_date={stats.get('bar_date')})"
+            )
+        summary = {k: stats.get(k) for k in (
+            "bar_date", "prev_bar_date", "sealed_count", "broken_count",
+            "max_streak", "promotion_rate", "broken_rate",
+        )}
+        logger.info(f"Limit-up sentiment task done: {summary}, ebb={ebb}")
+        return {"written": written, "stats": summary, "ebb": ebb}
+    except Exception as e:
+        logger.error(f"Error in update_limit_up_sentiment task: {e}")
+        return {"written": False, "error": str(e)}
+
+
+@celery_app.task(name="tasks.update_sector_fund_flow")
+def update_sector_fund_flow():
+    """行业资金流排名（午间/盘后各一次）：东财行业主力净流入排名落 breadth_history。
+
+    写 SECTOR 行的 fund_flow_rank/main_force_net 两列，供候选证据门的
+    sector_context 判断"独立走强 vs 板块共振"。接口失败 fail-open。
+    节假日闸门：非交易日东财"今日"返回上一交易日数据但会被标成今天的
+    bar_date，制造越界最新行——直接跳过。
+    """
+    try:
+        if not is_a_share_trading_day(datetime.now()):
+            return {"status": "skipped", "reason": "non_trading_day"}
+        from core.sector_fund_flow import collect_sector_fund_flow_rank
+
+        result = collect_sector_fund_flow_rank()
+        logger.info(f"Sector fund flow task done: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in update_sector_fund_flow task: {e}")
+        return {"saved": 0, "errors": 1, "error": str(e)}
+
+
+@celery_app.task(name="tasks.update_lhb_records")
+def update_lhb_records(days: int = 3):
+    """龙虎榜日度记录（盘后）：最近交易日全市场龙虎榜落 lhb_records。
+
+    供 ReviewCenter 查持仓/候选股"近 3 日是否上榜、净买多少"，只读参考。
+    """
+    try:
+        from core.lhb_records import collect_lhb_records
+
+        result = collect_lhb_records(days=int(days))
+        logger.info(f"LHB records task done: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Error in update_lhb_records task: {e}")
+        return {"saved": 0, "errors": 1, "error": str(e)}
+
+
+# ── 数据新鲜度看门狗（改动：data-freshness-watchdog-v2）──────────────────────
+# 全链路"失败只 log 不抛"的安全契约让单条数据链路断流可数周无人发现（数据源
+# 改版、接口限流、进程故障都会静默停更）。本看门狗盘后交叉比对各链路的最新
+# 日期：以 daily_k 为市场数据心跳基准（节假日两端同时停更，天然鲁棒），其余
+# 链路落后基准超容差即视为断流并推送一条 Bark 汇总。
+# v2：daily_k 心跳滞后改用**交易日差**（akshare 官方日历）度量——v1 的 5 个
+# 自然日容忍窗覆盖不了春节 8 天长假，假期内每个工作日都会误报。
+
+FRESHNESS_MIN_MISSED_SESSIONS = 1
+# 官方日历加载失败时的自然日兜底容忍（>10 天才告警，宁漏报勿误报）
+FRESHNESS_HEARTBEAT_LAG_DAYS_FALLBACK = 10
+
+
+def _heartbeat_lag_sessions(reference, now: datetime) -> Optional[int]:
+    """reference（最后同步日）之后到 now 之间错过的 A 股交易日数；日历不可用返回 None。"""
+    from core.trading_calendar import is_a_share_trading_day
+
+    try:
+        day = reference + timedelta(days=1)
+        sessions = 0
+        # 上限 30 天，防日历异常导致死循环
+        for _ in range(30):
+            if day > now.date():
+                break
+            if is_a_share_trading_day(datetime.combine(day, datetime_time(12, 0))):
+                sessions += 1
+            day += timedelta(days=1)
+        return sessions
+    except Exception:
+        return None
+
+
+def compute_data_freshness(engine, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """比对各数据链路最新日期与 daily_k 心跳，返回 {stale: [...], reference_date}。"""
+    now = now or datetime.now()
+    result: Dict[str, Any] = {"reference_date": None, "heartbeat_lag_days": None, "stale": []}
+    if engine is None:
+        return result
+    try:
+        with engine.connect() as conn:
+            ref = conn.execute(text("SELECT MAX(date) FROM daily_k")).scalar()
+            probes = [
+                ("涨停/炸板事件(limit_up_events)", "SELECT MAX(event_date) FROM limit_up_events", 1),
+                ("市场宽度(breadth_history)", "SELECT MAX(bar_date) FROM breadth_history WHERE scope='MARKET' AND advance_ratio IS NOT NULL", 1),
+                ("涨停情绪(zt_sentiment)", "SELECT MAX(bar_date) FROM breadth_history WHERE scope='MARKET' AND zt_sealed_count IS NOT NULL", 1),
+                ("行业资金流(fund_flow_rank)", "SELECT MAX(bar_date) FROM breadth_history WHERE scope='SECTOR' AND fund_flow_rank IS NOT NULL", 2),
+                ("龙虎榜(lhb_records)", "SELECT MAX(event_date) FROM lhb_records", 2),
+            ]
+    except Exception as exc:
+        logger.warning(f"compute_data_freshness: probe query failed: {exc}")
+        result["stale"].append(f"daily_k 心跳查询失败: {exc}")
+        return result
+
+    if ref is None:
+        result["stale"].append("daily_k 为空（同步从未成功）")
+        return result
+    ref_date = pd.Timestamp(ref).date() if not isinstance(ref, datetime) else ref.date()
+    result["reference_date"] = ref_date.isoformat()
+    result["heartbeat_lag_days"] = (now.date() - ref_date).days
+    lag_sessions = _heartbeat_lag_sessions(ref_date, now)
+    result["heartbeat_lag_sessions"] = lag_sessions
+    if lag_sessions is None:
+        # 官方日历不可用：退回自然日口径（放宽到 10 天，宁漏报勿在长假误报）
+        if result["heartbeat_lag_days"] > FRESHNESS_HEARTBEAT_LAG_DAYS_FALLBACK:
+            result["stale"].append(
+                f"daily_k 心跳滞后 {result['heartbeat_lag_days']} 个自然日（最后 {ref_date}，交易日历不可用）——全市场同步可能断流"
+            )
+    elif lag_sessions >= FRESHNESS_MIN_MISSED_SESSIONS:
+        result["stale"].append(
+            f"daily_k 心跳已错过 {lag_sessions} 个交易日（最后 {ref_date}）——全市场同步可能断流"
+        )
+    for name, query, tolerance in probes:
+        try:
+            with engine.connect() as conn:
+                latest = conn.execute(text(query)).scalar()
+        except Exception as exc:
+            result["stale"].append(f"{name}: 查询失败 {exc}")
+            continue
+        if latest is None:
+            # 链路从未产出过数据：涨停/宽度属核心链路，其余（资金流/龙虎榜）
+            # 可能是新增功能尚未到首次运行时间，不告警
+            if "limit_up_events" in query or "advance_ratio" in query:
+                result["stale"].append(f"{name}: 从未写入")
+            continue
+        latest_date = pd.Timestamp(latest).date() if not isinstance(latest, datetime) else latest.date()
+        lag = (ref_date - latest_date).days
+        if lag > tolerance:
+            result["stale"].append(f"{name}: 落后行情基准 {lag} 天（最后 {latest_date}）")
+    return result
+
+
+_DATA_FRESHNESS_ALERT_DATE: Dict[str, str] = {}
+
+
+@celery_app.task(name="tasks.check_data_freshness")
+def check_data_freshness():
+    """盘后看门狗：任何数据链路静默断流时推送一条 Bark 汇总（每日最多一次）。"""
+    now = datetime.now()
+    try:
+        engine = get_db_engine()
+        if not engine:
+            return {"status": "skipped", "reason": "no_db"}
+        report = compute_data_freshness(engine, now)
+        if not report["stale"]:
+            logger.info(f"Data freshness check ok: ref={report['reference_date']}")
+            return {"status": "ok", "reference_date": report["reference_date"]}
+        body = "以下数据链路疑似断流，请检查同步/采集任务：\n" + "\n".join(
+            f"· {item}" for item in report["stale"]
+        )
+        title = f"⚠️数据链路告警（基准 {report['reference_date']}）"
+        trading_date = now.strftime("%Y-%m-%d")
+        sent = False
+        if _DATA_FRESHNESS_ALERT_DATE.get("watchdog") != trading_date:
+            delivery = asyncio.run(notifier.send(
+                title, body, channels=["bark"], group="AlphaVision_Data",
+            ))
+            sent = bool(delivery.get("bark"))
+            # 送达成功才记去重日期：发送失败（notifier 会转 outbox 重试）时不
+            # 标记，避免"告警没发出去却被记成已发"的静默丢失
+            if sent:
+                _DATA_FRESHNESS_ALERT_DATE["watchdog"] = trading_date
+        logger.warning(f"Data freshness stale: {report['stale']}, bark={sent}")
+        return {"status": "stale", "stale": report["stale"], "bark": sent}
+    except Exception as e:
+        logger.error(f"Error in check_data_freshness task: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+@celery_app.task(name="tasks.weekly_data_maintenance")
+def weekly_data_maintenance():
+    """每周数据维护（周六 04:00）：按保留窗口清理非业务高增长表。
+
+    只清审计/快照/分钟bar 类表（白名单见 db.purge_expired_data），绝不触碰
+    paper_trades/daily_k/scan_history。分批 DELETE 防长事务；失败推送 Bark。
+    """
+    try:
+        from core.db import purge_expired_data
+
+        report = purge_expired_data()
+        logger.info(f"Weekly data maintenance done: {report}")
+        return {"status": "ok", "purged": report.get("purged", {})}
+    except Exception as e:
+        logger.error(f"Weekly data maintenance failed: {e}")
+        try:
+            asyncio.run(notifier.send(
+                "⚠️数据维护任务失败",
+                f"容量清理任务异常：{str(e)[:200]}（各表清理为独立事务，部分可能已完成）",
+                channels=["bark"], group="AlphaVision_Data",
+            ))
+        except Exception:
+            pass
+        return {"status": "error", "error": str(e)}
+
+
+# ── Redis 健康看门（redis-health-watch-v1）────────────────────────────────────
+# task_always_eager 只在 celery_app import 时判定一次：Redis 运行中宕机后，
+# 所有 .delay() 入死 broker——分钟级采集/风控告警/每日备份静默丢失且无错误日志。
+# 本任务每 5 分钟探测一次，仅在状态翻转时推送 Bark（避免刷屏），把"静默丢失"
+# 变成"分钟级可知"。
+
+_REDIS_HEALTH_STATE: Optional[str] = None  # "up" / "down"
+
+
+@celery_app.task(name="tasks.redis_health_watch")
+def redis_health_watch():
+    global _REDIS_HEALTH_STATE
+    try:
+        import os as _os
+
+        import redis as _redis
+
+        client = _redis.Redis.from_url(
+            _os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            socket_connect_timeout=2, socket_timeout=2,
+        )
+        alive = bool(client.ping())
+    except Exception:
+        alive = False
+
+    previous = _REDIS_HEALTH_STATE
+    _REDIS_HEALTH_STATE = "up" if alive else "down"
+    if previous == _REDIS_HEALTH_STATE:
+        return {"status": _REDIS_HEALTH_STATE, "transition": False}
+
+    if not alive:
+        title = "🔴Redis 不可达"
+        body = (
+            "Redis 连接失败：Celery 定时任务（分钟级采集/风控告警/每日备份）将静默丢失，"
+            "直到恢复为止。请检查 redis 服务状态。恢复后会再推送一条。"
+        )
+    else:
+        title = "🟢Redis 已恢复"
+        body = "Redis 连接恢复，定时任务恢复正常调度。宕机期间错过的任务不会自动补跑，建议核对数据完整性。"
+    try:
+        asyncio.run(notifier.send(title, body, channels=["bark"], group="AlphaVision_Data"))
+    except Exception as exc:
+        logger.warning(f"Redis health bark push failed: {exc}")
+    logger.warning(f"Redis health transition: {previous} -> {_REDIS_HEALTH_STATE}")
+    return {"status": _REDIS_HEALTH_STATE, "transition": True, "previous": previous}
