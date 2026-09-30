@@ -10,6 +10,7 @@
 |---|---|---|---|---|
 | 1 | 四队列 worker | `ps aux \| grep "celery.*worker"` 应见 realtime / collector / scan / maintenance 四个进程；`.celery_collector_pid` 存在 | 4 个 worker + 1 个 beat | 只需重启 `./start.sh`；确认 AGENTS.md 四队列命令 |
 | 2 | 盘前 Bark 第 12 行 | 08:45 Bark 持仓推送正文 | "Elder宽度(…) 行"之后追加 "涨停情绪(日期): 涨停X家/炸板Y家 最高N板 晋级率Z% 炸板率W%"；炸板率≥40% 行尾带"降暴露" | 涨停情绪行首次出现需前一日 15:06 任务已跑（见 #5）；行缺失先查 `breadth_history` 的 zt_sealed_count 是否非空 |
+| 2b | 市场状态闸门 SHADOW | 盘前 Bark 第 13 行；19:15 日志 `Market state gate recorded` | 行含"10日动量±X% [正常/建议暂停新开仓]（SHADOW 观察中）"；system_setting 出现 `market_state_gate:日期` 键 | 行缺失查 daily_k 近 45 日数据；阈值 -3% 见 risk 常量 |
 | 3 | A-EOD SHADOW 无新意图 | 扫描日志/ReviewCenter：此前走"尾盘受控小仓"的候选 | 显示"尾盘受控[SHADOW]"、仓位 0、cautions 含"A-EOD受控通道SHADOW中"；**不再签发 A-EOD 执行意图** | 属预期行为。若需临时恢复 5% 实仓（不建议）：`A_EOD_CONTROLLED_ENABLED=true` |
 
 ## 二、盘中
