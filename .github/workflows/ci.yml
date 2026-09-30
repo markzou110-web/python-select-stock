@@ -45,4 +45,4 @@ jobs:
         continue-on-error: true
         run: npm run lint
       - name: Unit tests
-        run: npm run test:risk-lines && npm run test:signal-display
+        run: npm run test:risk-lines && npm run test:signal-display && npm run test:dow-phase
