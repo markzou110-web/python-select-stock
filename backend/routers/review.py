@@ -8,7 +8,7 @@ import pandas as pd
 
 from core.db import get_db_engine, validate_stock_code
 from core.db import get_scan_dates, get_scan_history_by_date
-from core.db import get_latest_ai_candidate_reviews
+from core.db import get_latest_ai_candidate_reviews, load_lhb_records
 from core.daily_strategy_report import build_daily_strategy_report, build_daily_strategy_report_body
 from core.logging_config import logger
 from core.outcome_calibration import (
@@ -1322,6 +1322,52 @@ def get_research_context(force_refresh: bool = False) -> Dict[str, Any]:
     )
 
 
+@router.get("/lhb-records")
+def get_lhb_records(days: int = 3, codes: str = "") -> Dict[str, Any]:
+    """近 N 日龙虎榜记录（借鉴 easy-stock 行情总览；只读参考，不进策略判定）。
+
+    每条记录标注 is_position（当前模拟/实盘 OPEN 持仓）与 is_recent_candidate
+    （近 3 个扫描日入选过），便于人工复核"上榜股在不在手上、值不值得跟"。
+    """
+    engine = get_db_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    days = max(1, min(int(days), 10))
+    wanted = [code.strip().zfill(6) for code in str(codes or "").split(",") if code.strip()]
+    records = load_lhb_records(engine, days=days, codes=wanted or None)
+    try:
+        open_codes = {
+            str(row["code"]).zfill(6)
+            for row in pd.read_sql(
+                text("SELECT code FROM paper_trading WHERE status = 'OPEN'"), engine
+            ).to_dict("records")
+        }
+        recent_candidate_codes = {
+            str(row["code"]).zfill(6)
+            for row in pd.read_sql(
+                text("""
+                    SELECT DISTINCT code FROM scan_history
+                    WHERE date IN (
+                        SELECT DISTINCT date FROM scan_history ORDER BY date DESC LIMIT 3
+                    )
+                """), engine
+            ).to_dict("records")
+        }
+    except Exception as exc:
+        logger.warning(f"lhb-records flag queries failed: {exc}")
+        open_codes, recent_candidate_codes = set(), set()
+    for record in records:
+        code = str(record.get("code") or "").zfill(6)
+        record["is_position"] = code in open_codes
+        record["is_recent_candidate"] = code in recent_candidate_codes
+    return {
+        "days": days,
+        "total": len(records),
+        "position_hits": sum(1 for record in records if record["is_position"]),
+        "records": records,
+    }
+
+
 @router.get("/recommendation-outcome-loop")
 def get_recommendation_outcome_loop(days: int = 120) -> Dict[str, Any]:
     """Closed-loop outcome view for Bark/scan recommendations after 1/3/5/10 trading days."""
@@ -1371,12 +1417,15 @@ def get_strategy_calibration_report(
             end_date = str((pd.to_datetime(outcomes["signal_date"]).max() + pd.Timedelta(days=max_hold_days * 3)).date())
             query = text("""
                 SELECT code, date AS "日期", open AS "开盘", high AS "最高",
-                       low AS "最低", close AS "收盘"
+                       low AS "最低", close AS "收盘", volume AS "成交量"
                 FROM daily_k WHERE code IN :codes AND date >= :start_date AND date <= :end_date
                 ORDER BY code, date
             """).bindparams(bindparam("codes", expanding=True))
             daily = pd.read_sql(query, engine, params={"codes": codes, "start_date": start_date, "end_date": end_date})
-            outcomes = build_executable_labels(outcomes, daily, max_hold_days=max_hold_days)
+            outcomes = build_executable_labels(
+                outcomes, daily, max_hold_days=max_hold_days,
+                planned_order_value=5000, max_volume_share_pct=5.0, volume_in_lots=True,
+            )
         payload = build_calibration_report(outcomes, min_samples=min_grade_samples)
         payload["summary"]["days"] = days
         payload["blocker_analysis"] = build_blocker_report(outcomes, min_samples=min_blocker_samples)

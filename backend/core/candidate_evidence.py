@@ -12,6 +12,9 @@ from core.execution_insights import get_active_execution_plan
 CONTRACT_VERSION = "candidate-evidence-v1"
 VALID_MODES = {"OFF", "SHADOW", "ENFORCED"}
 PASS_GRADES = {"A", "B"}
+# 行业资金流排名进入"板块共振"备忘录的名次门槛（借鉴 easy-stock 题材雷达；
+# 仅影响 decision_memo 叙述，不改任何域状态/评级）。
+SECTOR_FLOW_TOP_RANK = 10
 
 
 def _number(value: Any) -> float | None:
@@ -156,6 +159,11 @@ def _decision_memo(
 
     if candidate.get("共振") == "🔥 核心热点" or str(candidate.get("sector_mainline") or "").upper() in {"ACTIVE", "LEADING"}:
         add(bull, "板块主线与个股方向形成共振", "sector_context.mainline")
+    flow_rank = _number(candidate.get("sector_fund_flow_rank"))
+    if flow_rank is not None and 0 < flow_rank <= SECTOR_FLOW_TOP_RANK:
+        net = _number(candidate.get("sector_main_force_net"))
+        net_text = f"，主力净流入 {net:.2f} 亿" if net and net > 0 else ""
+        add(bull, f"所属行业资金流排名第 {int(flow_rank)}{net_text}，板块资金共振", "sector_context.fund_flow")
     if candidate.get("pa_volume_confirmed"):
         add(bull, "价格结构已获得量能确认", "technical_structure.volume")
     if str(candidate.get("price_action_regime") or "") in {"向上突破", "多头趋势"}:
@@ -266,6 +274,9 @@ def build_candidate_evidence(
             "mainline": candidate.get("sector_mainline"),
             "trend": candidate.get("sector_trend"),
             "alignment": _number(candidate.get("sector_alignment_score")),
+            "industry_fund_flow_rank": _number(candidate.get("sector_fund_flow_rank")),
+            "industry_main_force_net": _number(candidate.get("sector_main_force_net")),
+            "industry_flow_bar_date": candidate.get("sector_flow_bar_date"),
         }, None if sector_value not in (None, "") else "SECTOR_CONTEXT_MISSING"),
         "event_catalyst": _domain("CONDITIONAL_REQUIRED" if event_required else "OPTIONAL", event_status, "event_catalyst", catalyst.get("published_at"), catalyst, event_reason),
         "money_flow": _research_domain(research, ("money_flow", "intraday_fund_flow", "dragon_tiger", "daily_dragon_tiger"), "research_sources"),
