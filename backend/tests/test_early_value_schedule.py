@@ -34,7 +34,9 @@ def test_celery_routes_realtime_and_long_scans_to_separate_queues():
     assert routes["tasks.check_realtime_alerts"]["queue"] == "realtime"
     assert routes["tasks.check_position_operation_alerts"]["queue"] == "realtime"
     assert routes["tasks.send_premarket_position_advice"]["queue"] == "realtime"
-    assert routes["tasks.collect_limit_up_leadership"]["queue"] == "realtime"
+    # 批3-4：分钟级涨停采集拆到独立 collector 队列（macOS solo 单 worker 下不再阻塞风控推送）
+    assert routes["tasks.collect_limit_up_leadership"]["queue"] == "collector"
+    assert routes["tasks.collect_candidate_minute_bars"]["queue"] == "collector"
     assert routes["tasks.intraday_monitor_checkpoint"]["queue"] == "scan"
     assert routes["tasks.recover_late_formal_scan"]["queue"] == "scan"
     assert routes["tasks.early_value_scan"]["queue"] == "scan"

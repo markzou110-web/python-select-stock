@@ -141,7 +141,25 @@ def test_build_labels_only_uses_bars_after_signal_date():
     prices["code"] = "000001"
     result = build_executable_labels(signals, prices, max_hold_days=3)
     assert result.loc[0, "exec_filled"]
-    assert result.loc[0, "exec_execution_model_version"] == "a-share-confirmation-trigger-v3"
+    assert result.loc[0, "exec_execution_model_version"] == "a-share-confirmation-trigger-v4"
+
+
+def test_build_labels_uses_price_action_trigger_and_structural_stop_target():
+    signals = pd.DataFrame([{
+        "code": "000001", "signal_date": "2026-07-01", "signal_close": 10.0,
+        "price_action_detail": {"pa_entry_price": 10.5, "pa_stop_price": 9.5, "pa_target_price": 11.5},
+    }])
+    prices = _bars()
+    prices["code"] = "000001"
+    prices.loc[0, "最高"] = 10.6
+    prices.loc[1, "最低"] = 9.4
+
+    result = build_executable_labels(signals, prices, max_hold_days=3)
+
+    assert result.loc[0, "exec_filled"]
+    assert result.loc[0, "exec_entry_trigger_price"] == 10.5
+    assert result.loc[0, "exec_exit_reason"] == "结构止损"
+    assert result.loc[0, "exec_exit_price"] < 9.5
 
 
 def test_capital_sized_label_applies_lot_capacity_and_minimum_commission():

@@ -69,6 +69,8 @@ def test_tv_ema20_exit_is_scheduled_then_filled_at_next_open(monkeypatch):
     monkeypatch.setattr(paper_trade, "datetime", FakeAfterClose)
     monkeypatch.setattr(paper_trade, "get_db_engine", lambda: engine)
     monkeypatch.setattr(data, "get_market_snapshot", lambda: snapshot_holder["value"])
+    # 风控取价已切换到小名单快报价入口，一并固定为同一份测试快照（读 holder 以兼容两个阶段）
+    monkeypatch.setattr(data, "get_fast_quotes", lambda codes, **kwargs: snapshot_holder["value"])
     monkeypatch.setattr(data, "get_market_regime", lambda: {"status": "OFFENSIVE", "desc": "进攻"})
     monkeypatch.setattr(
         data,
@@ -747,3 +749,29 @@ def test_signal_reverse_does_not_override_stop_loss():
     assert decision["action"] == "CLOSE"
     assert "止损线" in decision["trigger"] or "执行" in decision["trigger"]
     assert "趋势反转" not in decision["trigger"]  # 走的是止损分支，不是信号反转分支
+
+
+def test_real_stop_close_confirmed_escalates_every_30_minutes():
+    """确认失守(CLOSE_CONFIRMED)后不再当日静默：每 30 分钟升级重复提醒。"""
+    from routers.paper_trade import (
+        _real_stop_alert_state,
+        _REAL_STOP_ALERT_DATE,
+        _REAL_STOP_ALERT_PHASE,
+        _REAL_STOP_LAST_NOTIFY,
+    )
+
+    _real_stop_alert_state.clear()
+    _REAL_STOP_ALERT_DATE.clear()
+    _REAL_STOP_ALERT_PHASE.clear()
+    _REAL_STOP_LAST_NOTIFY.clear()
+
+    kwargs = {"code": "600080", "trading_date": "2026-09-04", "stop_price": 4.81, "intraday_low": 4.79}
+    first = _real_stop_alert_transition(current_price=4.80, now=datetime(2026, 9, 4, 14, 51), **kwargs)
+    assert first["notify"] is True and first["event"] == "CLOSE_CONFIRMED"
+    # 10 分钟后仍失守：不重复提醒
+    soon = _real_stop_alert_transition(current_price=4.79, now=datetime(2026, 9, 4, 15, 1), **kwargs)
+    assert soon["notify"] is False
+    # 31 分钟后仍失守：升级提醒
+    escalated = _real_stop_alert_transition(current_price=4.78, now=datetime(2026, 9, 4, 15, 22), **kwargs)
+    assert escalated["notify"] is True and escalated["event"] == "CLOSE_CONFIRMED_ESCALATED"
+    _REAL_STOP_LAST_NOTIFY.clear()

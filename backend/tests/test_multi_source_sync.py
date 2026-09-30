@@ -1,7 +1,11 @@
+import os
+import sys
 import time
 import threading
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pandas as pd
 
@@ -279,10 +283,24 @@ def test_sync_batch_max_workers_config():
 # 5. 回归保护：已是最新数据时不发起任何网络调用
 # ---------------------------------------------------------------------------
 
-def test_sync_single_stock_already_latest_returns_early():
-    """数据足够且 last_date >= today 时应立即返回，不调用任何源的 get_hist_data。"""
-    today = datetime.now().date()
-    # data_count=1200 (>1000 阈值) 且 last_date >= today → 命中"已是最新"分支
+def _frozen_multi_source_clock(hour, minute):
+    """冻结 multi_source_sync 模块时钟：原测试依赖真实 now，15:05 前后行为不同。"""
+    import core.multi_source_sync as mss
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls):
+            return datetime(2026, 9, 28, hour, minute)
+
+    return mss, _Frozen
+
+
+def test_sync_single_stock_already_latest_returns_early(monkeypatch):
+    """盘中（<15:05）数据足够且 last_date >= today → 立即返回，不调用任何源的 get_hist_data。"""
+    mss, frozen = _frozen_multi_source_clock(14, 0)
+    monkeypatch.setattr(mss, "datetime", frozen)
+    today = datetime(2026, 9, 28).date()
+    # data_count=1200 (>1000 阈值) 且 last_date == today → 命中"已是最新"分支
     engine = _conn_returning(today, 1200)
 
     network_source = _FakeSource("腾讯财经", hist_data=None)  # 不应被调用
@@ -294,6 +312,24 @@ def test_sync_single_stock_already_latest_returns_early():
     assert "已是最新" in result["message"]
     # 关键回归断言：不应触达任何数据源的网络调用
     network_source._get_hist.assert_not_called()
+
+
+def test_sync_single_stock_finalizes_today_bar_after_close(monkeypatch):
+    """收盘后（>=15:05）daily_k 已有当日（午间半日）bar → 回拉当日终值覆盖（批1-1）。
+
+    修复前该分支被"已是最新"短路，半日 close/vol 永久留在库里且次日增量不回头修正。"""
+    mss, frozen = _frozen_multi_source_clock(15, 30)
+    monkeypatch.setattr(mss, "datetime", frozen)
+    today = datetime(2026, 9, 28).date()
+    engine = _conn_returning(today, 1200)
+
+    network_source = _FakeSource("腾讯财经", hist_data=None)
+    syncer = _make_syncer([network_source], engine=engine)
+
+    syncer._sync_single_stock_impl("000001")
+
+    # 关键断言：收盘后必须发起当日回拉，而非短路跳过
+    network_source._get_hist.assert_called()
 
 
 # ---------------------------------------------------------------------------

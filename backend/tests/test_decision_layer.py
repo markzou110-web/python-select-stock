@@ -163,10 +163,32 @@ def test_a_minus_trial_position_is_capped_at_five_percent():
     assert "受控试仓" in result["execution_instruction"]
 
 
-def test_a_eod_trial_position_is_capped_at_five_and_portfolio_fifteen_percent():
+def test_a_eod_trial_position_is_shadowed_by_default():
+    """批4-3：A-EOD 默认 SHADOW——资格打标保留、仓位归零（E3 前推未通过）。"""
     stocks = [_stock(
         a_eod_controlled_trial=True,
-        a_eod_policy_version="a-eod-controlled-trial-v1",
+        a_eod_policy_version="a-eod-controlled-trial-v1-shadow",
+        trade_execution_policy="A_EOD_CONTROLLED_TRIAL",
+    )]
+
+    apply_decision_layer(stocks, _snapshot([8, 7, 6, 5, 4, 3, 2, 1]), {"status": "OFFENSIVE"})
+
+    result = stocks[0]
+    assert result["a_eod_controlled_trial"] is True  # 对照统计打标保留
+    position = result["position_plan"]
+    assert position["initial_position_pct"] == 0
+    assert position["max_position_pct"] == 0
+    assert "SHADOW" in position["label"]
+
+
+def test_a_eod_trial_position_is_capped_when_enabled(monkeypatch):
+    """开关打开（E3 通过后）时恢复受控小仓 5%/15% 行为。"""
+    import core.risk_constants as rc
+
+    monkeypatch.setattr(rc, "A_EOD_CONTROLLED_ENABLED", True)
+    stocks = [_stock(
+        a_eod_controlled_trial=True,
+        a_eod_policy_version="a-eod-controlled-trial-v1-shadow",
         trade_execution_policy="A_EOD_CONTROLLED_TRIAL",
     )]
 

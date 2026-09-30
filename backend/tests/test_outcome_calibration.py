@@ -141,6 +141,23 @@ def test_price_action_calibration_stays_shadow_until_oos_review():
     assert {row["value"] for row in report["dimensions"]["pa_h2_state"]} == {"H2_TRIGGERED", "NONE"}
 
 
+def test_price_action_calibration_splits_setup_by_regime_and_keeps_execution_cohort_separate():
+    frame = _sample_frame()
+    frame["pa_trade_setup"] = ["H2", "H2"] * 12
+    frame["market_regime"] = ["OFFENSIVE", "DEFENSIVE"] * 12
+    frame["exec_return_pct"] = [1.2, -0.4] * 12
+    frame["exec_filled"] = [True, False] * 12
+
+    report = build_price_action_shadow_calibration(frame, min_samples=10)
+
+    assert len(report["setup_by_market_regime"]) == 2
+    offensive = next(row for row in report["setup_by_market_regime"] if row["market_regime"] == "OFFENSIVE")
+    assert offensive["setup"] == "H2"
+    assert offensive["executable"]["avg_return"] == 1.2
+    assert offensive["filled"] == 12
+    assert "chronological_test_30pct" in offensive
+
+
 def test_grade_monotonicity_passes_with_mature_a_b_c_samples():
     df = _sample_frame()
     c_rows = df[df["sop_grade"].eq("B")].copy()

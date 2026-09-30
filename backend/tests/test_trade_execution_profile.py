@@ -317,6 +317,8 @@ def test_v2_softens_sector_and_weekly_conditions_for_confirmed_trade():
         "板块强度不足，降低仓位优先级",
         "板块联动<70，降低仓位优先级",
         "周线中性，降低仓位优先级",
+        # 批4-3a：A-EOD 默认 SHADOW，cautions 追加影子提示（不签发意图）
+        "A-EOD受控通道SHADOW中（E3前推验证未通过），仅观察不签发",
     ]
 
 

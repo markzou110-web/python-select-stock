@@ -3,6 +3,7 @@ import json
 import pandas as pd
 
 from core.price_action import (
+    aggregate_weekly_bars,
     _detect_breakout_volume_pullback,
     _evaluate_pullback_validity,
     _mtr_first_pullback_rebreak,
@@ -40,6 +41,22 @@ def _breakout_volume_pullback_df(invalidated=False):
     if invalidated:
         rows[-1].update({"开盘": 10.10, "最高": 10.12, "最低": 9.35, "收盘": 9.45, "成交量": 2_200_000})
     return pd.DataFrame(rows)
+
+
+def test_aggregate_weekly_bars_uses_last_session_date_and_ohlcv_rules():
+    frame = pd.DataFrame({
+        "日期": pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-08", "2026-01-12"]),
+        "开盘": [10, 11, 9, 12],
+        "最高": [12, 13, 11, 14],
+        "最低": [9, 10, 8, 11],
+        "收盘": [11, 12, 10, 13],
+        "成交量": [100, 200, 300, 400],
+    })
+
+    weekly = aggregate_weekly_bars(frame)
+
+    assert weekly["日期"].dt.strftime("%Y-%m-%d").tolist() == ["2026-01-08", "2026-01-12"]
+    assert weekly.loc[0, ["开盘", "最高", "最低", "收盘", "成交量"]].tolist() == [10, 13, 8, 10, 600]
 
 
 def _ohlc_from_closes(closes):
@@ -205,6 +222,110 @@ def test_price_action_annotations_show_breakout_and_pullback_markers():
     assert annotations["summary"]["pa_volume_pullback_status"] == "CONFIRMED"
     assert any(line.get("kind") == "pullback_support" for line in annotations["lines"])
     assert any(line.get("kind") == "pullback_stop" for line in annotations["lines"])
+
+
+def test_price_action_trendline_uses_unviolated_dow_swing_anchors(monkeypatch):
+    count = 30
+    close = pd.Series([10 + index * 0.1 for index in range(count)])
+    frame = pd.DataFrame({
+        "日期": pd.bdate_range("2026-01-05", periods=count),
+        "开盘": close - 0.05,
+        "最高": close + 0.2,
+        "最低": close - 0.2,
+        "收盘": close,
+        "成交量": 100_000,
+    })
+    frame.loc[2, "最低"] = 8.0
+    frame.loc[10, "最低"] = 9.0
+    frame.loc[20, "最高"] = 15.0
+    monkeypatch.setattr("core.price_action.analyze_price_action", lambda _: {
+        "price_action_signal": "暂无",
+        "price_action_pattern": None,
+        "price_action_score": 0,
+        "pa_eight_rule_primary": None,
+        "pa_trend_phase": "",
+        "pa_tags": [],
+    })
+
+    lines = build_price_action_annotations(frame)["lines"]
+    trendline = next(line for line in lines if line["kind"] == "support")
+
+    assert trendline["label"] == "道氏上升趋势线·有效支撑"
+    assert trendline["status"] == "active"
+    assert trendline["points"][0] == {
+        "time": frame.loc[2, "日期"].strftime("%Y-%m-%d"), "value": 8.0,
+    }
+    assert trendline["points"][1]["time"] == frame.loc[29, "日期"].strftime("%Y-%m-%d")
+    assert trendline["points"][1]["value"] == 11.38
+    slope = (11.38 - 8.0) / (29 - 2)
+    assert all(8.0 + slope * (index - 2) <= frame.loc[index, "最低"] for index in range(3, 10))
+
+
+def test_price_action_truncates_uptrendline_after_two_closes_below(monkeypatch):
+    count = 30
+    close = pd.Series([10 + index * 0.1 for index in range(count)])
+    frame = pd.DataFrame({
+        "日期": pd.bdate_range("2026-01-05", periods=count),
+        "开盘": close - 0.05,
+        "最高": close + 0.2,
+        "最低": close - 0.2,
+        "收盘": close,
+        "成交量": 100_000,
+    })
+    frame.loc[2, "最低"] = 8.0
+    frame.loc[10, "最低"] = 9.0
+    frame.loc[20, "最高"] = 15.0
+    frame.loc[22:23, ["开盘", "最高", "最低", "收盘"]] = [9.55, 9.8, 9.3, 9.5]
+    monkeypatch.setattr("core.price_action.analyze_price_action", lambda _: {
+        "price_action_signal": "暂无",
+        "price_action_pattern": None,
+        "price_action_score": 0,
+        "pa_eight_rule_primary": None,
+        "pa_trend_phase": "",
+        "pa_tags": [],
+    })
+
+    trendline = next(
+        line for line in build_price_action_annotations(frame)["lines"]
+        if line["kind"] == "support"
+    )
+
+    assert trendline["status"] == "broken"
+    assert trendline["label"] == "上升线已跌破·回抽压力参考"
+    assert trendline["break_date"] == frame.loc[23, "日期"].strftime("%Y-%m-%d")
+    assert trendline["points"][1]["time"] == frame.loc[29, "日期"].strftime("%Y-%m-%d")
+
+
+def test_price_action_marks_valid_descending_dow_trendline(monkeypatch):
+    count = 30
+    close = pd.Series([20 - index * 0.3 for index in range(count)])
+    frame = pd.DataFrame({
+        "日期": pd.bdate_range("2026-01-05", periods=count),
+        "开盘": close + 0.05,
+        "最高": close + 0.2,
+        "最低": close - 0.2,
+        "收盘": close,
+        "成交量": 100_000,
+    })
+    frame.loc[2, "最高"] = 22.0
+    frame.loc[10, "最高"] = 19.0
+    frame.loc[20, "最低"] = 4.0
+    monkeypatch.setattr("core.price_action.analyze_price_action", lambda _: {
+        "price_action_signal": "暂无",
+        "price_action_pattern": None,
+        "price_action_score": 0,
+        "pa_eight_rule_primary": None,
+        "pa_trend_phase": "",
+        "pa_tags": [],
+    })
+
+    lines = build_price_action_annotations(frame)["lines"]
+    trendline = next(line for line in lines if line["kind"] == "resistance")
+
+    assert trendline["label"] == "道氏下降趋势线·有效压力"
+    assert trendline["status"] == "active"
+    assert trendline["points"][0]["value"] == 22.0
+    assert trendline["points"][1]["time"] == frame.loc[29, "日期"].strftime("%Y-%m-%d")
 
 
 def test_bull_mtr_first_pullback_rebreak_marks_only_after_close_confirmation(monkeypatch):
@@ -508,6 +629,8 @@ def test_incomplete_calendar_week_is_marked_unconfirmed():
 
     assert result["pa_current_week_complete"] is False
     assert "本周尚未收盘" in result["pa_multi_timeframe_note"]
+    assert "观察，不参与周线方向确认" in result["pa_multi_timeframe_note"]
+    assert result["pa_weekly_permission"] in {"ALLOW_LONG", "REDUCE_SIZE", "WAIT"}
 
 
 def test_price_action_detects_gap_failure_and_failed_second_entry():

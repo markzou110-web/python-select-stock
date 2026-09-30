@@ -132,6 +132,15 @@ def test_intraday_reference_push_when_market_risk_blocks_all(monkeypatch):
         lambda *args, **kwargs: created_intents.append(args) or [],
     )
 
+    # 冻结时间到上午：标题前缀依赖墙钟（14:20 后为"尾盘参考/决策"），不冻结则
+    # 测试仅在尾盘窗口外的时段通过（存量墙钟脆弱，修复为确定性断言）
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls):
+            return datetime(2026, 9, 4, 10, 30, 0)
+
+    monkeypatch.setattr("core.sentinel.datetime", _FrozenDatetime)
+
     body = send_intraday_notification(stocks)
 
     assert body

@@ -8,7 +8,26 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core.decision_layer import _leadership_score
-from core.limit_up_leadership import collect_candidate_minute_bars, collect_limit_up_events, load_limit_up_event_map, save_minute_bars
+import pytest
+
+from core.limit_up_leadership import (
+    _MINUTE_BAR_WATERMARK,
+    _POOL_SNAPSHOT,
+    collect_candidate_minute_bars,
+    collect_limit_up_events,
+    load_limit_up_event_map,
+    save_minute_bars,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_collector_watermarks():
+    """隔离进程内水位：签名快照/分钟bar水位跨测试残留会破坏 diff 断言。"""
+    _POOL_SNAPSHOT.clear()
+    _MINUTE_BAR_WATERMARK.clear()
+    yield
+    _POOL_SNAPSHOT.clear()
+    _MINUTE_BAR_WATERMARK.clear()
 
 
 def _engine():
@@ -73,7 +92,7 @@ def test_collection_saves_sealed_and_broken_events(monkeypatch):
     result = collect_limit_up_events("20260612", engine, datetime(2026, 6, 12, 10, 5))
     event_map = load_limit_up_event_map("2026-06-12", engine)
 
-    assert result == {"sealed": 1, "broken": 1, "saved": 2, "errors": 0}
+    assert result == {"sealed": 1, "broken": 1, "saved": 2, "total_in_pool": 2, "errors": 0}
     assert event_map["000001"]["status"] == "SEALED"
     assert event_map["000001"]["limit_up_sector_rank"] == 1
     assert event_map["000002"]["status"] == "BROKEN"
@@ -255,3 +274,47 @@ def test_candidate_minute_bar_prefers_live_snapshot_over_eastmoney(monkeypatch):
     assert result["snapshot_bars"] == 1
     assert result["eastmoney_bars"] == 0
     assert result["errors"] == 0
+
+
+def test_second_identical_collection_writes_only_changed_rows(monkeypatch):
+    """变化量写入：同一池重复采集 → 0 行落库；封单变化 → 只写该行。"""
+    sealed = pd.DataFrame([{
+        "代码": "000011", "名称": "一号", "所属行业": "银行",
+        "首次封板时间": "093501", "最后封板时间": "100001",
+        "炸板次数": 1, "连板数": 2, "封板资金": 200000000,
+        "换手率": 8.0, "成交额": 500000000,
+    }])
+    monkeypatch.setattr("core.limit_up_leadership.ak.stock_zt_pool_em", lambda date: sealed)
+    monkeypatch.setattr("core.limit_up_leadership.ak.stock_zt_pool_zbgc_em", lambda date: pd.DataFrame())
+    engine = _engine()
+
+    first = collect_limit_up_events("20260701", engine, datetime(2026, 7, 1, 10, 0))
+    assert first["saved"] == 1 and first["total_in_pool"] == 1
+    second = collect_limit_up_events("20260701", engine, datetime(2026, 7, 1, 10, 1))
+    assert second["saved"] == 0  # 无变化不重写
+
+    sealed.loc[0, "封板资金"] = 260000000  # 封单变化
+    third = collect_limit_up_events("20260701", engine, datetime(2026, 7, 1, 10, 2))
+    assert third["saved"] == 1  # 只写变化行
+
+
+def test_minute_bar_watermark_skips_unchanged_history(monkeypatch):
+    """分钟 bar 水位：第二次拉全天只落水位之后的新 bar。"""
+    bars = pd.DataFrame([
+        {"时间": "2026-07-01 10:00:00", "开盘": 1, "收盘": 1, "最高": 1, "最低": 1, "成交量": 1, "成交额": 1, "均价": 1},
+        {"时间": "2026-07-01 10:01:00", "开盘": 1, "收盘": 1, "最高": 1, "最低": 1, "成交量": 1, "成交额": 1, "均价": 1},
+    ])
+    monkeypatch.setattr("core.limit_up_leadership._snapshot_minute_frame", lambda codes, date: pd.DataFrame())
+    monkeypatch.setattr(
+        "core.limit_up_leadership._fetch_minute_bars",
+        lambda code, date, retries=1: bars.copy(),
+    )
+    engine = _engine()
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE scan_history (code VARCHAR(20), date DATE, score FLOAT)"))
+        conn.execute(text("INSERT INTO limit_up_events (event_date, code, status) VALUES ('2026-07-01', '000021', 'SEALED')"))
+
+    first = collect_candidate_minute_bars("2026-07-01", engine, max_codes=1)
+    assert first["bars"] == 2
+    second = collect_candidate_minute_bars("2026-07-01", engine, max_codes=1)
+    assert second["bars"] == 0  # 全天已落库，水位后无新 bar

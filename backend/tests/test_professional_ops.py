@@ -450,22 +450,39 @@ def test_portfolio_risk_budget_warns_on_exposure():
         conn.execute(text("""
             INSERT INTO paper_trading (
                 code, name, entry_price, entry_date, current_price, status,
-                strategy_type, trade_mode, pa_risk_pct
+                strategy_type, trade_mode, pa_risk_pct, capital_used
             ) VALUES (
                 '000001', '平安银行', 10, '2025-05-30', 10, 'OPEN',
-                'squeeze', 'REAL', 2.5
+                'squeeze', 'REAL', 2.5, 500000
             )
         """))
 
     result = evaluate_portfolio_risk_budget(
         engine,
-        {"code": "000002", "strategy_type": "squeeze", "trade_mode": "REAL", "pa_risk_pct": 4.0},
-        budget={"max_sector_positions": 1, "max_total_plan_risk_pct": 5.0},
+        {"code": "000002", "strategy_type": "squeeze", "trade_mode": "REAL", "pa_risk_pct": 4.0, "capital_used": 500000},
+        budget={"max_sector_positions": 1, "max_single_risk_pct": 1.0, "max_total_plan_risk_pct": 2.0},
     )
 
     assert result["status"] == "warning"
     assert any("行业" in item for item in result["warnings"])
-    assert any("组合计划风险" in item for item in result["warnings"])
+    assert any("组合资本风险" in item for item in result["warnings"])
+    assert result["summary"]["projected_plan_risk_pct"] == 3.25
+
+
+def test_portfolio_risk_budget_uses_position_pct_as_account_capital():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+
+    result = evaluate_portfolio_risk_budget(
+        engine,
+        {"code": "002192", "position_pct": 20, "pa_risk_pct": 5},
+        budget={"virtual_total_capital": 1000000, "max_single_risk_pct": 0.9},
+    )
+
+    assert result["status"] == "warning"
+    assert result["summary"]["new_capital_risk_amount"] == 10000
+    assert result["summary"]["projected_capital_risk_pct"] == 1.0
+    assert any("单笔账户风险" in item for item in result["warnings"])
 
 
 def test_portfolio_risk_budget_accepts_empty_optional_position_fields():

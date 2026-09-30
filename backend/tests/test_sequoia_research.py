@@ -110,6 +110,180 @@ def test_turtle_breakout_uses_prior_20_day_high_and_liquidity():
     assert not bool(mask.iloc[:-1].any())
 
 
+def test_trader_vic_2b_requires_support_reclaim_and_long_term_ma_context():
+    from core.sequoia_research import trader_vic_2b_signal_mask
+
+    close = np.linspace(10.0, 12.0, 250)
+    frame = _frame(close)
+    support = float(frame["最低"].iloc[-23:-3].min())
+    frame.loc[247, ["最低", "收盘", "开盘"]] = [support * 0.97, support * 0.98, support * 0.99]
+    frame.loc[248, ["最低", "收盘", "开盘"]] = [support * 0.975, support * 0.985, support * 0.99]
+    frame.loc[249, ["最低", "收盘", "开盘", "成交量"]] = [
+        support * 0.99, support * 1.02, support * 1.005, 300_000.0,
+    ]
+
+    mask = trader_vic_2b_signal_mask(frame)
+
+    assert bool(mask.iloc[-1]) is True
+    assert not bool(mask.iloc[:-1].any())
+
+
+def test_trader_vic_2b_chart_markers_are_observation_labels():
+    from core.sequoia_research import build_trader_vic_2b_markers
+
+    close = np.full(232, 100.0)
+    close[-2:] = [98.5, 100.5]
+    low = np.full(232, 99.0)
+    low[-2] = 98.0
+    volume = np.full(232, 100_000.0)
+    volume[-1] = 150_000.0
+    frame = _frame(close, low=low, volume=volume)
+
+    markers = build_trader_vic_2b_markers(frame)
+
+    assert markers == [{
+        "time": frame.iloc[-1]["日期"].date().isoformat(),
+        "position": "belowBar",
+        "color": "#0f766e",
+        "shape": "circle",
+        "text": "VIC 2B形态",
+        "source": "trader_vic_2b",
+    }]
+
+
+def test_book_123_and_2b_markers_show_both_reversal_directions_without_future_backdating():
+    from core.sequoia_research import build_123_2b_markers
+
+    close = [10, 11, 10.5, 11.5, 10.8, 12, 11.4, 11.8, 11.0, 10.4, 10.6, 11.5, 10.8, 10.2, 9.8]
+    high = [value + 0.1 for value in close]
+    high[11] = 12.2  # false breakout of the previous swing high
+    frame = _frame(close, high=high)
+
+    markers = build_123_2b_markers(frame)
+
+    assert {marker["text"] for marker in markers} >= {"123-1", "123-2", "123-3", "2B卖"}
+    sell_2b = [marker for marker in markers if marker["text"] == "2B卖"]
+    assert len(sell_2b) == 1
+    assert all(marker["time"] <= frame.iloc[-1]["日期"].date().isoformat() for marker in markers)
+
+
+def test_book_2b_marks_bullish_false_break_and_reclaim():
+    from core.sequoia_research import build_123_2b_markers
+
+    close = np.full(35, 100.0)
+    low = np.full(35, 99.0)
+    high = np.full(35, 101.0)
+    low[-1] = 97.0
+    close[-1] = 100.5
+    frame = _frame(close, high=high, low=low)
+
+    markers = build_123_2b_markers(frame)
+
+    assert any(marker["text"] == "2B买" and marker["source"] == "book_2b" for marker in markers)
+
+
+def test_trader_vic_2b_rejects_reclaim_without_volume_confirmation():
+    from core.sequoia_research import trader_vic_2b_signal_mask
+
+    close = np.linspace(10.0, 12.0, 250)
+    frame = _frame(close)
+    support = float(frame["最低"].iloc[-23:-3].min())
+    frame.loc[247, ["最低", "收盘", "开盘"]] = [support * 0.97, support * 0.98, support * 0.99]
+    frame.loc[248, ["最低", "收盘", "开盘"]] = [support * 0.975, support * 0.985, support * 0.99]
+    frame.loc[249, ["最低", "收盘", "开盘", "成交量"]] = [
+        support * 0.99, support * 1.02, support * 1.005, 100_000.0,
+    ]
+
+    mask = trader_vic_2b_signal_mask(frame)
+
+    assert not bool(mask.any())
+
+
+def test_trader_vic_2b_rejects_reclaim_far_below_declining_200_day_average():
+    from core.sequoia_research import trader_vic_2b_signal_mask
+
+    close = np.linspace(12.0, 10.0, 250)
+    frame = _frame(close)
+    support = float(frame["最低"].iloc[-23:-3].min())
+    frame.loc[247, ["最低", "收盘", "开盘"]] = [support * 0.97, support * 0.98, support * 0.99]
+    frame.loc[248, ["最低", "收盘", "开盘"]] = [support * 0.975, support * 0.985, support * 0.99]
+    frame.loc[249, ["最低", "收盘", "开盘", "成交量"]] = [
+        support * 0.99, support * 1.02, support * 1.005, 300_000.0,
+    ]
+
+    mask = trader_vic_2b_signal_mask(frame)
+
+    assert not bool(mask.any())
+
+
+def test_trader_vic_2b_strategy_is_registered_as_shadow_scan_only():
+    from core.strategy_registry import get_strategy
+
+    strategy = get_strategy("trader_vic_2b")
+
+    assert strategy["supports_scan"] is True
+    assert strategy["supports_backtest"] is False
+    assert strategy["trade_eligible"] is False
+
+
+def test_trader_vic_2b_scanner_result_is_observation_only():
+    from core.scanner import _check_sequoia_research_strategy
+
+    frame = _frame(np.linspace(10.0, 12.0, 250))
+    support = float(frame["最低"].iloc[-23:-3].min())
+    frame.loc[247, ["最低", "收盘", "开盘"]] = [support * 0.97, support * 0.98, support * 0.99]
+    frame.loc[248, ["最低", "收盘", "开盘"]] = [support * 0.975, support * 0.985, support * 0.99]
+    frame.loc[249, ["最低", "收盘", "开盘", "成交量"]] = [
+        support * 0.99, support * 1.02, support * 1.005, 300_000.0,
+    ]
+
+    matched, result = _check_sequoia_research_strategy(
+        frame, "600001", "测试股份", "trader_vic_2b",
+    )
+
+    assert matched is True
+    assert result["trader_vic_2b_watch_only"] is True
+    assert result["trade_eligible"] is False
+    assert result["trader_vic_2b_metrics"]["vic_2b_support"] > 0
+    assert result["trader_vic_2b_metrics"]["rps_120_minimum"] == 60
+
+
+def test_ma_volume_requires_same_day_golden_cross_and_volume_surge():
+    from core.sequoia_research import ma_volume_signal_mask
+
+    close = np.r_[np.full(17, 10.0), np.full(3, 9.5), 12.0]
+    volume = np.r_[np.full(20, 100_000.0), 200_000.0]
+    frame = _frame(close, volume=volume)
+
+    mask = ma_volume_signal_mask(frame)
+
+    assert bool(mask.iloc[-1]) is True
+    assert not bool(mask.iloc[:-1].any())
+
+
+def test_uptrend_limit_down_requires_prior_bull_trend_and_volume_surge():
+    from core.sequoia_research import uptrend_limit_down_signal_mask
+
+    close = np.r_[np.linspace(10, 20, 61), 18.0]
+    volume = np.r_[np.full(61, 100_000.0), 250_000.0]
+    frame = _frame(close, volume=volume)
+
+    mask = uptrend_limit_down_signal_mask(frame, "600001")
+
+    assert bool(mask.iloc[-1]) is True
+    assert not bool(mask.iloc[:-1].any())
+
+
+def test_rps_breakout_requires_proximity_to_120_day_high():
+    from core.sequoia_research import rps_breakout_proximity_mask
+
+    near_high = _frame(np.r_[np.linspace(10, 20, 119), 19.0])
+    far_from_high = _frame(np.r_[np.linspace(10, 20, 119), 17.0])
+
+    assert bool(rps_breakout_proximity_mask(near_high).iloc[-1]) is True
+    assert bool(rps_breakout_proximity_mask(far_from_high).iloc[-1]) is False
+
+
 def test_limit_up_shakeout_respects_board_specific_price_limits():
     from core.sequoia_research import limit_up_shakeout_signal_mask
 
@@ -139,13 +313,16 @@ def test_limit_up_shakeout_respects_board_specific_price_limits():
 def test_sequoia_research_strategies_are_registered_as_shadow_only():
     from core.strategy_registry import get_strategy
 
-    for strategy_type in ("high_tight_flag", "turtle_breakout", "limit_up_shakeout"):
+    for strategy_type in (
+        "high_tight_flag", "turtle_breakout", "limit_up_shakeout",
+        "ma_volume", "uptrend_limit_down", "rps_breakout",
+    ):
         item = get_strategy(strategy_type)
         assert item is not None
         assert item["supports_scan"] is True
-        assert item["supports_backtest"] is True
         assert item["release_state"] == "SHADOW"
         assert item["trade_eligible"] is False
+        assert item["supports_backtest"] is (strategy_type != "rps_breakout")
 
 
 def test_backtest_dispatch_uses_new_signal_definitions():
@@ -228,6 +405,30 @@ def test_scanner_research_candidate_is_never_trade_eligible():
     assert result["sequoia_research_shadow_only"] is True
 
 
+def test_new_sequoia_scan_strategies_are_shadow_only():
+    from core.scanner import _check_sequoia_research_strategy
+
+    cases = [
+        ("ma_volume", _frame(
+            np.r_[np.full(17, 10.0), np.full(3, 9.5), 12.0],
+            volume=np.r_[np.full(20, 100_000.0), 200_000.0],
+        )),
+        ("uptrend_limit_down", _frame(
+            np.r_[np.linspace(10, 20, 61), 18.0],
+            volume=np.r_[np.full(61, 100_000.0), 250_000.0],
+        )),
+        ("rps_breakout", _frame(np.r_[np.linspace(10, 20, 119), 19.0])),
+    ]
+    for strategy_type, frame in cases:
+        matched, result = _check_sequoia_research_strategy(
+            frame, "600001", "测试股份", strategy_type,
+        )
+        assert matched is True
+        assert result["release_state"] == "SHADOW"
+        assert result["trade_eligible"] is False
+        assert result[f"{strategy_type}_watch_only"] is True
+
+
 def test_shadow_research_candidate_never_enters_bark_operation_lists():
     from core.sentinel import (
         _candidate_brief_action,
@@ -248,3 +449,60 @@ def test_shadow_research_candidate_never_enters_bark_operation_lists():
     assert _select_intraday_push_stocks([candidate]) == []
     assert _select_after_close_watchlist([candidate]) == []
     assert _candidate_brief_action(candidate) == "SHADOW研究观察"
+
+
+def test_kangaroo_tail_detects_low_pierce_with_upper_half_close():
+    """看涨袋鼠尾：常态振幅2倍长柱刺破20日低点、收盘回到柱体上半部。"""
+    from core.sequoia_research import kangaroo_tail_signal_mask
+
+    size = 40
+    close = np.full(size, 100.0)
+    open_ = np.full(size, 99.0)
+    high = np.full(size, 101.0)
+    low = np.full(size, 99.0)
+    # 末日长柱：振幅 20（常态 2 的 10 倍），低点 80 刺破 20 日低点 99，收盘 96 位于柱体 80% 处
+    open_[-1], high[-1], low[-1], close[-1] = 98.0, 100.0, 80.0, 96.0
+    mask = kangaroo_tail_signal_mask(_frame(close, open_=open_, high=high, low=low))
+    assert mask.iloc[-1] is True or bool(mask.iloc[-1]) is True
+    assert int(mask.sum()) == 1
+
+
+def test_kangaroo_tail_rejects_lower_half_close():
+    from core.sequoia_research import kangaroo_tail_signal_mask
+
+    size = 40
+    close = np.full(size, 100.0)
+    open_ = np.full(size, 99.0)
+    high = np.full(size, 101.0)
+    low = np.full(size, 99.0)
+    open_[-1], high[-1], low[-1], close[-1] = 98.0, 100.0, 80.0, 85.0  # 收盘位于柱体 25%
+    mask = kangaroo_tail_signal_mask(_frame(close, open_=open_, high=high, low=low))
+    assert not bool(mask.iloc[-1])
+
+
+def test_kangaroo_tail_requires_piercing_prior_20_day_low():
+    from core.sequoia_research import kangaroo_tail_signal_mask
+
+    size = 40
+    close = np.full(size, 100.0)
+    open_ = np.full(size, 99.0)
+    high = np.full(size, 101.0)
+    low = np.full(size, 99.0)
+    # 长柱但未刺破 20 日低点（low=99.5 > 前低 99）
+    open_[-1], high[-1], low[-1], close[-1] = 98.0, 119.5, 99.5, 112.0
+    mask = kangaroo_tail_signal_mask(_frame(close, open_=open_, high=high, low=low))
+    assert not bool(mask.iloc[-1])
+
+
+def test_kangaroo_tail_requires_range_expansion():
+    from core.sequoia_research import kangaroo_tail_signal_mask
+
+    size = 40
+    close = np.full(size, 100.0)
+    open_ = np.full(size, 99.0)
+    high = np.full(size, 101.0)
+    low = np.full(size, 99.0)
+    # 刺破低点但振幅仅 3（不足常态 2 的 2 倍）
+    open_[-1], high[-1], low[-1], close[-1] = 98.5, 101.0, 98.0, 100.5
+    mask = kangaroo_tail_signal_mask(_frame(close, open_=open_, high=high, low=low))
+    assert not bool(mask.iloc[-1])

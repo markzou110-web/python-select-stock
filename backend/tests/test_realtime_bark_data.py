@@ -371,6 +371,8 @@ def test_realtime_alert_task_rejects_stale_snapshot(monkeypatch):
     monkeypatch.setattr(tasks, "get_db_engine", lambda: object())
     monkeypatch.setattr(tasks.pd, "read_sql", lambda *args, **kwargs: open_trades)
     monkeypatch.setattr(tasks, "get_market_snapshot", lambda: stale)
+    # 风控/告警取价已切换到小名单快报价入口，一并固定为同一份过期快照
+    monkeypatch.setattr("core.data.get_fast_quotes", lambda codes, **kwargs: stale)
 
     assert tasks.check_realtime_alerts() == "Failed to fetch fresh snapshot"
 
@@ -433,6 +435,8 @@ def test_wind_control_rejects_stale_snapshot(monkeypatch):
     monkeypatch.setattr(paper_trade, "get_db_engine", lambda: object())
     monkeypatch.setattr(paper_trade.pd, "read_sql", lambda *args, **kwargs: open_trades)
     monkeypatch.setattr("core.data.get_market_snapshot", lambda: stale)
+    # 风控取价已切换到小名单快报价入口，一并固定为同一份过期快照
+    monkeypatch.setattr("core.data.get_fast_quotes", lambda codes, **kwargs: stale)
 
     result = paper_trade.run_wind_control()
 

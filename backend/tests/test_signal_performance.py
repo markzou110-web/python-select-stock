@@ -128,9 +128,12 @@ def test_signal_report_separates_timing_confirmation_and_gate_attribution():
     selection = next(item for item in report["cohorts"] if item["cohort"] == "selection")
 
     assert report["summary"]["snapshot_events"] == 1
-    assert report["validation"]["selection"] == {
-        "status": "INSUFFICIENT_DATA", "mature_5d": 1, "required": 30,
-    }
+    # 批4-3b：VALIDATED 双条件后，selection 项新增独立事件与表现门槛标记
+    selection_validation = report["validation"]["selection"]
+    assert selection_validation["status"] == "INSUFFICIENT_DATA"
+    assert selection_validation["mature_5d"] == 1
+    assert selection_validation["required"] == 30
+    assert selection_validation["independent_events_only"] is True
     assert report["validation"]["execution"]["mature_5d"] == 0
     assert report["validation"]["confirmation"]["triggered_samples"] == 1
     assert report["status"] == "INSUFFICIENT_DATA"

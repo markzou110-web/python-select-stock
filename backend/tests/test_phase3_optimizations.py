@@ -156,15 +156,18 @@ def test_daily_loss_within_limit_is_ok():
 
 
 def test_daily_loss_triggers_halt():
-    """日内亏损超过熔断线 → status=halt, halted=True。"""
+    """日内亏损超过熔断线 → status=halt, halted=True。
+
+    批2-4：分母统一为 virtual_total_capital（默认 100 万），亏损额需超 5 万。"""
     from core.portfolio_risk import evaluate_daily_loss_circuit_breaker
     engine = _setup_paper_engine()
-    # entry=10, close=9.2 → -8%，超过 -5% 熔断线
-    _insert_closed_trade(engine, entry=10.0, close=9.2, shares=100)
+    # entry=10, close=4.9, shares=10000 → 亏损 -51,000 → -5.1%，超过 -5% 熔断线
+    _insert_closed_trade(engine, entry=10.0, close=4.9, shares=10000)
     result = evaluate_daily_loss_circuit_breaker(engine)
     assert result["status"] == "halt"
     assert result["halted"] is True
     assert result["daily_loss_pct"] <= -5.0
+    assert result["denominator"] == 1000000.0  # 统一后的分母透明可审计
 
 
 def test_daily_loss_profit_never_halts():
@@ -180,10 +183,10 @@ def test_daily_loss_profit_never_halts():
 
 
 def test_daily_loss_custom_limit():
-    """自定义更紧的熔断线（daily_loss_limit_pct=3）→ -4% 也触发。"""
+    """自定义更紧的熔断线（daily_loss_limit_pct=3）→ 亏损额超 3% 分母即触发。"""
     from core.portfolio_risk import evaluate_daily_loss_circuit_breaker
     engine = _setup_paper_engine()
-    _insert_closed_trade(engine, entry=10.0, close=9.6, shares=100)  # -4%
+    _insert_closed_trade(engine, entry=10.0, close=6.9, shares=10000)  # -31,000 → -3.1%
     result = evaluate_daily_loss_circuit_breaker(engine, budget={"daily_loss_limit_pct": 3.0})
     assert result["status"] == "halt"
     assert result["halted"] is True
@@ -204,23 +207,27 @@ def _insert_open_trade(engine, code="000001", entry=10.0, shares=1000):
 
 
 def test_floating_loss_triggers_on_deep_drawdown():
-    """B5：组合浮亏超 -5% 时熔断（halt），阻止加仓。"""
+    """B5：组合浮亏超 -5% 时熔断（halt），阻止加仓。
+
+    批2-4：分母统一为 virtual_total_capital（默认 100 万），浮亏额需超 5 万。"""
     import pandas as pd
     from core.portfolio_risk import evaluate_floating_loss_circuit_breaker
 
     engine = _setup_paper_engine()
     for code in ["000001", "000002", "000003"]:
-        _insert_open_trade(engine, code=code, entry=10.0, shares=1000)
-    # 全部 -8% → 组合浮亏 -8% > 5% 熔断线
+        _insert_open_trade(engine, code=code, entry=10.0, shares=20000)
+    # 全部 -8% → 浮亏额 -48,000×... 3×(9.2-10)×20000 = -48,000 → -4.8% 不够；
+    # 用 price=9.0：3×(-1.0)×20000 = -60,000 → -6.0% > 5% 熔断线
     snap = pd.DataFrame([
-        {"code": "000001", "price": 9.2},
-        {"code": "000002", "price": 9.2},
-        {"code": "000003", "price": 9.2},
+        {"code": "000001", "price": 9.0},
+        {"code": "000002", "price": 9.0},
+        {"code": "000003", "price": 9.0},
     ])
     result = evaluate_floating_loss_circuit_breaker(engine, snap)
     assert result["status"] == "halt"
     assert result["halted"] is True
     assert result["floating_loss_pct"] < -5.0
+    assert result["denominator"] == 1000000.0
 
 
 def test_floating_loss_ok_within_limit():
