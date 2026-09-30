@@ -3,7 +3,7 @@
 This module does not create buy signals. It converts existing market, sector,
 price-action, and money-flow evidence into execution permissions and sizing.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import math
 
 import pandas as pd
@@ -126,12 +126,15 @@ def apply_growth_segment_context(
     return segments
 
 
-def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
+def load_market_cycle_history(engine, days: int = 10, as_of: Optional[str] = None) -> List[Dict[str, Any]]:
     """Build daily breadth history for cycle classification.
 
     优先用 breadth_history 表的 MARKET 行（盘中实时聚合写入），修复 6/22 节后首日 bug：
     节后首日 daily_k 还是上个交易日数据，导致 cycle_history 缺今日宽度、情绪误判。
     新表空时回退 daily_k 聚合逻辑（向下兼容）。
+
+    as_of（回放扫描的数据日）给定时只读 ≤ as_of 的数据——否则回放会拿"未来"
+    日期的宽度做情绪周期判定，校准结论不可复现。实时扫描不传，行为不变。
     """
     if engine is None:
         return []
@@ -141,10 +144,11 @@ def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
         bh = pd.read_sql(text("""
             SELECT bar_date, advance_ratio, strong_ratio, weak_ratio, avg_return
             FROM breadth_history
-            WHERE scope = 'MARKET'
+            WHERE scope = 'MARKET' AND advance_ratio IS NOT NULL
+              AND (:as_of IS NULL OR bar_date <= :as_of)
             ORDER BY bar_date DESC
             LIMIT :days
-        """), engine, params={"days": int(days)})
+        """), engine, params={"days": int(days), "as_of": as_of})
     except Exception:
         bh = pd.DataFrame()
 
@@ -164,14 +168,16 @@ def load_market_cycle_history(engine, days: int = 10) -> List[Dict[str, Any]]:
     try:
         query = """
             WITH recent_dates AS (
-                SELECT DISTINCT date FROM daily_k ORDER BY date DESC LIMIT :date_limit
+                SELECT DISTINCT date FROM daily_k
+                WHERE (:as_of IS NULL OR date <= :as_of)
+                ORDER BY date DESC LIMIT :date_limit
             )
             SELECT code, date, close
             FROM daily_k
             WHERE date IN (SELECT date FROM recent_dates)
             ORDER BY code, date
         """
-        frame = pd.read_sql(text(query), engine, params={"date_limit": int(days) + 1})
+        frame = pd.read_sql(text(query), engine, params={"date_limit": int(days) + 1, "as_of": as_of})
     except Exception:
         return []
     if frame.empty:
@@ -618,15 +624,29 @@ def apply_decision_layer(
         )
         position_blocked = blocked or not score_gate_applicable
         if stock.get("a_eod_controlled_trial") and not position_blocked:
-            controlled_cap = min(float(market_cap), A_EOD_PORTFOLIO_CAP_PCT)
-            controlled_position = min(A_EOD_POSITION_PCT, controlled_cap)
-            position = _risk_normalize_position({
-                "label": "尾盘受控小仓" if controlled_position > 0 else "观望",
-                "initial_position_pct": controlled_position,
-                "max_position_pct": controlled_position,
-                "portfolio_position_cap_pct": controlled_cap,
-                "a_eod_max_positions": A_EOD_MAX_CONCURRENT_POSITIONS,
-            }, stock)
+            from core.risk_constants import A_EOD_CONTROLLED_ENABLED
+
+            if A_EOD_CONTROLLED_ENABLED:
+                controlled_cap = min(float(market_cap), A_EOD_PORTFOLIO_CAP_PCT)
+                controlled_position = min(A_EOD_POSITION_PCT, controlled_cap)
+                position = _risk_normalize_position({
+                    "label": "尾盘受控小仓" if controlled_position > 0 else "观望",
+                    "initial_position_pct": controlled_position,
+                    "max_position_pct": controlled_position,
+                    "portfolio_position_cap_pct": controlled_cap,
+                    "a_eod_max_positions": A_EOD_MAX_CONCURRENT_POSITIONS,
+                }, stock)
+            else:
+                # SHADOW（a-eod-v1-shadow）：资格判定保留用于点内对照统计，
+                # 仓位归零——E3 walk-forward 未通过前不承接真实仓位
+                position = _risk_normalize_position({
+                    "label": "尾盘受控[SHADOW]",
+                    "initial_position_pct": 0,
+                    "max_position_pct": 0,
+                    "portfolio_position_cap_pct": 0,
+                    "a_eod_max_positions": 0,
+                    "a_eod_shadow": True,
+                }, stock)
         else:
             position = _risk_normalize_position(
                 _position_plan(opportunity, market_cap, mainline, position_blocked), stock,

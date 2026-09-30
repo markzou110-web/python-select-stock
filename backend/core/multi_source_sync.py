@@ -48,6 +48,13 @@ MIN_REQUIRED_TRADING_DAYS = 950
 # 平均返回 990~996 天，足以覆盖 950 天阈值，确保回填后稳定收敛。
 HISTORY_LOOKBACK_CALENDAR_DAYS = 1500
 
+# 收盘最终化时刻：12:10 午间同步会把当日半日 bar 写进 daily_k（此时 close/vol
+# 是进行中值），此后 daily_k 已有当日数据。若收盘后同步仍按"已是最新"跳过，
+# 半日 bar 将永久留在库里且次日增量同步不会回头修正（check_realtime_alerts、
+# NH-NL 宽度、回测都消费 daily_k）。save_to_db 对 (code, date) 是 upsert，
+# 收盘后回拉当日即可用终值覆盖半日值。
+DAILY_K_FINALIZE_TIME = "15:05"
+
 # 批量同步并发度。外部免费行情源对突发并发较敏感，10 个 worker 在保持
 # 同步吞吐的同时，减少 RemoteDisconnected 与限流。
 SYNC_MAX_WORKERS = 10
@@ -984,14 +991,25 @@ class MultiSourceSync:
                     needed_start_date = today - timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
                     start_date = needed_start_date.strftime("%Y%m%d")
                     result["message"] = f"数据不足({data_count}天)，补齐历史数据..."
+                elif last_date > today:
+                    # 未来数据（不应出现），跳过
+                    result["success"] = True
+                    result["message"] = f"已是最新 ({data_count}天)"
+                    return result
+                elif last_date == today and datetime.now().strftime("%H:%M") >= DAILY_K_FINALIZE_TIME:
+                    # 收盘后 daily_k 已有当日（午间半日）bar：回拉当日，用终值覆盖
+                    start_date = today.strftime("%Y%m%d")
                 elif last_date >= today:
-                    # 数据足够且已是最新
+                    # 盘中且当日已同步（半日数据属预期），跳过
                     result["success"] = True
                     result["message"] = f"已是最新 ({data_count}天)"
                     return result
                 else:
-                    # 数据足够但不是最新，增量更新
-                    start_date = (last_date + timedelta(days=1)).strftime("%Y%m%d")
+                    # 数据足够但不是最新，增量更新。起点含 last_date 当日：
+                    # save_to_db 对 (code, date) 是 upsert，重复回拉幂等无害，
+                    # 但能自愈"昨天 15:05 最终化窗口错过"的半日 bar（否则该
+                    # 半日值永不修正），代价是每次多拉一根K线。
+                    start_date = last_date.strftime("%Y%m%d")
             else:
                 # 无历史数据，获取足够的历史数据
                 start_date = (today - timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")

@@ -89,6 +89,24 @@ def save_limit_up_events(rows: Iterable[Dict[str, Any]], engine=None) -> int:
     return len(rows)
 
 
+# 每分钟涨停池采集的变化量水位（minute-collector-diff-v1）：池内绝大多数行在
+# 分钟间不变，全量 upsert 每日 ~4-5 万次写（>95% 空转，MVCC 死元组 churn）。
+# 进程内保留上次快照签名，只写变化行；首轮（进程启动/跨日）全量写。
+# 签名覆盖落库全部业务列——任一字段变化即视为该行需要重写。
+_POOL_SIGNATURE_FIELDS = (
+    "name", "industry", "status", "first_limit_time", "last_limit_time",
+    "break_count", "limit_up_streak", "seal_amount", "turnover", "amount",
+)
+_POOL_SNAPSHOT: Dict[str, Dict[str, tuple]] = {}  # db_date -> {code: signature}
+
+
+def _pool_signature(rows: Iterable[Dict[str, Any]]) -> Dict[str, tuple]:
+    return {
+        row["code"]: tuple(str(row.get(field)) for field in _POOL_SIGNATURE_FIELDS)
+        for row in rows
+    }
+
+
 def collect_limit_up_events(event_date: Optional[str] = None, engine=None, collected_at: Optional[datetime] = None) -> Dict[str, int]:
     collected_at = collected_at or datetime.now()
     event_date = event_date or collected_at.strftime("%Y%m%d")
@@ -108,11 +126,25 @@ def collect_limit_up_events(event_date: Optional[str] = None, engine=None, colle
     for status in ("BROKEN", "SEALED"):
         for row in _pool_rows(pools[status], status, db_date, collected_at):
             rows_by_code[row["code"]] = row
-    saved = save_limit_up_events(rows_by_code.values(), engine=engine)
+    signature = _pool_signature(rows_by_code.values())
+    previous = _POOL_SNAPSHOT.get(db_date)
+    if previous:
+        changed_rows = [
+            row for row in rows_by_code.values()
+            if signature.get(row["code"]) != previous.get(row["code"])
+        ]
+    else:
+        changed_rows = list(rows_by_code.values())
+    saved = save_limit_up_events(changed_rows, engine=engine)
+    # 水位只保留当前交易日：跨日首轮自然退化为全量写（正确语义）
+    for stale in [d for d in _POOL_SNAPSHOT if d < db_date]:
+        _POOL_SNAPSHOT.pop(stale, None)
+    _POOL_SNAPSHOT[db_date] = signature
     return {
         "sealed": 0 if pools["SEALED"] is None else len(pools["SEALED"]),
         "broken": 0 if pools["BROKEN"] is None else len(pools["BROKEN"]),
         "saved": saved,
+        "total_in_pool": len(rows_by_code),
         "errors": errors,
     }
 
@@ -271,6 +303,29 @@ def _snapshot_minute_frame(codes: List[str], event_date: str) -> pd.DataFrame:
     })
 
 
+# 分钟 bar 写入水位（minute-collector-diff-v1）：东财 fallback 每次拉全天
+# 09:25-15:05 分钟线并全量 upsert，单根 bar 到收盘被重写 ~48 次（每日 ~34 万
+# 次 upsert 空转 + 4 组索引维护）。按 code 记录已写入的最后 bar_time，只落
+# 水位之后的增量；快照路径本就只写当前分钟，无需处理。
+_MINUTE_BAR_WATERMARK: Dict[str, Dict[str, str]] = {}  # event_date -> {code: last_bar_time}
+
+
+def _minute_watermark(event_date: str, code: str) -> str:
+    return _MINUTE_BAR_WATERMARK.get(event_date, {}).get(str(code), "")
+
+
+def _update_minute_watermark(event_date: str, code: str, frame: "pd.DataFrame") -> None:
+    if frame is None or frame.empty or "时间" not in frame.columns:
+        return
+    latest = str(frame["时间"].iloc[-1])[:19]
+    bucket = _MINUTE_BAR_WATERMARK.setdefault(event_date, {})
+    if latest > bucket.get(str(code), ""):
+        bucket[str(code)] = latest
+    # 跨日清理：水位只保留当前交易日
+    for stale in [d for d in _MINUTE_BAR_WATERMARK if d < event_date]:
+        _MINUTE_BAR_WATERMARK.pop(stale, None)
+
+
 def collect_candidate_minute_bars(event_date: Optional[str] = None, engine=None, max_codes: int = 30) -> Dict[str, int]:
     engine = engine or get_db_engine()
     if not engine:
@@ -301,7 +356,15 @@ def collect_candidate_minute_bars(event_date: Optional[str] = None, engine=None,
     for code in codes:
         try:
             frame = _fetch_minute_bars(code, event_date, retries=1)
+            # 增量水位：只落上次已写 bar_time 之后的新 bar（字符串比较即时间序）
+            watermark = _minute_watermark(event_date, str(code))
+            if watermark and frame is not None and not frame.empty and "时间" in frame.columns:
+                frame = frame[frame["时间"].astype(str).str[:19] > watermark]
+                if frame.empty:
+                    empty += 1
+                    continue
             saved = save_minute_bars(code, frame, engine=engine)
+            _update_minute_watermark(event_date, str(code), frame)
             if saved == 0:
                 empty += 1
             eastmoney_bars += saved

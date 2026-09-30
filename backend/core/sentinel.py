@@ -1675,6 +1675,8 @@ class IntradaySentinel:
         self._stop = False
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+        # 改动 F1：持仓秒级快盯（独立线程，只推送不交易），与主循环 30s tick 解耦
+        start_fast_position_watcher()
 
     def _run(self):
         while not self._stop:
@@ -1730,4 +1732,187 @@ class IntradaySentinel:
             time.sleep(30)
 
 
+# ── 持仓秒级快盯（改动 F1：fast-position-watch-v1）───────────────────────────
+# 常规风控 tick 为 30/10 分钟一跳，急跌击穿止损时上班族完全无感。本线程在
+# 交易时段每 FAST_WATCH_INTERVAL_SECONDS（默认 15 秒）用直连快报价检查
+# OPEN 持仓是否击穿当前有效止损，命中即推 Bark。
+# 语义边界：只推送、不自动平仓、不动 pending_exit——交易动作仍归
+# run_wind_control；与 5 分钟告警任务的状态机解耦（自带进程内 30 分钟冷却），
+# 避免两个告警生产者互相覆盖去重状态造成漏推/刷屏。
+import os as _os
+
+FAST_WATCH_INTERVAL_SECONDS = float(_os.getenv("FAST_WATCH_INTERVAL_SECONDS", "15"))
+FAST_WATCH_COOLDOWN_SECONDS = 30 * 60
+
+
+class FastPositionWatcher:
+    """交易时段持仓快盯：止损击穿秒级 Bark 提醒（alert-only）。"""
+
+    def __init__(self, interval_seconds: Optional[float] = None):
+        self.interval = float(
+            interval_seconds if interval_seconds is not None else FAST_WATCH_INTERVAL_SECONDS
+        )
+        self._stop = False
+        self._breach_since: Dict[str, float] = {}  # code -> 首次击穿时间戳（冷却用）
+
+    def stop(self):
+        self._stop = True
+
+    def _load_open_positions(self, engine):
+        import pandas as pd
+        from sqlalchemy import text
+        return pd.read_sql(
+            text("SELECT code, name, entry_price, high_since_entry, trade_mode "
+                 "FROM paper_trading WHERE status = 'OPEN'"),
+            engine,
+        )
+
+    def watch_once(self, engine=None, now: Optional[datetime] = None) -> List[str]:
+        """评估一轮持仓快盯，返回需推送的告警文案（engine 可注入，便于测试）。"""
+        from core.db import get_db_engine
+        from core.risk_engine import compute_paper_risk_levels_with_context, safe_float
+        from core.data import get_fast_quotes, snapshot_lookup
+
+        engine = engine or get_db_engine()
+        if engine is None:
+            return []
+        df = self._load_open_positions(engine)
+        if df.empty:
+            return []
+        quotes = get_fast_quotes(df["code"].astype(str).tolist())
+        if quotes.empty:
+            return []
+        now = now or datetime.now()
+        alerts: List[str] = []
+        for _, row in df.iterrows():
+            code = str(row["code"])
+            entry_price = safe_float(row.get("entry_price"))
+            if entry_price <= 0:
+                continue
+            price, _fetched_at, _source = snapshot_lookup(quotes, code, "price")
+            low, _, _ = snapshot_lookup(quotes, code, "low")
+            try:
+                price = float(price) if price is not None else 0.0
+                low = float(low) if low is not None else 0.0
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            # 与风控同口径：盘中任一时刻击穿即算（effective = min(现价, 当日最低)）
+            effective_price = min(price, low) if low > 0 else price
+            # 统一止损口径：走 with_context（自动取 ATR/弱市收紧，ATR 带 10 分钟
+            # TTL 缓存，15s 循环开销可控）。此前裸调用在弱市/低 ATR 时告警线比
+            # 风控宽 3-4 个点，急跌最需要提醒的窗口反而沉默。
+            risk = compute_paper_risk_levels_with_context(
+                entry_price, safe_float(row.get("high_since_entry"), entry_price), price, code=code
+            )
+            active_stop = safe_float(risk.get("active_stop_price"))
+            if active_stop <= 0:
+                continue
+            if effective_price < active_stop:
+                first = self._breach_since.get(code)
+                if first is None or now.timestamp() - first >= FAST_WATCH_COOLDOWN_SECONDS:
+                    # 冷却持久化：进程内 dict 在重启/多进程部署下失效，会重复刷屏；
+                    # DB 槽位跨进程共享，内存 dict 保留为 DB 故障时的兜底。
+                    if not _fast_watch_cooldown_active(code, now):
+                        self._breach_since[code] = now.timestamp()
+                        _fast_watch_cooldown_set(code, now)
+                        mode_label = "实盘" if str(row.get("trade_mode") or "").upper() == "REAL" else "模拟"
+                        alerts.append(
+                            f"{row.get('name') or code}({code}) [{mode_label}] "
+                            f"现价 {price:.2f} 已击穿有效止损 {active_stop:.2f}，请人工确认"
+                        )
+                    else:
+                        self._breach_since[code] = now.timestamp()
+            else:
+                # 收回即清冷却，再次击穿可重新提醒；仅在内存确有记录时才写库，
+                # 否则未触止损的持仓每 15 秒空写一次 system_setting（每仓每日 240 次）
+                if self._breach_since.pop(code, None) is not None:
+                    _fast_watch_cooldown_clear(code)
+        return alerts
+
+    def _run(self):
+        while not self._stop:
+            try:
+                now = datetime.now()
+                if is_a_share_intraday_session(now):
+                    alerts = self.watch_once()
+                    if alerts:
+                        self._push(alerts)
+            except Exception as exc:
+                logger.error(f"FastPositionWatcher loop error: {exc}")
+            time.sleep(self.interval)
+
+    def _push(self, alerts: List[str]):
+        from .notifier import notifier
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        title = f"🚨 持仓止损快报 ({len(alerts)})"
+        loop.run_until_complete(
+            notifier.send(title, "\n".join(alerts), channels=["bark"], group="AlphaVision_WindControl")
+        )
+
+
+_fast_position_watcher: Optional[FastPositionWatcher] = None
+
+
+def start_fast_position_watcher() -> FastPositionWatcher:
+    """启动持仓快盯线程（幂等；由 IntradaySentinel.start() 调用）。"""
+    global _fast_position_watcher
+    if _fast_position_watcher is not None:
+        return _fast_position_watcher
+    _fast_position_watcher = FastPositionWatcher()
+    threading.Thread(
+        target=_fast_position_watcher._run, daemon=True, name="fast-position-watch",
+    ).start()
+    logger.info(f"FastPositionWatcher started (interval={_fast_position_watcher.interval}s)")
+    return _fast_position_watcher
+
+
 sentinel = IntradaySentinel()
+
+
+# ── 快盯冷却的 DB 持久化（fast-watch-cooldown-v1）────────────────────────────
+# 进程内 _breach_since 在 worker 重启后清零 → 同一击穿事件重复推送；多进程部署
+# 下各进程各有一份 → 去重完全失效。用 system_setting 槽位跨进程共享，30 分钟
+# 窗口与 FAST_WATCH_COOLDOWN_SECONDS 一致；读写失败静默降级到内存 dict。
+
+_FAST_WATCH_SETTING_PREFIX = "fast_watch_breach:"
+
+
+def _fast_watch_cooldown_active(code: str, now: datetime) -> bool:
+    from core.db import get_setting
+    try:
+        raw = get_setting(f"{_FAST_WATCH_SETTING_PREFIX}{code}", "")
+        if not raw:
+            return False
+        import json as _json
+        state = _json.loads(raw)
+        last = datetime.fromisoformat(str(state.get("ts")))
+        return (now - last).total_seconds() < FAST_WATCH_COOLDOWN_SECONDS
+    except Exception:
+        return False
+
+
+def _fast_watch_cooldown_set(code: str, now: datetime) -> None:
+    from core.db import save_setting
+    try:
+        save_setting(f"{_FAST_WATCH_SETTING_PREFIX}{code}", _json_dumps({"ts": now.isoformat(timespec="seconds")}))
+    except Exception:
+        pass
+
+
+def _fast_watch_cooldown_clear(code: str) -> None:
+    from core.db import save_setting
+    try:
+        save_setting(f"{_FAST_WATCH_SETTING_PREFIX}{code}", "")
+    except Exception:
+        pass
+
+
+def _json_dumps(payload: dict) -> str:
+    import json
+    return json.dumps(payload, ensure_ascii=False)

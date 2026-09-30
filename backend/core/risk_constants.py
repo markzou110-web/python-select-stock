@@ -60,6 +60,26 @@ SOP_A_GRADE_MIN_MATURE_SAMPLES = 30
 TRADE_GATE_POLICY_VERSION = "trade-gate-v2"
 TRADE_GATE_V2_ENABLED = True  # 一行回滚：False 恢复 v1 全拦截行为
 
+# ── 晋升硬前置（promotion gate，量化纪律审查 2026-09-30）──
+# 任何 SHADOW/advisory 阈值转正（影响仓位/交易资格）前必须通过
+# core.validation_gate.promotion_allowed()：≥3 个滚动样本外正期望窗口，
+# 每窗口 ≥30 个独立样本。这是代码级强制门，替代此前的文档约定。
+WALK_FORWARD_MIN_POSITIVE_WINDOWS = 3
+WALK_FORWARD_MIN_SAMPLES_PER_WINDOW = 30
+
+# ── 活阈值验证状态表（2026-09-30 盘点；行为保留，验证补齐前禁止加严/扩权）──
+# PROMOTED=已过验证；PREREGISTERED=门槛已预注册未通过；PENDING=未经本库验证；
+# EXTERNAL=外部依据（书籍/经验），方向为风控收紧。
+# SECTOR_FUND_OUTFLOW_5D_YI=-10.0          PENDING（零依据直接砍资格，最优先补验证）
+# REGIME_POSITION_MULTIPLIER DEFENSIVE/CRIT PREREGISTERED（gates_ready 未 PASS 即生效）
+# AMP20_GATE 6% 分界                        PENDING（同段样本事后挑分界）
+# TREND_PHASE_POSITION_MULTIPLIER           PENDING（同上）
+# A_EOD 受控通道                            SHADOW（2026-09-30 降级，E3 未通过）
+# OPPORTUNITY_GATE_MIN_SCORE=60             PENDING（自标 DIAGNOSTIC_ONLY 却是活门）
+# BREADTH_DOWNGRADE_DEFENSIVE/CRITICAL      EXTERNAL（经验值联动 regime）
+# MAX_CONSECUTIVE_LOSSES / MONTHLY_RISK_PCT EXTERNAL（书籍法则，纯风控收紧）
+VALIDATION_STATUS_NOTE = "见 core/validation_gate.py PROMOTION_REGISTRY 与 promotion_allowed"
+
 # 市场环境 → 仓位乘数（替换 market_blocked 一票否决）。
 # CRITICAL 默认 0（禁止新仓），是否允许极强结构验证仓由 CRITICAL_TRIAL_ENABLED 决定。
 REGIME_POSITION_MULTIPLIER = {"OFFENSIVE": 1.0, "DEFENSIVE": 0.5, "CRITICAL": 0.0}
@@ -72,6 +92,16 @@ LOSS_STREAK_BREAKER_ENABLED = os.getenv("LOSS_STREAK_BREAKER_ENABLED", "true").l
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_STREAK_COOLDOWN_DAYS = 1
 LOSS_STREAK_POLICY_VERSION = "loss-streak-breaker-v1"
+
+# ── 月度风险熔断（monthly-risk-breaker-v1，Elder《以交易为生》6% 法则）──
+# 当月已实现净亏损 + 当前持仓资金风险，占虚拟总资金比例达到 MONTHLY_RISK_LIMIT_PCT
+# 时，本月剩余时间硬熔断新开仓（不可 force 绕过）。与日内/浮亏熔断（快）互补：
+# 日内熔断管"今天"，本熔断管"这个月"，防"亏钱后加大头寸救交易"的月度累积失控。
+# 账户净值暂以 DEFAULT_RISK_BUDGET.virtual_total_capital 近似（paper_trading 无资金
+# 字段，同 portfolio_risk 既有口径）。一行回滚：ENABLED=false。
+MONTHLY_RISK_BREAKER_ENABLED = os.getenv("MONTHLY_RISK_BREAKER_ENABLED", "true").lower() == "true"
+MONTHLY_RISK_LIMIT_PCT = 6.0
+MONTHLY_RISK_POLICY_VERSION = "monthly-risk-breaker-v1"
 
 # ── 波动率(振幅)闸门（amp20-gate-v1，《交易之路》波动率规则 + 本库90天分层验证）──
 # 近90天点内样本：20日均振幅>=6% 的信号 5日 -3.50%/胜率35.5%，而 2-4% 档 +0.40%。
@@ -88,6 +118,15 @@ AMP_SPIKE_RATIO = 1.8
 AMP_SPIKE_BASE_MAX_PCT = 2.5
 # 中途半端买点：现价高出突破触发价超过该比例视为追价（软约束）
 ENTRY_CHASE_MAX_EXTENSION_PCT = 3.0
+
+# ── 涨停情绪退潮观察（zt-sentiment-watch-v1，借鉴 easy-stock 超短情绪周期）──
+# 趋势回调策略不参与连板，但炸板率（炸板家数/(涨停+炸板)）是全市场风险偏好的
+# 领先温度计：>40% 即情绪退潮特征，所有策略的胜率环境都会被拖累。当前仅作
+# 盘前 Bark 功课行的"降暴露"提示（advisory），不改仓位/资格——与 AMP20 闸门
+# 不同，本阈值未经本库点内样本回测验证，先观察积累数据再决定是否入策略。
+# 数据源：limit_up_events（collect_limit_up_leadership 盘中逐分钟落库）。
+ZT_EBB_BROKEN_RATE_PCT = 40.0
+ZT_SENTIMENT_POLICY_VERSION = "zt-sentiment-watch-v1"
 
 # ── 道氏趋势阶段仓位约束（trend-phase-gate-v1）──
 # 道氏三阶段视角：衰竭段(CLIMAX/上轨过冲/楔形)与加速段属于公众参与后期/派发特征，
@@ -181,7 +220,14 @@ A_MINUS_TRIAL_ROUND_TRIP_COST_PCT = 0.15
 # 2022-05-12~2026-08-04 全市场点时K线回放中，严格双共振 + PA>=60
 # + 5日涨幅<=10% 是唯一在开发/验证/研究三段均保持正平均收益和 PF>1 的门槛。
 # 该通道只软化重复的板块/周线执行阻断，不放宽确认价、追高、涨停和结构失效门禁。
-A_EOD_CONTROLLED_POLICY_VERSION = "a-eod-controlled-trial-v1"
+#
+# 2026-09-30 降级 SHADOW（量化纪律审查 4-3）：该门槛是从多个 gate 配置里按
+# validation 段收益最大化挑出的"唯一幸存者"，且自家 E3 前推走查自认未执行
+# （a_grade_kline_replay e3_blockers: E3_NOT_REACHED）——多重检验幸存偏差未
+# 排除。SHADOW 模式保留资格判定与打标（继续积累点内对照样本），但仓位归零、
+# 不签发执行意图；E3（≥3 个滚动样本外正期望窗口）通过后置回 true。
+A_EOD_CONTROLLED_ENABLED = os.getenv("A_EOD_CONTROLLED_ENABLED", "false").lower() == "true"
+A_EOD_CONTROLLED_POLICY_VERSION = "a-eod-controlled-trial-v1-shadow"
 A_EOD_MIN_QUALITY_SCORE = 60.0
 A_EOD_MIN_PRICE_ACTION_SCORE = 60.0
 A_EOD_MIN_RISK_REWARD = 1.5

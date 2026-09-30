@@ -8,7 +8,8 @@ import re
 import hashlib
 import pandas as pd
 from datetime import datetime, timedelta, date
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import HTTPException
 import akshare as ak
@@ -701,6 +702,14 @@ def _discovery_pool_mask(snapshot_df: pd.DataFrame, strategy_type: str) -> tuple
         return pct.between(-12.0, 5.0, inclusive="both"), "LIMIT_UP_SHAKEOUT_SHADOW"
     if strategy_type == "turtle_breakout":
         return pct.gt(0), "TURTLE_BREAKOUT_SHADOW"
+    if strategy_type == "ma_volume":
+        return pct.between(-20.0, 20.0, inclusive="both"), "MA_VOLUME_SHADOW"
+    if strategy_type == "uptrend_limit_down":
+        return pct.le(-7.0), "UPTREND_LIMIT_DOWN_SHADOW"
+    if strategy_type == "rps_breakout":
+        return pct.between(-20.0, 20.0, inclusive="both"), "RPS_BREAKOUT_SHADOW"
+    if strategy_type == "trader_vic_2b":
+        return pct.between(-12.0, 12.0, inclusive="both"), "TRADER_VIC_2B_SHADOW"
     if strategy_type == "sector_watch":
         return pct.between(-2.0, 8.0, inclusive="both"), "PULLBACK_DISCOVERY"
     return pct > 0, "MOMENTUM_DISCOVERY"
@@ -803,6 +812,10 @@ _OBSERVATION_ONLY_PLAN_FLAGS = (
     "high_tight_flag_watch_only",
     "turtle_breakout_watch_only",
     "limit_up_shakeout_watch_only",
+    "ma_volume_watch_only",
+    "uptrend_limit_down_watch_only",
+    "rps_breakout_watch_only",
+    "trader_vic_2b_watch_only",
 )
 
 
@@ -1562,14 +1575,22 @@ def _check_sequoia_research_strategy(
     from core.sequoia_research import (
         high_tight_flag_signal_mask,
         limit_up_shakeout_signal_mask,
+        ma_volume_signal_mask,
+        rps_breakout_proximity_mask,
         signal_metrics,
         turtle_breakout_signal_mask,
+        trader_vic_2b_signal_mask,
+        uptrend_limit_down_signal_mask,
     )
 
     masks = {
         "high_tight_flag": lambda: high_tight_flag_signal_mask(df),
         "turtle_breakout": lambda: turtle_breakout_signal_mask(df),
         "limit_up_shakeout": lambda: limit_up_shakeout_signal_mask(df, code),
+        "ma_volume": lambda: ma_volume_signal_mask(df),
+        "uptrend_limit_down": lambda: uptrend_limit_down_signal_mask(df, code),
+        "rps_breakout": lambda: rps_breakout_proximity_mask(df),
+        "trader_vic_2b": lambda: trader_vic_2b_signal_mask(df),
     }
     if strategy_type not in masks:
         return False, {"reason": "未知研究策略"}
@@ -1586,14 +1607,30 @@ def _check_sequoia_research_strategy(
         "high_tight_flag": ("HTF高位收敛", "高位窄幅缩量整理，等待放量突破整理区高点"),
         "turtle_breakout": ("20日新高突破", "简单突破基准已命中，等待收盘与次日价格确认"),
         "limit_up_shakeout": ("涨停后洗盘", "放量换手但支撑未破，等待再次转强，禁止直接抄底"),
+        "ma_volume": ("均线放量金叉", "5日线上穿20日线并放量；研究信号，不代表追买"),
+        "uptrend_limit_down": ("上升趋势急跌", "前一交易日20/60日线多头排列后放量跌停；只观察风险释放"),
+        "rps_breakout": ("RPS强势突破观察", "120日相对强度前10%且接近120日高点；等待后续确认"),
+        "trader_vic_2b": ("Trader Vic 2B反转", "20日支撑假跌破后放量收复；等待确认，不追突破"),
     }
     metric_fields = {
         "high_tight_flag": "high_tight_flag_metrics",
         "turtle_breakout": "turtle_breakout_metrics",
         "limit_up_shakeout": "limit_up_shakeout_metrics",
+        "ma_volume": "ma_volume_metrics",
+        "uptrend_limit_down": "uptrend_limit_down_metrics",
+        "rps_breakout": "rps_breakout_metrics",
+        "trader_vic_2b": "trader_vic_2b_metrics",
     }
     signal, instruction = labels[strategy_type]
-    score = {"high_tight_flag": 66.0, "turtle_breakout": 70.0, "limit_up_shakeout": 62.0}[strategy_type]
+    score = {
+        "high_tight_flag": 66.0,
+        "turtle_breakout": 70.0,
+        "limit_up_shakeout": 62.0,
+        "ma_volume": 65.0,
+        "uptrend_limit_down": 55.0,
+        "rps_breakout": 68.0,
+        "trader_vic_2b": 68.0,
+    }[strategy_type]
     flag = f"{strategy_type}_watch_only"
     return True, {
         "代码": code,
@@ -1874,7 +1911,10 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
     if 0 < sector_alignment < MIN_EXECUTION_SECTOR_ALIGNMENT:
         blockers.append(f"板块联动<{MIN_EXECUTION_SECTOR_ALIGNMENT:.0f}，降级观察")
     weekly_context = str(res.get('pa_weekly_context') or "")
+    weekly_permission = str(res.get('pa_weekly_permission') or "")
     trend_phase = str(res.get('pa_trend_phase') or "")
+    if weekly_permission == "WAIT" or weekly_context in {"周线空头", "周线向下破位", "周线数据不足"}:
+        blockers.append(f"{weekly_context or '周线数据不足'}，等待周线转强")
     if weekly_context in {"周线中性", "周线交易区间"}:
         blockers.append(f"{weekly_context}，降级观察")
     if trend_phase == "震荡观察":
@@ -2088,6 +2128,13 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
             res['a_eod_controlled_trial'] = True
             res['a_eod_policy_version'] = A_EOD_CONTROLLED_POLICY_VERSION
             res['a_eod_trade_cautions'] = a_eod_cautions
+            from core.risk_constants import A_EOD_CONTROLLED_ENABLED
+            if not A_EOD_CONTROLLED_ENABLED:
+                # SHADOW：保留打标用于点内对照统计，但不贡献交易资格
+                res['a_eod_shadow'] = True
+                res.setdefault('trade_cautions', []).append(
+                    "A-EOD受控通道SHADOW中（E3前推验证未通过），仅观察不签发"
+                )
     fatal_markers = ("回避", "结构不进入交易池", "结构失效", "异常价格跳变", "板块下跌", "禁止实盘")
     has_fatal_blocker = any(any(marker in b for marker in fatal_markers) for b in blockers)
     # 字母等级不再参与执行。严格模式直接使用策略、板块、价格行为和阻断条件。
@@ -2112,7 +2159,9 @@ def _apply_trade_execution_profile(res: Dict[str, Any]) -> None:
                 and res.get('共振') == "🔥 核心热点"
                 and _trade_quality_confirmed(res, sector_strength, stock_sector_fit)
             )
-        trade_eligible = formal_trade or a_minus_trial or a_eod_trial
+        # SHADOW 模式下 a_eod_trial 不再贡献交易资格（res 打标保留供对照统计）
+        from core.risk_constants import A_EOD_CONTROLLED_ENABLED
+        trade_eligible = formal_trade or a_minus_trial or (a_eod_trial and A_EOD_CONTROLLED_ENABLED)
     else:
         trade_eligible = not blockers and strategy_type in CORE_TRADE_STRATEGIES
     if trade_eligible:
@@ -2192,17 +2241,23 @@ def _inject_failure_pattern(results, engine):
         res['recent_failure_count'] = cnt
 
 
-def _inject_capital_event_risk(results, engine, lookback_days: int = 60):
-    """Mark recent financing/unlock/reduction events that can turn into 'good news sold' risk."""
+def _inject_capital_event_risk(results, engine, lookback_days: int = 60, as_of: Optional[str] = None):
+    """Mark recent financing/unlock/reduction events that can turn into 'good news sold' risk.
+
+    as_of（回放数据日）给定时，事件窗口改为 [as_of-lookback, as_of]，且
+    publish_time 不得晚于 as_of——否则回放会命中"未来"新闻（点时违约）。
+    """
     if not results or engine is None:
         return
     codes = [str(res.get('代码') or '').zfill(6) for res in results if res.get('代码')]
     if not codes:
         return
-    cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+    as_of_date = date.fromisoformat(str(as_of)[:10]) if as_of else date.today()
+    cutoff = (as_of_date - timedelta(days=lookback_days)).isoformat()
+    upper_bound = as_of_date.isoformat()
     keyword_expr = " OR ".join([f"n.title LIKE :kw{i} OR COALESCE(n.content, '') LIKE :kw{i}" for i, _ in enumerate(CAPITAL_EVENT_KEYWORDS)])
     params = {f"kw{i}": f"%{kw}%" for i, kw in enumerate(CAPITAL_EVENT_KEYWORDS)}
-    params.update({"codes": codes, "cutoff": cutoff})
+    params.update({"codes": codes, "cutoff": cutoff, "as_of_end": f"{upper_bound} 23:59:59"})
     try:
         stmt = text(f"""
             SELECT DISTINCT s.stock_code, n.title
@@ -2210,6 +2265,7 @@ def _inject_capital_event_risk(results, engine, lookback_days: int = 60):
             JOIN news_raw n ON n.id = s.news_id
             WHERE s.stock_code IN :codes
               AND COALESCE(n.publish_time, n.created_at) >= :cutoff
+              AND COALESCE(n.publish_time, n.created_at) <= :as_of_end
               AND ({keyword_expr})
         """).bindparams(bindparam("codes", expanding=True))
         with engine.connect() as conn:
@@ -2789,6 +2845,12 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
     if min_data_days is None:
         if strategy_type in {"pine", "tv_zp", "tv_dual", "tv_dual_strict"}:
             min_days = 120
+        elif strategy_type == "uptrend_limit_down":
+            min_days = 80
+        elif strategy_type == "rps_breakout":
+            min_days = 125
+        elif strategy_type == "trader_vic_2b":
+            min_days = 220
         elif strategy_type in {
             "early_value", "bottom_discovery", "high_tight_flag",
             "turtle_breakout", "limit_up_shakeout",
@@ -2972,7 +3034,10 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
                 "结构": "H2二次入场",
                 "h2_watch_only": plan_action != "READY",
             }
-        elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
+        elif strategy_type in {
+            "high_tight_flag", "turtle_breakout", "limit_up_shakeout",
+            "ma_volume", "uptrend_limit_down", "rps_breakout", "trader_vic_2b",
+        }:
             match, stats = _check_sequoia_research_strategy(df, code, name, strategy_type)
             return stats
         else:
@@ -3006,6 +3071,1457 @@ def single_stock_task(code, name, price, vol, open_price, threshold, vol_multipl
         return {"reason": "策略计算异常"}
 
 
+@dataclass
+class _MarketScanContext:
+    """perform_market_scan 机械拆分后的跨阶段显式上下文。
+
+    原实现通过函数内闭包捕获共享状态；拆成 `_scan_*` 阶段函数后，所有跨阶段
+    变量统一收敛到该 dataclass，由每个阶段函数显式接收，并按原执行位置写回，
+    保持行为与计时打点完全等价。
+    """
+    # ---- 扫描入参（只读；除 adaptive 八参外原样传递） ----
+    strategy_type: str
+    market_range: str
+    use_macd_filter: bool
+    use_weekly: bool
+    use_rs_filter: bool
+    local_only: bool
+    data_date: Optional[str]
+    min_data_days: Optional[int]
+    weekly_ma_period: int
+    tv_weekly_gate: bool
+    require_live_snapshot: bool
+    mkt_cap_min: float
+    scan_context: Optional[Dict[str, Any]]
+    publish_to_sentinel: bool
+    # ---- 大盘自适应改参目标（_scan_prepare_environment 内可能被写回） ----
+    threshold: float
+    vol_multiplier: float
+    rsi_min: int
+    use_bb_sqz: bool
+    sqz_lookback: int
+    pine_min_signals: int
+    stop_loss_pct: float
+    turnover_min: float
+    # ---- 审计与计时 ----
+    audit_payload: Dict[str, Any]
+    phase_timings: Dict[str, float]
+    scan_started_at: datetime
+    # ---- 阶段产物（默认值仅为拆分占位，正常流程由各阶段按原位置写回） ----
+    max_date: Any = None
+    engine: Any = None
+    snapshot_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    data_mode: str = "LIVE_SNAPSHOT"
+    snapshot_as_of: Any = None
+    resolved_data_date: str = ""
+    discovery_pool: str = ""
+    candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
+    start_time: Optional[float] = None
+    bench_slice: Optional[pd.DataFrame] = None
+    hist_map: Dict[str, pd.DataFrame] = field(default_factory=dict)
+    fund_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    money_flow_map: Dict[str, Any] = field(default_factory=dict)
+    results: List[Dict[str, Any]] = field(default_factory=list)
+    rps_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    sector_map: Dict[str, str] = field(default_factory=dict)
+    sector_trends: Dict[str, Any] = field(default_factory=dict)
+    sector_strength: Dict[str, Any] = field(default_factory=dict)
+    market_regime: Dict[str, Any] = field(default_factory=dict)
+    monthly_sector_context: Dict[str, Any] = field(default_factory=dict)
+    active_plan_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
+def _scan_prepare_environment(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) -> bool:
+    """阶段 1/6：大盘环境取参与自适应改参、数据预检熔断、快照获取与本地装载。
+
+    对应原 perform_market_scan 中 mark_phase("market_snapshot_load") 之前的段落。
+    返回 True 表示数据预检熔断且非实时模式，调用方应立即返回空结果。
+    """
+    data_date = ctx.data_date
+    strategy_type = ctx.strategy_type
+    local_only = ctx.local_only
+    require_live_snapshot = ctx.require_live_snapshot
+    scan_context = ctx.scan_context
+    audit_payload = ctx.audit_payload
+    max_date = ctx.max_date
+    threshold = ctx.threshold
+    vol_multiplier = ctx.vol_multiplier
+    rsi_min = ctx.rsi_min
+    use_bb_sqz = ctx.use_bb_sqz
+    sqz_lookback = ctx.sqz_lookback
+    pine_min_signals = ctx.pine_min_signals
+    stop_loss_pct = ctx.stop_loss_pct
+    turnover_min = ctx.turnover_min
+
+    # 获取大盘环境以动态调整参数。
+    # 回放扫描（data_date=历史日）时拿到的 get_market_regime() 是"今天"的
+    # 实时状态——用它改写历史扫描的阈值会把未来信息泄进回放，校准失真。
+    # 因此回放模式下跳过自适应改参（冻结传入参数），只保留实时扫描行为。
+    regime = get_market_regime()
+    reg_status = regime.get("status", "UNKNOWN")
+
+    # 启用 REGIME_PARAMS 自适应阈值（改动 #7）：根据大盘状态自动收紧/放宽
+    # threshold、vol_multiplier、rsi_min、stop_loss_pct 等。bear 时最严，bull 时最松。
+    # 用 SCAN_REGIME_ADAPTIVE 开关控制，便于回退到旧的固定参数。
+    if SCAN_REGIME_ADAPTIVE and not data_date:
+        from core.market_regime import get_adaptive_params
+        adaptive = get_adaptive_params(reg_status, strategy_type)
+        threshold = float(adaptive.get("threshold", threshold))
+        vol_multiplier = float(adaptive.get("vol_multiplier", vol_multiplier))
+        if "rsi_min" in adaptive:
+            rsi_min = int(adaptive["rsi_min"])
+        if "stop_loss_pct" in adaptive:
+            stop_loss_pct = float(adaptive["stop_loss_pct"])
+        if "sqz_lookback" in adaptive:
+            sqz_lookback = int(adaptive["sqz_lookback"])
+        if adaptive.get("use_bb_sqz") is not None:
+            use_bb_sqz = bool(adaptive["use_bb_sqz"])
+        if "pine_min_signals" in adaptive:
+            pine_min_signals = int(adaptive["pine_min_signals"])
+        logger.info(
+            f"[SCAN] Market regime={reg_status}. Adaptive params: threshold={threshold}, "
+            f"vol_mult={vol_multiplier}, rsi_min={rsi_min}, stop_loss={stop_loss_pct}."
+        )
+    # 换手率调整保留：进攻市适度放宽换手要求（同样只在实时扫描生效，回放冻结）
+    if reg_status == "OFFENSIVE" and not data_date:
+        turnover_min = max(2.5, turnover_min - 0.5)
+        logger.info(f"[SCAN] Market is OFFENSIVE. Adjusting turnover requirement to {turnover_min}.")
+    ctx.threshold = threshold
+    ctx.vol_multiplier = vol_multiplier
+    ctx.rsi_min = rsi_min
+    ctx.stop_loss_pct = stop_loss_pct
+    ctx.sqz_lookback = sqz_lookback
+    ctx.use_bb_sqz = use_bb_sqz
+    ctx.pine_min_signals = pine_min_signals
+    ctx.turnover_min = turnover_min
+
+    ctx.snapshot_df = snapshot_df = pd.DataFrame()
+    ctx.engine = engine = get_db_engine()
+
+    # 数据预检熔断：若数据质量 blocking，中止扫描，避免坏/陈旧数据静默产生假信号。
+    # （此前 preflight 仅作为 GET 接口暴露，扫描器从不检查。）
+    if SCAN_PREFLIGHT_ENFORCE and engine is not None:
+        try:
+            preflight = build_scan_preflight(engine, data_date=data_date)
+            if preflight.get("blocking"):
+                block_msgs = [
+                    c.get("message", c.get("name", ""))
+                    for c in preflight.get("checks", [])
+                    if c.get("status") == "error"
+                ]
+                logger.warning(
+                    f"[RUN_MARKET_SCAN] 扫描被数据预检熔断中止："
+                    f"{'; '.join(block_msgs) or '存在 error 级检查项'}"
+                )
+                if require_live_snapshot:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "实时扫描已中止：数据预检未通过。"
+                            f"{'; '.join(block_msgs) or '存在数据完整性问题'}"
+                        ),
+                    )
+                return True
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # 预检本身失败不应阻断扫描（降级为告警，保持可用性）
+            logger.warning(f"[RUN_MARKET_SCAN] 数据预检执行异常，跳过熔断：{exc}")
+
+    # 1. 如果需要实时行情，或不是强制本地，尝试联网获取快照。
+    # 午间/Bark 扫描会传 local_only=True + require_live_snapshot=True；
+    # 这种组合必须主动拉实时快照，否则会直接因 snapshot_df 为空而熔断。
+    if (require_live_snapshot or not local_only) and data_date is None:
+        try:
+            ctx.snapshot_df = snapshot_df = _load_market_snapshot(force_refresh=require_live_snapshot)
+        except Exception:
+            logger.debug("Network snapshot failed.")
+
+    # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
+    if require_live_snapshot and is_snapshot_stale(snapshot_df):
+        raise HTTPException(
+            status_code=503,
+            detail="实时行情快照已过期，已中止扫描，避免 Bark 使用过时行情数据。",
+        )
+    if snapshot_df.empty:
+        if require_live_snapshot:
+            raise HTTPException(
+                status_code=503,
+                detail="实时行情快照不可用，已中止扫描，避免 Bark 使用历史 daily_k 数据。",
+            )
+        logger.info(f"Switching to LOCAL DB mode (Local Only: {local_only}, Data Date: {data_date or 'Auto'})...")
+        try:
+            with engine.connect() as conn:
+                # 如果指定了日期，使用指定日期；否则查找有足够数据的最近日期
+                if data_date:
+                    # 验证日期格式和存在性
+                    date_check = conn.execute(
+                        text("SELECT date, COUNT(DISTINCT code) as stock_count FROM daily_k WHERE date = :date GROUP BY date"),
+                        {"date": data_date}
+                    ).fetchone()
+                    if not date_check:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"指定日期 {data_date} 没有数据或格式不正确。请使用 YYYY-MM-DD 格式。"
+                        )
+                    ctx.max_date = max_date = data_date
+                    stock_count = date_check[1]
+                    logger.info(f"Using specified date: {max_date} ({stock_count} stocks)")
+                else:
+                    # 查找有足够数据的最近日期（至少 1000 只股票）
+                    logger.debug("Querying DB for best available date...")
+                    best_date_query = text("""
+                        SELECT date, COUNT(DISTINCT code) as stock_count
+                        FROM daily_k
+                        GROUP BY date
+                        HAVING COUNT(DISTINCT code) >= 1000
+                        ORDER BY date DESC
+                        LIMIT 1
+                    """)
+                    best_date_res = conn.execute(best_date_query).fetchone()
+                    if best_date_res and best_date_res[0]:
+                        ctx.max_date = max_date = best_date_res[0]
+                        stock_count = best_date_res[1]
+                        logger.info(f"Found best date in DB: {max_date} ({stock_count} stocks)")
+                    else:
+                        raise HTTPException(status_code=503, detail="数据库中没有足够的数据进行扫描")
+
+                # 使用参数化查询防止 SQL 注入
+                # pct_chg 使用与前一日收盘价对比 (日涨幅)，而非日内 open→close
+                # 使用 LAG 窗口函数高效获取前日收盘价
+                # 注意: 避免 :: 类型转换语法，SQLAlchemy 会将 :: 误解析为命名参数
+                query = text("""
+                    WITH ranked AS (
+                        SELECT code, date, close, open, high, low, vol,
+                               LAG(close) OVER (PARTITION BY code ORDER BY date) as prev_close
+                        FROM daily_k
+                        WHERE date <= CAST(:max_date AS date)
+                          AND date >= CAST(CAST(:max_date AS date) - interval '7 days' AS date)
+                    )
+                    SELECT r.code, b.name, b.industry, r.close as price, r.open, r.high, r.low, r.vol,
+                           CASE WHEN r.prev_close > 0
+                               THEN ROUND(CAST((r.close - r.prev_close) / r.prev_close * 100 AS numeric), 2)
+                               ELSE 0
+                           END as pct_chg,
+                           NULL as turnover,
+                           NULL as mkt_cap
+                    FROM ranked r
+                    LEFT JOIN stock_basic b ON r.code = b.code
+                    WHERE r.date = CAST(:max_date AS date)
+                """)
+                ctx.snapshot_df = snapshot_df = pd.read_sql(query, engine, params={"max_date": max_date})
+                logger.info(f"Loaded {len(snapshot_df)} rows from DB fallback.")
+                # 保存数据日期信息用于返回
+                if hasattr(snapshot_df, 'attrs'):
+                    snapshot_df.attrs['data_date'] = max_date
+                # Fallback for name if join failed
+                if not snapshot_df.empty:
+                    snapshot_df['name'] = snapshot_df['name'].fillna(snapshot_df['code'])
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Local fallback error: {e}")
+            raise HTTPException(status_code=500, detail=f"加载数据失败: {str(e)}")
+
+    if snapshot_df.empty:
+        detail_msg = "无法获取市场数据。"
+        if local_only:
+            detail_msg += "【离线模式】已开启，但本地数据库尚未同步今日数据。请先执行【数据管理 -> 同步当日数据】。"
+        else:
+            detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
+        raise HTTPException(status_code=503, detail=detail_msg)
+    ctx.data_mode = data_mode = "LOCAL_DB" if max_date else "LIVE_SNAPSHOT"
+    snapshot_attrs = getattr(snapshot_df, "attrs", {}) or {}
+    ctx.snapshot_as_of = snapshot_as_of = (
+        max_date or snapshot_attrs.get("data_date")
+        if data_mode == "LOCAL_DB"
+        else snapshot_attrs.get("fetched_at") or datetime.now()
+    )
+    ctx.resolved_data_date = resolved_data_date = str(
+        max_date or snapshot_attrs.get("data_date") or datetime.now().strftime("%Y-%m-%d")
+    )[:10]
+    if scan_context is not None:
+        scan_context.update({
+            "data_date": resolved_data_date,
+            "data_mode": data_mode,
+            "as_of": snapshot_as_of,
+        })
+    audit_payload.update(_build_snapshot_audit(snapshot_df, data_mode, snapshot_as_of))
+    dataset_version = f"{data_mode}:{str(snapshot_as_of)[:19]}"
+    audit_payload["version_snapshot"]["dataset_version"] = dataset_version
+    audit_payload["point_in_time_snapshot_count"] = save_point_in_time_snapshot(
+        snapshot_df, dataset_version, snapshot_as_of, data_mode, engine,
+    )
+    audit_payload["params_snapshot"]["point_in_time_snapshot_count"] = audit_payload["point_in_time_snapshot_count"]
+    audit_payload["params_snapshot"]["evidence_pipeline"] = {
+        "stage": "MARKET_DATA_READY", "mode": EVIDENCE_GATE_MODE,
+    }
+    if audit_payload["point_in_time_snapshot_count"] <= 0:
+        audit_payload["research_only"] = True
+        audit_payload.setdefault("degradation_reasons", []).append("点时快照持久化失败")
+    mark_phase("market_snapshot_load")
+
+    return False
+
+
+def _scan_filter_candidates(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) -> None:
+    """阶段 2/6：SOP 初始过滤（主板/创业板/科创板、剔除 ST/退市）、discovery pool
+    判定、疑似调整缺口隔离与市场范围（科创板/指数成分）过滤，并广播 scan_start。"""
+    snapshot_df = ctx.snapshot_df
+    audit_payload = ctx.audit_payload
+    engine = ctx.engine
+    strategy_type = ctx.strategy_type
+    turnover_min = ctx.turnover_min
+    mkt_cap_min = ctx.mkt_cap_min
+    data_date = ctx.data_date
+    market_range = ctx.market_range
+
+    # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
+    total_snapshot = len(snapshot_df)
+    audit_payload["total_snapshot"] = total_snapshot
+
+    # SOP: 仅保留 沪深主板(60, 00)、创业板(30)、科创板(688)；剔除 ST、退市整理
+    snapshot_df['code_str'] = snapshot_df['code'].astype(str)
+    snapshot_df['name_str'] = snapshot_df['name'].astype(str)
+
+    is_target_market = snapshot_df['code_str'].str.startswith(('60', '688', '00', '30'))
+    is_not_st = ~snapshot_df['name_str'].str.contains('ST|退', case=False)
+
+    # fallback 模式下 turnover/mkt_cap 可能为 NULL（本地DB无此数据），需特殊处理
+    has_turnover = snapshot_df['turnover'].notna()
+    has_mkt_cap = snapshot_df['mkt_cap'].notna()
+    has_core_quote = snapshot_df['price'].notna() & snapshot_df['pct_chg'].notna()
+
+    discovery_mask, discovery_pool = _discovery_pool_mask(snapshot_df, strategy_type)
+    ctx.discovery_pool = discovery_pool
+    audit_payload["effective_filters"] = [
+        item for item in audit_payload.get("effective_filters", [])
+        if item != "positive_pct_change"
+    ] + [f"discovery_pool:{discovery_pool}"]
+    turnover_filter = (
+        has_turnover & (snapshot_df['turnover'] >= turnover_min)
+        if "turnover_min" in audit_payload.get("effective_filters", [])
+        else pd.Series(True, index=snapshot_df.index)
+    )
+    mkt_cap_filter = (
+        has_mkt_cap & (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)
+        if "market_cap_min" in audit_payload.get("effective_filters", [])
+        else pd.Series(True, index=snapshot_df.index)
+    )
+    candidates = snapshot_df[
+        discovery_mask &
+        is_target_market & is_not_st & has_core_quote &
+        mkt_cap_filter & turnover_filter
+    ].copy()
+    candidates["discovery_pool"] = discovery_pool
+    audit_payload["params_snapshot"]["discovery_pool"] = discovery_pool
+    adjustment_gap_codes = get_suspected_adjustment_gap_codes(engine, target_date=data_date)
+    if adjustment_gap_codes:
+        candidates = candidates[~candidates["code"].astype(str).isin(adjustment_gap_codes)]
+        audit_payload.setdefault("fail_reasons", {})["suspected_adjustment_gap"] = len(adjustment_gap_codes)
+        logger.warning(f"Quarantined {len(adjustment_gap_codes)} suspected adjustment-gap candidates.")
+    audit_payload["candidate_count"] = len(candidates)
+    mark_phase("candidate_filter")
+
+    logger.info(f"Snapshot: {total_snapshot} stocks")
+    logger.info(f"After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
+
+    # 1. 处理科创板过滤
+    if "包含科创板" not in market_range:
+        candidates = candidates[~candidates['code'].astype(str).str.startswith('688')]
+
+    # 2. 处理成分股精确过滤
+    index_map = {
+        "沪深300": "000300",
+        "上证50": "000016",
+        "中证500": "000905",
+        "中证1000": "000852"
+    }
+
+    target_index = None
+    for key, val in index_map.items():
+        if key in market_range:
+            target_index = val
+            break
+
+    if target_index:
+        try:
+            import akshare as ak
+            cons_df = ak.index_stock_cons(symbol=target_index)
+            if not cons_df.empty:
+                cons_codes = cons_df['品种代码'].tolist()
+                candidates = candidates[candidates['code'].isin(cons_codes)]
+        except Exception as e:
+            logger.warning(f"{market_range} filter failed: {e}")
+
+    # 无数量上限，用户可按需调整筛选条件
+    logger.info(f"准备扫描 {len(candidates)} 只股票...")
+        
+    ws_manager.broadcast_threadsafe({
+        "type": "scan_start",
+        "message": f"准备扫描 {len(candidates)} 只股票..."
+    })
+    ctx.candidates = candidates
+
+
+def _scan_load_data(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) -> bool:
+    """阶段 3/6：预拉取基准指数、批量装载候选历史 K 线、注入实时快照行、
+    流动性/次新股过滤与向量化指标计算，产出 hist_map。
+
+    返回 True 表示过滤后无候选（审计已落库），调用方应立即返回空结果。
+    """
+    data_date = ctx.data_date
+    strategy_type = ctx.strategy_type
+    snapshot_df = ctx.snapshot_df
+    audit_payload = ctx.audit_payload
+    resolved_data_date = ctx.resolved_data_date
+    scan_started_at = ctx.scan_started_at
+
+    results = []
+    ctx.engine = engine = get_db_engine()
+
+    # 核心优化：预拉取指数历史并过滤，避免在线程内重复查询和过滤
+    bench_df = get_index_hist("000001")
+    ctx.bench_slice = bench_slice = None
+    if not bench_df.empty:
+        # 预先过滤出需要的日期范围
+        hist_end = datetime.now() if not data_date else datetime.strptime(data_date, "%Y-%m-%d")
+        hist_start = hist_end - timedelta(days=365)
+        bench_df = bench_df.copy()
+        bench_df['日期'] = pd.to_datetime(bench_df['日期'], errors='coerce')
+        mask = (bench_df['日期'] >= hist_start) & (bench_df['日期'] <= hist_end)
+        ctx.bench_slice = bench_slice = bench_df.loc[mask, ['日期', '收盘']].copy()
+        logger.info(f"Pre-filtered benchmark data: {len(bench_slice)} points.")
+
+    # 核心优化：批量拉取所有候选标的的历史数据，并进行向量化指标计算
+    logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
+    ctx.start_time = start_time = time.time()
+    end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
+    # 图表和扫描共用同一 TV 预热窗口；Alternate Signal 对历史起点敏感。
+    start_date_hist = (
+        datetime.strptime(end_date_hist, "%Y-%m-%d")
+        - timedelta(days=TV_SIGNAL_WARMUP_DAYS)
+    ).strftime("%Y-%m-%d")
+    candidate_codes = candidates['code'].tolist()
+
+    dfs = []
+    try:
+        chunk_size = 1000
+        for i in range(0, len(candidate_codes), chunk_size):
+            chunk = candidate_codes[i:i + chunk_size]
+            placeholders = ", ".join([f":code_{j}" for j in range(len(chunk))])
+            query_params = {f"code_{j}": c for j, c in enumerate(chunk)}
+            query_params["start_date"] = start_date_hist
+            query_params["end_date"] = end_date_hist
+
+            query = text(f"""
+                SELECT d.code, d.date as "日期", d.open as "开盘", d.high as "最高",
+                       d.low as "最低", d.close as "收盘", d.vol as "成交量",
+                       b.name
+                FROM daily_k d
+                LEFT JOIN stock_basic b ON d.code = b.code
+                WHERE d.code IN ({placeholders}) AND d.date >= :start_date AND d.date <= :end_date
+                ORDER BY d.code, d.date ASC
+            """)
+            with engine.connect() as conn:
+                chunk_df = pd.read_sql(query, conn, params=query_params)
+                if not chunk_df.empty:
+                    dfs.append(chunk_df)
+
+        if not dfs:
+            logger.error("No historical data found for candidates.")
+            raise HTTPException(status_code=404, detail="本地历史数据缺失，请先同步数据。")
+
+        master_df = pd.concat(dfs).reset_index(drop=True)
+
+        # --- 注入实盘快照数据 ---
+        # snapshot_df 包含了我们要筛选的标的的实时数据
+        # 如果是本地历史回测 (local_only 且 snapshot 从 db fallback 加载)，master_df 已经包含该日数据，不可重复添加
+        # 我们通过判断 snapshot 的日期是否大于 master_df 中的最大日期来决定是否追加
+        snapshot_date = getattr(snapshot_df, 'attrs', {}).get('data_date', datetime.now().strftime("%Y-%m-%d"))
+        # 确保 snapshot_date 是字符串格式
+        if isinstance(snapshot_date, date):
+            snapshot_date = snapshot_date.strftime("%Y-%m-%d")
+        else:
+            snapshot_date = str(snapshot_date)[:10]
+
+        db_max_date = master_df['日期'].max()
+        if isinstance(db_max_date, pd.Timestamp):
+            db_max_date = db_max_date.strftime("%Y-%m-%d")
+        else:
+            db_max_date = str(db_max_date)[:10]
+
+        if snapshot_date > db_max_date:
+            logger.info(f"Appending snapshot live data ({snapshot_date}) to historical database series ({db_max_date})...")
+            snap_to_append = snapshot_df[snapshot_df['code'].isin(master_df['code'].unique())].copy()
+            snap_to_append = snap_to_append.rename(columns={
+                'price': '收盘',
+                'open': '开盘',
+                'high': '最高',
+                'low': '最低',
+                'vol': '成交量'
+            })
+            snap_to_append['日期'] = snapshot_date
+            master_df = pd.concat([master_df, snap_to_append], ignore_index=True)
+            # 重新排序并重置索引，确保 batch calculation 的索引对齐逻辑正常工作
+            master_df = master_df.sort_values(['code', '日期']).reset_index(drop=True)
+
+        candidates, universe_filter_stats = _apply_liquidity_and_new_stock_filters(
+            candidates,
+            master_df,
+        )
+        ctx.candidates = candidates
+        allowed_codes = set(candidates["code"].astype(str))
+        master_df = master_df[master_df["code"].astype(str).isin(allowed_codes)].copy()
+        audit_payload["candidate_count"] = len(candidates)
+        audit_payload["params_snapshot"]["universe_filters"] = {
+            "avg_amount_lookback_days": UNIVERSE_LIQUIDITY_LOOKBACK_DAYS,
+            "min_avg_amount_yuan": UNIVERSE_MIN_AVG_AMOUNT_YUAN,
+            "amount_estimation": "close_x_volume_hands_x_100_when_exact_missing",
+            **universe_filter_stats,
+        }
+        audit_payload["effective_filters"] = list(dict.fromkeys([
+            *audit_payload.get("effective_filters", []),
+            "avg_amount_5d",
+            "exclude_new_one_price_stock",
+        ]))
+        if candidates.empty:
+            logger.info("No candidates remain after five-day liquidity and new-stock filters.")
+            audit_payload.update({
+                "scan_date": resolved_data_date,
+                "finished_at": datetime.now(),
+                "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
+                "result_count": 0,
+            })
+            save_scan_audit_log(audit_payload, engine)
+            return True
+
+        logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
+
+        # --- 向量化指标计算 ---
+        master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
+
+        # Pine Script 策略或 同时启用 策略需要额外的指标计算
+        if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
+            logger.info("Calculating Pine Script indicators in parallel...")
+            # 对每只股票单独计算 Pine 指标 (使用并行加速)
+            groups = [group.copy() for _, group in master_df.groupby('code')]
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                pine_results = list(executor.map(calculate_pine_indicators, groups))
+
+            if pine_results:
+                master_df = pd.concat(pine_results, ignore_index=True)
+            logger.info(f"Parallel Pine Script indicators calculation completed.")
+
+        logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
+        mark_phase("indicator_batch")
+
+        # 按代码切分，供并发扫描使用
+        ctx.hist_map = hist_map = {code: group for code, group in master_df.groupby('code')}
+
+    except Exception as e:
+        logger.error(f"Batch processing failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"数据预处理失败: {str(e)}")
+
+    return False
+
+
+def _scan_evaluate_candidates(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) -> None:
+    """阶段 4/6：装载基本面/资金流映射、线程池并发执行单股策略扫描、RPS 截面闸门、
+    Top 100 截断、板块上下文构建与板块观察/历史复活/动量加速候选注入。"""
+    engine = ctx.engine
+    candidates = ctx.candidates
+    hist_map = ctx.hist_map
+    bench_slice = ctx.bench_slice
+    audit_payload = ctx.audit_payload
+    snapshot_df = ctx.snapshot_df
+    max_date = ctx.max_date
+    data_date = ctx.data_date
+    resolved_data_date = ctx.resolved_data_date
+    strategy_type = ctx.strategy_type
+    threshold = ctx.threshold
+    vol_multiplier = ctx.vol_multiplier
+    rsi_min = ctx.rsi_min
+    use_macd_filter = ctx.use_macd_filter
+    use_bb_sqz = ctx.use_bb_sqz
+    sqz_lookback = ctx.sqz_lookback
+    use_weekly = ctx.use_weekly
+    use_rs_filter = ctx.use_rs_filter
+    local_only = ctx.local_only
+    pine_min_signals = ctx.pine_min_signals
+    min_data_days = ctx.min_data_days
+    weekly_ma_period = ctx.weekly_ma_period
+    tv_weekly_gate = ctx.tv_weekly_gate
+
+    # 加载基本面数据
+    ctx.fund_map = fund_map = {}
+    try:
+        with engine.connect() as conn:
+            fund_res = conn.execute(text("SELECT code, roe, net_profit_yoy, revenue_yoy, label FROM stock_fundamentals")).fetchall()
+            for r in fund_res:
+                # 强制使用字符串作为 Key，防止 pandas 类型推断导致 int/str 匹配失败
+                code_key = str(r[0]).zfill(6)
+                fund_map[code_key] = {
+                    "roe": float(r[1]) if r[1] is not None else 0.0,
+                    "net_profit_yoy": float(r[2]) if r[2] is not None else 0.0,
+                    "revenue_yoy": float(r[3]) if r[3] is not None else 0.0,
+                    "label": str(r[4]) if r[4] is not None else ""
+                }
+            logger.info(f"Loaded fundamentals for {len(fund_map)} stocks from database.")
+    except Exception as e:
+        logger.error(f"Failed to load fundamentals: {e}")
+
+    ctx.money_flow_map = money_flow_map = _build_scan_money_flow_map(limit=6000)
+
+    # 并发扫描逻辑 - 执行策略筛选和周线确认
+    workers = 24  # 向量化后主压力在周线重采样，可提高并发
+    logger.info(f"Starting strategy scan for {len(candidates)} stocks (workers={workers})...")
+
+    ctx.results = results = []
+    fail_reasons = {}
+    none_count = 0
+    processed_count = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_stock = {
+            executor.submit(
+                single_stock_task,
+                row['code'], row['name'], row['price'], row['vol'], row['open'],
+                threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
+                local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
+                bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days,
+                weekly_ma_period=weekly_ma_period, fund_data=fund_map.get(str(row['code'])),
+                tv_weekly_gate=tv_weekly_gate
+            ): row for _, row in candidates.iterrows()
+        }
+
+        for future in as_completed(future_to_stock):
+            processed_count += 1
+            if processed_count % 100 == 0 or processed_count == len(future_to_stock):
+                logger.info(f"Scan Progress: {processed_count}/{len(future_to_stock)} stocks processed...")
+                ws_manager.broadcast_threadsafe({
+                    "type": "scan_progress",
+                    "current": processed_count,
+                    "total": len(future_to_stock),
+                    "message": f"扫描中... ({processed_count}/{len(future_to_stock)})"
+                })
+
+            try:
+                res = future.result(timeout=60)
+                if isinstance(res, dict) and 'Score' in res:
+                    results.append(res)
+                elif isinstance(res, dict):
+                    reason = res.get('reason', '未知')
+                    fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                elif res is None:
+                    none_count += 1
+            except Exception as e:
+                fail_reasons[f"异常: {str(e)[:30]}"] = fail_reasons.get(f"异常: {str(e)[:30]}", 0) + 1
+
+        normalized_fail_reasons, fail_reason_details = _summarize_rejection_reasons(fail_reasons)
+        logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
+        audit_payload["fail_reasons"] = normalized_fail_reasons
+        audit_payload["params_snapshot"]["fail_reason_details"] = fail_reason_details
+        if normalized_fail_reasons:
+            logger.info(f"Rejection Summary: {normalized_fail_reasons}")
+
+        # Pine 策略或 同时启用 策略额外统计
+        if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
+            pine_stats = {}
+            for reason, count in fail_reasons.items():
+                if "信号不足" in reason:
+                    # 提取信号数，如 "信号不足 (2/3)"
+                    match = re.search(r'\((\d+)/(\d+)\)', reason)
+                    if match:
+                        signals = int(match.group(1))
+                        pine_stats[signals] = pine_stats.get(signals, 0) + count
+            if pine_stats:
+                logger.info(f"Pine Strategy Signal Distribution: {pine_stats}")
+
+    logger.info(f"Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
+    mark_phase("strategy_evaluation")
+
+    # 排序并取 Top 100；先记录截断压力，供影子排序验证，不改变正式结果。
+    rps_map: Dict[str, Dict[str, Any]] = {}
+    ctx.rps_map = rps_map
+    if strategy_type in {"rps_breakout", "trader_vic_2b"}:
+        from core.sequoia_research import load_cross_sectional_rps
+
+        rps_as_of = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
+        rps_map = load_cross_sectional_rps(engine, rps_as_of)
+        ctx.rps_map = rps_map
+        rps_threshold = 90 if strategy_type == "rps_breakout" else 60
+        ctx.results = results = [
+            row for row in results
+            if (rps_map.get(str(row.get("代码") or "").zfill(6), {}).get("rps_120") or 0) >= rps_threshold
+        ]
+        for row in results:
+            row.update(rps_map.get(str(row.get("代码") or "").zfill(6), {}))
+        audit_payload[f"{strategy_type}_rps_gate"] = {
+            "as_of": rps_as_of,
+            "threshold": rps_threshold,
+            "candidate_count": len(results),
+            "universe_count": len(rps_map),
+            "trade_permission": False,
+        }
+
+    ctx.results = results = sorted(results, key=lambda x: x['Score'], reverse=True)
+    prelimit_count = len(results)
+    audit_payload["params_snapshot"]["prelimit_ranking"] = {
+        "candidate_count": prelimit_count,
+        "limit": 100,
+        "truncated_count": max(0, prelimit_count - 100),
+        "top100_cutline_score": round(float(results[99]['Score']), 2) if prelimit_count >= 100 else None,
+        "top200_cutline_score": round(float(results[199]['Score']), 2) if prelimit_count >= 200 else None,
+    }
+    ctx.results = results = results[:100]
+    if strategy_type == "limit_up_shakeout":
+        from core.limit_up_leadership import load_limit_up_event_map
+        from core.sequoia_research import confirm_limit_up_shakeout_candidates
+
+        signal_date = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
+        prior_event_date = shift_a_share_trading_date(signal_date, -1)
+        before_event_gate = len(results)
+        prior_event_map = load_limit_up_event_map(prior_event_date, engine)
+        ctx.results = results = confirm_limit_up_shakeout_candidates(
+            results,
+            prior_event_map,
+            prior_event_date,
+        )
+        audit_payload["limit_up_shakeout_event_gate"] = {
+            "event_date": prior_event_date,
+            "input_count": before_event_gate,
+            "confirmed_count": len(results),
+            "event_universe_count": len(prior_event_map),
+            "fail_closed": True,
+        }
+
+    ctx.sector_map = sector_map = get_sector_map()
+    ctx.sector_trends = sector_trends = get_sector_trends()
+    ctx.market_regime = market_regime = get_market_regime()
+    # 把实时快照聚合写入 breadth_history（修复 6/22 节后首日 bug：让后续
+    # build_sector_history_context / load_market_cycle_history 读到今日实时宽度，
+    # 而非滞后的 daily_k）。失败只 log 不阻断扫描。
+    # bar_date 必须显式传 data_date：回放扫描（data_date=历史日）的快照是
+    # 历史数据，缺省会被写成"今天"，此后实时扫描的板块强度全部读到被历史
+    # 数据覆盖的宽度。实时扫描 data_date=None → record 函数缺省用今天，行为不变。
+    if not snapshot_df.empty and 'pct_chg' in snapshot_df.columns:
+        from core.db import record_breadth_snapshot
+        record_breadth_snapshot(snapshot_df, sector_map, engine, bar_date=data_date)
+    sector_history = build_sector_history_context(engine, sector_map, as_of=data_date)
+    ctx.monthly_sector_context = monthly_sector_context = build_previous_month_sector_context(
+        engine,
+        sector_map,
+        as_of_date=resolved_data_date,
+    )
+    ctx.sector_strength = sector_strength = build_sector_strength(
+        snapshot_df,
+        sector_map,
+        sector_trends,
+        sector_history,
+        monthly_sector_context,
+    )
+
+    if strategy_type == "early_value":
+        results, dropped, kept_pending = _apply_early_value_sector_filter(results, sector_map, sector_strength)
+        ctx.results = results
+        if dropped:
+            logger.info(f"Early value sector-start filter dropped {dropped} candidates.")
+        if kept_pending:
+            logger.info("Early value sector-start filter found no confirmed sectors; keeping pending watch candidates.")
+
+    if _should_include_sector_watch(strategy_type):
+        ctx.results = results = []
+        sector_watch = _build_sector_watch_candidates(
+            candidates,
+            set(),
+            hist_map,
+            sector_map,
+            sector_strength,
+        )
+        if sector_watch:
+            logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
+            results.extend(sector_watch)
+    elif strategy_type in {"tv_dual", "tv_dual_strict"}:
+        existing_codes = {str(res.get('代码', '')).zfill(6) for res in results}
+        sector_watch = _build_sector_watch_candidates(
+            candidates,
+            existing_codes,
+            hist_map,
+            sector_map,
+            sector_strength,
+            max_per_sector=2,
+        )
+        if sector_watch:
+            logger.info(
+                f"Added {len(sector_watch)} early strong-sector observation candidates."
+            )
+            results.extend(sector_watch)
+
+    active_plan_map: Dict[str, Dict[str, Any]] = {}
+    ctx.active_plan_map = active_plan_map
+    if strategy_type in {"tv_dual", "tv_dual_strict"}:
+        existing_codes = {str(res.get('代码', '')).zfill(6) for res in results}
+        candidate_codes = [str(code).zfill(6) for code in candidates['code'].tolist()]
+        signal_map = _fetch_recent_signal_map(
+            engine,
+            candidate_codes,
+            str(max_date or datetime.now().strftime("%Y-%m-%d")),
+        )
+        ctx.active_plan_map = active_plan_map = _fetch_active_execution_plan_map(
+            engine,
+            candidate_codes,
+            str(max_date or datetime.now().strftime("%Y-%m-%d")),
+        )
+        revival_candidates = _build_historical_revival_candidates(
+            candidates,
+            existing_codes,
+            hist_map,
+            signal_map,
+            strategy_type,
+        )
+        if revival_candidates:
+            logger.info(f"Added {len(revival_candidates)} historical revival candidates.")
+            results.extend(revival_candidates)
+            existing_codes.update(str(res.get('代码', '')).zfill(6) for res in revival_candidates)
+        momentum_candidates = _build_momentum_acceleration_candidates(
+            candidates,
+            existing_codes,
+            hist_map,
+            sector_map,
+            sector_strength,
+            strategy_type,
+        )
+        if momentum_candidates:
+            logger.info(f"Added {len(momentum_candidates)} momentum acceleration candidates.")
+            results.extend(momentum_candidates)
+
+    mark_phase("strategy_post_filter")
+
+
+def _scan_enrich_candidates(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) -> None:
+    """阶段 5/6：并发回测补充（胜率/行业/风险位）、近期推送/冻结计划/早期观察质量
+    过滤，及板块共振/地雷/换手/PE/板块角色/资金流/RPS/景气度/月度板块等增强注入。"""
+    engine = ctx.engine
+    results = ctx.results
+    hist_map = ctx.hist_map
+    fund_map = ctx.fund_map
+    money_flow_map = ctx.money_flow_map
+    active_plan_map = ctx.active_plan_map
+    audit_payload = ctx.audit_payload
+    snapshot_df = ctx.snapshot_df
+    candidates = ctx.candidates
+    max_date = ctx.max_date
+    data_date = ctx.data_date
+    snapshot_as_of = ctx.snapshot_as_of
+    data_mode = ctx.data_mode
+    strategy_type = ctx.strategy_type
+    stop_loss_pct = ctx.stop_loss_pct
+    pine_min_signals = ctx.pine_min_signals
+    threshold = ctx.threshold
+    vol_multiplier = ctx.vol_multiplier
+    rsi_min = ctx.rsi_min
+    use_macd_filter = ctx.use_macd_filter
+    use_bb_sqz = ctx.use_bb_sqz
+    sqz_lookback = ctx.sqz_lookback
+    use_rs_filter = ctx.use_rs_filter
+    sector_map = ctx.sector_map
+    sector_trends = ctx.sector_trends
+    sector_strength = ctx.sector_strength
+    market_regime = ctx.market_regime
+    monthly_sector_context = ctx.monthly_sector_context
+    rps_map = ctx.rps_map
+
+    # 补充增强 data (行业, 胜率) - 并发处理 Top 100 + 板块观察
+    logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
+
+    def process_supplement(res):
+        try:
+            if res.get('sector_watch_only'):
+                return res
+            _inject_missing_fundamentals(res, fund_map)
+            code = res['代码']
+            # 1. 计算回测统计
+            # 直接使用 hist_map 中已计算好指标的数据，避免重复计算
+            df_hist = hist_map.get(code)
+            if df_hist is not None:
+                df_hist = df_hist.copy().reset_index(drop=True)
+            df_labeled = df_hist
+                
+            # 获取止损参数 (前端可配置)
+            try:
+                sl_pct = float(stop_loss_pct)
+            except (TypeError, ValueError):
+                sl_pct = BACKTEST_STOP_LOSS_PCT
+                
+            if strategy_type == "pine":
+                bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct, code=code)
+            elif strategy_type == "tv_zp":
+                bt = calculate_tv_zp_win_rate(df_labeled, stop_loss_pct=sl_pct, code=code)
+            elif strategy_type in {"tv_dual", "tv_dual_strict"}:
+                bt = calculate_tv_dual_win_rate(
+                    df_labeled,
+                    stop_loss_pct=sl_pct,
+                    threshold=threshold,
+                    vol_multiplier=vol_multiplier,
+                    rsi_min=rsi_min,
+                    use_macd_filter=use_macd_filter,
+                    sqz_lookback=sqz_lookback,
+                    require_both=(strategy_type == "tv_dual_strict"),
+                    code=code,
+                )
+            elif strategy_type == "both":
+                bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct, code=code)
+            elif strategy_type == "consensus":
+                bt = calculate_consensus_win_rate(df_labeled, stop_loss_pct=sl_pct, code=code)
+            elif strategy_type == "h2":
+                bt = {
+                    "win_rate": 0,
+                    "signal_count": 0,
+                    "avg_return": 0,
+                    "max_drawdown": 0,
+                    "profit_factor": 0,
+                    "avg_hold_days": 0,
+                    "stop_loss_hits": 0,
+                    "adjusted_win_rate": 0,
+                    "confidence": 0,
+                    "expectancy": 0,
+                    "sample_warning": "H2独立策略暂无单股专项回测样本",
+                }
+            elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
+                bt = calculate_research_pattern_win_rate(
+                    df_labeled,
+                    strategy_type,
+                    stop_loss_pct=sl_pct,
+                    code=code,
+                )
+            else:
+                bt = calculate_historical_win_rate(
+                    df_labeled,
+                    stop_loss_pct=sl_pct,
+                    threshold=threshold,
+                    vol_multiplier=vol_multiplier,
+                    rsi_min=rsi_min,
+                    use_macd_filter=use_macd_filter,
+                    use_bb_sqz=use_bb_sqz,
+                    sqz_lookback=sqz_lookback,
+                    use_rs_filter=use_rs_filter,
+                    code=code,
+                )
+                
+            res['历史胜率'] = f"{bt['win_rate']}%"
+            res['信号次数'] = bt['signal_count']
+            res['回测统计'] = {
+                "avg_return": bt['avg_return'],
+                "max_drawdown": bt['max_drawdown'],
+                "profit_factor": bt['profit_factor'],
+                "avg_hold_days": bt['avg_hold_days'],
+                "stop_loss_hits": bt['stop_loss_hits'],
+                "adjusted_win_rate": bt.get('adjusted_win_rate', bt['win_rate']),
+                "adjusted_win_rate_method": bt.get('adjusted_win_rate_method', 'wilson_lower_99'),
+                "confidence": bt.get('confidence', 1.0),
+                "expectancy": bt.get('expectancy', 0),
+                "sample_warning": bt.get('sample_warning', ''),
+                "backtest_engine_version": BACKTEST_ENGINE_VERSION,
+                "exit_rule_version": EXIT_RULE_VERSION,
+            }
+            res['strategy_logic_version'] = STRATEGY_LOGIC_VERSION
+            res['backtest_engine_version'] = BACKTEST_ENGINE_VERSION
+            res['exit_rule_version'] = EXIT_RULE_VERSION
+
+            # 2. 获取行业
+            industry = sector_map.get(code, "未知")
+            if industry == "未知":
+                try:
+                    import akshare as ak
+                    info_df = ak.stock_individual_info_em(symbol=code)
+                    if not info_df.empty:
+                        industry_val = info_df[info_df['item'] == '行业分类']['value'].values
+                        if len(industry_val) > 0:
+                            industry = industry_val[0]
+                except Exception: pass
+            res['行业'] = industry
+
+            # 3. SOP 新增字段
+            if df_hist is not None and len(df_hist) >= 6:
+                close_now = float(df_hist['收盘'].iloc[-1])
+                close_5d_ago = float(df_hist['收盘'].iloc[-6])
+                res['pct_5d'] = round((close_now - close_5d_ago) / close_5d_ago * 100, 2)
+            else:
+                res['pct_5d'] = 0.0
+
+            # 候选计划价：突破确认位 + 结构失效/初始风控，而不是简单 -8%
+            if df_hist is not None and not df_hist.empty:
+                pa = analyze_price_action(df_hist)
+                res.update(pa)
+                chip = build_chip_distribution(df_hist)
+                if chip.get('available'):
+                    res['chip_distribution'] = chip
+                    res['chip_buy_impact'] = chip.get('buy_impact')
+                    res['chip_holding_impact'] = chip.get('holding_impact')
+                    res['chip_score_delta'] = chip.get('score_delta', 0)
+                entry_price = float(pa.get('pa_entry_price') or df_hist['最高'].iloc[-1])
+                current_price = float(df_hist['收盘'].iloc[-1])
+                risk = compute_paper_risk_levels(entry_price, entry_price, current_price, pa)
+                res['entry_price'] = round(entry_price, 2)
+                res['stop_price'] = risk['active_stop_price']
+                res['plan_stop_price'] = risk['active_stop_price']
+                res['initial_stop_price'] = risk['initial_stop_price']
+                res['structure_stop_price'] = risk['structure_stop_price']
+                res['target_price'] = risk['take_profit_price']
+                res['risk_reward'] = risk['risk_reward']
+                res['risk_notes'] = risk['risk_notes']
+                if not res.get('结构') and pa.get('price_action_pattern') not in (None, "无明确形态"):
+                    res['结构'] = pa.get('price_action_pattern')
+            else:
+                res['entry_price'] = res.get('现价', 0)
+                risk = compute_paper_risk_levels(float(res.get('现价', 0)), float(res.get('现价', 0)), float(res.get('现价', 0)))
+                res['stop_price'] = risk['active_stop_price']
+                res['plan_stop_price'] = risk['active_stop_price']
+                res['target_price'] = risk['take_profit_price']
+
+        except Exception as e:
+            logger.error(f"Supplement error for {res.get('代码')}: {e}")
+        return res
+
+    # 使用线程池并发补充 100 只股票
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        list(executor.map(process_supplement, results))
+    mark_phase("result_supplement")
+
+    recent_push_counts = load_recent_push_counts(
+        engine,
+        (res.get("代码") for res in results),
+        strategy_type,
+        str(max_date or datetime.now().strftime("%Y-%m-%d")),
+    )
+    for res in results:
+        res["recent_push_days"] = recent_push_counts.get(str(res.get("代码") or "").zfill(6), 1)
+
+    for res in results:
+        _apply_frozen_execution_plan(
+            res,
+            active_plan_map.get(str(res.get('代码', '')).zfill(6), {}),
+        )
+
+    early_drop_count = 0
+    for res in results:
+        if res.get('early_watch_only'):
+            ok, reasons = _early_watch_quality(res)
+            res['early_watch_quality_ok'] = ok
+            res['early_watch_quality_reasons'] = reasons
+            if not ok:
+                early_drop_count += 1
+                res['_drop_early_watch'] = True
+    if early_drop_count:
+        logger.info(f"Early watch quality filter dropped {early_drop_count} candidates.")
+        ctx.results = results = [r for r in results if not r.get('_drop_early_watch')]
+
+    # --- SOP: 板块共振 (Sector Resonance) 计算 ---
+    industry_counts = {}
+    for res in results:
+        ind = res.get('行业', '未知')
+        industry_counts[ind] = industry_counts.get(ind, 0) + 1
+
+    for res in results:
+        ind = res.get('行业', '未知')
+        if industry_counts.get(ind, 0) > 1 and ind != '未知':
+            res['共振'] = "🔥 核心热点"
+        else:
+            res['共振'] = "独苗"
+
+    # --- SOP: 地雷监测 (Mine Sweeper) ---
+    mine_data = fetch_mine_sweeper_data()
+    for res in results:
+        code = res['代码']
+        warnings = []
+        if code in mine_data["earnings"]: warnings.append("📅 财报")
+        if code in mine_data["unlocks"]: warnings.append("🔒 解禁")
+        # reductions 分支已停用：原数据源 ak.stock_dzjy_mrtj() 是大宗交易（≠减持），
+        # 且返回陈旧数据，曾导致 601138 等股票被误判 D 级。mine_data["reductions"] 恒为空。
+        # 若未来接入正确的减持数据源（如高管减持公告），此行可直接复用。
+        if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
+        res['warnings'] = warnings
+
+    # --- SOP: 注入市值/换手/PE (从快照数据) ---
+    snap_mkt_map = {}
+    snap_turnover_map = {}
+    snap_pe_map = {}
+    liquidity_map = {
+        str(row["code"]).zfill(6): {
+            "avg_amount_5d": float(row.get("avg_amount_5d") or 0),
+            "avg_amount_5d_estimated": bool(row.get("avg_amount_5d_estimated", True)),
+        }
+        for _, row in candidates.iterrows()
+    }
+    if not snapshot_df.empty and 'mkt_cap' in snapshot_df.columns:
+        for _, row in snapshot_df.iterrows():
+            code = str(row['code'])
+            snap_mkt_map[code] = row.get('mkt_cap', 0)
+            snap_turnover_map[code] = row.get('turnover', None)
+            # 改动 P2：注入 PE（快照含 pe 列，原代码漏注入导致 scan_history.pe 全 None）
+            snap_pe_map[code] = row.get('pe', None)
+    for res in results:
+        code = res['代码']
+        res.update(liquidity_map.get(str(code).zfill(6), {}))
+        mkt_raw = snap_mkt_map.get(code, 0)
+        res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
+        turnover_raw = snap_turnover_map.get(code)
+        if turnover_raw is not None:
+            res['turnover'] = float(turnover_raw or 0)
+        elif res['mkt_cap_yi'] > 0:
+            # 改动 P1：快照无换手率（盘后/快照过期）时，用"成交额/市值"复算近似换手率。
+            # turnover ≈ (vol × close) / mkt_cap × 100。这是标准近似（流通市值≈总市值的大盘股误差小），
+            # 让"大市值低换手"过滤(306-309行)在盘后也能生效，不再因 turnover 缺失而静默跳过。
+            _vol = float(res.get('成交量', 0) or res.get('vol', 0) or 0)
+            _close = float(res.get('price', 0) or res.get('最新价', 0) or 0)
+            _mkt = float(mkt_raw)  # 元
+            if _vol > 0 and _close > 0 and _mkt > 0:
+                res['turnover'] = round(_vol * _close / _mkt * 100, 2)
+        # 改动 P2：注入 PE（原代码漏注入，导致 scan_history.pe 全 None）
+        pe_raw = snap_pe_map.get(code)
+        if pe_raw is not None:
+            try:
+                res['pe'] = round(float(pe_raw), 1)
+            except (TypeError, ValueError):
+                pass
+
+    # 改动 P0：预计算每只票在板块内的涨幅排名（用于 classify_sector_role 的 LEADER 判定）。
+    # 原 res.update(strength) 会把"板块排名"(sector_rank) 覆盖到 res，但那是板块在全市场的排名，
+    # 不是个股在板块内的排名。这里从快照按板块分组、涨幅降序算出个股板块内 rank。
+    stock_sector_rank_map: Dict[str, int] = {}
+    if not snapshot_df.empty and 'pct_chg' in snapshot_df.columns and 'industry' in snapshot_df.columns:
+        snap_rank = snapshot_df.copy()
+        snap_rank['code'] = snap_rank['code'].astype(str).str.zfill(6)
+        snap_rank['pct_chg'] = pd.to_numeric(snap_rank['pct_chg'], errors='coerce').fillna(0)
+        for _ind, _grp in snap_rank.groupby('industry'):
+            _ranked = _grp.sort_values('pct_chg', ascending=False)
+            for _r, (_, _row) in enumerate(_ranked.iterrows(), start=1):
+                stock_sector_rank_map[str(_row['code']).zfill(6)] = _r
+
+    # 注入板块走势到每个结果
+    sector_fund_flow_map = _load_sector_fund_flow_map()
+    for res in results:
+        sector = res.get('行业', '')
+        s_info = sector_trends.get(sector, {})
+        res['sector_trend'] = s_info.get('trend', 'UNKNOWN')
+        res['sector_pct'] = s_info.get('pct', 0)
+        strength = sector_strength.get(sector, {})
+        res.update(strength)
+        if sector in sector_fund_flow_map:
+            res['sector_main_net_inflow_5d_yi'] = sector_fund_flow_map[sector]
+        stock_pct = float(res.get('涨幅%', 0) or 0)
+        sector_avg = float(strength.get('sector_avg_pct', res.get('sector_pct', 0)) or 0)
+        relative_pct = round(stock_pct - sector_avg, 2)
+        res['sector_relative_pct'] = relative_pct
+        # 个股在板块内的涨幅排名（P0：传入 rank 约束 LEADER 判定）
+        _stock_rank_in_sector = stock_sector_rank_map.get(str(res.get('代码', '')).zfill(6), 0)
+        res['stock_rank_in_sector'] = _stock_rank_in_sector
+        res['sector_strength_score'] = _sector_strength_score(res)
+        res['stock_sector_fit_score'] = _stock_sector_fit_score(res)
+        res['sector_alignment_score'] = _combined_sector_alignment(
+            res['sector_strength_score'],
+            res['stock_sector_fit_score'],
+        )
+        res['sector_role'] = classify_sector_role(
+            stock_pct,
+            sector_avg,
+            rank_in_sector=_stock_rank_in_sector,
+            alignment_score=res['sector_alignment_score'],
+        )
+        # sector_role 依赖 alignment，算出角色后重新计算个股适配，让龙头/核心定位参与解释。
+        res['stock_sector_fit_score'] = _stock_sector_fit_score({**res, 'stock_sector_fit_score': None})
+        res['sector_alignment_score'] = _combined_sector_alignment(
+            res['sector_strength_score'],
+            res['stock_sector_fit_score'],
+        )
+
+    # 行业景气度聚合（ROE/净利同比中位数）：供逻辑链展示与AI复核参考，不参与风控判定。
+    prosperity_map = build_industry_prosperity(results)
+    if prosperity_map:
+        for res in results:
+            _prosperity = prosperity_map.get(str(res.get('行业') or '').strip())
+            if _prosperity:
+                res['industry_prosperity'] = _prosperity
+
+    if monthly_sector_context:
+        # 月度板块强弱只做标注与排序参考，不做硬性剔除。
+        # 上月前5板块 × 每板块2只月度龙头的硬闸门曾把全市场日信号压到个位数。
+        monthly_leaders = build_sector_leaders(
+            engine,
+            snapshot_df,
+            sector_map,
+            sector_strength,
+            top_n=MONTHLY_SECTOR_LEADERS_PER_SECTOR,
+        )
+        leader_code_set = {
+            str(item.get("code") or "").zfill(6)
+            for items in monthly_leaders.values()
+            for item in items
+        }
+        for res in results:
+            res["monthly_sector_leader"] = str(res.get("代码") or "").zfill(6) in leader_code_set
+        monthly_sample = next(iter(monthly_sector_context.values()))
+        audit_payload["params_snapshot"]["monthly_sector_gate"] = {
+            "period": monthly_sample.get("sector_prev_month_period"),
+            "mode": "annotate_only",
+            "top_sectors": sorted(
+                sector for sector, context in monthly_sector_context.items()
+                if context.get("sector_prev_month_top5")
+            ),
+            "leaders_per_sector": MONTHLY_SECTOR_LEADERS_PER_SECTOR,
+            "results_in_top5_sectors": sum(
+                1 for res in results if res.get("sector_prev_month_top5")
+            ),
+            "results_monthly_leaders": sum(
+                1 for res in results if res.get("monthly_sector_leader")
+            ),
+        }
+
+    # 横截面 RPS 使用最新完整日线截面计算，只参与排序和解释，不授予交易权限。
+    from core.sequoia_research import load_cross_sectional_rps
+    rps_as_of = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
+    if not rps_map:
+        rps_map = load_cross_sectional_rps(engine, rps_as_of) if results else {}
+        ctx.rps_map = rps_map
+    for res in results:
+        res.update(rps_map.get(str(res.get("代码") or "").zfill(6), {}))
+    audit_payload["rps_factor"] = {
+        "as_of": rps_as_of,
+        "universe_count": len(rps_map),
+        "point_in_time": True,
+        "trade_permission": False,
+    }
+
+    # 改动 #17：预查近期失败模式，注入 recent_failure_count 供 _apply_sop_filter 否决
+    _inject_failure_pattern(results, engine)
+    _inject_breakdown_retracement(results, hist_map)
+    _inject_capital_event_risk(results, engine, as_of=data_date)
+    for res in results:
+        if res.get('capital_event_risk'):
+            warnings = list(res.get('warnings') or [])
+            warnings.append("🏦 定增/资本事件")
+            res['warnings'] = warnings
+
+    _apply_money_flow_to_results(results, money_flow_map)
+    for res in results:
+        _apply_close_confirmation_timing(res, snapshot_as_of, data_mode)
+        history = res.get('revival_history')
+        if history:
+            res.update(_classify_historical_revival(res, history))
+
+    # 受控试仓先读取历史健康度；数据库异常时健康门禁故障安全关闭。
+    from core.a_minus_trial import build_a_minus_trial_health
+    a_minus_trial_health = build_a_minus_trial_health(engine)
+    for res in results:
+        res['a_minus_trial_health'] = a_minus_trial_health
+
+    # 成长板块可能先于宽基指数修复；先注入板块级市场状态，再进行 SOP 评分。
+    growth_segment_context = apply_growth_segment_context(results, snapshot_df, market_regime)
+    market_regime['growth_segments'] = growth_segment_context
+    mark_phase("result_enrichment")
+
+
+def _scan_decide_and_persist(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) -> None:
+    """阶段 6/6：决策管线（SOP 过滤/决策层/评分校准/策略健康/事件驱动）、候选证据与
+    执行可达性、结果排序与哨兵推送、扫描结果与审计日志持久化及 scan_end 广播。"""
+    engine = ctx.engine
+    results = ctx.results
+    audit_payload = ctx.audit_payload
+    snapshot_df = ctx.snapshot_df
+    max_date = ctx.max_date
+    data_date = ctx.data_date
+    snapshot_as_of = ctx.snapshot_as_of
+    data_mode = ctx.data_mode
+    resolved_data_date = ctx.resolved_data_date
+    discovery_pool = ctx.discovery_pool
+    phase_timings = ctx.phase_timings
+    start_time = ctx.start_time
+    strategy_type = ctx.strategy_type
+    publish_to_sentinel = ctx.publish_to_sentinel
+    market_regime = ctx.market_regime
+    sector_trends = ctx.sector_trends
+
+    # 应用质量与风险评估；旧字母等级只在函数内部保留以兼容历史测试，
+    # 不再参与后续准入、排序、推送或持久化。
+    _apply_sop_filter(results, market_regime, sector_trends)
+    for res in results:
+        for legacy_grade_field in (
+            "sop_grade", "sop_subgrade", "sop_base_grade", "sop_a_grade_eligible",
+            "sop_a_grade_gate_reasons", "sop_grade_policy_version",
+            "sop_quality_gap_to_a", "sop_grade_transition_reasons", "sop_grade_reason",
+            "grade_execution_mode", "grade_execution_shadow_eligible",
+        ):
+            res.pop(legacy_grade_field, None)
+    for res in results:
+        res['market_regime'] = market_regime.get('status', 'UNKNOWN')
+    from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
+    scan_event_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
+    apply_limit_up_features(results, load_limit_up_event_map(scan_event_date, engine))
+    from core.event_driven import apply_event_catalysts
+    apply_event_catalysts(
+        results,
+        load_active_event_catalysts(engine, as_of=scan_event_date),
+    )
+    from core.decision_layer import load_market_cycle_history
+    decision_context = apply_decision_layer(
+        results,
+        snapshot_df,
+        market_regime,
+        load_market_cycle_history(engine, as_of=data_date),
+        data_date=str(max_date) if max_date else None,  # 改动 A3：传数据日，修复周末误判
+    )
+    from core.score_calibration import calibrate_scan_scores
+    calibrate_scan_scores(results)
+    from core.strategy_health import apply_strategy_health_controls, build_strategy_health
+    apply_strategy_health_controls(results, build_strategy_health(engine))
+    from core.event_driven import finalize_event_trade_state
+    finalize_event_trade_state(results)
+    from core.decision_semantics import apply_decision_semantics
+    apply_decision_semantics(results)
+    for row in results:
+        row.setdefault("discovery_pool", discovery_pool)
+        row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
+        row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
+        row["execution_rr"] = build_execution_rr(row)
+        row["execution_plan_state"] = build_frozen_plan_state(row)
+        row["distance_to_trade"] = build_distance_to_trade(row)
+    _apply_research_only_gate(results, audit_payload)
+    mark_phase("decision_pipeline")
+    from core.candidate_evidence import apply_candidate_evidence
+    from core.stock_research import get_cached_stock_research_signals
+
+    # 行业资金流共振证据（借鉴 easy-stock 题材雷达）：把行业排名注入候选，
+    # 供证据门 sector_context / decision_memo 参考。映射为空（首日未采集/
+    # 接口失败）时整段跳过，fail-open 不影响扫描主流程。
+    try:
+        from core.db import get_stock_basic_map, load_sector_fund_flow_map
+
+        sector_flow_map = load_sector_fund_flow_map(engine, scan_event_date)
+        if sector_flow_map:
+            industry_map = get_stock_basic_map(engine)
+            for row in results:
+                code = str(row.get("代码") or row.get("code") or "").zfill(6)
+                industry = str(industry_map.get(code) or "")
+                if industry:
+                    row.setdefault("stock_industry", industry)
+                flow = sector_flow_map.get(industry)
+                if flow:
+                    row["sector_fund_flow_rank"] = flow.get("rank")
+                    row["sector_main_force_net"] = flow.get("main_force_net")
+                    row["sector_flow_bar_date"] = flow.get("bar_date")
+    except Exception as exc:
+        logger.debug(f"Sector fund flow evidence attach skipped: {exc}")
+
+    def _cached_research(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        code = str(row.get("代码") or row.get("code") or "").zfill(6)
+        return (
+            get_cached_stock_research_signals(code, scan_event_date)
+            or get_cached_stock_research_signals(code)
+        )
+
+    evidence_summary = apply_candidate_evidence(
+        results,
+        as_of=snapshot_as_of,
+        mode=EVIDENCE_GATE_MODE,
+        research_lookup=_cached_research,
+    )
+    mark_phase("candidate_evidence")
+    from core.execution_reachability import apply_execution_reachability
+    reachability_summary = apply_execution_reachability(results)
+    # Research-only and evidence gates run after the first presentation pass;
+    # refresh derived labels so Bark and persisted snapshots reflect final state.
+    apply_decision_semantics(results)
+    for row in results:
+        row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
+        row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
+        row["distance_to_trade"] = build_distance_to_trade(row)
+        shadow = assess_persistent_b_shadow(row)
+        row["persistent_b_shadow"] = shadow
+        row["persistent_b_shadow_eligible"] = shadow["eligible"]
+    from core.score_calibration import apply_score_display_contract
+    apply_score_display_contract(results)
+    audit_payload["evidence_pipeline"] = evidence_summary
+    audit_payload["params_snapshot"]["evidence_pipeline"] = {
+        **evidence_summary, "stage": "DECISION_READY",
+    }
+    audit_payload["version_snapshot"]["candidate_evidence"] = "candidate-evidence-v1"
+    audit_payload["version_snapshot"]["execution_reachability"] = "execution-reachability-v1"
+    audit_payload["params_snapshot"]["execution_reachability"] = reachability_summary
+    mark_phase("execution_reachability")
+    audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
+    audit_payload["version_snapshot"]["strategy_health_control"] = "execution-cohort-circuit-breaker-v2"
+    audit_payload["version_snapshot"]["decision_layer"] = (
+        decision_context.get("market_sentiment_model_version") or "cycle-unknown"
+    )
+    audit_payload["params_snapshot"]["market_sentiment_stage"] = decision_context.get("market_sentiment_stage")
+    audit_payload["params_snapshot"]["portfolio_position_cap_pct"] = decision_context.get("portfolio_position_cap_pct")
+    bucket_counts = {
+        bucket: sum(1 for row in results if row.get("trade_bucket") == bucket)
+        for bucket in ("TRADE", "EARLY", "OBSERVE", "BLOCK")
+    }
+    logger.info("Execution buckets: %s", bucket_counts)
+
+    bucket_order = {'TRADE': 0, 'EARLY': 1, 'OBSERVE': 2, 'BLOCK': 3}
+    ctx.results = results = sorted(
+        results,
+        key=lambda x: (
+            bucket_order.get(str(x.get('trade_bucket') or 'OBSERVE'), 2),
+            -float(x.get('trade_opportunity_score') or 0),
+            -float(x.get('calibrated_score', x.get('Score', 0)) or 0),
+        ),
+    )
+
+    # Only the designated execution strategy may update Bark/Sentinel memory.
+    if publish_to_sentinel:
+        from core.sentinel import sentinel, _select_intraday_push_stocks
+        sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else []
+    mark_phase("result_ranking")
+
+    # --- 持久化保存 ---
+    persist_started_at = time.perf_counter()
+    scan_data_date = resolved_data_date
+    for res in results:
+        res['data_date'] = scan_data_date
+        res['data_mode'] = data_mode
+        res['as_of'] = str(snapshot_as_of)
+        if res.get('revival_watch_only'):
+            res['result_group'] = 'HISTORICAL_REVIVAL'
+        elif res.get('momentum_acceleration_watch_only'):
+            res['result_group'] = 'MOMENTUM_WATCH'
+        elif res.get('sequoia_research_shadow_only'):
+            res['result_group'] = 'SHADOW_RESEARCH'
+        else:
+            res['result_group'] = 'FORMAL'
+    save_scan_results(
+        results,
+        engine,
+        data_date=scan_data_date,
+        replace_strategy_types=[strategy_type],
+    )
+    phase_timings["result_persistence"] = round(time.perf_counter() - persist_started_at, 3)
+    audit_payload["params_snapshot"]["performance_phases_sec"] = phase_timings
+    audit_payload.update({
+        "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
+        "finished_at": datetime.now(),
+        "duration_sec": round(time.time() - start_time, 2),
+        "result_count": len(results),
+    })
+    save_scan_audit_log(audit_payload, engine)
+
+    ws_manager.broadcast_threadsafe({
+        "type": "scan_end",
+        "matches": len(results),
+        "message": (
+            f"扫描完成！可交易{sum(1 for r in results if r.get('trade_bucket') == 'TRADE')}只 "
+            f"观察{sum(1 for r in results if r.get('trade_bucket') in {'EARLY', 'OBSERVE'})}只"
+        )
+    })
+
+
 def perform_market_scan(
     threshold: float = 0.12,
     vol_multiplier: float = 1.5,
@@ -3034,7 +4550,6 @@ def perform_market_scan(
     Executes the main market scan logic.
     """
     logger.info(f"[RUN_MARKET_SCAN] strategy_type={strategy_type}, min_data_days={min_data_days}, weekly_ma={weekly_ma_period}")
-    max_date = None
     scan_started_at = datetime.now()
     phase_started_at = time.perf_counter()
     phase_timings: Dict[str, float] = {}
@@ -3077,1198 +4592,49 @@ def perform_market_scan(
         },
     }
 
+    ctx = _MarketScanContext(
+        strategy_type=strategy_type,
+        market_range=market_range,
+        use_macd_filter=use_macd_filter,
+        use_weekly=use_weekly,
+        use_rs_filter=use_rs_filter,
+        local_only=local_only,
+        data_date=data_date,
+        min_data_days=min_data_days,
+        weekly_ma_period=weekly_ma_period,
+        tv_weekly_gate=tv_weekly_gate,
+        require_live_snapshot=require_live_snapshot,
+        mkt_cap_min=mkt_cap_min,
+        scan_context=scan_context,
+        publish_to_sentinel=publish_to_sentinel,
+        threshold=threshold,
+        vol_multiplier=vol_multiplier,
+        rsi_min=rsi_min,
+        use_bb_sqz=use_bb_sqz,
+        sqz_lookback=sqz_lookback,
+        pine_min_signals=pine_min_signals,
+        stop_loss_pct=stop_loss_pct,
+        turnover_min=turnover_min,
+        audit_payload=audit_payload,
+        phase_timings=phase_timings,
+        scan_started_at=scan_started_at,
+    )
+
     try:
-        # 获取大盘环境以动态调整参数
-        regime = get_market_regime()
-        reg_status = regime.get("status", "UNKNOWN")
-        
-        # 启用 REGIME_PARAMS 自适应阈值（改动 #7）：根据大盘状态自动收紧/放宽
-        # threshold、vol_multiplier、rsi_min、stop_loss_pct 等。bear 时最严，bull 时最松。
-        # 用 SCAN_REGIME_ADAPTIVE 开关控制，便于回退到旧的固定参数。
-        if SCAN_REGIME_ADAPTIVE:
-            from core.market_regime import get_adaptive_params
-            adaptive = get_adaptive_params(reg_status, strategy_type)
-            threshold = float(adaptive.get("threshold", threshold))
-            vol_multiplier = float(adaptive.get("vol_multiplier", vol_multiplier))
-            if "rsi_min" in adaptive:
-                rsi_min = int(adaptive["rsi_min"])
-            if "stop_loss_pct" in adaptive:
-                stop_loss_pct = float(adaptive["stop_loss_pct"])
-            if "sqz_lookback" in adaptive:
-                sqz_lookback = int(adaptive["sqz_lookback"])
-            if adaptive.get("use_bb_sqz") is not None:
-                use_bb_sqz = bool(adaptive["use_bb_sqz"])
-            if "pine_min_signals" in adaptive:
-                pine_min_signals = int(adaptive["pine_min_signals"])
-            logger.info(
-                f"[SCAN] Market regime={reg_status}. Adaptive params: threshold={threshold}, "
-                f"vol_mult={vol_multiplier}, rsi_min={rsi_min}, stop_loss={stop_loss_pct}."
-            )
-        # 换手率调整保留：进攻市适度放宽换手要求
-        if reg_status == "OFFENSIVE":
-            turnover_min = max(2.5, turnover_min - 0.5)
-            logger.info(f"[SCAN] Market is OFFENSIVE. Adjusting turnover requirement to {turnover_min}.")
-
-        snapshot_df = pd.DataFrame()
-        engine = get_db_engine()
-
-        # 数据预检熔断：若数据质量 blocking，中止扫描，避免坏/陈旧数据静默产生假信号。
-        # （此前 preflight 仅作为 GET 接口暴露，扫描器从不检查。）
-        if SCAN_PREFLIGHT_ENFORCE and engine is not None:
-            try:
-                preflight = build_scan_preflight(engine, data_date=data_date)
-                if preflight.get("blocking"):
-                    block_msgs = [
-                        c.get("message", c.get("name", ""))
-                        for c in preflight.get("checks", [])
-                        if c.get("status") == "error"
-                    ]
-                    logger.warning(
-                        f"[RUN_MARKET_SCAN] 扫描被数据预检熔断中止："
-                        f"{'; '.join(block_msgs) or '存在 error 级检查项'}"
-                    )
-                    if require_live_snapshot:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=(
-                                "实时扫描已中止：数据预检未通过。"
-                                f"{'; '.join(block_msgs) or '存在数据完整性问题'}"
-                            ),
-                        )
-                    return []
-            except HTTPException:
-                raise
-            except Exception as exc:
-                # 预检本身失败不应阻断扫描（降级为告警，保持可用性）
-                logger.warning(f"[RUN_MARKET_SCAN] 数据预检执行异常，跳过熔断：{exc}")
-
-        # 1. 如果需要实时行情，或不是强制本地，尝试联网获取快照。
-        # 午间/Bark 扫描会传 local_only=True + require_live_snapshot=True；
-        # 这种组合必须主动拉实时快照，否则会直接因 snapshot_df 为空而熔断。
-        if (require_live_snapshot or not local_only) and data_date is None:
-            try:
-                snapshot_df = _load_market_snapshot(force_refresh=require_live_snapshot)
-            except Exception:
-                logger.debug("Network snapshot failed.")
-
-        # 2. 如果数据为空（联网失败 或 强制本地），启用本地数据库兜底
-        if require_live_snapshot and is_snapshot_stale(snapshot_df):
-            raise HTTPException(
-                status_code=503,
-                detail="实时行情快照已过期，已中止扫描，避免 Bark 使用过时行情数据。",
-            )
-        if snapshot_df.empty:
-            if require_live_snapshot:
-                raise HTTPException(
-                    status_code=503,
-                    detail="实时行情快照不可用，已中止扫描，避免 Bark 使用历史 daily_k 数据。",
-                )
-            logger.info(f"Switching to LOCAL DB mode (Local Only: {local_only}, Data Date: {data_date or 'Auto'})...")
-            try:
-                with engine.connect() as conn:
-                    # 如果指定了日期，使用指定日期；否则查找有足够数据的最近日期
-                    if data_date:
-                        # 验证日期格式和存在性
-                        date_check = conn.execute(
-                            text("SELECT date, COUNT(DISTINCT code) as stock_count FROM daily_k WHERE date = :date GROUP BY date"),
-                            {"date": data_date}
-                        ).fetchone()
-                        if not date_check:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"指定日期 {data_date} 没有数据或格式不正确。请使用 YYYY-MM-DD 格式。"
-                            )
-                        max_date = data_date
-                        stock_count = date_check[1]
-                        logger.info(f"Using specified date: {max_date} ({stock_count} stocks)")
-                    else:
-                        # 查找有足够数据的最近日期（至少 1000 只股票）
-                        logger.debug("Querying DB for best available date...")
-                        best_date_query = text("""
-                            SELECT date, COUNT(DISTINCT code) as stock_count
-                            FROM daily_k
-                            GROUP BY date
-                            HAVING COUNT(DISTINCT code) >= 1000
-                            ORDER BY date DESC
-                            LIMIT 1
-                        """)
-                        best_date_res = conn.execute(best_date_query).fetchone()
-                        if best_date_res and best_date_res[0]:
-                            max_date = best_date_res[0]
-                            stock_count = best_date_res[1]
-                            logger.info(f"Found best date in DB: {max_date} ({stock_count} stocks)")
-                        else:
-                            raise HTTPException(status_code=503, detail="数据库中没有足够的数据进行扫描")
-
-                    # 使用参数化查询防止 SQL 注入
-                    # pct_chg 使用与前一日收盘价对比 (日涨幅)，而非日内 open→close
-                    # 使用 LAG 窗口函数高效获取前日收盘价
-                    # 注意: 避免 :: 类型转换语法，SQLAlchemy 会将 :: 误解析为命名参数
-                    query = text("""
-                        WITH ranked AS (
-                            SELECT code, date, close, open, high, low, vol,
-                                   LAG(close) OVER (PARTITION BY code ORDER BY date) as prev_close
-                            FROM daily_k
-                            WHERE date <= CAST(:max_date AS date)
-                              AND date >= CAST(CAST(:max_date AS date) - interval '7 days' AS date)
-                        )
-                        SELECT r.code, b.name, b.industry, r.close as price, r.open, r.high, r.low, r.vol,
-                               CASE WHEN r.prev_close > 0
-                                   THEN ROUND(CAST((r.close - r.prev_close) / r.prev_close * 100 AS numeric), 2)
-                                   ELSE 0
-                               END as pct_chg,
-                               NULL as turnover,
-                               NULL as mkt_cap
-                        FROM ranked r
-                        LEFT JOIN stock_basic b ON r.code = b.code
-                        WHERE r.date = CAST(:max_date AS date)
-                    """)
-                    snapshot_df = pd.read_sql(query, engine, params={"max_date": max_date})
-                    logger.info(f"Loaded {len(snapshot_df)} rows from DB fallback.")
-                    # 保存数据日期信息用于返回
-                    if hasattr(snapshot_df, 'attrs'):
-                        snapshot_df.attrs['data_date'] = max_date
-                    # Fallback for name if join failed
-                    if not snapshot_df.empty:
-                        snapshot_df['name'] = snapshot_df['name'].fillna(snapshot_df['code'])
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Local fallback error: {e}")
-                raise HTTPException(status_code=500, detail=f"加载数据失败: {str(e)}")
-
-        if snapshot_df.empty:
-            detail_msg = "无法获取市场数据。"
-            if local_only:
-                detail_msg += "【离线模式】已开启，但本地数据库尚未同步今日数据。请先执行【数据管理 -> 同步当日数据】。"
-            else:
-                detail_msg += "联网请求超时且本地无缓存数据，请检查网络或刷新后再试。"
-            raise HTTPException(status_code=503, detail=detail_msg)
-        data_mode = "LOCAL_DB" if max_date else "LIVE_SNAPSHOT"
-        snapshot_attrs = getattr(snapshot_df, "attrs", {}) or {}
-        snapshot_as_of = (
-            max_date or snapshot_attrs.get("data_date")
-            if data_mode == "LOCAL_DB"
-            else snapshot_attrs.get("fetched_at") or datetime.now()
-        )
-        resolved_data_date = str(
-            max_date or snapshot_attrs.get("data_date") or datetime.now().strftime("%Y-%m-%d")
-        )[:10]
-        if scan_context is not None:
-            scan_context.update({
-                "data_date": resolved_data_date,
-                "data_mode": data_mode,
-                "as_of": snapshot_as_of,
-            })
-        audit_payload.update(_build_snapshot_audit(snapshot_df, data_mode, snapshot_as_of))
-        dataset_version = f"{data_mode}:{str(snapshot_as_of)[:19]}"
-        audit_payload["version_snapshot"]["dataset_version"] = dataset_version
-        audit_payload["point_in_time_snapshot_count"] = save_point_in_time_snapshot(
-            snapshot_df, dataset_version, snapshot_as_of, data_mode, engine,
-        )
-        audit_payload["params_snapshot"]["point_in_time_snapshot_count"] = audit_payload["point_in_time_snapshot_count"]
-        audit_payload["params_snapshot"]["evidence_pipeline"] = {
-            "stage": "MARKET_DATA_READY", "mode": EVIDENCE_GATE_MODE,
-        }
-        if audit_payload["point_in_time_snapshot_count"] <= 0:
-            audit_payload["research_only"] = True
-            audit_payload.setdefault("degradation_reasons", []).append("点时快照持久化失败")
-        mark_phase("market_snapshot_load")
-
-        # 初始过滤 (核心优化：只分析当日上涨且满足换手率/市值要求的股票)
-        total_snapshot = len(snapshot_df)
-        audit_payload["total_snapshot"] = total_snapshot
-
-        # SOP: 仅保留 沪深主板(60, 00)、创业板(30)、科创板(688)；剔除 ST、退市整理
-        snapshot_df['code_str'] = snapshot_df['code'].astype(str)
-        snapshot_df['name_str'] = snapshot_df['name'].astype(str)
-
-        is_target_market = snapshot_df['code_str'].str.startswith(('60', '688', '00', '30'))
-        is_not_st = ~snapshot_df['name_str'].str.contains('ST|退', case=False)
-
-        # fallback 模式下 turnover/mkt_cap 可能为 NULL（本地DB无此数据），需特殊处理
-        has_turnover = snapshot_df['turnover'].notna()
-        has_mkt_cap = snapshot_df['mkt_cap'].notna()
-        has_core_quote = snapshot_df['price'].notna() & snapshot_df['pct_chg'].notna()
-
-        discovery_mask, discovery_pool = _discovery_pool_mask(snapshot_df, strategy_type)
-        audit_payload["effective_filters"] = [
-            item for item in audit_payload.get("effective_filters", [])
-            if item != "positive_pct_change"
-        ] + [f"discovery_pool:{discovery_pool}"]
-        turnover_filter = (
-            has_turnover & (snapshot_df['turnover'] >= turnover_min)
-            if "turnover_min" in audit_payload.get("effective_filters", [])
-            else pd.Series(True, index=snapshot_df.index)
-        )
-        mkt_cap_filter = (
-            has_mkt_cap & (snapshot_df['mkt_cap'] >= mkt_cap_min * 100000000)
-            if "market_cap_min" in audit_payload.get("effective_filters", [])
-            else pd.Series(True, index=snapshot_df.index)
-        )
-        candidates = snapshot_df[
-            discovery_mask &
-            is_target_market & is_not_st & has_core_quote &
-            mkt_cap_filter & turnover_filter
-        ].copy()
-        candidates["discovery_pool"] = discovery_pool
-        audit_payload["params_snapshot"]["discovery_pool"] = discovery_pool
-        adjustment_gap_codes = get_suspected_adjustment_gap_codes(engine, target_date=data_date)
-        if adjustment_gap_codes:
-            candidates = candidates[~candidates["code"].astype(str).isin(adjustment_gap_codes)]
-            audit_payload.setdefault("fail_reasons", {})["suspected_adjustment_gap"] = len(adjustment_gap_codes)
-            logger.warning(f"Quarantined {len(adjustment_gap_codes)} suspected adjustment-gap candidates.")
-        audit_payload["candidate_count"] = len(candidates)
-        mark_phase("candidate_filter")
-
-        logger.info(f"Snapshot: {total_snapshot} stocks")
-        logger.info(f"After SOP Filter (No ST/BJ/Delist, +%, TO>{turnover_min}%, MC>{mkt_cap_min}亿): {len(candidates)} candidates")
-
-        # 1. 处理科创板过滤
-        if "包含科创板" not in market_range:
-            candidates = candidates[~candidates['code'].astype(str).str.startswith('688')]
-
-        # 2. 处理成分股精确过滤
-        index_map = {
-            "沪深300": "000300",
-            "上证50": "000016",
-            "中证500": "000905",
-            "中证1000": "000852"
-        }
-
-        target_index = None
-        for key, val in index_map.items():
-            if key in market_range:
-                target_index = val
-                break
-
-        if target_index:
-            try:
-                import akshare as ak
-                cons_df = ak.index_stock_cons(symbol=target_index)
-                if not cons_df.empty:
-                    cons_codes = cons_df['品种代码'].tolist()
-                    candidates = candidates[candidates['code'].isin(cons_codes)]
-            except Exception as e:
-                logger.warning(f"{market_range} filter failed: {e}")
-
-        # 无数量上限，用户可按需调整筛选条件
-        logger.info(f"准备扫描 {len(candidates)} 只股票...")
-        
-        ws_manager.broadcast_threadsafe({
-            "type": "scan_start",
-            "message": f"准备扫描 {len(candidates)} 只股票..."
-        })
-
-        results = []
-        engine = get_db_engine()
-
-        # 核心优化：预拉取指数历史并过滤，避免在线程内重复查询和过滤
-        bench_df = get_index_hist("000001")
-        bench_slice = None
-        if not bench_df.empty:
-            # 预先过滤出需要的日期范围
-            hist_end = datetime.now() if not data_date else datetime.strptime(data_date, "%Y-%m-%d")
-            hist_start = hist_end - timedelta(days=365)
-            bench_df = bench_df.copy()
-            bench_df['日期'] = pd.to_datetime(bench_df['日期'], errors='coerce')
-            mask = (bench_df['日期'] >= hist_start) & (bench_df['日期'] <= hist_end)
-            bench_slice = bench_df.loc[mask, ['日期', '收盘']].copy()
-            logger.info(f"Pre-filtered benchmark data: {len(bench_slice)} points.")
-
-        # 核心优化：批量拉取所有候选标的的历史数据，并进行向量化指标计算
-        logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
-        start_time = time.time()
-        end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
-        # 图表和扫描共用同一 TV 预热窗口；Alternate Signal 对历史起点敏感。
-        start_date_hist = (
-            datetime.strptime(end_date_hist, "%Y-%m-%d")
-            - timedelta(days=TV_SIGNAL_WARMUP_DAYS)
-        ).strftime("%Y-%m-%d")
-        candidate_codes = candidates['code'].tolist()
-
-        dfs = []
-        try:
-            chunk_size = 1000
-            for i in range(0, len(candidate_codes), chunk_size):
-                chunk = candidate_codes[i:i + chunk_size]
-                placeholders = ", ".join([f":code_{j}" for j in range(len(chunk))])
-                query_params = {f"code_{j}": c for j, c in enumerate(chunk)}
-                query_params["start_date"] = start_date_hist
-                query_params["end_date"] = end_date_hist
-
-                query = text(f"""
-                    SELECT d.code, d.date as "日期", d.open as "开盘", d.high as "最高",
-                           d.low as "最低", d.close as "收盘", d.vol as "成交量",
-                           b.name
-                    FROM daily_k d
-                    LEFT JOIN stock_basic b ON d.code = b.code
-                    WHERE d.code IN ({placeholders}) AND d.date >= :start_date AND d.date <= :end_date
-                    ORDER BY d.code, d.date ASC
-                """)
-                with engine.connect() as conn:
-                    chunk_df = pd.read_sql(query, conn, params=query_params)
-                    if not chunk_df.empty:
-                        dfs.append(chunk_df)
-
-            if not dfs:
-                logger.error("No historical data found for candidates.")
-                raise HTTPException(status_code=404, detail="本地历史数据缺失，请先同步数据。")
-
-            master_df = pd.concat(dfs).reset_index(drop=True)
-
-            # --- 注入实盘快照数据 ---
-            # snapshot_df 包含了我们要筛选的标的的实时数据
-            # 如果是本地历史回测 (local_only 且 snapshot 从 db fallback 加载)，master_df 已经包含该日数据，不可重复添加
-            # 我们通过判断 snapshot 的日期是否大于 master_df 中的最大日期来决定是否追加
-            snapshot_date = getattr(snapshot_df, 'attrs', {}).get('data_date', datetime.now().strftime("%Y-%m-%d"))
-            # 确保 snapshot_date 是字符串格式
-            if isinstance(snapshot_date, date):
-                snapshot_date = snapshot_date.strftime("%Y-%m-%d")
-            else:
-                snapshot_date = str(snapshot_date)[:10]
-
-            db_max_date = master_df['日期'].max()
-            if isinstance(db_max_date, pd.Timestamp):
-                db_max_date = db_max_date.strftime("%Y-%m-%d")
-            else:
-                db_max_date = str(db_max_date)[:10]
-
-            if snapshot_date > db_max_date:
-                logger.info(f"Appending snapshot live data ({snapshot_date}) to historical database series ({db_max_date})...")
-                snap_to_append = snapshot_df[snapshot_df['code'].isin(master_df['code'].unique())].copy()
-                snap_to_append = snap_to_append.rename(columns={
-                    'price': '收盘',
-                    'open': '开盘',
-                    'high': '最高',
-                    'low': '最低',
-                    'vol': '成交量'
-                })
-                snap_to_append['日期'] = snapshot_date
-                master_df = pd.concat([master_df, snap_to_append], ignore_index=True)
-                # 重新排序并重置索引，确保 batch calculation 的索引对齐逻辑正常工作
-                master_df = master_df.sort_values(['code', '日期']).reset_index(drop=True)
-
-            candidates, universe_filter_stats = _apply_liquidity_and_new_stock_filters(
-                candidates,
-                master_df,
-            )
-            allowed_codes = set(candidates["code"].astype(str))
-            master_df = master_df[master_df["code"].astype(str).isin(allowed_codes)].copy()
-            audit_payload["candidate_count"] = len(candidates)
-            audit_payload["params_snapshot"]["universe_filters"] = {
-                "avg_amount_lookback_days": UNIVERSE_LIQUIDITY_LOOKBACK_DAYS,
-                "min_avg_amount_yuan": UNIVERSE_MIN_AVG_AMOUNT_YUAN,
-                "amount_estimation": "close_x_volume_hands_x_100_when_exact_missing",
-                **universe_filter_stats,
-            }
-            audit_payload["effective_filters"] = list(dict.fromkeys([
-                *audit_payload.get("effective_filters", []),
-                "avg_amount_5d",
-                "exclude_new_one_price_stock",
-            ]))
-            if candidates.empty:
-                logger.info("No candidates remain after five-day liquidity and new-stock filters.")
-                audit_payload.update({
-                    "scan_date": resolved_data_date,
-                    "finished_at": datetime.now(),
-                    "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
-                    "result_count": 0,
-                })
-                save_scan_audit_log(audit_payload, engine)
-                return []
-
-            logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
-
-            # --- 向量化指标计算 ---
-            master_df = batch_calculate_indicators(master_df, bench_df=bench_slice)
-
-            # Pine Script 策略或 同时启用 策略需要额外的指标计算
-            if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
-                logger.info("Calculating Pine Script indicators in parallel...")
-                # 对每只股票单独计算 Pine 指标 (使用并行加速)
-                groups = [group.copy() for _, group in master_df.groupby('code')]
-
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    pine_results = list(executor.map(calculate_pine_indicators, groups))
-
-                if pine_results:
-                    master_df = pd.concat(pine_results, ignore_index=True)
-                logger.info(f"Parallel Pine Script indicators calculation completed.")
-
-            logger.info(f"Batch indicator calculation completed in {time.time() - start_time:.2f}s.")
-            mark_phase("indicator_batch")
-
-            # 按代码切分，供并发扫描使用
-            hist_map = {code: group for code, group in master_df.groupby('code')}
-
-        except Exception as e:
-            logger.error(f"Batch processing failed: {e}")
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"数据预处理失败: {str(e)}")
-
-        # 加载基本面数据
-        fund_map = {}
-        try:
-            with engine.connect() as conn:
-                fund_res = conn.execute(text("SELECT code, roe, net_profit_yoy, revenue_yoy, label FROM stock_fundamentals")).fetchall()
-                for r in fund_res:
-                    # 强制使用字符串作为 Key，防止 pandas 类型推断导致 int/str 匹配失败
-                    code_key = str(r[0]).zfill(6)
-                    fund_map[code_key] = {
-                        "roe": float(r[1]) if r[1] is not None else 0.0,
-                        "net_profit_yoy": float(r[2]) if r[2] is not None else 0.0,
-                        "revenue_yoy": float(r[3]) if r[3] is not None else 0.0,
-                        "label": str(r[4]) if r[4] is not None else ""
-                    }
-                logger.info(f"Loaded fundamentals for {len(fund_map)} stocks from database.")
-        except Exception as e:
-            logger.error(f"Failed to load fundamentals: {e}")
-
-        money_flow_map = _build_scan_money_flow_map(limit=6000)
-
-        # 并发扫描逻辑 - 执行策略筛选和周线确认
-        workers = 24  # 向量化后主压力在周线重采样，可提高并发
-        logger.info(f"Starting strategy scan for {len(candidates)} stocks (workers={workers})...")
-
-        results = []
-        fail_reasons = {}
-        none_count = 0
-        processed_count = 0
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_stock = {
-                executor.submit(
-                    single_stock_task,
-                    row['code'], row['name'], row['price'], row['vol'], row['open'],
-                    threshold, vol_multiplier, rsi_min, use_macd_filter, use_bb_sqz, sqz_lookback, use_weekly, use_rs_filter,
-                    local_only=local_only, engine=engine, preloaded_df=hist_map.get(row['code']), target_date=data_date,
-                    bench_df=bench_slice, strategy_type=strategy_type, pine_min_signals=pine_min_signals, min_data_days=min_data_days,
-                    weekly_ma_period=weekly_ma_period, fund_data=fund_map.get(str(row['code'])),
-                    tv_weekly_gate=tv_weekly_gate
-                ): row for _, row in candidates.iterrows()
-            }
-
-            for future in as_completed(future_to_stock):
-                processed_count += 1
-                if processed_count % 100 == 0 or processed_count == len(future_to_stock):
-                    logger.info(f"Scan Progress: {processed_count}/{len(future_to_stock)} stocks processed...")
-                    ws_manager.broadcast_threadsafe({
-                        "type": "scan_progress",
-                        "current": processed_count,
-                        "total": len(future_to_stock),
-                        "message": f"扫描中... ({processed_count}/{len(future_to_stock)})"
-                    })
-
-                try:
-                    res = future.result(timeout=60)
-                    if isinstance(res, dict) and 'Score' in res:
-                        results.append(res)
-                    elif isinstance(res, dict):
-                        reason = res.get('reason', '未知')
-                        fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
-                    elif res is None:
-                        none_count += 1
-                except Exception as e:
-                    fail_reasons[f"异常: {str(e)[:30]}"] = fail_reasons.get(f"异常: {str(e)[:30]}", 0) + 1
-
-            normalized_fail_reasons, fail_reason_details = _summarize_rejection_reasons(fail_reasons)
-            logger.info(f"Scan Stats: Matches={len(results)}, Rejections={sum(fail_reasons.values())}")
-            audit_payload["fail_reasons"] = normalized_fail_reasons
-            audit_payload["params_snapshot"]["fail_reason_details"] = fail_reason_details
-            if normalized_fail_reasons:
-                logger.info(f"Rejection Summary: {normalized_fail_reasons}")
-
-            # Pine 策略或 同时启用 策略额外统计
-            if strategy_type in ["pine", "both", "tv_zp", "tv_dual", "tv_dual_strict"]:
-                pine_stats = {}
-                for reason, count in fail_reasons.items():
-                    if "信号不足" in reason:
-                        # 提取信号数，如 "信号不足 (2/3)"
-                        match = re.search(r'\((\d+)/(\d+)\)', reason)
-                        if match:
-                            signals = int(match.group(1))
-                            pine_stats[signals] = pine_stats.get(signals, 0) + count
-                if pine_stats:
-                    logger.info(f"Pine Strategy Signal Distribution: {pine_stats}")
-
-        logger.info(f"Scan completed in {time.time() - start_time:.2f}s. Found {len(results)} matches.")
-        mark_phase("strategy_evaluation")
-
-        # 排序并取 Top 100；先记录截断压力，供影子排序验证，不改变正式结果。
-        results = sorted(results, key=lambda x: x['Score'], reverse=True)
-        prelimit_count = len(results)
-        audit_payload["params_snapshot"]["prelimit_ranking"] = {
-            "candidate_count": prelimit_count,
-            "limit": 100,
-            "truncated_count": max(0, prelimit_count - 100),
-            "top100_cutline_score": round(float(results[99]['Score']), 2) if prelimit_count >= 100 else None,
-            "top200_cutline_score": round(float(results[199]['Score']), 2) if prelimit_count >= 200 else None,
-        }
-        results = results[:100]
-        if strategy_type == "limit_up_shakeout":
-            from core.limit_up_leadership import load_limit_up_event_map
-            from core.sequoia_research import confirm_limit_up_shakeout_candidates
-
-            signal_date = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
-            prior_event_date = shift_a_share_trading_date(signal_date, -1)
-            before_event_gate = len(results)
-            prior_event_map = load_limit_up_event_map(prior_event_date, engine)
-            results = confirm_limit_up_shakeout_candidates(
-                results,
-                prior_event_map,
-                prior_event_date,
-            )
-            audit_payload["limit_up_shakeout_event_gate"] = {
-                "event_date": prior_event_date,
-                "input_count": before_event_gate,
-                "confirmed_count": len(results),
-                "event_universe_count": len(prior_event_map),
-                "fail_closed": True,
-            }
-
-        sector_map = get_sector_map()
-        sector_trends = get_sector_trends()
-        market_regime = get_market_regime()
-        # 把实时快照聚合写入 breadth_history（修复 6/22 节后首日 bug：让后续
-        # build_sector_history_context / load_market_cycle_history 读到今日实时宽度，
-        # 而非滞后的 daily_k）。失败只 log 不阻断扫描。
-        if not snapshot_df.empty and 'pct_chg' in snapshot_df.columns:
-            from core.db import record_breadth_snapshot
-            record_breadth_snapshot(snapshot_df, sector_map, engine)
-        sector_history = build_sector_history_context(engine, sector_map)
-        monthly_sector_context = build_previous_month_sector_context(
-            engine,
-            sector_map,
-            as_of_date=resolved_data_date,
-        )
-        sector_strength = build_sector_strength(
-            snapshot_df,
-            sector_map,
-            sector_trends,
-            sector_history,
-            monthly_sector_context,
-        )
-
-        if strategy_type == "early_value":
-            results, dropped, kept_pending = _apply_early_value_sector_filter(results, sector_map, sector_strength)
-            if dropped:
-                logger.info(f"Early value sector-start filter dropped {dropped} candidates.")
-            if kept_pending:
-                logger.info("Early value sector-start filter found no confirmed sectors; keeping pending watch candidates.")
-
-        if _should_include_sector_watch(strategy_type):
-            results = []
-            sector_watch = _build_sector_watch_candidates(
-                candidates,
-                set(),
-                hist_map,
-                sector_map,
-                sector_strength,
-            )
-            if sector_watch:
-                logger.info(f"Added {len(sector_watch)} sector-watch candidates.")
-                results.extend(sector_watch)
-        elif strategy_type in {"tv_dual", "tv_dual_strict"}:
-            existing_codes = {str(res.get('代码', '')).zfill(6) for res in results}
-            sector_watch = _build_sector_watch_candidates(
-                candidates,
-                existing_codes,
-                hist_map,
-                sector_map,
-                sector_strength,
-                max_per_sector=2,
-            )
-            if sector_watch:
-                logger.info(
-                    f"Added {len(sector_watch)} early strong-sector observation candidates."
-                )
-                results.extend(sector_watch)
-
-        active_plan_map: Dict[str, Dict[str, Any]] = {}
-        if strategy_type in {"tv_dual", "tv_dual_strict"}:
-            existing_codes = {str(res.get('代码', '')).zfill(6) for res in results}
-            candidate_codes = [str(code).zfill(6) for code in candidates['code'].tolist()]
-            signal_map = _fetch_recent_signal_map(
-                engine,
-                candidate_codes,
-                str(max_date or datetime.now().strftime("%Y-%m-%d")),
-            )
-            active_plan_map = _fetch_active_execution_plan_map(
-                engine,
-                candidate_codes,
-                str(max_date or datetime.now().strftime("%Y-%m-%d")),
-            )
-            revival_candidates = _build_historical_revival_candidates(
-                candidates,
-                existing_codes,
-                hist_map,
-                signal_map,
-                strategy_type,
-            )
-            if revival_candidates:
-                logger.info(f"Added {len(revival_candidates)} historical revival candidates.")
-                results.extend(revival_candidates)
-                existing_codes.update(str(res.get('代码', '')).zfill(6) for res in revival_candidates)
-            momentum_candidates = _build_momentum_acceleration_candidates(
-                candidates,
-                existing_codes,
-                hist_map,
-                sector_map,
-                sector_strength,
-                strategy_type,
-            )
-            if momentum_candidates:
-                logger.info(f"Added {len(momentum_candidates)} momentum acceleration candidates.")
-                results.extend(momentum_candidates)
-
-        mark_phase("strategy_post_filter")
-
-        # 补充增强 data (行业, 胜率) - 并发处理 Top 100 + 板块观察
-        logger.info(f"Parallel supplementing {len(results)} results (WinRate + Industry)...")
-
-        def process_supplement(res):
-            try:
-                if res.get('sector_watch_only'):
-                    return res
-                _inject_missing_fundamentals(res, fund_map)
-                code = res['代码']
-                # 1. 计算回测统计
-                # 直接使用 hist_map 中已计算好指标的数据，避免重复计算
-                df_hist = hist_map.get(code)
-                if df_hist is not None:
-                    df_hist = df_hist.copy().reset_index(drop=True)
-                df_labeled = df_hist
-                
-                # 获取止损参数 (前端可配置)
-                try:
-                    sl_pct = float(stop_loss_pct)
-                except (TypeError, ValueError):
-                    sl_pct = BACKTEST_STOP_LOSS_PCT
-                
-                if strategy_type == "pine":
-                    bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
-                elif strategy_type == "tv_zp":
-                    bt = calculate_tv_zp_win_rate(df_labeled, stop_loss_pct=sl_pct)
-                elif strategy_type in {"tv_dual", "tv_dual_strict"}:
-                    bt = calculate_tv_dual_win_rate(
-                        df_labeled,
-                        stop_loss_pct=sl_pct,
-                        threshold=threshold,
-                        vol_multiplier=vol_multiplier,
-                        rsi_min=rsi_min,
-                        use_macd_filter=use_macd_filter,
-                        sqz_lookback=sqz_lookback,
-                        require_both=(strategy_type == "tv_dual_strict"),
-                    )
-                elif strategy_type == "both":
-                    bt = calculate_pine_win_rate(df_labeled, min_signals=pine_min_signals, stop_loss_pct=sl_pct)
-                elif strategy_type == "consensus":
-                    bt = calculate_consensus_win_rate(df_labeled, stop_loss_pct=sl_pct)
-                elif strategy_type == "h2":
-                    bt = {
-                        "win_rate": 0,
-                        "signal_count": 0,
-                        "avg_return": 0,
-                        "max_drawdown": 0,
-                        "profit_factor": 0,
-                        "avg_hold_days": 0,
-                        "stop_loss_hits": 0,
-                        "adjusted_win_rate": 0,
-                        "confidence": 0,
-                        "expectancy": 0,
-                        "sample_warning": "H2独立策略暂无单股专项回测样本",
-                    }
-                elif strategy_type in {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}:
-                    bt = calculate_research_pattern_win_rate(
-                        df_labeled,
-                        strategy_type,
-                        stop_loss_pct=sl_pct,
-                    )
-                else:
-                    bt = calculate_historical_win_rate(
-                        df_labeled,
-                        stop_loss_pct=sl_pct,
-                        threshold=threshold,
-                        vol_multiplier=vol_multiplier,
-                        rsi_min=rsi_min,
-                        use_macd_filter=use_macd_filter,
-                        use_bb_sqz=use_bb_sqz,
-                        sqz_lookback=sqz_lookback,
-                        use_rs_filter=use_rs_filter,
-                    )
-                
-                res['历史胜率'] = f"{bt['win_rate']}%"
-                res['信号次数'] = bt['signal_count']
-                res['回测统计'] = {
-                    "avg_return": bt['avg_return'],
-                    "max_drawdown": bt['max_drawdown'],
-                    "profit_factor": bt['profit_factor'],
-                    "avg_hold_days": bt['avg_hold_days'],
-                    "stop_loss_hits": bt['stop_loss_hits'],
-                    "adjusted_win_rate": bt.get('adjusted_win_rate', bt['win_rate']),
-                    "adjusted_win_rate_method": bt.get('adjusted_win_rate_method', 'wilson_lower_99'),
-                    "confidence": bt.get('confidence', 1.0),
-                    "expectancy": bt.get('expectancy', 0),
-                    "sample_warning": bt.get('sample_warning', ''),
-                    "backtest_engine_version": BACKTEST_ENGINE_VERSION,
-                    "exit_rule_version": EXIT_RULE_VERSION,
-                }
-                res['strategy_logic_version'] = STRATEGY_LOGIC_VERSION
-                res['backtest_engine_version'] = BACKTEST_ENGINE_VERSION
-                res['exit_rule_version'] = EXIT_RULE_VERSION
-
-                # 2. 获取行业
-                industry = sector_map.get(code, "未知")
-                if industry == "未知":
-                    try:
-                        import akshare as ak
-                        info_df = ak.stock_individual_info_em(symbol=code)
-                        if not info_df.empty:
-                            industry_val = info_df[info_df['item'] == '行业分类']['value'].values
-                            if len(industry_val) > 0:
-                                industry = industry_val[0]
-                    except Exception: pass
-                res['行业'] = industry
-
-                # 3. SOP 新增字段
-                if df_hist is not None and len(df_hist) >= 6:
-                    close_now = float(df_hist['收盘'].iloc[-1])
-                    close_5d_ago = float(df_hist['收盘'].iloc[-6])
-                    res['pct_5d'] = round((close_now - close_5d_ago) / close_5d_ago * 100, 2)
-                else:
-                    res['pct_5d'] = 0.0
-
-                # 候选计划价：突破确认位 + 结构失效/初始风控，而不是简单 -8%
-                if df_hist is not None and not df_hist.empty:
-                    pa = analyze_price_action(df_hist)
-                    res.update(pa)
-                    chip = build_chip_distribution(df_hist)
-                    if chip.get('available'):
-                        res['chip_distribution'] = chip
-                        res['chip_buy_impact'] = chip.get('buy_impact')
-                        res['chip_holding_impact'] = chip.get('holding_impact')
-                        res['chip_score_delta'] = chip.get('score_delta', 0)
-                    entry_price = float(pa.get('pa_entry_price') or df_hist['最高'].iloc[-1])
-                    current_price = float(df_hist['收盘'].iloc[-1])
-                    risk = compute_paper_risk_levels(entry_price, entry_price, current_price, pa)
-                    res['entry_price'] = round(entry_price, 2)
-                    res['stop_price'] = risk['active_stop_price']
-                    res['plan_stop_price'] = risk['active_stop_price']
-                    res['initial_stop_price'] = risk['initial_stop_price']
-                    res['structure_stop_price'] = risk['structure_stop_price']
-                    res['target_price'] = risk['take_profit_price']
-                    res['risk_reward'] = risk['risk_reward']
-                    res['risk_notes'] = risk['risk_notes']
-                    if not res.get('结构') and pa.get('price_action_pattern') not in (None, "无明确形态"):
-                        res['结构'] = pa.get('price_action_pattern')
-                else:
-                    res['entry_price'] = res.get('现价', 0)
-                    risk = compute_paper_risk_levels(float(res.get('现价', 0)), float(res.get('现价', 0)), float(res.get('现价', 0)))
-                    res['stop_price'] = risk['active_stop_price']
-                    res['plan_stop_price'] = risk['active_stop_price']
-                    res['target_price'] = risk['take_profit_price']
-
-            except Exception as e:
-                logger.error(f"Supplement error for {res.get('代码')}: {e}")
-            return res
-
-        # 使用线程池并发补充 100 只股票
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            list(executor.map(process_supplement, results))
-        mark_phase("result_supplement")
-
-        recent_push_counts = load_recent_push_counts(
-            engine,
-            (res.get("代码") for res in results),
-            strategy_type,
-            str(max_date or datetime.now().strftime("%Y-%m-%d")),
-        )
-        for res in results:
-            res["recent_push_days"] = recent_push_counts.get(str(res.get("代码") or "").zfill(6), 1)
-
-        for res in results:
-            _apply_frozen_execution_plan(
-                res,
-                active_plan_map.get(str(res.get('代码', '')).zfill(6), {}),
-            )
-
-        early_drop_count = 0
-        for res in results:
-            if res.get('early_watch_only'):
-                ok, reasons = _early_watch_quality(res)
-                res['early_watch_quality_ok'] = ok
-                res['early_watch_quality_reasons'] = reasons
-                if not ok:
-                    early_drop_count += 1
-                    res['_drop_early_watch'] = True
-        if early_drop_count:
-            logger.info(f"Early watch quality filter dropped {early_drop_count} candidates.")
-            results = [r for r in results if not r.get('_drop_early_watch')]
-
-        # --- SOP: 板块共振 (Sector Resonance) 计算 ---
-        industry_counts = {}
-        for res in results:
-            ind = res.get('行业', '未知')
-            industry_counts[ind] = industry_counts.get(ind, 0) + 1
-
-        for res in results:
-            ind = res.get('行业', '未知')
-            if industry_counts.get(ind, 0) > 1 and ind != '未知':
-                res['共振'] = "🔥 核心热点"
-            else:
-                res['共振'] = "独苗"
-
-        # --- SOP: 地雷监测 (Mine Sweeper) ---
-        mine_data = fetch_mine_sweeper_data()
-        for res in results:
-            code = res['代码']
-            warnings = []
-            if code in mine_data["earnings"]: warnings.append("📅 财报")
-            if code in mine_data["unlocks"]: warnings.append("🔒 解禁")
-            # reductions 分支已停用：原数据源 ak.stock_dzjy_mrtj() 是大宗交易（≠减持），
-            # 且返回陈旧数据，曾导致 601138 等股票被误判 D 级。mine_data["reductions"] 恒为空。
-            # 若未来接入正确的减持数据源（如高管减持公告），此行可直接复用。
-            if code in mine_data["reductions"]: warnings.append("⚠️ 减持")
-            res['warnings'] = warnings
-
-        # --- SOP: 注入市值/换手/PE (从快照数据) ---
-        snap_mkt_map = {}
-        snap_turnover_map = {}
-        snap_pe_map = {}
-        liquidity_map = {
-            str(row["code"]).zfill(6): {
-                "avg_amount_5d": float(row.get("avg_amount_5d") or 0),
-                "avg_amount_5d_estimated": bool(row.get("avg_amount_5d_estimated", True)),
-            }
-            for _, row in candidates.iterrows()
-        }
-        if not snapshot_df.empty and 'mkt_cap' in snapshot_df.columns:
-            for _, row in snapshot_df.iterrows():
-                code = str(row['code'])
-                snap_mkt_map[code] = row.get('mkt_cap', 0)
-                snap_turnover_map[code] = row.get('turnover', None)
-                # 改动 P2：注入 PE（快照含 pe 列，原代码漏注入导致 scan_history.pe 全 None）
-                snap_pe_map[code] = row.get('pe', None)
-        for res in results:
-            code = res['代码']
-            res.update(liquidity_map.get(str(code).zfill(6), {}))
-            mkt_raw = snap_mkt_map.get(code, 0)
-            res['mkt_cap_yi'] = round(float(mkt_raw) / 1e8, 1) if mkt_raw else 0
-            turnover_raw = snap_turnover_map.get(code)
-            if turnover_raw is not None:
-                res['turnover'] = float(turnover_raw or 0)
-            elif res['mkt_cap_yi'] > 0:
-                # 改动 P1：快照无换手率（盘后/快照过期）时，用"成交额/市值"复算近似换手率。
-                # turnover ≈ (vol × close) / mkt_cap × 100。这是标准近似（流通市值≈总市值的大盘股误差小），
-                # 让"大市值低换手"过滤(306-309行)在盘后也能生效，不再因 turnover 缺失而静默跳过。
-                _vol = float(res.get('成交量', 0) or res.get('vol', 0) or 0)
-                _close = float(res.get('price', 0) or res.get('最新价', 0) or 0)
-                _mkt = float(mkt_raw)  # 元
-                if _vol > 0 and _close > 0 and _mkt > 0:
-                    res['turnover'] = round(_vol * _close / _mkt * 100, 2)
-            # 改动 P2：注入 PE（原代码漏注入，导致 scan_history.pe 全 None）
-            pe_raw = snap_pe_map.get(code)
-            if pe_raw is not None:
-                try:
-                    res['pe'] = round(float(pe_raw), 1)
-                except (TypeError, ValueError):
-                    pass
-
-        # 改动 P0：预计算每只票在板块内的涨幅排名（用于 classify_sector_role 的 LEADER 判定）。
-        # 原 res.update(strength) 会把"板块排名"(sector_rank) 覆盖到 res，但那是板块在全市场的排名，
-        # 不是个股在板块内的排名。这里从快照按板块分组、涨幅降序算出个股板块内 rank。
-        stock_sector_rank_map: Dict[str, int] = {}
-        if not snapshot_df.empty and 'pct_chg' in snapshot_df.columns and 'industry' in snapshot_df.columns:
-            snap_rank = snapshot_df.copy()
-            snap_rank['code'] = snap_rank['code'].astype(str).str.zfill(6)
-            snap_rank['pct_chg'] = pd.to_numeric(snap_rank['pct_chg'], errors='coerce').fillna(0)
-            for _ind, _grp in snap_rank.groupby('industry'):
-                _ranked = _grp.sort_values('pct_chg', ascending=False)
-                for _r, (_, _row) in enumerate(_ranked.iterrows(), start=1):
-                    stock_sector_rank_map[str(_row['code']).zfill(6)] = _r
-
-        # 注入板块走势到每个结果
-        sector_fund_flow_map = _load_sector_fund_flow_map()
-        for res in results:
-            sector = res.get('行业', '')
-            s_info = sector_trends.get(sector, {})
-            res['sector_trend'] = s_info.get('trend', 'UNKNOWN')
-            res['sector_pct'] = s_info.get('pct', 0)
-            strength = sector_strength.get(sector, {})
-            res.update(strength)
-            if sector in sector_fund_flow_map:
-                res['sector_main_net_inflow_5d_yi'] = sector_fund_flow_map[sector]
-            stock_pct = float(res.get('涨幅%', 0) or 0)
-            sector_avg = float(strength.get('sector_avg_pct', res.get('sector_pct', 0)) or 0)
-            relative_pct = round(stock_pct - sector_avg, 2)
-            res['sector_relative_pct'] = relative_pct
-            # 个股在板块内的涨幅排名（P0：传入 rank 约束 LEADER 判定）
-            _stock_rank_in_sector = stock_sector_rank_map.get(str(res.get('代码', '')).zfill(6), 0)
-            res['stock_rank_in_sector'] = _stock_rank_in_sector
-            res['sector_strength_score'] = _sector_strength_score(res)
-            res['stock_sector_fit_score'] = _stock_sector_fit_score(res)
-            res['sector_alignment_score'] = _combined_sector_alignment(
-                res['sector_strength_score'],
-                res['stock_sector_fit_score'],
-            )
-            res['sector_role'] = classify_sector_role(
-                stock_pct,
-                sector_avg,
-                rank_in_sector=_stock_rank_in_sector,
-                alignment_score=res['sector_alignment_score'],
-            )
-            # sector_role 依赖 alignment，算出角色后重新计算个股适配，让龙头/核心定位参与解释。
-            res['stock_sector_fit_score'] = _stock_sector_fit_score({**res, 'stock_sector_fit_score': None})
-            res['sector_alignment_score'] = _combined_sector_alignment(
-                res['sector_strength_score'],
-                res['stock_sector_fit_score'],
-            )
-
-        # 行业景气度聚合（ROE/净利同比中位数）：供逻辑链展示与AI复核参考，不参与风控判定。
-        prosperity_map = build_industry_prosperity(results)
-        if prosperity_map:
-            for res in results:
-                _prosperity = prosperity_map.get(str(res.get('行业') or '').strip())
-                if _prosperity:
-                    res['industry_prosperity'] = _prosperity
-
-        if monthly_sector_context:
-            # 月度板块强弱只做标注与排序参考，不做硬性剔除。
-            # 上月前5板块 × 每板块2只月度龙头的硬闸门曾把全市场日信号压到个位数。
-            monthly_leaders = build_sector_leaders(
-                engine,
-                snapshot_df,
-                sector_map,
-                sector_strength,
-                top_n=MONTHLY_SECTOR_LEADERS_PER_SECTOR,
-            )
-            leader_code_set = {
-                str(item.get("code") or "").zfill(6)
-                for items in monthly_leaders.values()
-                for item in items
-            }
-            for res in results:
-                res["monthly_sector_leader"] = str(res.get("代码") or "").zfill(6) in leader_code_set
-            monthly_sample = next(iter(monthly_sector_context.values()))
-            audit_payload["params_snapshot"]["monthly_sector_gate"] = {
-                "period": monthly_sample.get("sector_prev_month_period"),
-                "mode": "annotate_only",
-                "top_sectors": sorted(
-                    sector for sector, context in monthly_sector_context.items()
-                    if context.get("sector_prev_month_top5")
-                ),
-                "leaders_per_sector": MONTHLY_SECTOR_LEADERS_PER_SECTOR,
-                "results_in_top5_sectors": sum(
-                    1 for res in results if res.get("sector_prev_month_top5")
-                ),
-                "results_monthly_leaders": sum(
-                    1 for res in results if res.get("monthly_sector_leader")
-                ),
-            }
-
-        # 横截面 RPS 使用最新完整日线截面计算，只参与排序和解释，不授予交易权限。
-        from core.sequoia_research import load_cross_sectional_rps
-        rps_as_of = str(max_date)[:10] if max_date else datetime.now().strftime("%Y-%m-%d")
-        rps_map = load_cross_sectional_rps(engine, rps_as_of) if results else {}
-        for res in results:
-            res.update(rps_map.get(str(res.get("代码") or "").zfill(6), {}))
-        audit_payload["rps_factor"] = {
-            "as_of": rps_as_of,
-            "universe_count": len(rps_map),
-            "point_in_time": True,
-            "trade_permission": False,
-        }
-
-        # 改动 #17：预查近期失败模式，注入 recent_failure_count 供 _apply_sop_filter 否决
-        _inject_failure_pattern(results, engine)
-        _inject_breakdown_retracement(results, hist_map)
-        _inject_capital_event_risk(results, engine)
-        for res in results:
-            if res.get('capital_event_risk'):
-                warnings = list(res.get('warnings') or [])
-                warnings.append("🏦 定增/资本事件")
-                res['warnings'] = warnings
-
-        _apply_money_flow_to_results(results, money_flow_map)
-        for res in results:
-            _apply_close_confirmation_timing(res, snapshot_as_of, data_mode)
-            history = res.get('revival_history')
-            if history:
-                res.update(_classify_historical_revival(res, history))
-
-        # 受控试仓先读取历史健康度；数据库异常时健康门禁故障安全关闭。
-        from core.a_minus_trial import build_a_minus_trial_health
-        a_minus_trial_health = build_a_minus_trial_health(engine)
-        for res in results:
-            res['a_minus_trial_health'] = a_minus_trial_health
-
-        # 成长板块可能先于宽基指数修复；先注入板块级市场状态，再进行 SOP 评分。
-        growth_segment_context = apply_growth_segment_context(results, snapshot_df, market_regime)
-        market_regime['growth_segments'] = growth_segment_context
-        mark_phase("result_enrichment")
-
-        # 应用质量与风险评估；旧字母等级只在函数内部保留以兼容历史测试，
-        # 不再参与后续准入、排序、推送或持久化。
-        _apply_sop_filter(results, market_regime, sector_trends)
-        for res in results:
-            for legacy_grade_field in (
-                "sop_grade", "sop_subgrade", "sop_base_grade", "sop_a_grade_eligible",
-                "sop_a_grade_gate_reasons", "sop_grade_policy_version",
-                "sop_quality_gap_to_a", "sop_grade_transition_reasons", "sop_grade_reason",
-                "grade_execution_mode", "grade_execution_shadow_eligible",
-            ):
-                res.pop(legacy_grade_field, None)
-        for res in results:
-            res['market_regime'] = market_regime.get('status', 'UNKNOWN')
-        from core.limit_up_leadership import apply_limit_up_features, load_limit_up_event_map
-        scan_event_date = str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d")
-        apply_limit_up_features(results, load_limit_up_event_map(scan_event_date, engine))
-        from core.event_driven import apply_event_catalysts
-        apply_event_catalysts(
-            results,
-            load_active_event_catalysts(engine, as_of=scan_event_date),
-        )
-        from core.decision_layer import load_market_cycle_history
-        decision_context = apply_decision_layer(
-            results,
-            snapshot_df,
-            market_regime,
-            load_market_cycle_history(engine),
-            data_date=str(max_date) if max_date else None,  # 改动 A3：传数据日，修复周末误判
-        )
-        from core.score_calibration import calibrate_scan_scores
-        calibrate_scan_scores(results)
-        from core.strategy_health import apply_strategy_health_controls, build_strategy_health
-        apply_strategy_health_controls(results, build_strategy_health(engine))
-        from core.event_driven import finalize_event_trade_state
-        finalize_event_trade_state(results)
-        from core.decision_semantics import apply_decision_semantics
-        apply_decision_semantics(results)
-        for row in results:
-            row.setdefault("discovery_pool", discovery_pool)
-            row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
-            row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
-            row["execution_rr"] = build_execution_rr(row)
-            row["execution_plan_state"] = build_frozen_plan_state(row)
-            row["distance_to_trade"] = build_distance_to_trade(row)
-        _apply_research_only_gate(results, audit_payload)
-        mark_phase("decision_pipeline")
-        from core.candidate_evidence import apply_candidate_evidence
-        from core.stock_research import get_cached_stock_research_signals
-
-        def _cached_research(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            code = str(row.get("代码") or row.get("code") or "").zfill(6)
-            return (
-                get_cached_stock_research_signals(code, scan_event_date)
-                or get_cached_stock_research_signals(code)
-            )
-
-        evidence_summary = apply_candidate_evidence(
-            results,
-            as_of=snapshot_as_of,
-            mode=EVIDENCE_GATE_MODE,
-            research_lookup=_cached_research,
-        )
-        mark_phase("candidate_evidence")
-        from core.execution_reachability import apply_execution_reachability
-        reachability_summary = apply_execution_reachability(results)
-        # Research-only and evidence gates run after the first presentation pass;
-        # refresh derived labels so Bark and persisted snapshots reflect final state.
-        apply_decision_semantics(results)
-        for row in results:
-            row["trade_blockers"] = _dedupe_trade_blockers(list(row.get("trade_blockers") or []))
-            row["trade_blocker_groups"] = classify_trade_blockers(row["trade_blockers"])
-            row["distance_to_trade"] = build_distance_to_trade(row)
-            shadow = assess_persistent_b_shadow(row)
-            row["persistent_b_shadow"] = shadow
-            row["persistent_b_shadow_eligible"] = shadow["eligible"]
-        from core.score_calibration import apply_score_display_contract
-        apply_score_display_contract(results)
-        audit_payload["evidence_pipeline"] = evidence_summary
-        audit_payload["params_snapshot"]["evidence_pipeline"] = {
-            **evidence_summary, "stage": "DECISION_READY",
-        }
-        audit_payload["version_snapshot"]["candidate_evidence"] = "candidate-evidence-v1"
-        audit_payload["version_snapshot"]["execution_reachability"] = "execution-reachability-v1"
-        audit_payload["params_snapshot"]["execution_reachability"] = reachability_summary
-        mark_phase("execution_reachability")
-        audit_payload["version_snapshot"]["score_calibration"] = "cross-strategy-percentile-v1"
-        audit_payload["version_snapshot"]["strategy_health_control"] = "execution-cohort-circuit-breaker-v2"
-        audit_payload["version_snapshot"]["decision_layer"] = (
-            decision_context.get("market_sentiment_model_version") or "cycle-unknown"
-        )
-        audit_payload["params_snapshot"]["market_sentiment_stage"] = decision_context.get("market_sentiment_stage")
-        audit_payload["params_snapshot"]["portfolio_position_cap_pct"] = decision_context.get("portfolio_position_cap_pct")
-        bucket_counts = {
-            bucket: sum(1 for row in results if row.get("trade_bucket") == bucket)
-            for bucket in ("TRADE", "EARLY", "OBSERVE", "BLOCK")
-        }
-        logger.info("Execution buckets: %s", bucket_counts)
-
-        bucket_order = {'TRADE': 0, 'EARLY': 1, 'OBSERVE': 2, 'BLOCK': 3}
-        results = sorted(
-            results,
-            key=lambda x: (
-                bucket_order.get(str(x.get('trade_bucket') or 'OBSERVE'), 2),
-                -float(x.get('trade_opportunity_score') or 0),
-                -float(x.get('calibrated_score', x.get('Score', 0)) or 0),
-            ),
-        )
-
-        # Only the designated execution strategy may update Bark/Sentinel memory.
-        if publish_to_sentinel:
-            from core.sentinel import sentinel, _select_intraday_push_stocks
-            sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else []
-        mark_phase("result_ranking")
-
-        # --- 持久化保存 ---
-        persist_started_at = time.perf_counter()
-        scan_data_date = resolved_data_date
-        for res in results:
-            res['data_date'] = scan_data_date
-            res['data_mode'] = data_mode
-            res['as_of'] = str(snapshot_as_of)
-            if res.get('revival_watch_only'):
-                res['result_group'] = 'HISTORICAL_REVIVAL'
-            elif res.get('momentum_acceleration_watch_only'):
-                res['result_group'] = 'MOMENTUM_WATCH'
-            elif res.get('sequoia_research_shadow_only'):
-                res['result_group'] = 'SHADOW_RESEARCH'
-            else:
-                res['result_group'] = 'FORMAL'
-        save_scan_results(
-            results,
-            engine,
-            data_date=scan_data_date,
-            replace_strategy_types=[strategy_type],
-        )
-        phase_timings["result_persistence"] = round(time.perf_counter() - persist_started_at, 3)
-        audit_payload["params_snapshot"]["performance_phases_sec"] = phase_timings
-        audit_payload.update({
-            "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
-            "finished_at": datetime.now(),
-            "duration_sec": round(time.time() - start_time, 2),
-            "result_count": len(results),
-        })
-        save_scan_audit_log(audit_payload, engine)
-
-        ws_manager.broadcast_threadsafe({
-            "type": "scan_end",
-            "matches": len(results),
-            "message": (
-                f"扫描完成！可交易{sum(1 for r in results if r.get('trade_bucket') == 'TRADE')}只 "
-                f"观察{sum(1 for r in results if r.get('trade_bucket') in {'EARLY', 'OBSERVE'})}只"
-            )
-        })
-
-        # 在结果中注入数据日期
-        return results
+        # 阶段 1-6 与原实现逐一对应；返回 True 的阶段表示按原语义提前返回空结果。
+        if _scan_prepare_environment(ctx, mark_phase):
+            return []
+        _scan_filter_candidates(ctx, mark_phase)
+        if _scan_load_data(ctx, mark_phase):
+            return []
+        _scan_evaluate_candidates(ctx, mark_phase)
+        _scan_enrich_candidates(ctx, mark_phase)
+        _scan_decide_and_persist(ctx, mark_phase)
+        return ctx.results
     except HTTPException as he:
         engine = get_db_engine()
         audit_payload.update({
-            "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
+            "scan_date": str(ctx.max_date) if ctx.max_date else datetime.now().strftime("%Y-%m-%d"),
             "finished_at": datetime.now(),
             "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
             "status": "FAILED",
@@ -4282,7 +4648,7 @@ def perform_market_scan(
         traceback.print_exc()
         engine = get_db_engine()
         audit_payload.update({
-            "scan_date": str(max_date) if max_date else datetime.now().strftime("%Y-%m-%d"),
+            "scan_date": str(ctx.max_date) if ctx.max_date else datetime.now().strftime("%Y-%m-%d"),
             "finished_at": datetime.now(),
             "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
             "status": "FAILED",

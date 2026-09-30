@@ -61,6 +61,72 @@ def track_high_since_entry(
     )
 
 
+def _daily_k_frontier(ttl_seconds: int = 60) -> Optional[str]:
+    """daily_k 最新日期（60s 小缓存）：作为 ATR 缓存的数据指纹。
+
+    没有指纹时，15:10 终值回拉（半日 bar → 全日 bar）后 TTL 内的缓存仍返回
+    半日口径 ATR，止损线短暂偏离风控口径。"""
+    from datetime import datetime
+    from sqlalchemy import text as _text
+    from core.db import get_db_engine
+
+    value, cached_at = _ATR_FRONTIER_CACHE
+    now = datetime.now()
+    if value is not None and (now - cached_at).total_seconds() < ttl_seconds:
+        return value
+    try:
+        engine = get_db_engine()
+        frontier = None
+        if engine:
+            with engine.connect() as conn:
+                frontier = conn.execute(_text("SELECT MAX(date) FROM daily_k")).scalar()
+        frontier = str(frontier) if frontier is not None else ""
+    except Exception:
+        frontier = value or ""  # 查询失败沿用旧指纹，避免缓存被清空造成穿透
+    _ATR_FRONTIER_CACHE[0] = frontier
+    _ATR_FRONTIER_CACHE[1] = now
+    return frontier
+
+
+def _cached_daily_atr(code: str, ttl_seconds: int = 600) -> float | None:
+    """按 code 缓存日线 ATR（TTL 默认 10 分钟 + daily_k 前沿指纹）。
+
+    ATR 基于日线、日内不变，但 load_from_db(365天)+calculate_indicators 单次
+    数十毫秒——15 秒快盯循环逐票现算会把 CPU 打满。缓存失效返回 None 时
+    调用方自动回退到无 ATR 的固定口径（fail-open）。daily_k 前沿变化（午间
+    半日写入 / 15:10 终值回拉）时指纹失配立即失效重算。"""
+    from datetime import datetime, timedelta
+
+    frontier = _daily_k_frontier() or ""
+    cached = _ATR_CACHE.get(code)
+    now = datetime.now()
+    if cached and cached[2] == frontier and (now - cached[1]).total_seconds() < ttl_seconds:
+        return cached[0]
+    atr_value: float | None = None
+    try:
+        from core.db import load_from_db, get_db_engine
+        from core.indicators import calculate_indicators
+
+        _eng = get_db_engine()
+        if _eng:
+            _df = load_from_db(code, (now - timedelta(days=365)).strftime("%Y-%m-%d"), _eng)
+            if _df is not None and not _df.empty:
+                _df_i = calculate_indicators(_df)
+                if "ATR" in _df_i.columns and not _df_i.empty:
+                    _v = float(_df_i["ATR"].iloc[-1])
+                    if _v == _v:  # 排除 NaN
+                        atr_value = _v
+    except Exception:
+        pass
+    if atr_value is not None:
+        _ATR_CACHE[code] = (atr_value, now, frontier)
+    return atr_value
+
+
+_ATR_CACHE: dict[str, tuple[float, "datetime", str]] = {}
+_ATR_FRONTIER_CACHE: list = [None, None]  # (daily_k MAX(date), 读取时间)
+
+
 def compute_paper_risk_levels_with_context(
     entry_price: float,
     high_since_entry: float,
@@ -71,7 +137,9 @@ def compute_paper_risk_levels_with_context(
     """compute_paper_risk_levels 的便捷封装：自动获取 ATR 和 market_regime。
 
     修复#2: 原来很多调用点不传 atr/market_regime，导致 UI/推送/策略信号
-    看到的止损线与风控循环不一致（弱市时差3%）。此函数统一获取这两个参数。
+    看到的止损线与风控循环不一致（弱市时差3%）。此函数统一获取这两个参数，
+    是风控循环/快盯/UI 的唯一止损口径入口（TV 信号源持仓的固定-9%保护除外，
+    那是策略语义选择）。
     """
     # 获取 market_regime（只取 status 映射到 bull/bear/volatile）
     _regime = None
@@ -84,26 +152,12 @@ def compute_paper_risk_levels_with_context(
     except Exception:
         pass
 
-    # 获取 ATR（从 price_action_summary 或按需计算）
+    # 获取 ATR（从 price_action_summary 或按需计算，带 TTL 缓存）
     _atr = None
     if price_action_summary and isinstance(price_action_summary, dict):
         _atr = price_action_summary.get("latest_atr")
     if _atr is None and code:
-        try:
-            from core.db import load_from_db, get_db_engine
-            from core.indicators import calculate_indicators
-            from datetime import datetime, timedelta
-            _eng = get_db_engine()
-            if _eng:
-                _df = load_from_db(code, (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"), _eng)
-                if _df is not None and not _df.empty:
-                    _df_i = calculate_indicators(_df)
-                    if "ATR" in _df_i.columns and not _df_i.empty:
-                        _v = float(_df_i["ATR"].iloc[-1])
-                        if _v == _v:  # 排除 NaN
-                            _atr = _v
-        except Exception:
-            pass
+        _atr = _cached_daily_atr(code)
 
     return compute_paper_risk_levels(
         entry_price, high_since_entry, current_price, price_action_summary,

@@ -17,13 +17,18 @@ from core.risk_engine import compute_paper_risk_levels, compute_paper_risk_level
 from core.sequoia_research import (
     high_tight_flag_signal_mask,
     limit_up_shakeout_signal_mask,
+    ma_volume_signal_mask,
     turtle_breakout_signal_mask,
+    uptrend_limit_down_signal_mask,
 )
 
 STRATEGY_LOGIC_VERSION = "2026.09-tv-or-tiered-execution-v2"
 BACKTEST_ENGINE_VERSION = "v8.1-daily-mark-causal-sizing"
 EXIT_RULE_VERSION = "tv-source-aware-next-open-v2-anomaly"
-RESEARCH_PATTERN_STRATEGIES = {"high_tight_flag", "turtle_breakout", "limit_up_shakeout"}
+RESEARCH_PATTERN_STRATEGIES = {
+    "high_tight_flag", "turtle_breakout", "limit_up_shakeout",
+    "ma_volume", "uptrend_limit_down",
+}
 
 
 def _find_research_pattern_indices(df: pd.DataFrame, strategy_type: str) -> List[int]:
@@ -35,6 +40,12 @@ def _find_research_pattern_indices(df: pd.DataFrame, strategy_type: str) -> List
         code_column = "code" if "code" in df.columns else "代码"
         code = str(df[code_column].iloc[-1]) if code_column in df.columns and not df.empty else ""
         mask = limit_up_shakeout_signal_mask(df, code)
+    elif strategy_type == "ma_volume":
+        mask = ma_volume_signal_mask(df)
+    elif strategy_type == "uptrend_limit_down":
+        code_column = "code" if "code" in df.columns else "代码"
+        code = str(df[code_column].iloc[-1]) if code_column in df.columns and not df.empty else ""
+        mask = uptrend_limit_down_signal_mask(df, code)
     else:
         return []
     return [int(position) for position, matched in enumerate(mask.to_numpy()) if bool(matched)]
@@ -723,6 +734,7 @@ def run_optimization_grid(
     param_x_values: Optional[List] = None,
     param_y: str = "stop_loss_pct",
     param_y_values: Optional[List] = None,
+    code: str = "",
 ) -> Dict[str, Any]:
     """
     参数寻优网格：对两个参数做笛卡尔积回测，返回胜率矩阵。
@@ -754,6 +766,7 @@ def run_optimization_grid(
                 low_vals=df['最低'].values,
                 signal_indices=signal_indices,
                 stop_loss_pct=float(y_val),
+                code=code,
                 atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
                 open_vals=df['开盘'].values if '开盘' in df.columns else None
             )
@@ -807,12 +820,26 @@ def _find_signal_indices_with_params(df: pd.DataFrame, strategy_type: str, param
         return []
 
 
+def _limit_up_open_threshold(code: str) -> float:
+    """次日开盘涨停跳过阈值（按板块涨跌幅限制取容差口径）。
+
+    主板 10% 板按 9.5% 实际涨停价容差；创业板/科创板 20% 板 0.195；
+    北交所 30% 板 0.295。此前写死 0.095，20% 板高开 9.5%~19.5% 的可成交
+    强信号被系统性误判为涨停跳过，回测胜率对创业板/科创板失真。"""
+    code = str(code or "").zfill(6)
+    if code[:3] in {"300", "301", "688", "689"}:
+        return 0.195
+    if code[:2] in {"43", "83", "87", "88", "92"}:
+        return 0.295
+    return 0.095
+
+
 def _simulate_backtest(
     close_vals, high_vals, low_vals, signal_indices,
     stop_loss_pct=BACKTEST_STOP_LOSS_PCT, max_hold_days=BACKTEST_MAX_HOLD_DAYS,
     atr_vals=None, vol_vals=None,
     use_trailing_stop=True, trailing_multiplier=BACKTEST_TRAILING_ATR_MULT, capital=100000,
-    vol_cap_pct=0.05, time_stop_days=None, open_vals=None,
+    vol_cap_pct=0.05, time_stop_days=None, open_vals=None, code: str = "",
 ) -> Dict[str, Any]:
     """
     通用回测模拟引擎 (v7.0 - 真实摩擦模型)
@@ -880,13 +907,13 @@ def _simulate_backtest(
             entry_idx = idx + 1
             entry_price = open_vals[entry_idx]
             vol_idx = entry_idx  # 流动性约束按入场日而非信号日
-            # 涨停跳过：A 股 T+1 入场日开盘若相对信号日收盘涨停（主板≥+9.5%，创业板/科创板≥+19.5%），
-            # 实盘根本买不到（封板无卖盘）。回测若把这些算成可成交信号会系统性高估胜率。
+            # 涨停跳过：A 股 T+1 入场日开盘若相对信号日收盘达到板块涨停容差
+            # （主板≥+9.5%，创业板/科创板≥+19.5%，北交所≥+29.5%），实盘根本
+            # 买不到（封板无卖盘）。回测若把这些算成可成交信号会系统性高估胜率。
             prev_close = close_vals[idx]
             if prev_close > 0:
                 open_chg = (entry_price - prev_close) / prev_close
-                # 0.185 阈值兼容 20% 板（300/301/688）与 10% 板（其余，按 9.5% 实际涨停价容差）
-                if open_chg >= 0.095:
+                if open_chg >= _limit_up_open_threshold(code):
                     limit_up_skipped += 1
                     continue
         else:
@@ -1019,12 +1046,13 @@ def _simulate_backtest(
     loss_prob = losses / total_trades if total_trades > 0 else 0
     expectancy = round((win_prob * avg_win - loss_prob * avg_loss) * 100, 2)
 
-    # 4. 样本量警告
+    # 4. 样本量警告（4-3c：与 _sample_confidence 对齐——10-19 笔内部只给 0.7
+    # 置信但展示层无警示；<20 笔一律带警告）
     if total_trades == 0:
         sample_warning = "无历史信号"
     elif total_trades < 5:
         sample_warning = f"仅{total_trades}笔交易，胜率仅供参考"
-    elif total_trades < 10:
+    elif total_trades < 20:
         sample_warning = f"样本偏少({total_trades}笔)，胜率可信度一般"
     else:
         sample_warning = ""
@@ -1211,8 +1239,9 @@ def calculate_historical_win_rate(
     use_bb_sqz=False,
     sqz_lookback=10,
     use_rs_filter=True,
+    code: str = "",
 ):
-    """向量化计算回测统计 (Enhanced v6.0 - 含止损/回撤/盈亏比)"""
+    """向量化计算回测统计 (Enhanced v6.0 - 含止损/回撤/盈亏比)；code 用于板块感知涨停跳过阈值"""
     empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
@@ -1244,7 +1273,8 @@ def calculate_historical_win_rate(
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
             vol_vals=df['成交量'].values if '成交量' in df.columns else None,
-            open_vals=df['开盘'].values if '开盘' in df.columns else None
+            open_vals=df['开盘'].values if '开盘' in df.columns else None,
+            code=code
         )
 
     except Exception as e:
@@ -1255,6 +1285,7 @@ def calculate_research_pattern_win_rate(
     df: pd.DataFrame,
     strategy_type: str,
     stop_loss_pct: float = BACKTEST_STOP_LOSS_PCT,
+    code: str = "",
 ):
     """Backtest a research pattern with the shared next-open/friction engine."""
     empty_result = _empty_backtest_result()
@@ -1276,6 +1307,7 @@ def calculate_research_pattern_win_rate(
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
             vol_vals=df['成交量'].values if '成交量' in df.columns else None,
             open_vals=df['开盘'].values if '开盘' in df.columns else None,
+            code=code,
         )
     except Exception:
         return empty_result
@@ -1633,7 +1665,7 @@ def check_tv_reversal_watch(
     }
 
 
-def calculate_tv_zp_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
+def calculate_tv_zp_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT, code: str = ""):
     empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
         return empty_result
@@ -1651,7 +1683,8 @@ def calculate_tv_zp_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
             vol_vals=df['成交量'].values if '成交量' in df.columns else None,
-            open_vals=df['开盘'].values if '开盘' in df.columns else None
+            open_vals=df['开盘'].values if '开盘' in df.columns else None,
+            code=code
         )
     except Exception:
         return empty_result
@@ -1667,6 +1700,7 @@ def calculate_tv_dual_win_rate(
     sqz_lookback=10,
     require_both=False,
     signal_window=3,
+    code: str = "",
 ):
     empty_result = _empty_backtest_result()
     if df.empty or len(df) < 130:
@@ -1715,7 +1749,8 @@ def calculate_tv_dual_win_rate(
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
             vol_vals=df['成交量'].values if '成交量' in df.columns else None,
-            open_vals=df['开盘'].values if '开盘' in df.columns else None
+            open_vals=df['开盘'].values if '开盘' in df.columns else None,
+            code=code,
         )
         if used_fallback:
             # 标注本次回测用的是"任意单信号"并集样本（因严格双共振样本不足），区别于实时强共振筛选。
@@ -1727,7 +1762,7 @@ def calculate_tv_dual_win_rate(
         return empty_result
 
 
-def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
+def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=BACKTEST_STOP_LOSS_PCT, code: str = ""):
     """
     计算 Pine Script 策略的回测统计 (Enhanced v6.0)
     """
@@ -1752,7 +1787,8 @@ def calculate_pine_win_rate(df, min_signals=3, stop_loss_pct=BACKTEST_STOP_LOSS_
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
             vol_vals=df['成交量'].values if '成交量' in df.columns else None,
-            open_vals=df['开盘'].values if '开盘' in df.columns else None
+            open_vals=df['开盘'].values if '开盘' in df.columns else None,
+            code=code,
         )
 
     except Exception as e:
@@ -1842,7 +1878,7 @@ def check_consensus_strategy(df, is_weekly_ok=True, vol_multiplier=1.8, fund_dat
         return False, debug_info
 
 
-def calculate_consensus_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
+def calculate_consensus_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT, code: str = ""):
     """
     计算 Azul 共识策略的回测统计 (Enhanced v6.0)
     """
@@ -1880,7 +1916,8 @@ def calculate_consensus_win_rate(df, stop_loss_pct=BACKTEST_STOP_LOSS_PCT):
             stop_loss_pct=stop_loss_pct,
             atr_vals=df['ATR'].values if 'ATR' in df.columns else None,
             vol_vals=df['成交量'].values if '成交量' in df.columns else None,
-            open_vals=df['开盘'].values if '开盘' in df.columns else None
+            open_vals=df['开盘'].values if '开盘' in df.columns else None,
+            code=code,
         )
     except Exception:
         return empty_result

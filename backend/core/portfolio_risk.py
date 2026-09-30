@@ -19,6 +19,9 @@ DEFAULT_RISK_BUDGET = {
     # 超过此值时，暂停加仓。与 daily_loss_limit_pct（已实现）互补——系统性下跌日
     # 持仓全部浮亏但未触发止损时，仍能阻止"越跌越加"。
     "floating_loss_limit_pct": 5.0,
+    # Elder《以交易为生》6% 法则：当月已实现净亏损 + 当前持仓资金风险，
+    # 占虚拟总资金比例达到此值时，本月剩余时间硬熔断新开仓。
+    "monthly_risk_limit_pct": 6.0,
     # 修复#4: 总仓位上限。所有OPEN持仓的capital_used之和占虚拟总资金的比例上限。
     # 防止理论上满仓单票或过度集中。
     "max_total_capital_pct": 80.0,
@@ -85,13 +88,16 @@ def evaluate_floating_loss_circuit_breaker(
     if df_valid.empty:
         return {"status": "ok", "halted": False, "floating_loss_pct": 0.0, "floating_loss_limit_pct": loss_limit, "message": "持仓无有效最新价"}
 
-    # 浮亏金额 = (curr - entry) * shares；初始投入 = entry * shares
+    # 浮亏金额 = (curr - entry) * shares；分母统一为虚拟总资金（与日内/月度
+    # 熔断同口径、与 docstring 语义一致）。原 OPEN 持仓成本分母使浮亏线随
+    # 仓位轻重浮动，与其他两条熔断线不可比。持仓总成本保留在返回值供核对。
     df_valid["unrealized_pnl"] = (df_valid["curr_price"].astype(float) - df_valid["entry_price"].astype(float)) * df_valid["shares"]
     df_valid["cost"] = df_valid["entry_price"].astype(float) * df_valid["shares"]
     total_unrealized = float(df_valid["unrealized_pnl"].sum())
     total_cost = float(df_valid["cost"].sum())
+    virtual_cap = float(limits.get("virtual_total_capital", 1000000.0))
 
-    floating_loss_pct = (total_unrealized / total_cost * 100.0) if total_cost > 0 else 0.0
+    floating_loss_pct = (total_unrealized / virtual_cap * 100.0) if virtual_cap > 0 else 0.0
 
     if floating_loss_pct < -abs(loss_limit):
         return {
@@ -99,6 +105,8 @@ def evaluate_floating_loss_circuit_breaker(
             "halted": True,
             "floating_loss_pct": round(floating_loss_pct, 2),
             "floating_loss_limit_pct": loss_limit,
+            "open_cost": round(total_cost, 2),
+            "denominator": virtual_cap,
             "message": f"组合浮亏 {floating_loss_pct:.2f}% 超过熔断线 -{loss_limit:.1f}%，暂停加仓",
         }
     return {
@@ -106,6 +114,7 @@ def evaluate_floating_loss_circuit_breaker(
         "halted": False,
         "floating_loss_pct": round(floating_loss_pct, 2),
         "floating_loss_limit_pct": loss_limit,
+        "open_cost": round(total_cost, 2),
         "message": "组合浮亏在熔断线内",
     }
 
@@ -128,6 +137,9 @@ def evaluate_daily_loss_circuit_breaker(
 
     limits = {**DEFAULT_RISK_BUDGET, **(budget or {})}
     loss_limit = float(limits.get("daily_loss_limit_pct", 5.0))
+    # 分母统一为虚拟总资金（与月度熔断/浮亏熔断同口径）：原"全表持仓初始投入"
+    # 分母随历史 CLOSED 行无界增长，-5% 熔断线越来越钝（历史行越多越难触发）。
+    virtual_cap = float(limits.get("virtual_total_capital", 1000000.0))
     today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
 
     try:
@@ -152,28 +164,9 @@ def evaluate_daily_loss_circuit_breaker(
     df["pnl"] = (df["close_price"].astype(float) - df["entry_price"].astype(float)) * df["shares"]
     realized_pnl = float(df["pnl"].sum())
 
-    # 修复 R3-3: 资金分母应为"总账户资金"（所有持仓的初始投入），
-    # 而非仅当日平仓笔的投入。否则单笔小仓位 -5% 就触发熔断（误杀），
-    # 或多笔小亏损永远不触发（漏杀）。
-    try:
-        capital_df = pd.read_sql(
-            text("""
-                SELECT entry_price, shares
-                FROM paper_trading
-                WHERE entry_price > 0 AND COALESCE(shares, 0) > 0
-            """),
-            engine,
-        )
-        if not capital_df.empty:
-            capital_df["shares"] = pd.to_numeric(capital_df["shares"], errors="coerce").fillna(0).astype(float)
-            capital_base = float((capital_df["entry_price"].astype(float) * capital_df["shares"]).sum())
-        else:
-            # fallback: 用当日平仓投入
-            capital_base = float((df["entry_price"].astype(float) * df["shares"]).sum())
-    except Exception:
-        capital_base = float((df["entry_price"].astype(float) * df["shares"]).sum())
-
-    daily_loss_pct = (realized_pnl / capital_base * 100.0) if capital_base > 0 else 0.0
+    # 批2-4：分母统一为虚拟总资金（原 R3-3 的"全表初始投入"分母随历史 CLOSED 行
+    # 无界增长，熔断线越来越钝；三套分母互斥导致 -5%/-5%/-6% 三条熔断线不可比）。
+    daily_loss_pct = (realized_pnl / virtual_cap * 100.0) if virtual_cap > 0 else 0.0
 
     if daily_loss_pct < -abs(loss_limit):
         return {
@@ -181,6 +174,7 @@ def evaluate_daily_loss_circuit_breaker(
             "halted": True,
             "daily_loss_pct": round(daily_loss_pct, 2),
             "daily_loss_limit_pct": loss_limit,
+            "denominator": virtual_cap,
             "message": f"日内已实现亏损 {daily_loss_pct:.2f}% 超过熔断线 -{loss_limit:.1f}%，暂停当日新开仓",
         }
     return {
@@ -190,6 +184,104 @@ def evaluate_daily_loss_circuit_breaker(
         "daily_loss_limit_pct": loss_limit,
         "message": "日内亏损在熔断线内",
     }
+
+
+def evaluate_monthly_risk_budget(
+    engine: Optional[Engine],
+    now: Optional[pd.Timestamp] = None,
+    budget: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Elder《以交易为生》6% 法则：月度风险熔断。
+
+    月度风险用量 = max(0, -当月已实现净盈亏) + 当前 OPEN 持仓资金风险，
+    除以虚拟总资金（virtual_total_capital，与 evaluate_portfolio_risk_budget
+    的资本风险口径一致）。达到 monthly_risk_limit_pct 时返回 status="halt"，
+    本月剩余时间阻止新开仓（与日内熔断同为硬限制，不可被 force 绕过）。
+
+    与 evaluate_daily_loss_circuit_breaker（"今天"）互补，本函数管"这个月"，
+    防止月度累积亏损失控后继续加大头寸"救交易"。
+
+    已实现盈亏按 (close_price - entry_price) * shares 近似（paper_trading 无资金
+    字段的既有口径）；当月盈利与亏损相互抵扣（净额口径）。
+    """
+    from core.risk_constants import MONTHLY_RISK_BREAKER_ENABLED, MONTHLY_RISK_POLICY_VERSION
+
+    if engine is None:
+        return {"status": "error", "halted": False, "monthly_risk_used_pct": 0.0, "message": "数据库不可用"}
+
+    limits = {**DEFAULT_RISK_BUDGET, **(budget or {})}
+    loss_limit = float(limits.get("monthly_risk_limit_pct", 6.0))
+    virtual_cap = float(limits.get("virtual_total_capital", 1000000.0))
+    current = pd.Timestamp(now) if now is not None else pd.Timestamp.now()
+    month_start = current.strftime("%Y-%m-01")
+    base = {
+        "status": "ok",
+        "halted": False,
+        "monthly_risk_used_pct": 0.0,
+        "monthly_risk_limit_pct": loss_limit,
+        "policy_version": MONTHLY_RISK_POLICY_VERSION,
+    }
+    if not MONTHLY_RISK_BREAKER_ENABLED:
+        return {**base, "message": "月度风险熔断已禁用"}
+
+    try:
+        closed_df = pd.read_sql(
+            text("""
+                SELECT entry_price, close_price, shares
+                FROM paper_trading
+                WHERE status = 'CLOSED' AND close_date >= :month_start
+                  AND close_price > 0 AND entry_price > 0
+            """),
+            engine,
+            params={"month_start": month_start},
+        )
+        open_df = pd.read_sql(
+            text("""
+                SELECT capital_used, pa_risk_pct
+                FROM paper_trading
+                WHERE status = 'OPEN' AND COALESCE(pa_risk_pct, 0) > 0
+            """),
+            engine,
+        )
+    except Exception as exc:
+        return {**base, "status": "error", "message": f"月度风险查询失败: {str(exc)[:80]}"}
+
+    mtd_realized_pnl = 0.0
+    if not closed_df.empty:
+        shares = pd.to_numeric(closed_df.get("shares"), errors="coerce").fillna(0).astype(float)
+        mtd_realized_pnl = float(
+            ((closed_df["close_price"].astype(float) - closed_df["entry_price"].astype(float)) * shares).sum()
+        )
+
+    open_capital_risk = 0.0
+    if not open_df.empty:
+        capital = pd.to_numeric(open_df.get("capital_used"), errors="coerce").fillna(0).astype(float)
+        risk_pct = pd.to_numeric(open_df.get("pa_risk_pct"), errors="coerce").fillna(0).astype(float)
+        open_capital_risk = float((capital * risk_pct / 100).sum())
+
+    monthly_loss = max(0.0, -mtd_realized_pnl)
+    risk_used_pct = ((monthly_loss + open_capital_risk) / virtual_cap * 100.0) if virtual_cap > 0 else 0.0
+
+    result = {
+        **base,
+        "monthly_risk_used_pct": round(risk_used_pct, 3),
+        "mtd_realized_pnl": round(mtd_realized_pnl, 2),
+        "monthly_realized_loss": round(monthly_loss, 2),
+        "open_capital_risk": round(open_capital_risk, 2),
+        "virtual_total_capital": virtual_cap,
+    }
+    if risk_used_pct >= loss_limit:
+        return {
+            **result,
+            "status": "halt",
+            "halted": True,
+            "message": (
+                f"月度风险用量 {risk_used_pct:.2f}%（当月已实现亏损 {monthly_loss:.0f} 元"
+                f" + 持仓风险 {open_capital_risk:.0f} 元）达到熔断线 {loss_limit:.1f}%，"
+                f"本月剩余时间暂停新开仓"
+            ),
+        }
+    return {**result, "message": "月度风险用量在熔断线内"}
 
 
 def evaluate_portfolio_risk_budget(
@@ -218,15 +310,15 @@ def evaluate_portfolio_risk_budget(
     new_mode = new_trade.get("trade_mode") or "SIMULATED"
     new_risk = float(new_trade.get("pa_risk_pct") or 0)
     new_capital_used = float(new_trade.get("capital_used") or 0)
-    new_capital_risk = calculate_capital_risk(new_capital_used, new_risk)
+    virtual_cap = float(limits.get("virtual_total_capital", 1000000))
     new_sector = sector_map.get(new_code, "未知")
 
     open_count = len(open_df)
     real_count = int((open_df.get("trade_mode", pd.Series(dtype=str)) == "REAL").sum()) if not open_df.empty else 0
-    total_plan_risk = float(open_df.get("pa_risk_pct", pd.Series(dtype=float)).fillna(0).sum()) if not open_df.empty else 0.0
     existing_capital = pd.to_numeric(open_df.get("capital_used", pd.Series(dtype=float)), errors="coerce").fillna(0)
     existing_risk = pd.to_numeric(open_df.get("pa_risk_pct", pd.Series(dtype=float)), errors="coerce").fillna(0)
     current_capital_risk = float((existing_capital * existing_risk / 100).sum())
+    current_plan_risk = current_capital_risk / virtual_cap * 100 if virtual_cap > 0 else 0.0
 
     strategy_count = 0
     sector_count = 0
@@ -244,12 +336,7 @@ def evaluate_portfolio_risk_budget(
         warnings.append(f"行业 {new_sector} 将达到 {sector_count + 1} 个持仓，超过上限 {int(limits['max_sector_positions'])}")
     if strategy_count + 1 > int(limits["max_strategy_positions"]):
         warnings.append(f"策略 {new_strategy} 将达到 {strategy_count + 1} 个持仓，超过上限 {int(limits['max_strategy_positions'])}")
-    if new_risk > float(limits["max_single_risk_pct"]):
-        warnings.append(f"单笔计划风险 {new_risk:.1f}% 超过上限 {float(limits['max_single_risk_pct']):.1f}%")
-    if total_plan_risk + new_risk > float(limits["max_total_plan_risk_pct"]):
-        warnings.append(f"组合计划风险将达到 {total_plan_risk + new_risk:.1f}%，超过上限 {float(limits['max_total_plan_risk_pct']):.1f}%")
-
-    # 修复#4: 总仓位上限检查。所有OPEN持仓的capital_used之和 + 新仓 占虚拟总资金的比例。
+    # Exposure and risk are both measured against the same account-capital denominator.
     try:
         existing_capital = float(pd.to_numeric(
             open_df.get("capital_used", pd.Series(dtype=float)), errors="coerce",
@@ -257,15 +344,20 @@ def evaluate_portfolio_risk_budget(
     except Exception:
         existing_capital = 0.0
     position_pct = float(new_trade.get("position_pct") or 0)
-    entry_price = float(new_trade.get("entry_price") or new_trade.get("price") or 0)
-    new_capital = float(new_trade.get("capital_used") or position_pct * entry_price / 100 or 0)
+    new_capital = new_capital_used or (virtual_cap * position_pct / 100 if virtual_cap > 0 else 0)
+    new_capital_risk = calculate_capital_risk(new_capital, new_risk)
     total_capital = existing_capital + new_capital
-    virtual_cap = float(limits.get("virtual_total_capital", 1000000))
     capital_pct = total_capital / virtual_cap * 100 if virtual_cap > 0 else 0
     max_cap_pct = float(limits.get("max_total_capital_pct", 80.0))
     if capital_pct > max_cap_pct:
         warnings.append(f"总仓位占比将达到 {capital_pct:.1f}%，超过上限 {max_cap_pct:.0f}%（虚拟资金¥{virtual_cap/10000:.0f}万）")
     projected_capital_risk_pct = (current_capital_risk + new_capital_risk) / virtual_cap * 100 if virtual_cap > 0 else 0
+    new_single_risk_pct = new_capital_risk / virtual_cap * 100 if virtual_cap > 0 else 0
+    if new_single_risk_pct > float(limits["max_single_risk_pct"]):
+        warnings.append(
+            f"单笔账户风险 {new_single_risk_pct:.2f}% 超过上限 "
+            f"{float(limits['max_single_risk_pct']):.1f}%"
+        )
     if projected_capital_risk_pct > float(limits["max_total_plan_risk_pct"]):
         warnings.append(
             f"组合资本风险将达到 {projected_capital_risk_pct:.2f}%，超过上限 "
@@ -278,8 +370,8 @@ def evaluate_portfolio_risk_budget(
         "new_sector": new_sector,
         "sector_positions": sector_count,
         "strategy_positions": strategy_count,
-        "current_plan_risk_pct": round(total_plan_risk, 2),
-        "projected_plan_risk_pct": round(total_plan_risk + new_risk, 2),
+        "current_plan_risk_pct": round(current_plan_risk, 3),
+        "projected_plan_risk_pct": round(projected_capital_risk_pct, 3),
         "current_capital_risk_amount": round(current_capital_risk, 2),
         "new_capital_risk_amount": new_capital_risk,
         "projected_capital_risk_pct": round(projected_capital_risk_pct, 3),
@@ -316,7 +408,12 @@ def build_portfolio_exposure(engine: Optional[Engine], budget: Optional[Dict[str
     sector_map = dict(zip(sector_df["code"].astype(str), sector_df["industry"])) if not sector_df.empty else {}
     open_df["industry"] = open_df["code"].astype(str).map(sector_map).fillna("未知")
     open_df["strategy_group"] = open_df.get("strategy_type", pd.Series(dtype=str)).fillna("unknown")
-    open_df["risk_pct_num"] = pd.to_numeric(open_df.get("pa_risk_pct", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    capital = pd.to_numeric(open_df.get("capital_used", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    stop_distance_pct = pd.to_numeric(open_df.get("pa_risk_pct", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    virtual_cap = float(limits.get("virtual_total_capital", 1000000))
+    open_df["risk_pct_num"] = (
+        capital * stop_distance_pct / 100 / virtual_cap * 100 if virtual_cap > 0 else 0
+    )
 
     def group_rows(column: str, kind: str, limit_key: str) -> list[Dict[str, Any]]:
         rows = []
@@ -343,7 +440,7 @@ def build_portfolio_exposure(engine: Optional[Engine], budget: Optional[Dict[str
     if real_positions > int(limits["max_real_positions"]):
         warnings.append(f"实盘持仓 {real_positions} 个超过上限 {int(limits['max_real_positions'])}")
     if total_plan_risk > float(limits["max_total_plan_risk_pct"]):
-        warnings.append(f"组合计划风险 {total_plan_risk:.1f}% 超过上限 {float(limits['max_total_plan_risk_pct']):.1f}%")
+        warnings.append(f"组合账户风险 {total_plan_risk:.2f}% 超过上限 {float(limits['max_total_plan_risk_pct']):.1f}%")
 
     items = group_rows("industry", "sector", "max_sector_positions") + group_rows("strategy_group", "strategy", "max_strategy_positions")
     warnings.extend(

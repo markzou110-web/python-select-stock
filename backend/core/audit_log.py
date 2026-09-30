@@ -251,10 +251,18 @@ def load_due_notifications(
     now = now or datetime.now()
     try:
         with engine.begin() as conn:
+            # 崩溃回收：PROCESSING 行的 next_retry_at 是领取时写的 now+15min，
+            # 已过期说明领取方在回写前崩溃/重启——回收回 PENDING 走正常重试，
+            # 否则该告警会在下面被标 DEAD 且 requeue 显式排除，形成永久丢失窗口。
+            conn.execute(text("""
+                UPDATE notification_outbox
+                SET status = 'PENDING'
+                WHERE status = 'PROCESSING' AND next_retry_at <= :now
+            """), {"now": now})
             conn.execute(text("""
                 UPDATE notification_outbox
                 SET status = 'DEAD', last_error = 'expired_before_delivery'
-                WHERE status IN ('PENDING', 'PROCESSING') AND created_at < :stale_before
+                WHERE status = 'PENDING' AND created_at < :stale_before
             """), {
                 "stale_before": now - timedelta(minutes=NOTIFICATION_MAX_AGE_MINUTES),
             })

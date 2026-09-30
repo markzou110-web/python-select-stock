@@ -70,22 +70,42 @@ def classify_mainline_sector(sector: Dict[str, Any]) -> str:
     return "NON_MAIN"
 
 
-def _load_today_sector_breadth(engine) -> Dict[str, Dict[str, Any]]:
+def _load_today_sector_breadth(engine, as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """从 breadth_history 表读取最新一天的 SECTOR 宽度（盘中实时聚合写入）。
 
+    as_of 给定时只读 ≤ as_of 的最新行（回放扫描的点时约束，防未来数据）。
     返回 {industry: {advance_ratio, strong_ratio, weak_ratio, avg_return, total_count, bar_date}}。
     表空或读取失败时返回 {}（调用方回退到 daily_k）。
     """
     if engine is None:
         return {}
+def _load_today_sector_breadth(engine, as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """读最新一个有宽度聚合的 SECTOR 行；as_of 给定时只读 ≤ as_of 的数据（回放点时）。"""
+    if engine is None:
+        return {}
     try:
-        df = pd.read_sql(text("""
-            SELECT industry, advance_ratio, strong_ratio, weak_ratio, avg_return, total_count, bar_date
-            FROM breadth_history
-            WHERE scope = 'SECTOR' AND bar_date = (
-                SELECT MAX(bar_date) FROM breadth_history WHERE scope = 'SECTOR'
-            )
-        """), engine)
+        # advance_ratio IS NOT NULL：排除只有资金流列（save_sector_fund_flow_rank
+        # 写入）的 SECTOR 行——它们会成为 MAX(bar_date) 最新行，把板块宽度读成 0%
+        # 且阻断 daily_k 回退（与 load_market_cycle_history 的 MARKET 行同款修复）。
+        if as_of:
+            df = pd.read_sql(text("""
+                SELECT industry, advance_ratio, strong_ratio, weak_ratio, avg_return, total_count, bar_date
+                FROM breadth_history
+                WHERE scope = 'SECTOR' AND advance_ratio IS NOT NULL
+                  AND bar_date <= :as_of AND bar_date = (
+                    SELECT MAX(bar_date) FROM breadth_history
+                    WHERE scope = 'SECTOR' AND advance_ratio IS NOT NULL AND bar_date <= :as_of
+                )
+            """), engine, params={"as_of": as_of})
+        else:
+            df = pd.read_sql(text("""
+                SELECT industry, advance_ratio, strong_ratio, weak_ratio, avg_return, total_count, bar_date
+                FROM breadth_history
+                WHERE scope = 'SECTOR' AND advance_ratio IS NOT NULL AND bar_date = (
+                    SELECT MAX(bar_date) FROM breadth_history
+                    WHERE scope = 'SECTOR' AND advance_ratio IS NOT NULL
+                )
+            """), engine)
     except Exception:
         return {}
     if df.empty:
@@ -181,30 +201,53 @@ def build_previous_month_sector_context(
     }
 
 
-def build_sector_history_context(engine, sector_map: Dict[str, str], lookback: int = 6) -> Dict[str, Dict[str, Any]]:
+def build_sector_history_context(
+    engine, sector_map: Dict[str, str], lookback: int = 6, as_of: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Build recent 3/5-day sector context from local daily_k data.
 
     优先用 breadth_history 表的今日 SECTOR 行覆盖"最新一天"（修复 6/22 节后首日 bug：
     节后首日 daily_k 还是上个交易日数据，导致 slope/pct 用滞后值误判板块）。
     新表空时回退纯 daily_k 逻辑（向下兼容）。
+
+    as_of（回放扫描的数据日）给定时，daily_k 与 breadth_history 均只读 ≤ as_of
+    的数据——否则回放会拿"未来"日期算 slope/pct，校准结论不可复现。
+    实时扫描不传 as_of，行为不变。
     """
     if engine is None or not sector_map:
         return {}
 
-    query = text("""
-        WITH recent_dates AS (
-            SELECT DISTINCT date
+    if as_of:
+        query = text("""
+            WITH recent_dates AS (
+                SELECT DISTINCT date
+                FROM daily_k
+                WHERE date <= :as_of
+                ORDER BY date DESC
+                LIMIT :limit
+            )
+            SELECT code, date, close
             FROM daily_k
-            ORDER BY date DESC
-            LIMIT :limit
-        )
-        SELECT code, date, close
-        FROM daily_k
-        WHERE date IN (SELECT date FROM recent_dates)
-        ORDER BY code, date
-    """)
+            WHERE date IN (SELECT date FROM recent_dates)
+            ORDER BY code, date
+        """)
+        params: Dict[str, Any] = {"limit": max(lookback + 1, 6), "as_of": as_of}
+    else:
+        query = text("""
+            WITH recent_dates AS (
+                SELECT DISTINCT date
+                FROM daily_k
+                ORDER BY date DESC
+                LIMIT :limit
+            )
+            SELECT code, date, close
+            FROM daily_k
+            WHERE date IN (SELECT date FROM recent_dates)
+            ORDER BY code, date
+        """)
+        params = {"limit": max(lookback + 1, 6)}
     try:
-        df = pd.read_sql(query, engine, params={"limit": max(lookback + 1, 6)})
+        df = pd.read_sql(query, engine, params=params)
     except Exception:
         df = pd.DataFrame()
     if not df.empty and 'code' in df.columns and 'close' in df.columns:
@@ -215,7 +258,7 @@ def build_sector_history_context(engine, sector_map: Dict[str, str], lookback: i
         df = df[df['industry'] != '未知']
 
     # ── 取今日实时 SECTOR 宽度（breadth_history），优先级最高 ──
-    today_breadth = _load_today_sector_breadth(engine)
+    today_breadth = _load_today_sector_breadth(engine, as_of=as_of)
 
     if not df.empty:
         df = df.sort_values(['code', 'date'])

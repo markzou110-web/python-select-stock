@@ -69,10 +69,12 @@ class ConnectionManager:
         dead_connections = []
         for connection in list(self.active_connections):
             try:
-                await connection.send_text(text_data)
-            except Exception:
+                # 单连接 2 秒超时：半开/卡死客户端曾会让顺序 await 拖住整个事件
+                # 循环（扫描进度每 100 票广播一次，一个死连接冻结所有浏览器进度条）
+                await asyncio.wait_for(connection.send_text(text_data), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
                 dead_connections.append(connection)
-        
+
         for dead in dead_connections:
             self.disconnect(dead)
 
