@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, Bot, CalendarDays, Copy, Download, Globe2, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { Activity, AlertTriangle, BarChart3, Bot, CalendarDays, Copy, Download, Globe2, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -85,6 +85,22 @@ type CalibrationPayload = {
     };
     by_confirmation_event?: CalibrationRow[];
     by_early_value_transition?: CalibrationRow[];
+    price_action_shadow_calibration?: {
+        production_effect?: boolean;
+        lifecycle_stages?: CalibrationRow[];
+        setup_by_market_regime?: Array<{
+            setup?: string;
+            market_regime?: string;
+            signals?: number;
+            mature_5d?: number;
+            status?: string;
+            signal_close_5d?: LayerMetric;
+            executable?: LayerMetric;
+            filled?: number;
+            unfilled?: number;
+            chronological_test_30pct?: LayerMetric & { status?: string; executable?: LayerMetric; executable_status?: string };
+        }>;
+    };
     bottom_discovery_analysis?: {
         status?: string;
         min_mature_b1_samples?: number;
@@ -307,24 +323,79 @@ type SignalPerformancePayload = {
     items?: SignalPerformanceItem[];
 };
 
+type ExecutionReplayPayload = {
+    verdict?: string;
+    verdict_reason?: string;
+    policies?: Array<{
+        policy?: string;
+        metrics_5d?: { signals?: number; win_rate?: number; avg_return?: number };
+    }>;
+    evidence_quality?: {
+        attribution?: Record<string, number>;
+    };
+    operation_advice_validation?: {
+        actual_bark_evidence?: {
+            status?: string;
+            tradable_instructions?: number;
+            audited_delivered_instructions?: number;
+            required?: number;
+            note?: string;
+            actual_fill_evidence?: { fills?: number; mature?: number };
+        };
+    };
+};
+
+type NextDayFollowupItem = {
+    code?: string;
+    name?: string;
+    industry?: string;
+    signal_date?: string;
+    followup_status?: string;
+    execution_action?: string;
+    trade_bucket?: string;
+    signal_price?: number | null;
+    entry_line?: number | null;
+    max_gain_pct?: number | null;
+    latest_gain_pct?: number | null;
+    setup?: string;
+};
+
+type NextDayFollowupPayload = {
+    items?: NextDayFollowupItem[];
+    summary?: {
+        signals?: number;
+        tracked?: number;
+        avg_max_gain_pct?: number | null;
+        status_counts?: Record<string, number>;
+    };
+};
+
 export default function ReviewCenter() {
+    // scan-performance 响应含 30+ 个宽松结构的分组数组（by_* / horizons / timeframe_shadow 等），
+    // 全部直接喂给 any 形参的 ChartCard/TableCard，完整建模收益低，故保留 any。
     const [data, setData] = useState<any>(null);
     const [profitability, setProfitability] = useState<ProfitabilityPayload | null>(null);
     const [sectorWatchPerformance, setSectorWatchPerformance] = useState<SectorWatchPerformance | null>(null);
     const [recommendationLoop, setRecommendationLoop] = useState<RecommendationOutcomeLoop | null>(null);
     const [dailyReport, setDailyReport] = useState<DailyStrategyReport | null>(null);
     const [calibration, setCalibration] = useState<CalibrationPayload | null>(null);
-    const [executionReplay, setExecutionReplay] = useState<any>(null);
+    const [executionReplay, setExecutionReplay] = useState<ExecutionReplayPayload | null>(null);
     const [signalPerformance, setSignalPerformance] = useState<SignalPerformancePayload | null>(null);
     const [researchContext, setResearchContext] = useState<ResearchContext | null>(null);
-    const [followup, setFollowup] = useState<any>(null);
+    const [lhb, setLhb] = useState<LhbPayload | null>(null);
+    const [followup, setFollowup] = useState<NextDayFollowupPayload | null>(null);
     const [loading, setLoading] = useState(true);
     const [followupLoading, setFollowupLoading] = useState(false);
     const [days, setDays] = useState(120);
     const [historyDates, setHistoryDates] = useState<string[]>([]);
     const [followupDate, setFollowupDate] = useState('');
+    const [loadError, setLoadError] = useState<string | null>(null);
+    const [followupError, setFollowupError] = useState<string | null>(null);
+    // 代数守卫：快速切换 days 时丢弃过期响应，防止旧数据覆盖新数据
+    const fetchGeneration = useRef(0);
 
     const fetchData = async () => {
+        const generation = ++fetchGeneration.current;
         setLoading(true);
         try {
             const results = await Promise.allSettled([
@@ -333,11 +404,16 @@ export default function ReviewCenter() {
                 api.get(`/api/review/sector-watch-performance?days=${days}`),
                 api.get(`/api/review/recommendation-outcome-loop?days=${days}`),
                 api.get('/api/review/daily-strategy-report'),
-                api.get(`/api/review/strategy-calibration-report?days=${days}`),
+                api.get(`/api/review/strategy-calibration-report?days=${days}&executable=true`),
                 api.get('/api/review/research-context'),
                 api.get(`/api/review/execution-policy-replay?days=${days}`),
                 api.get(`/api/system/signal-performance?days=${days}`),
+                api.get('/api/review/lhb-records?days=3'),
             ]);
+            if (fetchGeneration.current !== generation) return;
+            const failedCount = results.filter(
+                item => item.status === 'rejected' || (item.status === 'fulfilled' && item.value.data == null),
+            ).length;
             const value = (index: number) => results[index].status === 'fulfilled' ? (results[index] as PromiseFulfilledResult<any>).value.data : null;
             if (value(0)) setData(value(0));
             if (value(1)) setProfitability(value(1));
@@ -348,8 +424,10 @@ export default function ReviewCenter() {
             if (value(6)) setResearchContext(value(6));
             if (value(7)) setExecutionReplay(value(7));
             if (value(8)) setSignalPerformance(value(8));
+            if (value(9)) setLhb(value(9));
+            setLoadError(failedCount > 0 ? `复盘数据 ${failedCount} 项加载失败，以下数字可能不完整` : null);
         } finally {
-            setLoading(false);
+            if (fetchGeneration.current === generation) setLoading(false);
         }
     };
 
@@ -374,6 +452,10 @@ export default function ReviewCenter() {
         try {
             const res = await api.get(`/api/review/next-day-followup?date=${date}&limit=60`);
             setFollowup(res.data);
+            setFollowupError(null);
+        } catch {
+            setFollowup(null);
+            setFollowupError('次日跟踪数据加载失败，请稍后重试');
         } finally {
             setFollowupLoading(false);
         }
@@ -417,6 +499,18 @@ export default function ReviewCenter() {
                 </div>
             </div>
 
+            {loadError && (
+                <div className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 flex items-center justify-between gap-3" role="alert">
+                    <div className="flex items-center gap-2 text-sm font-bold text-amber-800">
+                        <AlertTriangle size={16} />
+                        <span>{loadError}</span>
+                    </div>
+                    <button onClick={fetchData} className="text-xs font-black text-amber-800 hover:text-amber-950">
+                        重试
+                    </button>
+                </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <Stat label="有效信号" value={`${summary.signals || 0}`} sub="有未来价格可验证" icon={<Target size={20} />} />
                 <Stat label="5日胜率" value={`${summary.win_rate_5d || 0}%`} sub={`均收 ${summary.avg_return_5d >= 0 ? '+' : ''}${summary.avg_return_5d || 0}%`} icon={<TrendingUp size={20} />} hot={(summary.win_rate_5d || 0) >= 50} />
@@ -427,6 +521,8 @@ export default function ReviewCenter() {
             <DailyStrategyReportCard data={dailyReport} />
 
             <ResearchContextCard data={researchContext} />
+
+            <LhbRecordsCard data={lhb} />
 
             <ProfitabilityLayerCard data={profitability} />
 
@@ -501,6 +597,7 @@ export default function ReviewCenter() {
                 dates={historyDates}
                 selectedDate={followupDate}
                 loading={followupLoading}
+                error={followupError}
                 onDateChange={setFollowupDate}
                 onRefresh={() => fetchFollowup(followupDate)}
                 onExport={exportFollowupCsv}
@@ -560,6 +657,58 @@ export default function ReviewCenter() {
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                 <RecommendationEventCard rows={data?.recommendation_events || []} />
                 <TableCard title="最近扫描日期表现" rows={data?.recent_dates || []} nameKey="date" />
+            </div>
+        </div>
+    );
+}
+
+type LhbRecord = {
+    event_date?: string;
+    code?: string;
+    name?: string;
+    reason?: string;
+    net_buy_wan?: number | null;
+    pct_chg?: number | null;
+    is_position?: boolean;
+    is_recent_candidate?: boolean;
+};
+
+type LhbPayload = {
+    days?: number;
+    total?: number;
+    position_hits?: number;
+    records?: LhbRecord[];
+};
+
+function LhbRecordsCard({ data }: { data: LhbPayload | null }) {
+    const records = data?.records || [];
+    return (
+        <div className="glass-card p-6">
+            <div className="flex items-baseline justify-between mb-4">
+                <h3 className="font-black text-slate-800">龙虎榜观察 <span className="text-[10px] font-bold text-slate-400 ml-2">近 {data?.days ?? 3} 日 · 只读参考</span></h3>
+                <span className="text-[10px] font-bold text-slate-400">持仓上榜 {data?.position_hits ?? 0} / 共 {data?.total ?? 0} 条</span>
+            </div>
+            <div className="space-y-2">
+                {records.slice(0, 12).map((row, idx) => (
+                    <div key={`${row.code}-${row.event_date}-${idx}`} className={`flex items-center justify-between py-2 border-b border-slate-50 last:border-b-0 ${row.is_position ? 'bg-amber-50/60 rounded-lg px-2 -mx-2' : ''}`}>
+                        <div className="min-w-0">
+                            <p className="text-sm font-black text-slate-700 truncate">
+                                {row.name || row.code}
+                                {row.is_position && <span className="ml-1 text-[9px] font-black text-amber-600 bg-amber-100 rounded px-1 py-0.5 align-middle">持仓</span>}
+                                {row.is_recent_candidate && <span className="ml-1 text-[9px] font-black text-sky-600 bg-sky-100 rounded px-1 py-0.5 align-middle">候选</span>}
+                            </p>
+                            <p className="text-[10px] font-bold text-slate-400 truncate">{String(row.event_date || '').slice(0, 10)} · {row.reason || '--'}</p>
+                        </div>
+                        <div className="text-right shrink-0 pl-2">
+                            <p className={cn("text-sm font-black", Number(row.net_buy_wan || 0) >= 0 ? "text-rose-600" : "text-emerald-600")}>
+                                {row.net_buy_wan == null ? '--' : `${Number(row.net_buy_wan) >= 0 ? '+' : ''}${Number(row.net_buy_wan).toFixed(0)}万`}
+                            </p>
+                            <p className="text-[10px] font-bold text-slate-400">净买 · {row.pct_chg == null ? '--' : `${Number(row.pct_chg) >= 0 ? '+' : ''}${Number(row.pct_chg).toFixed(2)}%`}</p>
+                        </div>
+                    </div>
+                ))}
+                {records.length === 0 && <div className="py-12 text-center text-slate-400 font-bold">近 3 日暂无龙虎榜记录（任务 17:05 采集）</div>}
+                {records.length > 12 && <div className="pt-2 text-center text-[10px] font-bold text-slate-400">仅显示前 12 条，共 {data?.total ?? records.length} 条</div>}
             </div>
         </div>
     );
@@ -1057,7 +1206,49 @@ function CalibrationCard({ data }: { data: CalibrationPayload | null }) {
                     </div>
                 </div>
             </div>
+            <PriceActionCalibration data={data?.price_action_shadow_calibration} />
             <MeasurementContractLine contract={data?.measurement_contract} />
+        </div>
+    );
+}
+
+function PriceActionCalibration({ data }: { data?: CalibrationPayload['price_action_shadow_calibration'] }) {
+    const rows = data?.setup_by_market_regime || [];
+    return (
+        <div className="mt-4 rounded-md border border-slate-100 bg-white/70 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                    <div className="text-xs font-black text-slate-700">价格行为：形态 × 市场状态</div>
+                    <div className="mt-1 text-[10px] font-bold text-slate-400">信号收盘后5日表现与T+1可执行净收益分开统计；仅研究，不影响生产策略</div>
+                </div>
+                <span className="rounded-full bg-amber-50 px-2 py-1 text-[9px] font-black text-amber-700">{data?.production_effect ? '生产生效' : '影子研究'}</span>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+                {(data?.lifecycle_stages || []).map(stage => (
+                    <span key={stage.value} className="rounded bg-slate-50 px-2 py-1 text-[10px] font-bold text-slate-600">
+                        {({ CONTEXT: '背景', SETUP: '形态成立', TRIGGER: '触发', FOLLOW_THROUGH: '后续确认', FAILURE: '失败' } as Record<string, string>)[stage.value || ''] || stage.value}
+                        {' · '}{stage.signals || 0} · 5日均值 {formatSignedPct(stage.metrics?.['5d']?.avg_return)}
+                    </span>
+                ))}
+            </div>
+            {rows.length ? (
+                <div className="mt-3 overflow-x-auto">
+                    <table className="w-full min-w-[820px] text-left text-[10px]">
+                        <thead className="text-slate-400"><tr><th className="p-2">形态</th><th className="p-2">市场状态</th><th className="p-2">成熟/信号</th><th className="p-2">信号后5日均值</th><th className="p-2">可执行净收益均值</th><th className="p-2">最新30%可执行留出</th><th className="p-2">成交/未成交</th><th className="p-2">样本状态</th></tr></thead>
+                        <tbody>{rows.slice(0, 24).map((row, idx) => (
+                            <tr key={`${row.setup}-${row.market_regime}-${idx}`} className="border-t border-slate-100 text-slate-600">
+                                <td className="p-2 font-bold">{row.setup || '未知'}</td><td className="p-2">{row.market_regime || '未知'}</td>
+                                <td className="p-2">{row.mature_5d || 0}/{row.signals || 0}</td>
+                                <td className="p-2">{formatSignedPct(row.signal_close_5d?.avg_return)}</td>
+                                <td className="p-2">{formatSignedPct(row.executable?.avg_return)}</td>
+                                <td className="p-2">{formatSignedPct(row.chronological_test_30pct?.executable?.avg_return)} · {row.chronological_test_30pct?.executable_status === 'DESCRIPTIVE_HOLDOUT' ? '留出' : '样本不足'}</td>
+                                <td className="p-2">{row.filled ?? '—'}/{row.unfilled ?? '—'}</td>
+                                <td className="p-2">{row.status === 'MATURE_SAMPLE_READY' ? '可複核' : '樣本不足'}</td>
+                            </tr>
+                        ))}</tbody>
+                    </table>
+                </div>
+            ) : <p className="mt-3 text-xs font-bold text-slate-400">暂无足够的价格行为分类样本</p>}
         </div>
     );
 }
@@ -1234,7 +1425,7 @@ function SignalPerformanceCard({ data }: { data: SignalPerformancePayload | null
 }
 
 
-function ExecutionReplayCard({ data }: { data: any }) {
+function ExecutionReplayCard({ data }: { data: ExecutionReplayPayload | null }) {
     if (!data) return null;
     const statusTone = data.verdict === 'SUPPORTED' ? 'text-emerald-600' : data.verdict === 'NOT_SUPPORTED' ? 'text-rose-600' : 'text-amber-600';
     const policies = Array.isArray(data.policies) ? data.policies : [];
@@ -1274,7 +1465,7 @@ function ExecutionReplayCard({ data }: { data: any }) {
                 <p className="mt-2 text-[10px] font-bold text-slate-500">{barkEvidence.note || '等待真实指令样本积累'}</p>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
-                {policies.map((item: any) => (
+                {policies.map((item) => (
                     <div key={item.policy} className="rounded-xl border border-slate-100 bg-slate-50/70 p-3">
                         <div className="text-[10px] font-black text-slate-400 uppercase">{item.policy}</div>
                         <div className="mt-2 text-sm font-black text-slate-700">成熟 {item.metrics_5d?.signals || 0} 笔</div>
@@ -1399,14 +1590,16 @@ function NextDayFollowupCard({
     dates,
     selectedDate,
     loading,
+    error,
     onDateChange,
     onRefresh,
     onExport,
 }: {
-    data: any;
+    data: NextDayFollowupPayload | null;
     dates: string[];
     selectedDate: string;
     loading: boolean;
+    error?: string | null;
     onDateChange: (date: string) => void;
     onRefresh: () => void;
     onExport: () => void;
@@ -1460,9 +1653,16 @@ function NextDayFollowupCard({
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
                 <MiniStat label="跟踪信号" value={`${summary.signals || 0}`} />
                 <MiniStat label="已验证" value={`${summary.tracked || 0}`} />
-                <MiniStat label="平均最高涨幅" value={`${summary.avg_max_gain_pct >= 0 ? '+' : ''}${summary.avg_max_gain_pct || 0}%`} hot />
+                <MiniStat label="平均最高涨幅" value={`${(summary.avg_max_gain_pct ?? 0) >= 0 ? '+' : ''}${summary.avg_max_gain_pct || 0}%`} hot />
                 <MiniStat label="大涨/涨停" value={`${(counts['大涨验证'] || 0) + (counts['涨停验证'] || 0)}`} />
             </div>
+
+            {error && (
+                <div className="mb-4 rounded-md border border-amber-100 bg-amber-50 px-3 py-2 flex items-center gap-2 text-xs font-bold text-amber-800" role="alert">
+                    <AlertTriangle size={13} />
+                    <span>{error}</span>
+                </div>
+            )}
 
             <div className="overflow-x-auto">
                 <table className="w-full text-left">
@@ -1479,20 +1679,20 @@ function NextDayFollowupCard({
                         </tr>
                     </thead>
                     <tbody>
-                        {items.slice(0, 12).map((item: any) => (
+                        {items.slice(0, 12).map((item) => (
                             <tr key={`${item.code}-${item.signal_date}`} className="border-b border-slate-50 last:border-b-0 text-xs">
                                 <td className="py-3 pr-3">
                                     <div className="font-black text-slate-800">{item.name}</div>
                                     <div className="font-mono text-[10px] text-slate-400">{item.code} · {item.industry || '--'}</div>
                                 </td>
                                 <td className="py-3 pr-3">
-                                    <span className={cn("px-2 py-1 rounded-md border text-[10px] font-black", statusTone[item.followup_status] || statusTone['未触发'])}>
+                                    <span className={cn("px-2 py-1 rounded-md border text-[10px] font-black", statusTone[item.followup_status || '未触发'] || statusTone['未触发'])}>
                                         {item.followup_status}
                                     </span>
                                 </td>
                                 <td className="py-3 pr-3 min-w-[160px]">
                                     <div className="font-bold text-slate-600">{item.execution_action || '--'}</div>
-                                    <span className={cn("inline-flex mt-1 px-1.5 py-0.5 rounded border text-[10px] font-black", bucketTone[item.trade_bucket] || 'bg-slate-50 text-slate-500 border-slate-100')}>
+                                    <span className={cn("inline-flex mt-1 px-1.5 py-0.5 rounded border text-[10px] font-black", bucketTone[item.trade_bucket || ''] || 'bg-slate-50 text-slate-500 border-slate-100')}>
                                         {item.trade_bucket || 'UNKNOWN'}
                                     </span>
                                 </td>

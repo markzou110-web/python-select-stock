@@ -66,14 +66,46 @@ api.interceptors.response.use(
     }
 );
 
+// /api/scan 查询参数（与 scanStore 的 ScanParams 对齐；strategy_types 为逗号分隔字符串，全部可选由后端给默认值）
+export interface ScanMarketParams {
+    strategy_type?: string;
+    strategy_types?: string;
+    match_mode?: 'any' | 'all';
+    pine_min_signals?: number;
+    min_data_days?: number;
+    threshold?: number;
+    vol_multiplier?: number;
+    rsi_min?: number;
+    use_macd_filter?: boolean;
+    use_bb_sqz?: boolean;
+    sqz_lookback?: number;
+    use_weekly?: boolean;
+    weekly_ma_period?: number;
+    market_range?: string;
+    turnover_min?: number;
+    mkt_cap_min?: number;
+    use_rs_filter?: boolean;
+    local_only?: boolean;
+    data_date?: string;
+    stop_loss_pct?: number;
+}
+
+// /api/ws/scan-progress 推送的最小消息结构（后端字段）
+export interface ScanProgressMessage {
+    type?: 'scan_start' | 'scan_progress' | 'scan_end' | string;
+    message?: string;
+    current?: number;
+    total?: number;
+}
+
 export const marketApi = {
     checkHealth: () => api.get('/api/health'),
     getIndices: () => api.get('/api/market/indices'),
     getSectors: () => api.get('/api/market/sectors'),
-    scanMarket: (params: any) => api.get('/api/scan', { params }),
+    scanMarket: (params: ScanMarketParams) => api.get('/api/scan', { params }),
 };
 
-export function connectScanWebSocket(onMessage: (msg: any) => void): WebSocket {
+export function connectScanWebSocket(onMessage: (msg: ScanProgressMessage) => void): WebSocket {
     const wsUrl = (process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000')
                     .replace(/^http/, 'ws') + '/api/ws/scan-progress';
     const ws = new WebSocket(wsUrl);

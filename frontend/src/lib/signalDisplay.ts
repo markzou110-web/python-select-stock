@@ -3,6 +3,33 @@ export interface DatedSignal {
     [key: string]: unknown;
 }
 
+export interface ChartMarker extends DatedSignal {
+    position?: unknown;
+    source?: unknown;
+    text?: unknown;
+    label?: unknown;
+}
+
+export function collapseChartMarkers<T extends ChartMarker>(markers: T[], preferredSources: string[] = []): T[] {
+    const groups = new Map<string, T[]>();
+    markers.forEach((marker) => {
+        const key = `${String(marker.time)}-${String(marker.position)}`;
+        groups.set(key, [...(groups.get(key) || []), marker]);
+    });
+    return Array.from(groups.values()).map((group) => {
+        if (group.length === 1) return group[0];
+        const primary = [...group].sort((a, b) => (
+            preferredSources.indexOf(String(a.source)) - preferredSources.indexOf(String(b.source))
+        ))[0];
+        if (!primary) return group[0];
+        return {
+            ...primary,
+            text: `${String(primary.text || '信号')} +${group.length - 1}`,
+            label: group.map((marker) => String(marker.label || marker.text || '信号')).join(' · '),
+        } as T;
+    });
+}
+
 export interface DisplaySignal {
     signal: DatedSignal;
     role: 'entry' | 'confirmation';

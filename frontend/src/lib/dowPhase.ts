@@ -45,7 +45,7 @@ export function dowPhaseColor(phase: string): string {
 /** 阶段切换点 → lightweight-charts series marker（多头在下方，其余在上方） */
 export function buildDowPhaseMarkers(phases?: DowPhasePoint[] | null) {
     return (phases || [])
-        .filter((point) => point?.time && point?.phase)
+        .filter((point) => point?.time && point?.phase && point.phase !== '震荡观察')
         .map((point) => {
             const category = dowPhaseCategory(point.phase);
             return {
@@ -66,7 +66,6 @@ export const DOW_PHASE_LEGEND: Array<{ label: string; color: string }> = [
     { label: '多头推进(拉升/回调/入场/突破)', color: CATEGORY_COLOR.bull },
     { label: '过热派发(加速/衰竭)→仓位×0.5', color: CATEGORY_COLOR.warning },
     { label: '趋势破坏(反转/空头)', color: CATEGORY_COLOR.bear },
-    { label: '震荡观察', color: CATEGORY_COLOR.neutral },
 ];
 
 /** K线图行情提示条 */
@@ -118,8 +117,6 @@ export interface ProjectionMarker {
 
 const SCENARIO_MARKER_STYLE = {
     买点: { color: '#0d9488', shape: 'arrowUp' as const, position: 'belowBar' as const },
-    目标: { color: '#16a34a', shape: 'arrowUp' as const, position: 'aboveBar' as const },
-    失效: { color: '#dc2626', shape: 'arrowDown' as const, position: 'aboveBar' as const },
 };
 
 /** 生成最后一根K线之后的 N 个未来交易日（跳过周末；节假日近似忽略，仅作示意） */
@@ -146,8 +143,6 @@ export function futureWhitespaceCandles(lastTime: string, count: number): Array<
 /**
  * 执行策略投影 → 未来日期上的箭头标记（替代虚线路径，更干净）：
  * - 回踩买点：青色↑（在K线下方）
- * - 目标位：绿色↑（在K线上方，多情景同类只标一次）
- * - 失效离场：红色↓（在K线上方）
  */
 export function buildProjectionScenarioMarkers(
     projection: TradeProjection | null | undefined,
@@ -179,17 +174,6 @@ export function buildProjectionScenarioMarkers(
         if (scenario.name === '回踩再上攻') {
             if (offsets[0] > 0 && values[0] > 0) {
                 push(dateAt(offsets[0]), '买点', '回踩买点', `回踩买入区 ${values[0].toFixed(2)} 附近介入`);
-            }
-            if (offsets[1] > 0 && values[1] > 0) {
-                push(dateAt(offsets[1]), '目标', '目标位', `第一目标 ${values[1].toFixed(2)}`);
-            }
-        } else if (scenario.name === '直接上攻') {
-            if (offsets[0] > 0 && values[0] > 0) {
-                push(dateAt(offsets[0]), '目标', '目标位', `第一目标 ${values[0].toFixed(2)}`);
-            }
-        } else if (scenario.name === '破位失效') {
-            if (offsets[0] > 0 && values[0] > 0) {
-                push(dateAt(offsets[0]), '失效', '失效离场', `跌破 ${values[0].toFixed(2)} 执行止损`);
             }
         }
     }

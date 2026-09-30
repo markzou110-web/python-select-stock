@@ -20,6 +20,7 @@ export interface RiskLevelSource {
     capital_protect_price?: unknown;
     moving_stop_price?: unknown;
     take_profit_price?: unknown;
+    risk_stage?: unknown;
     operation_bands?: OperationBand[];
 }
 
@@ -41,6 +42,26 @@ export function getEffectiveStopPrice(levels: RiskLevelSource | null | undefined
     return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
+export function getEffectiveStopLabel(levels: RiskLevelSource | null | undefined) {
+    const stop = getEffectiveStopPrice(levels);
+    if (stop == null) return '执行风控';
+    const sources = [
+        ['结构失效', levels?.structure_stop_price],
+        ['移动风控', levels?.moving_stop_price],
+        ['利润保护', levels?.capital_protect_price],
+        ['初始止损', levels?.initial_stop_price ?? levels?.stop_price],
+    ] as const;
+    const matched = sources
+        .filter(([, value]) => validPrice(value) === stop)
+        .map(([label]) => label);
+    if (matched.length > 0) return `执行风控·${matched.join('/')}`;
+    const stage = String(levels?.risk_stage || '');
+    const stageLabel = stage.includes('脉冲') ? '脉冲保护'
+        : stage.includes('保本') ? '保本保护'
+            : stage.includes('移动') || stage.includes('盈利收紧') ? '移动风控' : '';
+    return stageLabel ? `执行风控·${stageLabel}` : '执行风控';
+}
+
 export function buildRiskPriceLines(
     riskLevels: RiskLevelSource | null | undefined,
     paperLines: ChartPriceLine[] = [],
@@ -60,7 +81,7 @@ export function buildRiskPriceLines(
     pushUniqueLine(riskLevels?.buy_price ?? paperBuy?.price, '持仓成本', '#4f46e5', paperBuy?.date);
     pushUniqueLine(
         effectiveStop,
-        validPrice(riskLevels?.structure_stop_price) != null ? '执行风控/结构失效' : '执行风控',
+        getEffectiveStopLabel(riskLevels),
         '#e11d48',
     );
     pushUniqueLine(riskLevels?.capital_protect_price, '利润保护线', '#d97706');

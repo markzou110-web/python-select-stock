@@ -43,11 +43,92 @@ interface StockDetailPageProps {
     onBack: () => void;
 }
 
+// ── 后端 /api/stock/full-analysis 隐式契约的最小显式类型（字段名取自本文件实际访问点）──
+
+// 日K线柱（lightweight-charts 数据源）
+interface KLineCandle {
+    time: string; // 后端字段
+    open: number; // 后端字段
+    high: number; // 后端字段
+    low: number; // 后端字段
+    close: number; // 后端字段
+    volume?: number; // 后端字段
+}
+
+// 买卖信号；strategy_sets 由前端合并 /api/stock/{code}/signals 响应写入
+interface FullAnalysisSignals {
+    strategy_type?: string; // 后端字段
+    signal_sources?: string[]; // 后端字段
+    trailing_stops?: Array<{ time: string; value: number }>; // 后端字段
+    buy_signals?: Array<{ time: string; price: number; reason: string }>; // 后端字段
+    sell_signals?: Array<{ time: string; price: number; reason: string; pnl_pct?: number; hold_days?: number }>; // 后端字段
+    buy_count?: number;
+    sell_count?: number;
+    strategy_sets?: Record<string, {
+        buy_signals?: Array<{ time: string; price: number; reason: string }>; // 后端字段
+        sell_signals?: Array<{ time: string; price: number; reason: string }>; // 后端字段
+        buy_count?: number;
+        sell_count?: number;
+        strategy_type?: string;
+    }>;
+}
+
+// 个股基础信息；风控价格字段同时被 tradingLevels 的 RiskLevelSource 消费，持仓字段仅在 is_paper_trade 时存在
+interface StockInfo {
+    代码: string; // 后端字段
+    名称: string; // 后端字段
+    行业: string; // 后端字段
+    现价: number; // 后端字段
+    current_price?: number; // 后端字段：实时快照价
+    '涨幅%': number; // 后端字段
+    Score?: number; // 后端字段
+    RSI?: number; // 后端字段
+    display_signal_score?: number; // 后端字段
+    display_trade_score?: number; // 后端字段
+    final_trade_score?: number; // 后端字段
+    is_paper_trade?: boolean; // 后端字段
+    buy_price?: number; // 后端字段
+    initial_stop_price?: number; // 后端字段
+    structure_stop_price?: number; // 后端字段
+    active_stop_price?: number; // 后端字段
+    stop_price?: number; // 后端字段
+    capital_protect_price?: number; // 后端字段
+    moving_stop_price?: number; // 后端字段
+    take_profit_price?: number; // 后端字段
+    risk_stage?: string; // 后端字段
+    operation_bands?: Array<{ price?: number | string | null; label?: string; color?: string }>; // 后端字段
+    pl_pct?: number; // 后端字段
+    hold_days?: number; // 后端字段
+    entry_source?: string; // 后端字段
+    entry_date?: string; // 后端字段
+    entry_signal_date?: string; // 后端字段
+    entry_reason_snapshot?: string; // 后端字段
+    paper_remark?: string; // 后端字段
+    price_source?: string; // 后端字段
+    price_updated_at?: string; // 后端字段
+    chart_strategy_type?: string; // 后端字段
+    strategy_type?: string; // 后端字段
+    signal_sources?: string[]; // 后端字段
+    pa_execution_stage?: string; // 后端字段
+    pa_execution_stage_label?: string; // 后端字段
+    pa_signal_date?: string; // 后端字段
+    latest_scan_date?: string; // 后端字段
+    frozen_plan_date?: string; // 后端字段
+    frozen_plan_expiry_date?: string; // 后端字段
+    active_confirmation_price?: number; // 后端字段
+    trade_bucket?: string; // 后端字段
+    latest_scan_pa_action?: string; // 后端字段
+    position_decision?: { grade?: string; label?: string; action?: string }; // 后端字段
+    distance_to_trade?: { steps?: string[] }; // 后端字段
+    trade_blockers?: string[]; // 后端字段
+    trade_cautions?: string[]; // 后端字段
+}
+
 interface FullAnalysisData {
     code: string;
-    kline: any[];
-    signals: any;
-    stock_info: any;
+    kline: KLineCandle[];
+    signals: FullAnalysisSignals;
+    stock_info: StockInfo;
     concepts: { name: string; pct: number }[];
     financials: {
         roe: number | null;
@@ -74,6 +155,14 @@ interface FullAnalysisData {
     };
     price_action?: any;
     price_action_markers?: any[];
+    timeframe_confluence_markers?: Array<{
+        time: string;
+        position: string;
+        color: string;
+        shape: string;
+        text: string;
+        source: string;
+    }>;
     price_action_lines?: any[];
     trend_phases?: Array<{ time: string; phase: string; action?: string }>;
     chart_hints?: Array<{ level: string; text: string }>;
@@ -84,6 +173,33 @@ interface FullAnalysisData {
     } | null;
     chip_distribution?: ChipDistribution;
     money_flow?: MoneyFlowData;
+}
+
+interface WeeklyChartData {
+    candlestick: Array<{ time: string; open: number; high: number; low: number; close: number }>;
+    signals: {
+        buy_signals?: Array<{ time: string; price: number; reason: string }>;
+        sell_signals?: Array<{ time: string; price: number; reason: string; pnl_pct?: number; hold_days?: number }>;
+        trailing_stops?: Array<{ time: string; value: number }>;
+        buy_count?: number;
+        sell_count?: number;
+    };
+    trailing_stops?: Array<{ time: string; value: number }>;
+    strategy_sets?: Record<string, {
+        buy_signals?: Array<{ time: string; price: number; reason: string }>;
+        sell_signals?: Array<{ time: string; price: number; reason: string }>;
+        buy_count?: number;
+        sell_count?: number;
+        strategy_type?: string;
+    }>;
+    markers?: NonNullable<FullAnalysisData['price_action_markers']>;
+    price_action?: FullAnalysisData['price_action'];
+    price_action_lines?: FullAnalysisData['price_action_lines'];
+    trend_phases?: FullAnalysisData['trend_phases'];
+    chart_hints?: FullAnalysisData['chart_hints'];
+    trade_projection?: FullAnalysisData['trade_projection'];
+    chip_distribution?: ChipDistribution;
+    timeframe_complete?: boolean;
 }
 
 interface MoneyFlowData {
@@ -180,6 +296,9 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [research, setResearch] = useState<StockResearchData | null>(null);
     const [researchLoading, setResearchLoading] = useState(false);
+    const [chartTimeframe, setChartTimeframe] = useState<'day' | 'week'>('day');
+    const [weeklyChartData, setWeeklyChartData] = useState<WeeklyChartData | null>(null);
+    const [weeklyChartLoading, setWeeklyChartLoading] = useState(false);
 
     const showToast = useCallback((message: string, type: 'success' | 'error' = 'success') => {
         setToast({ message, type });
@@ -219,6 +338,14 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 };
             } catch (signalErr) {
                 console.warn("Overlay signal fetch failed:", signalErr);
+            }
+            try {
+                const strategy = analysis.signals?.strategy_type || 'squeeze';
+                const chartRes = await api.get(`/api/kline/${code}?strategy_type=${strategy}&timeframe=day`);
+                const markers: NonNullable<FullAnalysisData['timeframe_confluence_markers']> = chartRes.data.markers || [];
+                analysis.timeframe_confluence_markers = markers.filter(marker => marker.source === 'timeframe_confluence');
+            } catch (confluenceErr) {
+                console.warn("Daily/weekly confluence fetch failed (non-critical):", confluenceErr);
             }
             setData(analysis);
         } catch (err: any) {
@@ -295,6 +422,27 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const moneyDirectionLabel = isMainMoneyFlow ? '主力资金' : '资金净额';
     const activeStopPrice = getEffectiveStopPrice(info) || 0;
     const chartStrategy = data.signals?.strategy_type || info.chart_strategy_type || info.strategy_type || 'squeeze';
+    const changeChartTimeframe = async (timeframe: 'day' | 'week') => {
+        if (timeframe === 'day') {
+            setChartTimeframe('day');
+            setWeeklyChartData(null);
+            return;
+        }
+        if (weeklyChartLoading) return;
+        setWeeklyChartLoading(true);
+        try {
+            const response = await api.get(
+                `/api/kline/${code}?strategy_type=${chartStrategy}&timeframe=week`,
+            );
+            setWeeklyChartData(response.data as WeeklyChartData);
+            setChartTimeframe('week');
+        } catch {
+            showToast('周线数据加载失败，已切回日线', 'error');
+        } finally {
+            setWeeklyChartLoading(false);
+        }
+    };
+    const chartSignals = weeklyChartData?.signals || data.signals;
     const strategyLabels: Record<string, string> = {
         squeeze: '均线粘合（单策略）',
         pine: '五指标投票共振',
@@ -302,8 +450,8 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
         consensus: 'Azul 共识',
         both: '均线 + 五指标共振',
     };
-    const buySignalCount = data.signals?.buy_count ?? data.signals?.buy_signals?.length ?? 0;
-    const sellSignalCount = data.signals?.sell_count ?? data.signals?.sell_signals?.length ?? 0;
+    const buySignalCount = chartSignals?.buy_count ?? chartSignals?.buy_signals?.length ?? 0;
+    const sellSignalCount = chartSignals?.sell_count ?? chartSignals?.sell_signals?.length ?? 0;
     const priceSourceLabel = getQuoteSourceLabel(info.price_source, info.price_updated_at);
     const isLiveQuote = priceSourceLabel === '实时行情';
     const paExecutionStage = info.pa_execution_stage || (
@@ -544,33 +692,39 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                         <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
                             买点 {buySignalCount} · 卖点 {sellSignalCount}
                         </span>
-                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">200日K线 / 价格行为</span>
+                        <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                            {chartTimeframe === 'week' ? '200周K线 / 价格行为' : '200日K线 / 价格行为'}
+                            {weeklyChartLoading ? ' · 周线加载中' : ''}
+                        </span>
                     </div>
                 </div>
                 <SplitKLineCharts
-                    candles={data.kline}
+                    candles={chartTimeframe === 'week' ? weeklyChartData?.candlestick || [] : data.kline}
                     emaLines={[
                         { key: 'EMA5', label: 'EMA5', color: '#6366f1' },
                         { key: 'EMA20', label: 'EMA20', color: '#f59e0b' },
                         { key: 'EMA60', label: 'EMA60', color: '#8b5cf6' },
                     ]}
-                    trailingStops={data.signals?.trailing_stops || []}
-                    buySignals={data.signals?.buy_signals || []}
-                    sellSignals={data.signals?.sell_signals || []}
-                    strategySignalSets={data.signals?.strategy_sets || {}}
-                    markers={data.price_action_markers || []}
-                    priceAction={data.price_action}
-                    priceActionLines={data.price_action_lines || []}
-                    trendPhases={data.trend_phases || []}
-                    chartHints={data.chart_hints || []}
-                    tradeProjection={data.trade_projection || null}
-                    chipDistribution={data.chip_distribution || null}
+                    trailingStops={chartTimeframe === 'week' ? weeklyChartData?.trailing_stops || [] : data.signals?.trailing_stops || []}
+                    buySignals={chartTimeframe === 'week' ? weeklyChartData?.signals?.buy_signals || [] : data.signals?.buy_signals || []}
+                    sellSignals={chartTimeframe === 'week' ? weeklyChartData?.signals?.sell_signals || [] : data.signals?.sell_signals || []}
+                    strategySignalSets={chartTimeframe === 'week' ? weeklyChartData?.strategy_sets || {} : data.signals?.strategy_sets || {}}
+                    markers={chartTimeframe === 'week' ? weeklyChartData?.markers || [] : [...(data.price_action_markers || []), ...(data.timeframe_confluence_markers || [])]}
+                    priceAction={chartTimeframe === 'week' ? weeklyChartData?.price_action || null : data.price_action}
+                    priceActionLines={chartTimeframe === 'week' ? weeklyChartData?.price_action_lines || [] : data.price_action_lines || []}
+                    trendPhases={chartTimeframe === 'week' ? weeklyChartData?.trend_phases || [] : data.trend_phases || []}
+                    chartHints={chartTimeframe === 'week' ? weeklyChartData?.chart_hints || [] : data.chart_hints || []}
+                    tradeProjection={chartTimeframe === 'week' ? weeklyChartData?.trade_projection || null : data.trade_projection || null}
+                    chipDistribution={chartTimeframe === 'week' ? weeklyChartData?.chip_distribution || null : data.chip_distribution || null}
                     riskLevels={info}
                     paperLines={info.is_paper_trade ? [
-                        { price: info.buy_price, label: '买入价', color: '#6366f1', date: info.entry_date },
+                        { price: info.buy_price ?? 0, label: '买入价', color: '#6366f1', date: info.entry_date },
                         { price: activeStopPrice, label: '实时持仓风控线', color: '#f43f5e' },
-                        { price: info.take_profit_price, label: '止盈价', color: '#10b981' },
+                        { price: info.take_profit_price ?? 0, label: '止盈价', color: '#10b981' },
                     ] : []}
+                    timeframe={chartTimeframe}
+                    timeframeComplete={weeklyChartData?.timeframe_complete ?? true}
+                    onTimeframeChange={changeChartTimeframe}
                     height={460}
                 />
             </div>
@@ -779,17 +933,17 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
             {/* ═══ Trading Metrics Strip ═══ */}
             {info.is_paper_trade && (
                 <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-                    <MetricCard label="买入均价" value={`¥${info.buy_price.toFixed(2)}`} color="text-indigo-600" icon={<DollarSign size={14} />} />
+                    <MetricCard label="买入均价" value={`¥${(info.buy_price ?? 0).toFixed(2)}`} color="text-indigo-600" icon={<DollarSign size={14} />} />
                     <MetricCard label="初始止损" value={`¥${(info.initial_stop_price || 0).toFixed(2)}`} color="text-rose-500" icon={<ShieldAlert size={14} />} />
                     <MetricCard label="执行风控" value={`¥${activeStopPrice.toFixed(2)}`} color="text-rose-600" icon={<ShieldAlert size={14} />} />
-                    <MetricCard label="目标止盈" value={`¥${info.take_profit_price.toFixed(2)}`} color="text-emerald-600" icon={<Target size={14} />} />
+                    <MetricCard label="目标止盈" value={`¥${(info.take_profit_price ?? 0).toFixed(2)}`} color="text-emerald-600" icon={<Target size={14} />} />
                     <MetricCard
                         label="当前盈亏"
-                        value={`${info.pl_pct >= 0 ? '+' : ''}${info.pl_pct.toFixed(2)}%`}
-                        color={info.pl_pct >= 0 ? "text-rose-600" : "text-emerald-600"}
-                        icon={info.pl_pct >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
+                        value={`${(info.pl_pct ?? 0) >= 0 ? '+' : ''}${(info.pl_pct ?? 0).toFixed(2)}%`}
+                        color={(info.pl_pct ?? 0) >= 0 ? "text-rose-600" : "text-emerald-600"}
+                        icon={(info.pl_pct ?? 0) >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
                     />
-                    <MetricCard label="持仓天数" value={`${info.hold_days}天`} color="text-slate-600" icon={<Clock size={14} />} />
+                    <MetricCard label="持仓天数" value={`${info.hold_days ?? 0}天`} color="text-slate-600" icon={<Clock size={14} />} />
                 </div>
             )}
             {info.is_paper_trade && (info.entry_source || info.entry_signal_date || info.entry_reason_snapshot) && (

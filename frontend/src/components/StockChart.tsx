@@ -13,13 +13,14 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
     const [error, setError] = useState<string | null>(null);
     const [chartData, setChartData] = useState<any | null>(null);
     const [priceAction, setPriceAction] = useState<any>(null);
+    const [timeframe, setTimeframe] = useState<'day' | 'week'>('day');
 
     useEffect(() => {
         const fetchDataAndRender = async () => {
             try {
                 setLoading(true);
                 setError(null);
-                const response = await api.get(`/api/kline/${code}?strategy_type=${strategyType || 'squeeze'}`);
+                const response = await api.get(`/api/kline/${code}?strategy_type=${strategyType || 'squeeze'}&timeframe=${timeframe}`);
                 const data = response.data;
                 setChartData(data);
                 setPriceAction(data.price_action || null);
@@ -31,7 +32,7 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
         };
 
         fetchDataAndRender();
-    }, [code, strategyType]);
+    }, [code, strategyType, timeframe]);
 
     return (
         <div className="relative w-full bg-white rounded-lg overflow-hidden border border-slate-200">
@@ -143,6 +144,9 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
                     priceActionLines={chartData.price_action_lines || []}
                     chipDistribution={chartData.chip_distribution || null}
                     riskLevels={chartData.chart_context || {}}
+                    timeframe={timeframe}
+                    timeframeComplete={chartData.timeframe_complete ?? true}
+                    onTimeframeChange={setTimeframe}
                     height={400}
                 />
             )}

@@ -83,6 +83,8 @@ interface AppSettings {
     sentinel_schedule_times: string;
     market_sync_schedule_times: string;
     bark_key: string;
+    bark_key_set?: boolean;
+    bark_key_masked?: string;
     bark_scan_strategy: string;
     bark_scan_strategy_options?: BarkStrategyOption[];
 }
@@ -147,6 +149,18 @@ export default function SettingsView() {
             setTimeout(() => setSaved(false), 3000);
         } catch (err) {
             console.error("Save Settings Error:", err);
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleClearBarkKey = async () => {
+        setSaving(true);
+        try {
+            await api.post('/api/settings', { bark_key: '__CLEAR__' });
+            setSettings(prev => ({ ...prev, bark_key: '', bark_key_set: false, bark_key_masked: '' }));
+        } catch (err) {
+            console.error("Clear Bark Key Error:", err);
         } finally {
             setSaving(false);
         }
@@ -333,12 +347,23 @@ export default function SettingsView() {
                                 type="text"
                                 value={settings.bark_key || ""}
                                 onChange={(e) => setSettings({ ...settings, bark_key: e.target.value })}
-                                placeholder="输入您的 Bark Key"
+                                placeholder={settings.bark_key_set ? "已配置（留空表示不修改）" : "输入您的 Bark Key"}
                                 className="w-full bg-slate-50 border border-slate-100 text-slate-600 font-mono font-bold rounded-xl px-4 py-3 outline-none focus:ring-4 focus:ring-indigo-500/10 focus:bg-white transition-all"
                             />
-                            <p className="text-[10px] text-slate-400 font-medium">
-                                🔒 保存后将优先使用此 Key。如果为空，则使用 .env 文件中的默认配置。
-                            </p>
+                            <div className="flex items-center justify-between gap-3">
+                                <p className="text-[10px] text-slate-400 font-medium">
+                                    🔒 Key 不再回传明文{settings.bark_key_masked ? `，当前：${settings.bark_key_masked}` : ""}。留空保存 = 不修改；输入新 Key 覆盖。
+                                </p>
+                                {settings.bark_key_set && (
+                                    <button
+                                        type="button"
+                                        onClick={handleClearBarkKey}
+                                        className="shrink-0 text-[10px] font-bold text-rose-500 hover:text-rose-600 underline underline-offset-2"
+                                    >
+                                        清除已存 Key
+                                    </button>
+                                )}
+                            </div>
                         </div>
                     </div>
                 </div>

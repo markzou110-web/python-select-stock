@@ -40,6 +40,8 @@ interface MarketStore {
     marketRegime: MarketRegimeData | null;
     loading: boolean;
     lastUpdated: string;
+    // 最近一次行情类请求是否失败；成功后清掉，供 Dashboard 渲染错误横幅
+    lastFetchFailed: boolean;
 
     fetchMarketData: () => Promise<void>;
     fetchSyncStatus: () => Promise<void>;
@@ -58,6 +60,7 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
     marketRegime: null,
     loading: true,
     lastUpdated: '',
+    lastFetchFailed: false,
 
     setLastUpdated: (t) => set({ lastUpdated: t }),
 
@@ -77,22 +80,24 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
                 marketApi.getIndices(),
                 marketApi.getSectors()
             ]);
-            set({ indices: idxRes.data, sectors: secRes.data });
+            set({ indices: idxRes.data, sectors: secRes.data, lastFetchFailed: false });
 
             // Update cache
             localStorage.setItem('av_indices_cache', JSON.stringify(idxRes.data));
             localStorage.setItem('av_sectors_cache', JSON.stringify(secRes.data));
         } catch (e) {
             console.error("Failed to fetch market data:", e);
+            set({ lastFetchFailed: true });
         }
     },
 
     fetchSyncStatus: async () => {
         try {
             const res = await api.get('/api/sync/status');
-            set({ syncProgress: res.data });
+            set({ syncProgress: res.data, lastFetchFailed: false });
         } catch (e) {
             console.error("Sync status fetch failed", e);
+            set({ lastFetchFailed: true });
         }
     },
 
@@ -100,19 +105,22 @@ export const useMarketStore = create<MarketStore>((set, get) => ({
         try {
             const res = await api.get('/api/market/pulse');
             if (res.data && res.data.status) {
-                set({ marketRegime: res.data });
+                set({ marketRegime: res.data, lastFetchFailed: false });
             }
         } catch (e) {
             console.error("Market pulse fetch failed", e);
+            set({ lastFetchFailed: true });
         }
     },
 
     fetchMarketRegime: async (strategyType = "squeeze") => {
         try {
             const res = await api.get(`/api/market/regime?strategy_type=${strategyType}`);
+            set({ lastFetchFailed: false });
             return res.data || null;
         } catch (e) {
             console.error("Market regime fetch failed", e);
+            set({ lastFetchFailed: true });
             return null;
         }
     },

@@ -23,6 +23,7 @@ test('builds series markers only for valid phase changes', () => {
     const markers = buildDowPhaseMarkers([
         { time: '2026-09-01', phase: '第一波拉升', action: '顺势观察回踩入场' },
         { time: '2026-09-10', phase: '加速段', action: '持有为主，等待首次像样回调' },
+        { time: '2026-09-15', phase: '震荡观察', action: '等待区间边界信号' },
         { time: '', phase: '衰竭段' },
         null,
     ]);
@@ -41,6 +42,13 @@ test('builds series markers only for valid phase changes', () => {
     assert.equal(markers[1].color, '#f59e0b');
 });
 
+test('does not show ambiguous range-observation markers or legend entries', () => {
+    assert.deepEqual(buildDowPhaseMarkers([
+        { time: '2026-09-15', phase: '震荡观察', action: '等待区间边界信号' },
+    ]), []);
+    assert.equal(DOW_PHASE_LEGEND.some((item) => item.label === '震荡观察'), false);
+});
+
 import { buildProjectionScenarioMarkers, futureBusinessDates, futureWhitespaceCandles, projectionPriceLines } from '../src/lib/dowPhase.ts';
 
 test('futureBusinessDates skips weekends', () => {
@@ -48,7 +56,7 @@ test('futureBusinessDates skips weekends', () => {
     assert.deepEqual(futureBusinessDates('2026-09-18', 3), ['2026-09-21', '2026-09-22', '2026-09-23']);
 });
 
-test('builds projection arrow markers on future business days', () => {
+test('builds pullback markers without invalidation or target arrows', () => {
     const markers = buildProjectionScenarioMarkers({
         scenarios: [
             { name: '回踩再上攻', offsets: [4, 12], values: [19.6, 24.0] },
@@ -60,24 +68,20 @@ test('builds projection arrow markers on future business days', () => {
 
     assert.deepEqual(markers.map((m) => [m.time, m.shape, m.position, m.text]), [
         ['2026-09-24', 'arrowUp', 'belowBar', '回踩买点'],
-        ['2026-10-06', 'arrowUp', 'aboveBar', '目标位'],
-        ['2026-09-25', 'arrowDown', 'aboveBar', '失效离场'],
     ]);
     assert.equal(markers[0].color, '#0d9488');
     assert.ok(markers[0].label.includes('19.60'));
-    assert.ok(markers[2].label.includes('18.40'));
+    assert.equal(markers.some((m) => m.text === '失效离场'), false);
 });
 
-test('target marker is placed once across scenarios', () => {
+test('does not create target markers for either projection scenario', () => {
     const markers = buildProjectionScenarioMarkers({
         scenarios: [
             { name: '直接上攻', offsets: [7], values: [24.0] },
             { name: '回踩再上攻', offsets: [4, 12], values: [19.6, 24.0] },
         ],
     }, '2026-09-18');
-    assert.equal(markers.filter((m) => m.text === '目标位').length, 1);
-    // 直接上攻在前 → 目标取更早的 offset 7
-    assert.equal(markers.find((m) => m.text === '目标位').time, '2026-09-29');
+    assert.equal(markers.some((m) => m.text === '目标位'), false);
 });
 
 test('futureWhitespaceCandles reserves future area without OHLC', () => {

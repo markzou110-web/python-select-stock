@@ -11,8 +11,8 @@ import {
 } from 'lightweight-charts';
 import { AlertTriangle, CheckCircle2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { selectTvStrictSignals, selectWaveDisplaySignals } from '@/lib/signalDisplay';
-import { buildRiskPriceLines, getEffectiveStopPrice } from '@/lib/tradingLevels';
+import { collapseChartMarkers, selectTvStrictSignals, selectWaveDisplaySignals } from '@/lib/signalDisplay';
+import { buildRiskPriceLines, getEffectiveStopLabel, getEffectiveStopPrice } from '@/lib/tradingLevels';
 import { buildDowPhaseMarkers, buildProjectionScenarioMarkers, futureWhitespaceCandles, hintLevelStyle, projectionPriceLines, type ChartHint, type DowPhasePoint, type TradeProjection } from '@/lib/dowPhase';
 
 export interface ChipDistributionBar {
@@ -53,6 +53,9 @@ interface SplitKLineChartsProps {
     paperLines?: { price: number; label: string; color: string; date?: string }[];
     riskLevels?: any;
     chipDistribution?: ChipDistribution | null;
+    timeframe?: 'day' | 'week';
+    timeframeComplete?: boolean;
+    onTimeframeChange?: (timeframe: 'day' | 'week') => void;
     height?: number;
     compact?: boolean;
 }
@@ -87,6 +90,39 @@ function normalizeLine(data: any[] | undefined, valueKey = 'value') {
     return Array.from(map.entries())
         .map(([time, value]) => ({ time, value }))
         .sort((a, b) => a.time.localeCompare(b.time));
+}
+
+// 数据指纹：个股页每 30 秒全量重拉数据，数组引用变了但内容通常不变。
+// 大数组只取「长度 + 首尾时间 + 末元素摘要」，小对象直接 JSON.stringify，
+// 用于在内容完全未变时跳过图表的销毁重建（避免闪烁与滚动位置丢失）。
+function arrayEndpointFingerprint(data: unknown[]) {
+    if (data.length === 0) return 'empty';
+    const first = data[0] as { time?: unknown } | undefined;
+    const last = data[data.length - 1] as { time?: unknown } | undefined;
+    let lastSummary = '';
+    try {
+        lastSummary = JSON.stringify(last);
+    } catch {
+        lastSummary = String(last?.time ?? '');
+    }
+    return `${data.length}|${String(first?.time ?? '')}|${String(last?.time ?? '')}|${lastSummary}`;
+}
+
+function dependencyFingerprint(value: unknown): string {
+    if (Array.isArray(value)) {
+        if (value.length > 100) return arrayEndpointFingerprint(value);
+        try {
+            return JSON.stringify(value);
+        } catch {
+            return arrayEndpointFingerprint(value);
+        }
+    }
+    if (value == null || typeof value !== 'object') return String(value);
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
 }
 
 function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: string) {
@@ -132,6 +168,8 @@ function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: st
 
 function getSignalMarkerTone(marker: any) {
     const text = String(marker?.text || '');
+    if (marker?.source === 'timeframe_confluence') return { badge: 'D+W', label: '日周买点共振', color: '#7c3aed' };
+    if (marker?.source === 'trader_vic_2b') return { badge: '2B', label: '形态观察', color: '#0f766e' };
     if (marker?.source === 'mtr_pullback_rebreak') return { badge: '回踩', label: '企稳突破·观察', color: '#0f766e' };
     if (marker?.source === 'tv_strict') return marker.sameDay
         ? { badge: 'TV', label: '同日强共振·观察', color: '#7c3aed' }
@@ -357,6 +395,9 @@ export default function SplitKLineCharts({
     paperLines,
     riskLevels,
     chipDistribution,
+    timeframe = 'day',
+    timeframeComplete = true,
+    onTimeframeChange,
     height = 360,
     compact = false,
 }: SplitKLineChartsProps) {
@@ -369,6 +410,7 @@ export default function SplitKLineCharts({
     const chipOverlayRef = useRef<HTMLDivElement>(null);
     const strategyVisibleRangeRef = useRef<any>(null);
     const priceActionVisibleRangeRef = useRef<any>(null);
+    const chartsLifecycleRef = useRef<{ fingerprint: string; destroy: () => void } | null>(null);
     const [showChips, setShowChips] = useState(true);
 
     const sortedCandles = useMemo(() => normalizeCandles(candles), [candles]);
@@ -461,7 +503,7 @@ export default function SplitKLineCharts({
             });
         }
         const seen = new Set<string>();
-        return all
+        const unique = all
             .filter((marker) => (
                 marker?.time
                 && marker?.source !== 'eight_rule'
@@ -476,9 +518,12 @@ export default function SplitKLineCharts({
                 seen.add(key);
                 return true;
             });
+        return collapseChartMarkers(unique, [
+            'paper', 'tv_strict', 'mtr_pullback_rebreak', 'timeframe_confluence', 'bark',
+        ]);
     }, [markers, buySignals, sellSignals, strategySignalSets, tvStrictSignals, buyDate, barkDate, sortedCandles, trendPhases, tradeProjection]);
     const priceActionMarkers = useMemo(() => {
-        return (markers || [])
+        const filtered = (markers || [])
             .filter((marker) => (
                 marker?.time
                 && marker?.source !== 'eight_rule'
@@ -489,6 +534,7 @@ export default function SplitKLineCharts({
                 )
             ))
             .sort((a, b) => String(a.time).localeCompare(String(b.time)));
+        return collapseChartMarkers(filtered, ['price_action_second_entry']);
     }, [markers]);
 
     const strategySummary = useMemo(
@@ -519,7 +565,7 @@ export default function SplitKLineCharts({
                 color: 'text-indigo-700',
             },
             {
-                label: '弱市止损参考',
+                label: '初始止损参考',
                 value: validNumber(riskLevels?.initial_stop_price),
                 color: 'text-rose-700',
             },
@@ -529,7 +575,7 @@ export default function SplitKLineCharts({
                 color: 'text-orange-700',
             },
             {
-                label: validNumber(riskLevels?.structure_stop_price) != null ? '执行风控/结构失效' : '执行风控',
+                label: getEffectiveStopLabel(riskLevels),
                 value: effectiveStop ?? getPaperLinePrice(paperLines, '止损') ?? validNumber(priceAction?.pa_stop_price),
                 color: 'text-rose-700',
             },
@@ -558,6 +604,44 @@ export default function SplitKLineCharts({
     }, [strategySignalSets]);
 
     useEffect(() => {
+        // 数据指纹守卫：依赖数组不能改（React lint 要求），因此在函数体开头对关键依赖
+        // 计算轻量指纹；内容与上次完全一致时直接 return，跳过下方全量销毁重建。
+        // 注意 React 在依赖变化时会先执行上一次的 cleanup 再进入本函数体，
+        // 所以「销毁旧图表」也必须放在守卫之后、由本函数体接管（见 chartsLifecycleRef），
+        // 否则内容未变的轮询会先把图表销毁、又被守卫跳过重建，导致白屏。
+        const fingerprint = [
+            dependencyFingerprint(sortedCandles),
+            dependencyFingerprint(emaLines),
+            dependencyFingerprint(rfFilter),
+            dependencyFingerprint(trailingStops),
+            dependencyFingerprint(signalMarkers),
+            dependencyFingerprint(priceActionMarkers),
+            dependencyFingerprint(priceActionLines),
+            dependencyFingerprint(riskPriceLines),
+            dependencyFingerprint(tradeProjection),
+            dependencyFingerprint(buyDate),
+            height,
+            compact,
+            dependencyFingerprint(chipProfile ? {
+                maxWeight: chipProfile.maxWeight,
+                count: chipProfile.bars.length,
+                first: chipProfile.bars[0],
+                last: chipProfile.bars[chipProfile.bars.length - 1],
+            } : null),
+            dependencyFingerprint(chipDistribution ? {
+                available: chipDistribution.available,
+                peak_price: chipDistribution.peak_price,
+                average_cost: chipDistribution.average_cost,
+                cost_70_low: chipDistribution.cost_70_low,
+                cost_70_high: chipDistribution.cost_70_high,
+            } : null),
+            showChips,
+        ].join('~');
+        if (chartsLifecycleRef.current?.fingerprint === fingerprint) return;
+
+        chartsLifecycleRef.current?.destroy();
+        chartsLifecycleRef.current = null;
+
         if (!strategyRef.current || !priceActionRef.current || sortedCandles.length === 0) return;
 
         const strategyChart = createChart(strategyRef.current, {
@@ -585,7 +669,7 @@ export default function SplitKLineCharts({
             wickUpColor: '#ef4444',
             wickDownColor: '#22c55e',
         });
-        // 未来空白K线（仅 time）：为"执行策略投影"的箭头标记（回踩买点/目标位/失效离场）
+        // 未来空白K线（仅 time）：为执行策略投影的回踩买点
         // 留出可标注的未来区域；历史K线部分不受影响。
         const lastChartCandle = sortedCandles[sortedCandles.length - 1];
         const futureBars = futureWhitespaceCandles(String(lastChartCandle?.time || ''), 14);
@@ -661,7 +745,7 @@ export default function SplitKLineCharts({
                 color: line.color,
                 lineWidth: 2,
                 lineStyle: 2,
-                axisLabelVisible: true,
+                axisLabelVisible: /持仓成本|执行风控|第一止盈目标/.test(line.label),
                 title: `${line.label} ${price.toFixed(2)}${line.label.includes('买入') && (line.date || buyDate) ? ` ${formatDateLabel(line.date || buyDate)}` : ''}`,
             });
         });
@@ -735,15 +819,20 @@ export default function SplitKLineCharts({
                 .map(([time, value]) => ({ time, value }))
                 .sort((a, b) => a.time.localeCompare(b.time));
             if (points.length < 2) return;
-            const series = paChart.addSeries(LineSeries, {
+            const lineOptions = {
                 color: line.color || '#2563eb',
                 lineWidth: line.kind === 'entry' || line.kind === 'stop' ? 1 : 2,
                 lineStyle: line.style === 'dotted' ? 1 : line.style === 'dashed' ? 2 : 0,
                 title: line.label,
                 lastValueVisible: line.kind === 'entry' || line.kind === 'stop',
                 priceLineVisible: false,
-            });
+            } as const;
+            const series = paChart.addSeries(LineSeries, lineOptions);
             series.setData(points);
+            if (line.kind === 'support' || line.kind === 'resistance') {
+                const trendlineSeries = strategyChart.addSeries(LineSeries, lineOptions);
+                trendlineSeries.setData(points);
+            }
         });
 
         const renderTradeLabels = () => {
@@ -784,6 +873,7 @@ export default function SplitKLineCharts({
                 const box = document.createElement('div');
                 box.className = 'min-w-[34px] rounded-md px-2 py-1 text-center text-[10px] font-black leading-tight text-white shadow-lg ring-1 ring-white/60';
                 box.style.background = tone.color;
+                box.title = String(marker.label || marker.text || '');
                 box.innerHTML = `<div class="text-[11px]">${tone.badge}</div><div>${tone.label}</div>`;
 
                 const arrow = document.createElement('div');
@@ -821,7 +911,8 @@ export default function SplitKLineCharts({
                 label.style.left = `${x}px`;
                 label.style.top = `${Math.max(4, Math.min(height - 30, y + (marker.position === 'aboveBar' ? -34 : 10)))}px`;
                 label.style.transform = 'translateX(-50%)';
-                label.style.pointerEvents = 'none';
+                label.title = String(marker.label || marker.text || '');
+                label.style.pointerEvents = 'auto';
                 label.style.background = marker.color || '#2563eb';
                 label.textContent = String(marker.text || 'PA');
                 overlay.appendChild(label);
@@ -888,16 +979,27 @@ export default function SplitKLineCharts({
         };
         window.addEventListener('resize', handleResize);
 
-        return () => {
-            window.removeEventListener('resize', handleResize);
-            strategyChart.timeScale().unsubscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
-            paChart.timeScale().unsubscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
-            strategyChart.unsubscribeCrosshairMove(handleStrategyCrosshairMove);
-            paChart.unsubscribeCrosshairMove(handlePriceActionCrosshairMove);
-            strategyChart.remove();
-            paChart.remove();
+        chartsLifecycleRef.current = {
+            fingerprint,
+            destroy: () => {
+                window.removeEventListener('resize', handleResize);
+                strategyChart.timeScale().unsubscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
+                paChart.timeScale().unsubscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
+                strategyChart.unsubscribeCrosshairMove(handleStrategyCrosshairMove);
+                paChart.unsubscribeCrosshairMove(handlePriceActionCrosshairMove);
+                strategyChart.remove();
+                paChart.remove();
+            },
         };
     }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, riskPriceLines, barkDate, height, compact, chipDistribution, chipProfile, showChips]);
+
+    // 组件卸载时销毁图表（主 effect 不再返回 cleanup：依赖变化触发的清理已改由
+    // 函数体内的 chartsLifecycleRef.destroy() 接管，以便指纹守卫能跳过整轮销毁重建；
+    // StrictMode 重挂载时该 cleanup 会先销毁并清空 ref，第二次挂载仍会正常重建）。
+    useEffect(() => () => {
+        chartsLifecycleRef.current?.destroy();
+        chartsLifecycleRef.current = null;
+    }, []);
 
     return (
         <div className="grid grid-cols-1 divide-y divide-slate-200">
@@ -933,6 +1035,12 @@ export default function SplitKLineCharts({
                         <span>仅作结构提示，仍须按现有风控确认；不自动买入</span>
                     </div>
                 )}
+                {(markers || []).some((marker) => marker?.source === 'trader_vic_2b') && (
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-teal-100 bg-teal-50/70 px-4 py-1.5 text-[10px] font-bold text-teal-800">
+                        <span>VIC 2B形态观察</span>
+                        <span>标记表示支撑假突破后的收复结构；横截面RPS120过滤需另行确认，不等于买点或买入指令</span>
+                    </div>
+                )}
                 {chartHints && chartHints.length > 0 && (
                     <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-100 bg-slate-50/70 px-4 py-1.5">
                         {chartHints.map((hint, idx) => (
@@ -965,7 +1073,25 @@ export default function SplitKLineCharts({
                 <div className="px-4 py-2 border-b border-slate-100 flex items-center justify-between gap-3">
                     <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">价格行为结构</span>
                     <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-bold text-blue-600">趋势线 / 回踩支撑 / 入场 / 失效</span>
+                        <span className="text-[10px] font-bold text-blue-600">道氏趋势线（有效 / 破位）· 回踩支撑 / 入场 / 失效</span>
+                        {onTimeframeChange && (
+                            <div className="flex rounded-md border border-slate-200 bg-slate-50 p-0.5" role="group" aria-label="K线周期">
+                                {(['day', 'week'] as const).map((period) => (
+                                    <button
+                                        key={period}
+                                        type="button"
+                                        aria-pressed={timeframe === period}
+                                        onClick={() => onTimeframeChange(period)}
+                                        className={cn(
+                                            'rounded px-2 py-1 text-[10px] font-bold transition-colors',
+                                            timeframe === period ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-800'
+                                        )}
+                                    >
+                                        {period === 'day' ? '日线' : '周线'}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
                         {chipProfile ? (
                             <button
                                 type="button"
@@ -984,6 +1110,11 @@ export default function SplitKLineCharts({
                         )}
                     </div>
                 </div>
+                {timeframe === 'week' && (
+                    <div className="border-b border-indigo-100 bg-indigo-50/70 px-4 py-1.5 text-[10px] font-bold text-indigo-800">
+                        周线买卖点按周K重新计算，持有周期单位为周；{timeframeComplete ? '信号基于已收盘周K。' : '本周未收盘，本周K线仅作展示，不生成确认信号。'}
+                    </div>
+                )}
                 <div className="relative w-full" style={{ height }}>
                     <div ref={priceActionRef} className="absolute inset-0" />
                     <div ref={chipOverlayRef} className="absolute inset-0 z-[5] overflow-hidden pointer-events-none" />

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import api, { marketApi, connectScanWebSocket } from '@/lib/api';
+import api, { marketApi, connectScanWebSocket, type ScanMarketParams } from '@/lib/api';
+import { downloadCsv, toCsvString } from '@/lib/csv';
 
 export interface ScanResult {
     代码: string;
@@ -47,6 +48,13 @@ export interface ScanResult {
     rps_250?: number;
     rps_sector_120?: number;
     rps_acceleration?: number;
+    trader_vic_2b_metrics?: {
+        vic_2b_support?: number | null;
+        vic_2b_volume_ratio?: number | null;
+        ma200?: number | null;
+        ma200_slope_20d_pct?: number | null;
+        rps_120_minimum?: number;
+    };
     影线比?: number;
     strategy_type?: string;
     matched_strategies?: string[];
@@ -279,7 +287,7 @@ export interface BacktestStats {
     stop_loss_hits: number;
 }
 
-export type ScanStrategyType = 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'weekly_four_patterns' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp' | 'h2' | 'high_tight_flag' | 'turtle_breakout' | 'limit_up_shakeout';
+export type ScanStrategyType = 'tv_dual_strict' | 'tv_dual' | 'early_value' | 'bottom_discovery' | 'weekly_four_patterns' | 'sector_watch' | 'squeeze' | 'pine' | 'both' | 'consensus' | 'tv_zp' | 'h2' | 'high_tight_flag' | 'turtle_breakout' | 'limit_up_shakeout' | 'ma_volume' | 'uptrend_limit_down' | 'rps_breakout' | 'trader_vic_2b';
 
 export interface ScanParams {
     strategy_type: ScanStrategyType;
@@ -349,9 +357,13 @@ const SCAN_STRATEGY_LABELS: Record<ScanParams['strategy_type'], string> = {
     consensus: '放量突破',
     tv_zp: 'TV-ZP',
     h2: 'H2 二次入场',
-    high_tight_flag: 'HTF 高位收敛（SHADOW）',
-    turtle_breakout: '20日新高基准（SHADOW）',
-    limit_up_shakeout: '涨停洗盘观察（SHADOW）',
+    high_tight_flag: '高窄旗形（HTF，SHADOW）',
+    turtle_breakout: '海龟突破（20日新高，SHADOW）',
+    limit_up_shakeout: '涨停后洗盘（SHADOW）',
+    ma_volume: '均线放量金叉（SHADOW）',
+    uptrend_limit_down: '上升趋势放量跌停（SHADOW）',
+    rps_breakout: 'RPS 强势突破（SHADOW）',
+    trader_vic_2b: 'Trader Vic 2B反转（SHADOW）',
 };
 
 let resultRequestGeneration = 0;
@@ -577,15 +589,16 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                     throw new Error('后端尚未更新，暂不能执行“且”关系扫描，请更新服务后重试。');
                 }
             }
-            const cleanParams: Record<string, unknown> = {
+            const cleanParams: ScanMarketParams = {
                 ...requestedParams,
                 strategy_type: requestedStrategy,
                 strategy_types: requestedStrategies.join(','),
             };
             Object.keys(cleanParams).forEach(key => {
-                const val = cleanParams[key];
+                const typedKey = key as keyof ScanMarketParams;
+                const val = cleanParams[typedKey];
                 if (typeof val === 'number' && isNaN(val)) {
-                    delete cleanParams[key];
+                    delete cleanParams[typedKey];
                 }
             });
             if (typeof cleanParams.data_date !== 'string' || !cleanParams.data_date.trim()) {
@@ -598,7 +611,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 if (msg.type === 'scan_start') {
                     set({ scanProgress: { current: 0, total: 100, matches: 0, elapsed, message: msg.message } });
                 } else if (msg.type === 'scan_progress') {
-                    set({ scanProgress: { current: msg.current, total: msg.total, matches: 0, elapsed, message: msg.message } });
+                    set({ scanProgress: { current: msg.current ?? 0, total: msg.total ?? 0, matches: 0, elapsed, message: msg.message } });
                 } else if (msg.type === 'scan_end') {
                     set({ scanProgress: { current: 100, total: 100, matches: 0, elapsed, message: `正在核对${strategyLabel}正式入选结果...` } });
                 }
@@ -844,12 +857,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
         const rows = results.map(r => [
             r.代码, r.名称, r.行业, r.现价, r["涨幅%"], r.Score, r.RSI, r.DIF, r.BB, r.粘合度, r.历史胜率
         ]);
-        const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
-        const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.setAttribute("href", url);
-        link.setAttribute("download", `AlphaVision_Results_${new Date().toLocaleDateString()}.csv`);
-        link.click();
+        const csvContent = toCsvString(headers, rows);
+        downloadCsv(`AlphaVision_Results_${new Date().toLocaleDateString()}.csv`, csvContent);
     },
 }));

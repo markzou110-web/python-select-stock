@@ -23,6 +23,7 @@ import {
     Sparkles
 } from 'lucide-react';
 import { clampScore, cn } from '@/lib/utils';
+import { downloadCsv, toCsvString } from '@/lib/csv';
 import api from '@/lib/api';
 import dynamic from 'next/dynamic';
 const StockChart = dynamic(() => import('./StockChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
@@ -85,6 +86,8 @@ export default function ResultsTable({
         try {
             const response = await api.get(`/api/review/execution-plan-timeline/${code}`);
             setTimeline(response.data);
+        } catch {
+            showToast('时间线加载失败', 'error');
         } finally {
             setTimelineLoading(false);
         }
@@ -235,24 +238,8 @@ export default function ResultsTable({
             r.影线比 || '', r.strategy_type || '', (r.matched_strategies || []).join('|')
         ]);
 
-        // BOM for Excel UTF-8 compatibility
-        const csv = '\uFEFF' + [headers, ...rows].map(row =>
-            row.map(cell => {
-                const str = String(cell ?? '');
-                return str.includes(',') || str.includes('"') || str.includes('\n')
-                    ? `"${str.replace(/"/g, '""')}"`
-                    : str;
-            }).join(',')
-        ).join('\n');
-
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        const date = new Date().toISOString().slice(0, 10);
-        a.href = url;
-        a.download = `AlphaVision_选股_${date}.csv`;
-        a.click();
-        URL.revokeObjectURL(url);
+        const csv = toCsvString(headers, rows);
+        downloadCsv(`AlphaVision_选股_${new Date().toISOString().slice(0, 10)}.csv`, csv);
     };
 
     const runAIReview = async () => {
@@ -472,6 +459,11 @@ export default function ResultsTable({
                                     {res.rps_120 != null && (
                                         <span className="rounded border border-sky-100 bg-sky-50 px-1.5 py-0.5 text-[8px] font-black text-sky-700">
                                             RPS120 {res.rps_120.toFixed(0)}
+                                        </span>
+                                    )}
+                                    {res.trader_vic_2b_metrics && (
+                                        <span className="rounded border border-amber-100 bg-amber-50 px-1.5 py-0.5 text-[8px] font-black text-amber-800">
+                                            2B收复位 ¥{res.trader_vic_2b_metrics.vic_2b_support?.toFixed(2) ?? '--'} · MA200 ¥{res.trader_vic_2b_metrics.ma200?.toFixed(2) ?? '--'} · 20日斜率 {res.trader_vic_2b_metrics.ma200_slope_20d_pct?.toFixed(1) ?? '--'}% · 量比 {res.trader_vic_2b_metrics.vic_2b_volume_ratio?.toFixed(1) ?? '--'}x
                                         </span>
                                     )}
                                 </div>

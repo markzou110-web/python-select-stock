@@ -26,7 +26,7 @@ import SectorRadarView from '@/components/SectorRadarView';
 import ResearchRadarView from '@/components/ResearchRadarView';
 import HotStocksView from '@/components/HotStocksView';
 import ExecutionInbox from '@/components/ExecutionInbox';
-import { Download, LayoutGrid, List, Search, Zap, Calendar } from 'lucide-react';
+import { Download, LayoutGrid, List, Search, Zap, Calendar, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useScanStore } from '@/stores/scanStore';
 import { useMarketStore } from '@/stores/marketStore';
@@ -41,6 +41,8 @@ interface MarketPulseIndex {
 const signedPct = (value?: number) => value == null || !Number.isFinite(value)
     ? '--'
     : `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+
+const formatTimestamp = (date: Date) => `${date.toISOString().split('T')[0]} ${date.toLocaleTimeString()}`;
 
 export default function Dashboard() {
     // ── Market store ──
@@ -57,6 +59,7 @@ export default function Dashboard() {
     const stopSync = useMarketStore(s => s.stopSync);
     const setLastUpdated = useMarketStore(s => s.setLastUpdated);
     const marketRegime = useMarketStore(s => s.marketRegime);
+    const marketFetchFailed = useMarketStore(s => s.lastFetchFailed);
 
     // ── Scan store ──
     const results = useScanStore(s => s.results);
@@ -93,18 +96,18 @@ export default function Dashboard() {
     useEffect(() => {
         const init = async () => {
             useMarketStore.setState({ loading: true });
-            const now = new Date();
-            const dateStr = now.toISOString().split('T')[0];
-            const timeStr = now.toLocaleTimeString();
-            setLastUpdated(`${dateStr} ${timeStr}`);
             await Promise.all([
-                fetchMarketData(), 
-                fetchSyncStatus(), 
-                fetchHistory(), 
+                fetchMarketData(),
+                fetchSyncStatus(),
+                fetchHistory(),
                 fetchAvailableDates(),
                 fetchMarketPulse()
             ]);
             useMarketStore.setState({ loading: false });
+            // 只有行情请求全部成功时才刷新时间戳，失败场景由错误横幅提示
+            if (!useMarketStore.getState().lastFetchFailed) {
+                setLastUpdated(formatTimestamp(new Date()));
+            }
         };
         init();
 
@@ -112,6 +115,13 @@ export default function Dashboard() {
         return () => clearInterval(intervalId);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    const handleRetryMarketFetch = async () => {
+        await Promise.all([fetchMarketData(), fetchSyncStatus(), fetchMarketPulse()]);
+        if (!useMarketStore.getState().lastFetchFailed) {
+            setLastUpdated(formatTimestamp(new Date()));
+        }
+    };
 
     return (
         <div className="flex min-h-dvh w-full overflow-hidden bg-[var(--background)] md:h-dvh">
@@ -155,6 +165,24 @@ export default function Dashboard() {
                 />
 
                 <main id="main-content" tabIndex={-1} className="flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-5">
+                    {marketFetchFailed && (
+                        <div
+                            className="mx-auto mb-4 flex w-full max-w-[1920px] items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3"
+                            role="alert"
+                        >
+                            <div className="flex items-center gap-2 text-sm font-bold text-rose-800">
+                                <AlertTriangle size={16} aria-hidden="true" />
+                                <span>行情服务未响应，数据可能过期</span>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={handleRetryMarketFetch}
+                                className="rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-black text-rose-700 hover:bg-rose-100"
+                            >
+                                重试
+                            </button>
+                        </div>
+                    )}
                     <div className="mx-auto flex w-full max-w-[1920px] flex-col items-start gap-5 xl:flex-row">
                         <div className={cn("min-w-0 space-y-5 transition-[width] duration-300", selectedStock ? "flex-1" : "w-full")}>
                             {searchDetailStock ? (

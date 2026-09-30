@@ -30,6 +30,17 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
             strategy_types: strategyTypes,
         });
     };
+    const toggleStrategyVariant = (strategy: ScanStrategyType, variants: ScanStrategyType[], overrides: Partial<ScanParams> = {}) => {
+        const next = selectedStrategies.filter(item => !variants.includes(item));
+        if (!hasStrategy(strategy)) next.unshift(strategy);
+        if (!next.length) next.push(strategy);
+        setParams({
+            ...params,
+            ...overrides,
+            strategy_type: next[0],
+            strategy_types: next,
+        });
+    };
     const showSqueezeParams = ['tv_dual_strict', 'tv_dual', 'squeeze', 'both'].some(item => hasStrategy(item as ScanStrategyType));
     const showPineParams = ['pine', 'both'].some(item => hasStrategy(item as ScanStrategyType));
     const showConsensusParams = hasStrategy('consensus');
@@ -233,34 +244,39 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                     正式选股与观察
                                 </div>
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-                                    <StrategyOption
-                                        title="宽松观察池"
-                                        description="均线B 或 TV-ZP趋势信号，数量更多"
-                                        active={hasStrategy("tv_dual")}
-                                        onClick={() => toggleStrategy("tv_dual", {
-                                            threshold: 0.15,
-                                            vol_multiplier: 1.3,
-                                            rsi_min: 52,
-                                            use_bb_sqz: false,
-                                            use_rs_filter: false,
-                                            use_weekly: false,
-                                        })}
-                                        icon="TV"
-                                    />
-                                    <StrategyOption
-                                        title="强确认精选"
-                                        description="均线B + TV-ZP趋势信号（非五指标），少而精"
-                                        active={hasStrategy("tv_dual_strict")}
-                                        onClick={() => toggleStrategy("tv_dual_strict", {
-                                            threshold: 0.12,
-                                            vol_multiplier: 1.5,
-                                            rsi_min: 55,
-                                            use_bb_sqz: false,
-                                            use_rs_filter: false,
-                                            use_weekly: false,
-                                        })}
-                                        icon="TV+"
-                                    />
+                                    <div className="rounded-2xl border border-indigo-100 bg-white/50 p-3 md:col-span-2" role="group" aria-label="TV双策略模式，二选一">
+                                        <p className="mb-2 text-xs font-bold text-slate-600">TV 双策略模式（二选一）</p>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                            <StrategyOption
+                                                title="宽松观察"
+                                                description="均线B 或 TV-ZP趋势信号，数量更多"
+                                                active={hasStrategy("tv_dual")}
+                                                onClick={() => toggleStrategyVariant("tv_dual", ["tv_dual", "tv_dual_strict"], {
+                                                    threshold: 0.15,
+                                                    vol_multiplier: 1.3,
+                                                    rsi_min: 52,
+                                                    use_bb_sqz: false,
+                                                    use_rs_filter: false,
+                                                    use_weekly: false,
+                                                })}
+                                                icon="TV"
+                                            />
+                                            <StrategyOption
+                                                title="严格双信号"
+                                                description="均线B + TV-ZP趋势信号（非五指标），少而精"
+                                                active={hasStrategy("tv_dual_strict")}
+                                                onClick={() => toggleStrategyVariant("tv_dual_strict", ["tv_dual", "tv_dual_strict"], {
+                                                    threshold: 0.12,
+                                                    vol_multiplier: 1.5,
+                                                    rsi_min: 55,
+                                                    use_bb_sqz: false,
+                                                    use_rs_filter: false,
+                                                    use_weekly: false,
+                                                })}
+                                                icon="TV+"
+                                            />
+                                        </div>
+                                    </div>
                                     <StrategyOption
                                         title="放量突破"
                                         description="高低点结构 + 放量大阳线"
@@ -307,14 +323,58 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                         icon="周"
                                     />
                                 </div>
+                                <section className="mt-5 rounded-2xl border border-amber-100 bg-amber-50/40 p-4" aria-labelledby="breakout-research-heading">
+                                    <div className="mb-3">
+                                        <h3 id="breakout-research-heading" className="text-sm font-bold text-amber-900">突破形态研究（仅观察）</h3>
+                                        <p className="mt-1 text-xs text-slate-500">已接入扫描，但不会生成买入指令或实盘推送。</p>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                                        <StrategyOption
+                                            title="高窄旗形（HTF）"
+                                            description="强势拉升后高位窄幅缩量整理；等待突破确认。"
+                                            active={hasStrategy("high_tight_flag")}
+                                            onClick={() => toggleStrategy("high_tight_flag", { min_data_days: 80 })}
+                                            icon="HTF"
+                                        />
+                                        <StrategyOption
+                                            title="海龟突破（20日新高）"
+                                            description="收盘突破前20日高点，并满足成交额、阳线和真涨过滤。"
+                                            active={hasStrategy("turtle_breakout")}
+                                            onClick={() => toggleStrategy("turtle_breakout", { min_data_days: 80 })}
+                                            icon="T20"
+                                        />
+                                        <StrategyOption
+                                            title="涨停后洗盘"
+                                            description="前日涨停后放量换手且支撑未破；等待再次转强，不直接抄底。"
+                                            active={hasStrategy("limit_up_shakeout")}
+                                            onClick={() => toggleStrategy("limit_up_shakeout", { min_data_days: 80 })}
+                                            icon="ZT"
+                                        />
+                                    </div>
+                                </section>
+                                <section className="rounded-2xl border border-amber-100 bg-amber-50/40 p-3" aria-labelledby="trader-vic-research-heading">
+                                    <div className="mb-2 flex items-center justify-between gap-2">
+                                        <h3 id="trader-vic-research-heading" className="text-sm font-black text-amber-800">交易法则研究（仅观察）</h3>
+                                        <span className="text-[11px] text-amber-700">鳄鱼原则：判断错误及时退出</span>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                                        <StrategyOption
+                                            title="Trader Vic 2B反转"
+                                            description="20日支撑假跌破后5日内放量收复；200日均线转平/向上、RPS120≥60。SHADOW研究，不自动买入。"
+                                            active={hasStrategy("trader_vic_2b")}
+                                            onClick={() => toggleStrategy("trader_vic_2b", { min_data_days: 220 })}
+                                            icon="2B"
+                                        />
+                                    </div>
+                                </section>
                                 <details className="rounded-2xl border border-indigo-100 bg-white/60 p-3">
                                     <summary className="cursor-pointer select-none text-xs font-black uppercase tracking-wider text-indigo-600">
-                                        单信号研究 / 策略对照
+                                        单指标策略与策略对照
                                     </summary>
                                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
                                         <StrategyOption
                                             title="均线粘合（单策略）"
-                                            description="仅检查TV均线B信号"
+                                            description="EMA均线粘合，并结合量能、RSI、MACD等条件"
                                             active={hasStrategy("squeeze")}
                                             onClick={() => toggleStrategy("squeeze")}
                                             icon="📊"
@@ -326,19 +386,15 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                             onClick={() => toggleStrategy("pine")}
                                             icon="🚀"
                                         />
+                                        <p className="rounded-xl bg-indigo-50 p-3 text-xs leading-relaxed text-indigo-800 sm:col-span-2 lg:col-span-4">
+                                            已移除重复的“均线 + 五指标”组合入口；如需该组合，同时选择“均线粘合”和“五指标投票共振”，并将上方匹配关系设为“且”。
+                                        </p>
                                         <StrategyOption
                                             title="TV-ZP趋势信号"
                                             description="RF主导 + Volume/QQE确认"
                                             active={hasStrategy("tv_zp")}
                                             onClick={() => toggleStrategy("tv_zp")}
                                             icon="ZP"
-                                        />
-                                        <StrategyOption
-                                            title="均线 + 五指标共振"
-                                            description="均线粘合 + 五指标投票（不是ZP双确认）"
-                                            active={hasStrategy("both")}
-                                            onClick={() => toggleStrategy("both")}
-                                            icon="🔥"
                                         />
                                         <StrategyOption
                                             title="H2 二次入场"
@@ -348,25 +404,25 @@ export default function FilterModal({ isOpen, onClose, params, setParams, onScan
                                             icon="H2"
                                         />
                                         <StrategyOption
-                                            title="HTF 高位收敛"
-                                            description="强势上涨后高位窄幅缩量；SHADOW研究"
-                                            active={hasStrategy("high_tight_flag")}
-                                            onClick={() => toggleStrategy("high_tight_flag", { min_data_days: 80 })}
-                                            icon="HTF"
+                                            title="均线放量金叉"
+                                            description="5日线上穿20日线且成交量超过20日均量1.5倍；SHADOW研究"
+                                            active={hasStrategy("ma_volume")}
+                                            onClick={() => toggleStrategy("ma_volume", { min_data_days: 30 })}
+                                            icon="MA"
                                         />
                                         <StrategyOption
-                                            title="20日新高基准"
-                                            description="突破前20日高点并通过流动性过滤；SHADOW研究"
-                                            active={hasStrategy("turtle_breakout")}
-                                            onClick={() => toggleStrategy("turtle_breakout", { min_data_days: 80 })}
-                                            icon="T20"
+                                            title="上升趋势放量跌停"
+                                            description="前日20/60日线多头后出现放量跌停；只观察风险释放，不作为抄底信号"
+                                            active={hasStrategy("uptrend_limit_down")}
+                                            onClick={() => toggleStrategy("uptrend_limit_down", { min_data_days: 80 })}
+                                            icon="LD"
                                         />
                                         <StrategyOption
-                                            title="涨停后洗盘"
-                                            description="前日封板、放量换手且支撑未破；SHADOW研究"
-                                            active={hasStrategy("limit_up_shakeout")}
-                                            onClick={() => toggleStrategy("limit_up_shakeout", { min_data_days: 80 })}
-                                            icon="ZT"
+                                            title="RPS 强势突破"
+                                            description="120日相对强度全市场前10%，且接近120日高点；SHADOW研究"
+                                            active={hasStrategy("rps_breakout")}
+                                            onClick={() => toggleStrategy("rps_breakout", { min_data_days: 125 })}
+                                            icon="RPS"
                                         />
                                     </div>
                                 </details>
@@ -812,7 +868,7 @@ function StrategyOption({
                             </div>
                         )}
                     </div>
-                    <p className="text-[10px] text-slate-500 mt-1 leading-relaxed">{description}</p>
+            <p className="text-xs text-slate-500 mt-1 leading-relaxed">{description}</p>
                 </div>
             </div>
         </button>

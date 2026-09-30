@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { selectTvStrictSignals, selectWaveDisplaySignals } from '../src/lib/signalDisplay.ts';
+import { collapseChartMarkers, selectTvStrictSignals, selectWaveDisplaySignals } from '../src/lib/signalDisplay.ts';
+
+test('collapses same-candle markers while preserving signal details and priority', () => {
+    const result = collapseChartMarkers([
+        { time: '2026-09-26', position: 'belowBar', source: 'bark', text: 'Bark推荐' },
+        { time: '2026-09-26', position: 'belowBar', source: 'tv_strict', text: 'TV共振' },
+        { time: '2026-09-26', position: 'aboveBar', source: 'exit', text: '止损' },
+    ], ['tv_strict', 'bark']);
+
+    assert.equal(result.length, 2);
+    assert.equal(result[0].text, 'TV共振 +1');
+    assert.equal(result[0].label, 'Bark推荐 · TV共振');
+});
 
 test('keeps only the first and latest buy signal in one wave', () => {
     const result = selectWaveDisplaySignals([
