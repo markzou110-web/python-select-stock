@@ -23,6 +23,10 @@ PROMOTION_REGISTRY: Dict[str, str] = {
     "sector_fund_outflow_blocker": "blocker 对照：hit/miss 分层 5 日前瞻差异显著且方向一致",
     "amp20_gate": "滚动前推：6% 分界各档样本量与 Wilson 下界披露",
     "trend_phase_gate": "同上（道氏阶段分界滚动前推）",
+    # 历史证据：regime_attribution 2026-09-30（132,681 事件三段 walk-forward），
+    # 拦截交易三段均为负（train -1.72/validation -2.34/test -2.44）；
+    # 转正另需 SHADOW 实盘期 ≥3 个月方向一致 + 退潮型月份（ZT_EBB）覆盖评估
+    "market_state_gate": "R3 十日动量闸门：历史三段已过；SHADOW 期逐日状态对照 ≥3 个月方向一致",
 }
 
 

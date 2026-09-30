@@ -4,7 +4,7 @@
 """
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, Any, Optional
 
@@ -456,3 +456,64 @@ def limit_up_sentiment_ebb(stats: Dict[str, Any]) -> bool:
 
     broken_rate = stats.get("broken_rate")
     return broken_rate is not None and float(broken_rate) >= ZT_EBB_BROKEN_RATE_PCT
+
+
+# ── 市场状态闸门 R3（market-state-gate-v1-shadow，2026-09-30）─────────────────
+# 依据 scripts/regime_attribution.py（132,681 事件三段 walk-forward）：
+# 全市场截面代理 10 日动量 < -3% 期间的交易，三段期望一致为负
+# （train -1.72% / validation -2.34% / test -2.44%），保留期期望三段全部改善。
+# SHADOW 语义：只记录状态与打标，不改资格/仓位/推送；转正须走
+# core.validation_gate.promotion_allowed（SHADOW 实盘期 ≥3 个月方向一致）。
+# 边界（逐月拆解证实）：动量闸门拦"普跌型"月份（2024-06/2026-07），
+# 拦不住"退潮型"月份（2026-08/09）——后者待涨停情绪序列（ZT_EBB）积累。
+MARKET_STATE_GATE_POLICY_VERSION = "market-state-gate-v1-shadow"
+MARKET_STATE_MOM_THRESHOLD_PCT = -3.0
+
+
+def compute_market_state_gate(engine, as_of: Optional[datetime] = None) -> Dict[str, Any]:
+    """计算 R3 市场状态闸门（SHADOW）：截面代理 10 日动量。
+
+    代理口径与 a_grade_kline_replay._market_proxy 一致（全市场截面日均收益
+    累积为代理指数），窗口取近 45 个自然日（足够算 10 日动量）。
+    as_of 为空时以库内最新数据日为锚（point-in-time 安全）。
+    """
+    result: Dict[str, Any] = {
+        "policy_version": MARKET_STATE_GATE_POLICY_VERSION,
+        "bar_date": None, "mom_10d_pct": None,
+        "blocked": False, "threshold_pct": MARKET_STATE_MOM_THRESHOLD_PCT,
+    }
+    if engine is None:
+        return result
+    try:
+        proxy = pd.read_sql(text("""
+            WITH priced AS (
+                SELECT date, AVG(close / NULLIF(prev_close, 0) - 1) AS market_return
+                FROM (
+                    SELECT date, code, close,
+                           LAG(close) OVER (PARTITION BY code ORDER BY date) AS prev_close
+                    FROM daily_k
+                    WHERE date >= :window_start
+                ) d
+                WHERE prev_close > 0 AND close / prev_close BETWEEN 0.75 AND 1.25
+                GROUP BY date
+            )
+            SELECT date, market_return FROM priced ORDER BY date
+        """), engine, params={
+            "window_start": (datetime.now() - timedelta(days=45)).strftime("%Y-%m-%d"),
+        })
+    except Exception as exc:
+        logger.warning(f"compute_market_state_gate: proxy query failed: {exc}")
+        return result
+    if proxy.empty or len(proxy) < 12:
+        return result
+    level = (1 + proxy["market_return"].fillna(0.0)).cumprod()
+    mom_10d = float((level.iloc[-1] / level.iloc[-11] - 1) * 100) if len(level) > 10 else None
+    result["bar_date"] = str(proxy["date"].iloc[-1])
+    result["mom_10d_pct"] = round(mom_10d, 2) if mom_10d is not None else None
+    if mom_10d is not None:
+        result["blocked"] = mom_10d < MARKET_STATE_MOM_THRESHOLD_PCT
+    logger.debug(
+        f"market state gate @{result['bar_date']}: mom_10d={result['mom_10d_pct']}% "
+        f"blocked={result['blocked']}"
+    )
+    return result

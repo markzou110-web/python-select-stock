@@ -289,6 +289,12 @@ celery_app.conf.update(
             'schedule': crontab(minute='*/5', hour='7-23'),
             'options': {'expires': 240},
         },
+        # 市场状态闸门（SHADOW）：每日记录 R3 十日动量状态，为转正积累对照样本
+        'market-state-gate-daily-1915': {
+            'task': 'tasks.update_market_state_gate',
+            'schedule': crontab(hour=19, minute=15, day_of_week='1-5'),
+            'options': {'expires': 1800},
+        },
         # Full-market sync is owned by MarketSyncScheduler in the API process so
         # progress is observable and it cannot race an embedded Celery beat.
     },

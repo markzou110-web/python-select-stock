@@ -274,6 +274,13 @@ def send_premarket_position_advice():
                 message["body"] = f"{message['body']}\n{sentiment_line}"
         except Exception as exc:
             logger.debug(f"Premarket sentiment line unavailable: {exc}")
+        # 第 13 项：市场状态闸门（R3 十日动量，SHADOW 只提示不改行为）
+        try:
+            gate_line = _market_state_gate_line(get_db_engine())
+            if gate_line:
+                message["body"] = f"{message['body']}\n{gate_line}"
+        except Exception as exc:
+            logger.debug(f"Premarket gate line unavailable: {exc}")
         delivery = asyncio.run(notifier.send(
             message["title"],
             message["body"],
@@ -1773,3 +1780,48 @@ def redis_health_watch():
         logger.warning(f"Redis health bark push failed: {exc}")
     logger.warning(f"Redis health transition: {previous} -> {_REDIS_HEALTH_STATE}")
     return {"status": _REDIS_HEALTH_STATE, "transition": True, "previous": previous}
+
+
+def _market_state_gate_line(engine) -> str | None:
+    """盘前功课第 13 行：市场状态闸门（R3 动量，SHADOW 只提示不改行为）。"""
+    try:
+        from core.market_regime import compute_market_state_gate
+
+        gate = compute_market_state_gate(engine)
+    except Exception:
+        return None
+    if not gate.get("bar_date") or gate.get("mom_10d_pct") is None:
+        return None
+    mark = "⚠️建议暂停新开仓" if gate.get("blocked") else "正常"
+    return (
+        f"市场状态闸门({pd.Timestamp(gate['bar_date']).strftime('%m-%d')}): "
+        f"10日动量{gate['mom_10d_pct']:+.1f}% [{mark}]（SHADOW 观察中）"
+    )
+
+
+@celery_app.task(name="tasks.update_market_state_gate")
+def update_market_state_gate():
+    """市场状态闸门（SHADOW）：每日记录 R3 动量状态到 system_setting。
+
+    记录格式 market_state_gate:YYYY-MM-DD = {mom_10d_pct, blocked, ...}，
+    为 promotion_allowed 的 SHADOW 实盘期积累逐日对照样本（只记录，不改行为）。
+    """
+    try:
+        import json as _json
+
+        from core.db import save_setting
+        from core.market_regime import compute_market_state_gate
+
+        engine = get_db_engine()
+        if not engine:
+            return {"status": "skipped", "reason": "no_db"}
+        gate = compute_market_state_gate(engine)
+        if not gate.get("bar_date"):
+            return {"status": "skipped", "reason": "no_data"}
+        trading_date = datetime.now().strftime("%Y-%m-%d")
+        save_setting(f"market_state_gate:{trading_date}", _json.dumps(gate, ensure_ascii=False))
+        logger.info(f"Market state gate recorded: {gate}")
+        return {"status": "ok", **gate}
+    except Exception as e:
+        logger.error(f"Error in update_market_state_gate task: {e}")
+        return {"status": "error", "error": str(e)}
