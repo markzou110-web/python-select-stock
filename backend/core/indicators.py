@@ -66,6 +66,32 @@ def calculate_indicators(df, current_price=None, current_vol=None, current_open=
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     true_range = ranges.max(axis=1)
     df['ATR'] = true_range.rolling(window=14).mean()
+
+    # --- Elder 扩展指标（SHADOW 研究用，暂不参与现有策略判定）---
+    # ADX/DMI 趋向系统 (Wilder 14)：区分趋势与震荡。Elder：ADX 下降时不要用趋势跟随工具。
+    up_move = df['最高'].diff()
+    down_move = -df['最低'].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    atr_wilder = true_range.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    pdi = 100 * plus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr_wilder.replace(0, np.nan)
+    mdi = 100 * minus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr_wilder.replace(0, np.nan)
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    df['PDI'] = pdi
+    df['MDI'] = mdi
+    df['ADX'] = dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+
+    # 强力指数 Force Index (Elder)：价量合力 = 成交量 × 收盘变动；2日EMA看短线多空转折
+    force_index = df['成交量'] * df['收盘'].diff()
+    df['Force_Index'] = force_index
+    df['FI2'] = force_index.ewm(span=2, adjust=False).mean()
+    df['FI13'] = force_index.ewm(span=13, adjust=False).mean()
+
+    # OBV / A-D 集散线 (Elder)：量能流向；关注其与价格的背离（领先性）
+    df['OBV'] = (np.sign(df['收盘'].diff()) * df['成交量']).fillna(0).cumsum()
+    bar_range = (df['最高'] - df['最低']).replace(0, np.nan)
+    money_flow_multiplier = ((df['收盘'] - df['开盘']) / bar_range).clip(-1, 1)
+    df['AD_Line'] = (money_flow_multiplier * df['成交量']).fillna(0).cumsum()
     
     # Azul's SMA system
     df['MA20'] = df['收盘'].rolling(window=20).mean()
@@ -269,10 +295,28 @@ def get_weekly_indicators(code, df=None, local_only=False, weekly_ma_period=20):
             
             # 重采样逻辑 (周五作为收盘参考)
             df_w = temp_df['收盘'].resample('W').last().dropna().to_frame()
+            last_date = temp_df.index.max().date()
+            today = pd.Timestamp.now().date()
+            week_complete = last_date.weekday() == 4 and (
+                last_date < today or (last_date == today and pd.Timestamp.now().time() >= pd.Timestamp('15:00').time())
+            )
+            if not week_complete and not df_w.empty:
+                df_w = df_w.iloc[:-1]
             if len(df_w) < 30: return False
         else:
             # 只有在非本地模式下才去拉取
             df_w = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
+            date_col = next((column for column in ("日期", "date", "Date") if column in df_w.columns), None)
+            if date_col and not df_w.empty:
+                last_date = pd.to_datetime(df_w[date_col].iloc[-1], errors="coerce")
+                if pd.notna(last_date):
+                    today = pd.Timestamp.now().date()
+                    week_complete = last_date.weekday() == 4 and (
+                        last_date.date() < today
+                        or (last_date.date() == today and pd.Timestamp.now().time() >= pd.Timestamp('15:00').time())
+                    )
+                    if not week_complete:
+                        df_w = df_w.iloc[:-1]
             if len(df_w) < 30: return False
             
         df_w['EMA10w'] = df_w['收盘'].ewm(span=10, adjust=False).mean()
@@ -394,7 +438,13 @@ def batch_calculate_indicators(df, snapshot_df=None, periods=[5, 10, 20, 60], be
     avg_gain_w = gain_w.groupby(df['code']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
     avg_loss_w = loss_w.groupby(df['code']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
     rs_w = avg_gain_w / avg_loss_w.replace(0, np.nan)
-    df['RSI_WILDER'] = (100 - (100 / (1 + rs_w))).fillna(50)
+    rsi_w = 100 - (100 / (1 + rs_w))
+    # 对齐单票路径语义（calculate_indicators 44 行）：纯上涨(avg_loss=0)→100、
+    # 纯下跌(avg_gain=0)→0；否则连板股 RSI 被错误填成 50，rsi_min=55 门槛把
+    # 最强的票误过滤。仅预热期（diff 无效）保留 fillna(50)。
+    rsi_w = rsi_w.mask((avg_loss_w == 0) & (avg_gain_w > 0), 100.0)
+    rsi_w = rsi_w.mask((avg_gain_w == 0) & (avg_loss_w > 0), 0.0)
+    df['RSI_WILDER'] = rsi_w.fillna(50)
 
     # ATR (Average True Range, 14期 SMA of True Range)
     prev_close = df.groupby('code')['收盘'].shift(1)

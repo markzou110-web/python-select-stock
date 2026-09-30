@@ -1,10 +1,11 @@
 """Point-in-time executable labels for A-share signal research."""
+import json
 from typing import Any, Dict
 
 import pandas as pd
 
 
-EXECUTION_MODEL_VERSION = "a-share-confirmation-trigger-v3"
+EXECUTION_MODEL_VERSION = "a-share-confirmation-trigger-v4"
 
 
 def daily_limit_pct(code: str, *, is_st: bool = False, limit_pct_override: float | None = None) -> float:
@@ -45,6 +46,8 @@ def evaluate_execution_path(
     max_volume_share_pct: float = 5.0,
     commission_min: float = 5.0,
     volume_in_lots: bool = False,
+    planned_stop_price: float | None = None,
+    planned_target_price: float | None = None,
 ) -> Dict[str, Any]:
     """Label one signal using a T+1 entry plan and conservative OHLC ordering.
 
@@ -126,8 +129,14 @@ def evaluate_execution_path(
                 }
     if len(bars) < max_hold_days:
         return {**empty, "reason": "持有期未成熟"}
-    stop = entry_raw * (1 + stop_loss_pct / 100)
-    target = entry_raw * (1 + take_profit_pct / 100) if take_profit_pct is not None else None
+    use_structural_stop = planned_stop_price is not None and 0 < float(planned_stop_price) < entry_raw
+    use_structural_target = planned_target_price is not None and float(planned_target_price) > entry_raw
+    stop = float(planned_stop_price) if use_structural_stop else entry_raw * (1 + stop_loss_pct / 100)
+    target = (
+        float(planned_target_price) if use_structural_target
+        else entry_raw * (1 + take_profit_pct / 100) if take_profit_pct is not None
+        else None
+    )
     max_high = entry_raw
     min_low = entry_raw
     exit_raw = float(bars.loc[len(bars) - 1, "收盘"])
@@ -142,10 +151,10 @@ def evaluate_execution_path(
         if low <= stop:
             # ponytail: daily OHLC cannot reveal intraday order; conservative stop-first is the ceiling.
             exit_raw = min(float(bar["开盘"]), stop) if float(bar["开盘"]) <= stop else stop
-            exit_reason, exit_day = "固定止损", idx + 1
+            exit_reason, exit_day = "结构止损" if use_structural_stop else "固定止损", idx + 1
             break
         if target is not None and high >= target:
-            exit_raw, exit_reason, exit_day = target, "固定止盈", idx + 1
+            exit_raw, exit_reason, exit_day = target, "结构目标" if use_structural_target else "固定止盈", idx + 1
             break
 
     exit_price = exit_raw * (1 - max(0.0, slippage_bps) / 10000)
@@ -197,13 +206,34 @@ def build_executable_labels(signals: pd.DataFrame, daily_k: pd.DataFrame, **para
         st_value = signal.get("is_st_or_delist")
         is_st = (pd.notna(st_value) and bool(st_value)) or "ST" in name.upper()
         call_params = dict(params)
+        detail = signal.get("price_action_detail")
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except (ValueError, TypeError):
+                detail = {}
+        detail = detail if isinstance(detail, dict) else {}
         if "planned_entry_price" not in call_params:
-            planned_entry = signal.get("planned_entry_price")
-            if planned_entry is None or pd.isna(planned_entry):
-                planned_entry = signal.get("confirmation_price")
+            planned_entry = next((signal.get(key) for key in ("planned_entry_price", "pa_entry_price", "confirmation_price") if signal.get(key) is not None and not pd.isna(signal.get(key))), None)
+            if planned_entry is None:
+                planned_entry = detail.get("pa_entry_price") or detail.get("entry_price")
             try:
                 if planned_entry is not None and not pd.isna(planned_entry) and float(planned_entry) > 0:
                     call_params["planned_entry_price"] = float(planned_entry)
+            except (TypeError, ValueError):
+                pass
+        for param, keys in (
+            ("planned_stop_price", ("pa_stop_price", "planned_stop_price", "stop_price")),
+            ("planned_target_price", ("pa_target_price", "planned_target_price", "target_price")),
+        ):
+            if param in call_params:
+                continue
+            value = next((signal.get(key) for key in keys if signal.get(key) is not None and not pd.isna(signal.get(key))), None)
+            if value is None:
+                value = next((detail.get(key) for key in keys if detail.get(key) is not None), None)
+            try:
+                if value is not None and float(value) > 0:
+                    call_params[param] = float(value)
             except (TypeError, ValueError):
                 pass
         label = evaluate_execution_path(code, float(signal["signal_close"]), future, is_st=is_st, **call_params)

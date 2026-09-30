@@ -29,6 +29,9 @@ PRICE_ACTION_SHADOW_FIELDS = (
     "pa_h2_state", "pa_follow_through_state", "pa_gap_type_v2", "pa_mtr_state",
     "pa_structure_state", "pa_sr_confluence_grade", "pa_mtf_state",
 )
+PRICE_ACTION_CONTEXT_FIELDS = (
+    "pa_trade_setup", "price_action_pattern", "pa_trade_action", "pa_pullback_status", "effective_market_regime",
+)
 
 
 def _as_list(value: Any) -> List[str]:
@@ -233,7 +236,7 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
         key: [] for key in (
             "grade_stage", "decision_lifecycle_state", "confirmation_event_state",
             "early_value_transition_state", "sector_phase", "bottom_discovery_stage",
-            *PRICE_ACTION_SHADOW_FIELDS,
+            *PRICE_ACTION_SHADOW_FIELDS, *PRICE_ACTION_CONTEXT_FIELDS,
         )
     }
     research_eligible: List[bool] = []
@@ -259,6 +262,17 @@ def load_scan_outcomes(engine: Engine, days: int = 120) -> pd.DataFrame:
         blockers.append(list(dict.fromkeys(item for item in values if item)))
     for key, values in extracted.items():
         df[key] = values
+    df["pa_trade_setup"] = df["pa_trade_setup"].where(df["pa_trade_setup"].ne("UNKNOWN"), df["price_action_pattern"])
+    df["market_regime"] = df["market_regime"].where(df["market_regime"].ne("UNKNOWN"), df["effective_market_regime"])
+    follow_through = df["pa_follow_through_state"].astype(str).str.upper()
+    invalidated = df["pa_pullback_status"].astype(str).str.upper().eq("INVALIDATED")
+    triggered = df["confirmation_event_state"].astype(str).str.upper().eq("CONFIRMED") | df["pa_h2_state"].astype(str).str.upper().eq("H2_TRIGGERED")
+    has_setup = df["pa_trade_setup"].astype(str).ne("UNKNOWN")
+    df["pa_lifecycle_stage"] = "CONTEXT"
+    df.loc[has_setup, "pa_lifecycle_stage"] = "SETUP"
+    df.loc[triggered, "pa_lifecycle_stage"] = "TRIGGER"
+    df.loc[follow_through.isin(["STRONG", "WEAK"]), "pa_lifecycle_stage"] = "FOLLOW_THROUGH"
+    df.loc[follow_through.eq("FAILED") | invalidated, "pa_lifecycle_stage"] = "FAILURE"
     df["research_eligible"] = pd.Series(research_eligible, index=df.index, dtype=bool)
     df["trade_opportunity_score"] = pd.to_numeric(
         pd.Series(opportunity_scores, index=df.index), errors="coerce"
@@ -606,6 +620,46 @@ def build_price_action_shadow_calibration(df: pd.DataFrame, min_samples: int = 3
     min_samples = max(1, int(min_samples))
     independent = _independent_event_frame(df)
     mature = int(pd.to_numeric(independent.get("ret_5d", pd.Series(dtype=float)), errors="coerce").notna().sum())
+    setup_regime_rows: List[Dict[str, Any]] = []
+    if not independent.empty and {"pa_trade_setup", "market_regime"}.issubset(independent.columns):
+        for (setup, regime), group in independent.groupby(
+            [independent["pa_trade_setup"].fillna("UNKNOWN").astype(str), independent["market_regime"].fillna("UNKNOWN").astype(str)],
+            dropna=False,
+        ):
+            row = {
+                "setup": setup,
+                "market_regime": regime,
+                "signals": int(len(group)),
+                "mature_5d": int(pd.to_numeric(group["ret_5d"], errors="coerce").notna().sum()),
+                "signal_close_5d": _metric_summary(group["ret_5d"]),
+                "status": "MATURE_SAMPLE_READY" if pd.to_numeric(group["ret_5d"], errors="coerce").notna().sum() >= min_samples else "INSUFFICIENT_DATA",
+            }
+            if "exec_return_pct" in group.columns:
+                filled = group["exec_filled"].fillna(False).astype(bool) if "exec_filled" in group else pd.Series(False, index=group.index)
+                row["executable"] = _metric_summary(group.loc[filled, "exec_return_pct"])
+                row["filled"] = int(filled.sum())
+                row["unfilled"] = int((~filled).sum())
+            if "signal_date" in group.columns:
+                ordered = group.assign(_date=pd.to_datetime(group["signal_date"], errors="coerce")).dropna(subset=["_date"]).sort_values("_date")
+                split_at = int(len(ordered) * 0.7)
+                test = ordered.iloc[split_at:]
+                test_metrics = _metric_summary(test["ret_5d"])
+                test_metrics["period_start"] = str(test["_date"].min().date()) if not test.empty else None
+                test_metrics["period_end"] = str(test["_date"].max().date()) if not test.empty else None
+                row["chronological_test_30pct"] = {
+                    **test_metrics,
+                    "status": "DESCRIPTIVE_HOLDOUT" if test_metrics["signals"] >= min_samples else "INSUFFICIENT_DATA",
+                    "method": "按信号日期排序，最早70%描述性训练段，最新30%留出段；样本外描述，不据此自动调权",
+                }
+                if "exec_return_pct" in test.columns:
+                    test_filled = test["exec_filled"].fillna(False).astype(bool) if "exec_filled" in test else pd.Series(False, index=test.index)
+                    holdout_exec = _metric_summary(test.loc[test_filled, "exec_return_pct"])
+                    row["chronological_test_30pct"]["executable"] = holdout_exec
+                    row["chronological_test_30pct"]["executable_status"] = (
+                        "DESCRIPTIVE_HOLDOUT" if holdout_exec["signals"] >= min_samples else "INSUFFICIENT_DATA"
+                    )
+            setup_regime_rows.append(row)
+    setup_regime_rows.sort(key=lambda row: (row["mature_5d"], row["setup"], row["market_regime"]), reverse=True)
     return {
         "status": "READY_FOR_OOS_REVIEW" if mature >= min_samples else "INSUFFICIENT_DATA",
         "production_effect": False,
@@ -615,6 +669,8 @@ def build_price_action_shadow_calibration(df: pd.DataFrame, min_samples: int = 3
             field: _group_rows(independent, field)
             for field in PRICE_ACTION_SHADOW_FIELDS
         },
+        "lifecycle_stages": _group_rows(independent, "pa_lifecycle_stage"),
+        "setup_by_market_regime": setup_regime_rows,
         "promotion_rule": "累计足够成熟独立样本后，仍需滚动样本外验证；当前不自动调权。",
     }
 
@@ -916,14 +972,28 @@ def build_trade_gate_readiness_report(df: pd.DataFrame, min_samples: int = 30) -
         "v1 行为基线对照组；gates_ready 只由当前v2检查项决定。",
         "初期 v2 样本不足属预期：门槛的目的就是先积累再放行。",
         "样本外/滑点/手续费口径见 /api/review/strategy-calibration-report?executable=true。",
+        # 晋升硬前置（4-3a）：gates_ready 从此是 regime 乘数等特性转正的前置条件，
+        # 判定入口 core.validation_gate.promotion_allowed（代码级，替代文档约定）
+        "晋升硬前置：SHADOW/advisory 阈值转正须经 core.validation_gate.promotion_allowed() 判定。",
     ]
     if not v2_checks:
         notes.append("当前v2策略版本暂无样本")
+    from core.validation_gate import promotion_allowed
+
+    regime_allowed, regime_detail = promotion_allowed(
+        "trade_gate_v2_regime_multiplier", gates_ready=bool(v2_checks) and all(
+            item["status"] == "PASS" for item in v2_checks
+        ),
+    )
     return {
         "policy_version": TRADE_GATE_POLICY_VERSION,
         "min_samples_per_regime": min_samples,
         "min_profit_factor": TRADE_GATE_MIN_PROFIT_FACTOR,
         "gates_ready": bool(v2_checks) and all(item["status"] == "PASS" for item in v2_checks),
+        "promotion": {
+            "regime_multiplier_live_allowed": regime_allowed,
+            "detail": regime_detail,
+        },
         "checks": checks,
         "notes": notes,
     }

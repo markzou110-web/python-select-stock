@@ -668,6 +668,110 @@ def get_market_snapshot(force_refresh: bool = False) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 小名单快报价：持仓/自选盯盘专用（≤FAST_QUOTE_MAX_CODES 只）。
+# 全市场快照为扫描/决策服务（60s 缓存、多源容灾）；持仓盯盘只需要几十只票的
+# 秒级报价。get_fast_quotes 走直连批量接口（腾讯一次 GET → 新浪直连 → 全市场
+# 快照过滤兜底），返回与 get_market_snapshot 同构的 DataFrame（含 attrs 元数据），
+# 风控/告警/快盯的取价调用方无需区分两者。
+# ─────────────────────────────────────────────────────────────────────────────
+FAST_QUOTE_TTL_SECONDS = float(os.getenv("FAST_QUOTE_TTL_SECONDS", "5"))
+FAST_QUOTE_MAX_CODES = int(os.getenv("FAST_QUOTE_MAX_CODES", "60"))
+_FAST_QUOTE_CACHE: Dict[frozenset, Tuple[pd.DataFrame, float]] = {}
+_fast_quote_lock = threading.Lock()
+
+
+def _fast_quote_frame(codes: List[str]) -> Tuple[pd.DataFrame, str]:
+    """按优先级尝试 腾讯直连 → 新浪直连 → 全市场快照过滤，返回 (frame, source)。"""
+    # 1) 腾讯直连：一次 GET 批量报价（约百毫秒），首选
+    try:
+        from .direct_sources import tencent_quote
+        quotes = tencent_quote(codes)
+        rows = []
+        for code in codes:
+            quote = quotes.get(code) or {}
+            price = float(quote.get("price") or 0)
+            if price <= 0:
+                continue
+            last_close = float(quote.get("last_close") or 0)
+            rows.append({
+                "code": code,
+                "name": quote.get("name") or "",
+                "price": price,
+                "open": float(quote.get("open") or 0) or None,
+                "high": float(quote.get("high") or 0) or price,
+                "low": float(quote.get("low") or 0) or price,
+                # 涨跌幅以昨收现算为准，不依赖接口字段单位差异
+                "pct_chg": (price - last_close) / last_close * 100 if last_close > 0 else float(quote.get("change_pct") or 0.0),
+                "vol": float(quote.get("vol") or 0),
+                "quote_time": quote.get("quote_time") or "",
+            })
+        if rows:
+            return pd.DataFrame(rows), "腾讯直连快报价"
+    except Exception as exc:
+        logger.warning(f"fast quote tencent failed: {exc}")
+
+    # 2) 新浪直连（requests 实现，绕过 akshare 内 py_mini_racer 的 arm64 段错误）
+    try:
+        from .direct_sources import snapshot_from_sina
+        df = snapshot_from_sina(codes)
+        if df is not None and not df.empty and "code" in df.columns:
+            df = df[df["code"].isin(codes)].copy()
+            if not df.empty:
+                return df, "新浪直连快报价"
+    except Exception as exc:
+        logger.warning(f"fast quote sina direct failed: {exc}")
+
+    # 3) 兜底：全市场快照（自带 60s 缓存与多源容灾）过滤
+    full = get_market_snapshot()
+    if full is not None and not full.empty:
+        sub = full[full["code"].isin(codes)].copy()
+        if not sub.empty:
+            full_source = (getattr(full, "attrs", {}) or {}).get("source") or "全市场快照"
+            return sub, f"{full_source}(过滤)"
+    return pd.DataFrame(), "unknown"
+
+
+def get_fast_quotes(codes, force_refresh: bool = False, ttl_seconds: Optional[float] = None) -> pd.DataFrame:
+    """获取小名单（持仓/自选）的秒级实时报价。
+
+    与 get_market_snapshot 返回同构 DataFrame；TTL 缓存默认 5 秒，同一次
+    tick 内的多个调用方（风控/告警/快盯）共享一次网络请求。超过
+    FAST_QUOTE_MAX_CODES 只时自动截断（调用方应先按规模分流到全市场快照）。
+    """
+    wanted = sorted({str(c).strip().zfill(6) for c in (codes or []) if str(c).strip()})
+    if not wanted:
+        return pd.DataFrame()
+    ttl = FAST_QUOTE_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds)
+    cache_key = frozenset(wanted)
+    now_ts = time.time()
+    with _fast_quote_lock:
+        hit = _FAST_QUOTE_CACHE.get(cache_key)
+        if hit and not force_refresh and now_ts - hit[1] < ttl:
+            return hit[0]
+
+    df, source = _fast_quote_frame(wanted[:FAST_QUOTE_MAX_CODES])
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.zfill(6)
+    # 双重防御：high/low 缺失时以现价填充（与全市场快照同一约定）
+    if "price" in df.columns:
+        if "high" not in df.columns or df["high"].isna().all():
+            df["high"] = df["price"]
+        if "low" not in df.columns or df["low"].isna().all():
+            df["low"] = df["price"]
+    fetched_at = datetime.now()
+    df.attrs = {
+        "fetched_at": fetched_at,
+        "data_date": _infer_snapshot_data_date(df, fetched_at),
+        "source": source,
+    }
+    with _fast_quote_lock:
+        _FAST_QUOTE_CACHE[cache_key] = (df, now_ts)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # P1：行情新鲜度辅助函数（供 Bark 推送生成"⏱️ 行情 HH:MM · 源"标注）
 # 消除 5 处内联 set_index().to_dict() 重复（复用优先），并统一暴露 attrs 元数据。
 # ─────────────────────────────────────────────────────────────────────────────

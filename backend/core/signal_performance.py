@@ -16,6 +16,20 @@ from core.execution_insights import get_active_execution_plan
 SNAPSHOT_VERSION = "intraday-signal-snapshot-v1"
 
 
+def _maturity_date(daily_groups: Dict[str, "pd.DataFrame"], code: str, signal_date) -> Any:
+    """信号日后第 5 个交易日日期（成熟日）；无未来数据返回 None。"""
+    code_daily = daily_groups.get(code)
+    if code_daily is None or code_daily.empty:
+        return None
+    rows = code_daily.index[code_daily["date"] == signal_date].tolist()
+    if not rows:
+        return None
+    future = rows[0] + 5
+    if future >= len(code_daily):
+        return None
+    return code_daily.loc[future, "date"]
+
+
 def _number(value: Any) -> float | None:
     try:
         number = float(value)
@@ -305,6 +319,19 @@ def build_signal_performance_report(engine, days: int = 120) -> Dict[str, Any]:
         items.append(item)
 
     item_df = pd.DataFrame(items)
+    # 独立事件去重（4-3b）：同一票连续多日提醒的 5 日收益窗口高度重叠（自相关），
+    # 直接计数会夸大验证样本量。复用 outcome_calibration 的成熟期口径：
+    # 每票每策略在前一事件第 5 个交易日成熟前不重复计数。
+    if not item_df.empty:
+        from core.outcome_calibration import mark_independent_signal_events
+
+        item_df["maturity_5d_date"] = item_df.apply(
+            lambda row: _maturity_date(daily_groups, str(row["code"]), row["signal_date"]),
+            axis=1,
+        )
+        item_df["independent_event"] = mark_independent_signal_events(item_df)[
+            "independent_event"
+        ].fillna(False).astype(bool)
     cohorts = []
     masks = {
         "selection": pd.Series(True, index=item_df.index),
@@ -350,22 +377,32 @@ def build_signal_performance_report(engine, days: int = 120) -> Dict[str, Any]:
         denominator = coverage["dates"] * top_n
         coverage[f"top{top_n}_coverage_pct"] = round(coverage[f"top{top_n}_hits"] / denominator * 100, 2) if denominator else 0
 
-    mature_5d = int(item_df["ret_5d"].notna().sum())
-    execution_mature_5d = int(
-        item_df[item_df["trade_eligible"].astype(bool)]["ret_5d"].notna().sum()
-    )
+    # 4-3b：VALIDATED 改为"独立事件计数 + 表现门槛"双条件——重叠窗口的
+    # 计数虚高不再能单独把状态推成 VALIDATED，且零/负期望不被验证通过
+    independent_df = item_df[item_df.get("independent_event", pd.Series(True, index=item_df.index)).astype(bool)]
+    mature_series = independent_df["ret_5d"].dropna()
+    mature_5d = int(len(mature_series))
+    selection_avg_positive = bool(len(mature_series)) and float(mature_series.mean()) > 0
+    execution_independent = independent_df[independent_df["trade_eligible"].astype(bool)]
+    execution_mature_series = execution_independent["ret_5d"].dropna()
+    execution_mature_5d = int(len(execution_mature_series))
+    execution_avg_positive = bool(len(execution_mature_series)) and float(execution_mature_series.mean()) > 0
     confirmation_samples = int(item_df["confirmation_to_close_pct"].notna().sum())
     required = 30
     validation = {
         "selection": {
-            "status": "VALIDATED" if mature_5d >= required else "INSUFFICIENT_DATA",
+            "status": "VALIDATED" if (mature_5d >= required and selection_avg_positive) else "INSUFFICIENT_DATA",
             "mature_5d": mature_5d,
             "required": required,
+            "independent_events_only": True,
+            "avg_ret_5d_positive": selection_avg_positive,
         },
         "execution": {
-            "status": "VALIDATED" if execution_mature_5d >= required else "INSUFFICIENT_DATA",
+            "status": "VALIDATED" if (execution_mature_5d >= required and execution_avg_positive) else "INSUFFICIENT_DATA",
             "mature_5d": execution_mature_5d,
             "required": required,
+            "independent_events_only": True,
+            "avg_ret_5d_positive": execution_avg_positive,
         },
         "confirmation": {
             "status": "VALIDATED" if confirmation_samples >= required else "INSUFFICIENT_DATA",

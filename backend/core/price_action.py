@@ -8,6 +8,7 @@ levels without making a direct trading decision.
 
 from __future__ import annotations
 
+from datetime import datetime, time
 from typing import Any, Dict, List
 
 import numpy as np
@@ -83,6 +84,34 @@ def _volume_series(work: pd.DataFrame) -> pd.Series:
         if col in work.columns:
             return pd.to_numeric(work[col], errors="coerce").fillna(0)
     return pd.Series([0] * len(work), index=work.index, dtype=float)
+
+
+def aggregate_weekly_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate daily OHLCV into weekly bars dated by each week's last session."""
+    if frame is None or frame.empty or "日期" not in frame.columns:
+        return pd.DataFrame(columns=[] if frame is None else frame.columns)
+    work = frame.copy()
+    work["日期"] = pd.to_datetime(work["日期"], errors="coerce")
+    work = work.dropna(subset=["日期"])
+    aggregation = {
+        "日期": "last",
+        "开盘": "first",
+        "最高": "max",
+        "最低": "min",
+        "收盘": "last",
+    }
+    aggregation.update({
+        column: "sum" for column in ("成交量", "成交额", "换手率")
+        if column in work.columns
+    })
+    work["_week"] = work["日期"].dt.to_period("W-FRI")
+    return (
+        work.groupby("_week", sort=True)
+        .agg(aggregation)
+        .reset_index(drop=True)
+        .dropna(subset=["开盘", "最高", "最低", "收盘"])
+        .reset_index(drop=True)
+    )
 
 
 def _mtr_first_pullback_rebreak(frame: pd.DataFrame, confirmed_index: int, current_index: int) -> Dict[str, float] | None:
@@ -585,7 +614,10 @@ def _evaluate_pullback_validity(
 
 def _weekly_context(work: pd.DataFrame) -> Dict[str, Any]:
     if len(work) < 25:
-        return {"context": "周线数据不足", "score": 0, "note": "日线样本不足，暂不做多周期确认。"}
+        return {
+            "context": "周线数据不足", "permission": "WAIT", "score": 0,
+            "note": "日线样本不足，暂不做多周期确认。",
+        }
 
     weekly = pd.DataFrame()
     current_week_complete = True
@@ -600,7 +632,14 @@ def _weekly_context(work: pd.DataFrame) -> Dict[str, Any]:
                 "最低": "min",
                 "收盘": "last",
             }).dropna().rename(columns={"开盘": "open", "最高": "high", "最低": "low", "收盘": "close"}).tail(14)
-            current_week_complete = bool(dated.index[-1].weekday() == 4)
+            last_date = dated.index[-1].date()
+            today = datetime.now().date()
+            current_week_complete = bool(
+                last_date.weekday() == 4
+                and (last_date < today or (last_date == today and datetime.now().time() >= time(15, 0)))
+            )
+            if not current_week_complete and not weekly.empty:
+                weekly = weekly.iloc[:-1]
     if len(weekly) < 5:
         chunks = []
         for start in range(max(0, len(work) - 60), len(work), 5):
@@ -614,10 +653,16 @@ def _weekly_context(work: pd.DataFrame) -> Dict[str, Any]:
                 "close": _safe_float(part["收盘"].iloc[-1]),
             })
         fallback = pd.DataFrame(chunks)
+        if not current_week_complete and not fallback.empty:
+            fallback = fallback.iloc[:-1]
         if len(fallback) >= len(weekly):
             weekly = fallback
     if len(weekly) < 5:
-        return {"context": "周线数据不足", "score": 0, "note": "周线合成样本不足，暂不做多周期确认。", "current_week_complete": current_week_complete}
+        return {
+            "context": "周线数据不足", "permission": "WAIT", "score": 0,
+            "note": "周线合成样本不足，暂不做多周期确认。",
+            "current_week_complete": current_week_complete,
+        }
 
     weekly["EMA5"] = weekly["close"].ewm(span=5, adjust=False).mean()
     weekly["EMA10"] = weekly["close"].ewm(span=10, adjust=False).mean()
@@ -639,10 +684,15 @@ def _weekly_context(work: pd.DataFrame) -> Dict[str, Any]:
         result = {"context": "周线交易区间", "score": -5, "note": "周线仍在交易区间，日线信号需要看位置。"}
     else:
         result = {"context": "周线中性", "score": 0, "note": "周线方向未形成明确确认。"}
+    if result["context"] in {"周线多头", "周线向上突破"}:
+        result["permission"] = "ALLOW_LONG"
+    elif result["context"] in {"周线空头", "周线向下破位", "周线数据不足"}:
+        result["permission"] = "WAIT"
+    else:
+        result["permission"] = "REDUCE_SIZE"
     result["current_week_complete"] = current_week_complete
     if not current_week_complete:
-        result["score"] = int(round(result["score"] * 0.5))
-        result["note"] = f"{result['note']} 本周尚未收盘，仅按观察信号计半权重。"
+        result["note"] = f"{result['note']} 本周尚未收盘，仅展示观察，不参与周线方向确认。"
     return result
 
 
@@ -963,6 +1013,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_channel_state": "无明显通道",
         "pa_position_strategy": "等待更多K线",
         "pa_weekly_context": "周线数据不足",
+        "pa_weekly_permission": "WAIT",
         "pa_multi_timeframe_score": 0,
         "pa_multi_timeframe_note": "日线样本不足，暂不做多周期确认。",
         "pa_current_week_complete": False,
@@ -1880,6 +1931,7 @@ def analyze_price_action(df: pd.DataFrame) -> Dict[str, Any]:
         "pa_channel_state": channel_state,
         "pa_position_strategy": position_strategy,
         "pa_weekly_context": weekly_context,
+        "pa_weekly_permission": str(weekly.get("permission") or "WAIT"),
         "pa_multi_timeframe_score": mtf_score,
         "pa_multi_timeframe_note": mtf_note,
         "pa_current_week_complete": current_week_complete,
@@ -2327,26 +2379,103 @@ def build_price_action_annotations(df: pd.DataFrame, lookback: int = 90) -> Dict
             "value": round(_safe_float(recent[col].iloc[idx]), 2),
         }
 
-    if len(low_points) >= 2:
-        p1, p2 = low_points[-2], low_points[-1]
-        if p1 < p2:
+    def trendline(start: int, anchors: List[int], column: str, direction: str):
+        start_value = _safe_float(recent[column].iloc[start])
+        for end in reversed(anchors):
+            if end <= start:
+                continue
+            end_value = _safe_float(recent[column].iloc[end])
+            if (direction == "up" and end_value <= start_value) or (
+                direction == "down" and end_value >= start_value
+            ):
+                continue
+            slope = (end_value - start_value) / (end - start)
+            between = range(start + 1, end)
+            if direction == "up":
+                crossed = any(
+                    start_value + slope * (idx - start) > _safe_float(recent["最低"].iloc[idx])
+                    for idx in between
+                )
+            else:
+                crossed = any(
+                    start_value + slope * (idx - start) < _safe_float(recent["最高"].iloc[idx])
+                    for idx in between
+                )
+            if not crossed:
+                breach_indices = []
+                for idx in range(end + 1, len(recent)):
+                    line_value = start_value + slope * (idx - start)
+                    close = _safe_float(recent["收盘"].iloc[idx])
+                    breached = close < line_value if direction == "up" else close > line_value
+                    breach_indices.append(idx if breached else None)
+                confirmed_break = next(
+                    (
+                        breach_indices[offset + 1]
+                        for offset in range(len(breach_indices) - 1)
+                        if breach_indices[offset] is not None and breach_indices[offset + 1] is not None
+                    ),
+                    None,
+                )
+                latest_close = _safe_float(recent["收盘"].iloc[-1])
+                latest_line = start_value + slope * (len(recent) - 1 - start)
+                testing_break = (
+                    latest_close < latest_line if direction == "up" else latest_close > latest_line
+                ) and confirmed_break is None
+                return {
+                    "end_idx": len(recent) - 1,
+                    "end_value": latest_line,
+                    "broken": confirmed_break is not None,
+                    "break_idx": confirmed_break,
+                    "testing_break": testing_break,
+                }
+        return None
+
+    if low_points:
+        start = int(recent["最低"].idxmin())
+        peak = int(recent["最高"].idxmax())
+        result = trendline(start, [idx for idx in low_points if idx < peak], "最低", "up")
+        if result:
+            broken = result["broken"]
             lines.append({
                 "kind": "support",
-                "label": "上升趋势线/支撑",
-                "color": "#0d9488",
+                "label": "上升线已跌破·回抽压力参考" if broken else (
+                    "上升线破位待确认" if result["testing_break"] else "道氏上升趋势线·有效支撑"
+                ),
+                "status": "broken" if broken else "testing_break" if result["testing_break"] else "active",
+                "break_date": (
+                    recent["日期"].iloc[result["break_idx"]].strftime("%Y-%m-%d")
+                    if broken else None
+                ),
+                "color": "#b45309" if broken or result["testing_break"] else "#0d9488",
                 "style": "dashed",
-                "points": [point(p1, "最低"), point(p2, "最低")],
+                "points": [point(start, "最低"), {
+                    "time": recent["日期"].iloc[result["end_idx"]].strftime("%Y-%m-%d"),
+                    "value": round(result["end_value"], 2),
+                }],
             })
 
-    if len(high_points) >= 2:
-        p1, p2 = high_points[-2], high_points[-1]
-        if p1 < p2:
+    if high_points:
+        start = int(recent["最高"].idxmax())
+        trough = int(recent["最低"].idxmin())
+        result = trendline(start, [idx for idx in high_points if idx < trough], "最高", "down")
+        if result:
+            broken = result["broken"]
             lines.append({
                 "kind": "resistance",
-                "label": "下降趋势线/压力",
-                "color": "#dc2626",
+                "label": "下降线已突破·回踩支撑参考" if broken else (
+                    "下降线突破待确认" if result["testing_break"] else "道氏下降趋势线·有效压力"
+                ),
+                "status": "broken" if broken else "testing_break" if result["testing_break"] else "active",
+                "break_date": (
+                    recent["日期"].iloc[result["break_idx"]].strftime("%Y-%m-%d")
+                    if broken else None
+                ),
+                "color": "#0d9488" if broken else "#b45309" if result["testing_break"] else "#dc2626",
                 "style": "dashed",
-                "points": [point(p1, "最高"), point(p2, "最高")],
+                "points": [point(start, "最高"), {
+                    "time": recent["日期"].iloc[result["end_idx"]].strftime("%Y-%m-%d"),
+                    "value": round(result["end_value"], 2),
+                }],
             })
 
     if summary.get("pa_entry_price") and summary.get("pa_stop_price"):

@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Dict, Any, Optional
 
 from core.logging_config import logger
+from sqlalchemy import text
 
 
 class MarketRegime(Enum):
@@ -299,3 +300,159 @@ SEASONALITY_NOTES = {
 def get_seasonality_note(month: Optional[int] = None) -> Optional[str]:
     month = int(month) if month else datetime.now().month
     return SEASONALITY_NOTES.get(month)
+
+
+# Elder NH-NL 默认回看窗口（52 周新高/新低）
+NHNL_WINDOW_DAYS = 250
+NHNL_MIN_BARS = 200  # 不足此数的新股不计入（避免次新股把每根K线都算成新低）
+
+
+def compute_market_breadth_extremes(
+    engine,
+    window: int = NHNL_WINDOW_DAYS,
+) -> Dict[str, Any]:
+    """Elder 市场宽度指标：全市场创 N 日新高/新低家数 + 站上 MA50 占比。
+
+    《以交易为生》：NH-NL 指数是股票市场最好的领先指标，与指数背离预示转折；
+    站上 50 日均线的股票占比的极端值（>75% / <25%）后回落是中期顶部/底部信号。
+
+    直接对 daily_k 全市场逐票滚动统计，输出以数据中最后一个交易日为基准
+    （daily_k 未同步到今日时不写今日标签）。只做只读统计，不写库——
+    落库由 db.record_breadth_extremes 负责。
+
+    Args:
+        engine: SQLAlchemy engine（PG 生产 / SQLite 测试均可）
+        window: 新高新低回看交易日数（默认 250 ≈ 52 周）
+    Returns:
+        {bar_date, nh_count, nl_count, pct_above_ma50, total_count, window}；
+        无数据时 total_count=0。
+    """
+    result: Dict[str, Any] = {
+        "bar_date": None, "nh_count": 0, "nl_count": 0,
+        "pct_above_ma50": None, "total_count": 0, "window": int(window),
+    }
+    if engine is None:
+        return result
+    try:
+        df = pd.read_sql(
+            text("SELECT code, date, high, low, close FROM daily_k WHERE date >= :start ORDER BY code, date"),
+            engine,
+            params={"start": (datetime.now() - pd.Timedelta(days=int(window * 2.2))).strftime("%Y-%m-%d")},
+        )
+    except Exception as exc:
+        logger.warning(f"compute_market_breadth_extremes: daily_k query failed: {exc}")
+        return result
+    if df.empty:
+        return result
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values(["code", "date"])
+    bar_date = df["date"].max()
+    result["bar_date"] = bar_date.strftime("%Y-%m-%d")
+
+    # 逐票滚动窗口（含当日）：当日 high 即窗口最大值 → 创新高；low 同理。
+    # rolling(max) 含当日，故 high >= rolling_max 当且仅当当日创窗口新高。
+    grouped = df.groupby("code", sort=False)
+    high_max = grouped["high"].transform(lambda s: s.rolling(int(window), min_periods=NHNL_MIN_BARS).max())
+    low_min = grouped["low"].transform(lambda s: s.rolling(int(window), min_periods=NHNL_MIN_BARS).min())
+    ma50 = grouped["close"].transform(lambda s: s.rolling(50, min_periods=50).mean())
+    df = df.assign(_nh=df["high"] >= high_max, _nl=df["low"] <= low_min, _ma50=ma50)
+
+    tail = df[df["date"] == bar_date]
+    result["nh_count"] = int(tail["_nh"].sum())
+    result["nl_count"] = int(tail["_nl"].sum())
+    valid_ma = tail["_ma50"].notna()  # 上市不足50日的新股不计入 MA50 占比
+    result["pct_above_ma50"] = (
+        round(float((tail.loc[valid_ma, "close"] > tail.loc[valid_ma, "_ma50"]).mean() * 100), 2)
+        if bool(valid_ma.any()) else None
+    )
+    result["total_count"] = int(len(tail))
+    logger.debug(
+        f"NH-NL @{result['bar_date']}: nh={result['nh_count']} nl={result['nl_count']} "
+        f"ma50={result['pct_above_ma50']}% over {result['total_count']} stocks"
+    )
+    return result
+
+
+# ── 涨停情绪周期（借鉴 easy-stock 超短连板分析；数据源为 limit_up_events）──
+
+
+def compute_limit_up_sentiment(engine, event_date: Optional[str] = None) -> Dict[str, Any]:
+    """从 limit_up_events 聚合当日涨停情绪：涨停/炸板家数、最高连板、晋级率、炸板率。
+
+    原始事件由 collect_limit_up_leadership 盘中逐分钟落库（东财涨停池 SEALED +
+    炸板池 BROKEN），本函数只做只读 SQL 聚合，不写库——落库由
+    db.record_limit_up_sentiment 负责（与 NH-NL 宽度同一条安全契约）。
+
+    口径：
+      - 炸板率 = 炸板家数 / (涨停家数 + 炸板家数)，>40% 为退潮特征（ZT_EBB_BROKEN_RATE_PCT）
+      - 晋级率 = 今日 2 板及以上家数 / 上一交易日涨停家数；取表内最近的前一交易日，
+        表内无前日数据（冷启动/停采）时为 None，不猜。
+    """
+    result: Dict[str, Any] = {
+        "bar_date": None, "prev_bar_date": None,
+        "sealed_count": 0, "broken_count": 0, "max_streak": 0,
+        "streak_ge2_count": 0, "promotion_rate": None, "broken_rate": None,
+    }
+    if engine is None:
+        return result
+    try:
+        df = pd.read_sql(text("""
+            SELECT event_date, status, COUNT(*) AS cnt,
+                   MAX(CASE WHEN status = 'SEALED' THEN limit_up_streak ELSE 0 END) AS max_streak,
+                   SUM(CASE WHEN status = 'SEALED' AND limit_up_streak >= 2 THEN 1 ELSE 0 END) AS streak_ge2
+            FROM limit_up_events
+            GROUP BY event_date, status
+        """), engine)
+    except Exception as exc:
+        logger.warning(f"compute_limit_up_sentiment: limit_up_events query failed: {exc}")
+        return result
+    if df.empty:
+        return result
+
+    df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
+    df = df.dropna(subset=["event_date"])
+    if df.empty:
+        return result
+
+    dates = sorted(df["event_date"].unique())
+    if event_date:
+        target = pd.to_datetime(event_date, errors="coerce")
+        candidates = [d for d in dates if d <= target]
+        if not candidates:
+            return result
+        bar_date = max(candidates)
+    else:
+        bar_date = max(dates)
+    prev_date = max((d for d in dates if d < bar_date), default=None)
+    result["bar_date"] = pd.Timestamp(bar_date).strftime("%Y-%m-%d")
+    if prev_date is not None:
+        result["prev_bar_date"] = pd.Timestamp(prev_date).strftime("%Y-%m-%d")
+
+    day = df[df["event_date"] == bar_date]
+    sealed = int(day.loc[day["status"] == "SEALED", "cnt"].sum())
+    broken = int(day.loc[day["status"] == "BROKEN", "cnt"].sum())
+    result["sealed_count"] = sealed
+    result["broken_count"] = broken
+    result["max_streak"] = int(day["max_streak"].fillna(0).max())
+    result["streak_ge2_count"] = int(day["streak_ge2"].fillna(0).sum())
+    if sealed + broken > 0:
+        result["broken_rate"] = round(broken / (sealed + broken) * 100, 1)
+    if prev_date is not None:
+        prev = df[df["event_date"] == prev_date]
+        prev_sealed = int(prev.loc[prev["status"] == "SEALED", "cnt"].sum())
+        if prev_sealed > 0 and sealed + broken > 0:
+            result["promotion_rate"] = round(result["streak_ge2_count"] / prev_sealed * 100, 1)
+    logger.debug(
+        f"limit-up sentiment @{result['bar_date']}: sealed={sealed} broken={broken} "
+        f"max_streak={result['max_streak']} promotion={result['promotion_rate']} broken_rate={result['broken_rate']}%"
+    )
+    return result
+
+
+def limit_up_sentiment_ebb(stats: Dict[str, Any]) -> bool:
+    """炸板率达到退潮阈值时返回 True（数据缺失时 fail-open 返回 False）。"""
+    from core.risk_constants import ZT_EBB_BROKEN_RATE_PCT
+
+    broken_rate = stats.get("broken_rate")
+    return broken_rate is not None and float(broken_rate) >= ZT_EBB_BROKEN_RATE_PCT
