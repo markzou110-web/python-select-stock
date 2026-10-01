@@ -228,6 +228,69 @@ def _narrative(stats: Dict[str, Any]) -> str:
     return "；".join(parts) + "。热度为规则化研究评分，不构成交易依据。"
 
 
+
+
+AI_THEME_MAX_CALLS = int(__import__("os").getenv("AI_THEME_MAX_CALLS", "20"))
+
+
+def _post_chat_text(payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    """纯文本 /chat/completions 薄客户端（ai_stock_analysis._post_chat 是 JSON 专用
+    契约：返回解析后的 JSON 对象并对非 JSON 内容重试，叙述用不了它）。"""
+    import requests as _requests
+
+    from core.ai_stock_analysis import _chat_completions_url
+    from core.config import config
+
+    headers = {"Content-Type": "application/json"}
+    if config.AI_API_KEY:
+        headers["Authorization"] = f"Bearer {config.AI_API_KEY}"
+    response = _requests.post(
+        _chat_completions_url(config.AI_BASE_URL), headers=headers,
+        json=payload, timeout=config.AI_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    body = response.json()
+    choice = (body.get("choices") or [{}])[0]
+    content = (choice.get("message") or {}).get("content")
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    return str(content or "").strip(), usage
+
+
+def generate_narrative_llm(theme: str, stats: Dict[str, Any], evidence: List[str]) -> Optional[str]:
+    """LLM 生成主题叙述（OpenAI 兼容 /chat/completions，复用 ai_stock_analysis 客户端）。
+
+    未配置 AI（is_ai_analysis_configured=False）或任何异常时返回 None，
+    调用方回落规则模板 narrative。输出为研究叙述，禁止买卖指令。"""
+    try:
+        from core.config import config
+
+        if not config.is_ai_analysis_configured():
+            return None
+        payload = {
+            "model": config.AI_MODEL,
+            "messages": [
+                {"role": "system", "content": (
+                    "你是 A 股题材研究助手。基于给定的题材结构化数据与新闻标题，输出一段"
+                    "不超过120字的中文研究叙述：先判断题材所处阶段（发酵/主线/分化/退潮），"
+                    "引用资金与涨停梯队证据，最后一句给风险提示。禁止给出任何买卖指令或"
+                    "具体操作建议，禁止编造数据中不存在的事实。直接输出叙述正文。"
+                )},
+                {"role": "user", "content": (
+                    f"主题：{theme}\n"
+                    f"热度数据：{__import__('json').dumps(stats, ensure_ascii=False)}\n"
+                    f"新闻标题：{__import__('json').dumps(evidence, ensure_ascii=False)}"
+                )},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 400,
+        }
+        text_out, _usage = _post_chat_text(payload)
+        return text_out[:400] if text_out else None
+    except Exception as exc:
+        logger.debug(f"LLM narrative unavailable for {theme}: {exc}")
+        return None
+
+
 def _tier(stats: Dict[str, Any], heat: float) -> str:
     if heat >= 80 and (stats.get("limit_up_count") or 0) >= 3:
         return "主线（涨停+资金共振）"
@@ -244,6 +307,7 @@ def collect_theme_heat(
     bar_date: Optional[str] = None,
     top_n: int = TOP_THEMES,
     fetchers: Optional[Dict[str, Any]] = None,
+    use_llm: bool = True,
 ) -> Dict[str, Any]:
     """采集并落库当日题材热度（scope: CONCEPT / INDUSTRY）。fetcher 可注入便于测试。"""
     fetchers = fetchers or {}
@@ -316,6 +380,16 @@ def collect_theme_heat(
     rows.sort(key=lambda r: r["heat_score"], reverse=True)
     for rank, row in enumerate(rows, start=1):
         row["rank"] = rank
+    # LLM 叙述（top 主题，成本受 AI_THEME_MAX_CALLS 限制；未配置 AI 时全部回落规则模板）
+    if use_llm:
+        for row in rows[:max(0, AI_THEME_MAX_CALLS)]:
+            row["narrative_llm"] = generate_narrative_llm(
+                row["theme"],
+                {k: row.get(k) for k in ("heat_score", "flow_3d", "chg_today",
+                                          "limit_up_count", "max_streak",
+                                          "pct_above_ma20", "hot_overlap")},
+                row.get("evidence") or [],
+            )
     saved = save_theme_heat_history(rows, engine=engine)
     return {"saved": saved, "scope": scope, "bar_date": bar_date, "themes": len(rows)}
 
@@ -362,6 +436,7 @@ def load_theme_board(engine=None, scope: str = "CONCEPT", bar_date: Optional[str
             "max_streak": row.get("max_streak"), "hot_overlap": row.get("hot_overlap"),
             "pct_above_ma20": row.get("pct_above_ma20"), "members_count": row.get("members_count"),
             "narrative": row.get("narrative"),
+            "narrative_llm": row.get("narrative_llm"),
             "evidence": _json.loads(row.get("evidence_json") or "[]"),
             "tier": row.get("tier"),
             "members": _json.loads(row.get("members_json") or "[]"),

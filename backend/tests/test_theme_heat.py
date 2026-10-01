@@ -115,3 +115,48 @@ def test_theme_api_heat_and_members(monkeypatch):
     members = client.get("/api/themes/members?theme=人工智能&scope=CONCEPT").json()
     assert members["members"] == ["600001", "600002", "600003"]
     assert client.get("/api/themes/members?theme=不存在主题").status_code == 404
+
+
+def test_llm_narrative_generation(monkeypatch):
+    """AI 未配置 → None 回落；配置 + fake 客户端 → 叙述生成。"""
+    from core import theme_heat as th
+    from core.config import config as app_config
+
+    stats = {"heat_score": 88.5, "flow_3d": 8.37, "chg_today": 3.2,
+             "limit_up_count": 2, "max_streak": 3, "pct_above_ma20": 66.7}
+    evidence = ["OpenAI 发布新智能体"]
+
+    monkeypatch.setattr(app_config, "AI_MODEL", "")
+    assert th.generate_narrative_llm("人工智能", stats, evidence) is None
+
+    monkeypatch.setattr(app_config, "AI_MODEL", "test-model")
+    monkeypatch.setattr(app_config, "AI_API_KEY", "test-key")
+
+    import core.theme_heat as th_mod
+    calls = []
+    def _fake_post(payload):
+        calls.append(payload)
+        return "题材处于发酵阶段，资金与涨停梯队共振；注意追高风险。", {"total_tokens": 100}
+    monkeypatch.setattr(th_mod, "_post_chat_text", _fake_post)
+
+    out = th.generate_narrative_llm("人工智能", stats, evidence)
+    assert out and "发酵" in out
+    assert len(calls) == 1 and "人工智能" in calls[0]["messages"][1]["content"]
+
+
+def test_collect_llm_narrative_wired(monkeypatch):
+    """collect 的 use_llm 路径：fake 生成函数被调用且结果落库。"""
+    from core.theme_heat import collect_theme_heat, load_theme_board
+    import core.theme_heat as th
+
+    engine = _engine()
+    _seed_limit_up(engine)
+    monkeypatch.setattr(th, "generate_narrative_llm",
+                        lambda theme, stats, evidence: f"AI 解读 {theme}")
+    collect_theme_heat(engine=engine, scope="CONCEPT", bar_date=BAR,
+                       fetchers={"board": _fake_board, "flow": _fake_flow,
+                                 "hot": lambda: pd.DataFrame([{"代码": "600001"}]),
+                                 "members": _fake_members})
+    board = load_theme_board(engine, scope="CONCEPT", bar_date=BAR)
+    by_theme = {t["theme"]: t for t in board["themes"]}
+    assert by_theme["人工智能"]["narrative_llm"] == "AI 解读 人工智能"

@@ -996,6 +996,23 @@ def init_db(engine=None):
             except Exception as e:
                 logger.warning(f"theme_heat_history migration FAILED: {e}")
 
+            # 题材热度 LLM 叙述列（NULL 向下兼容）
+            try:
+                if engine.dialect.name == "sqlite":
+                    existing = {row[1] for row in conn.execute(text("PRAGMA table_info(theme_heat_history)"))}
+                    if "narrative_llm" not in existing:
+                        conn.execute(text("ALTER TABLE theme_heat_history ADD COLUMN narrative_llm TEXT"))
+                else:
+                    conn.execute(text("ALTER TABLE theme_heat_history ADD COLUMN IF NOT EXISTS narrative_llm TEXT"))
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-30-theme-heat-llm-v1', CURRENT_TIMESTAMP, 'LLM narrative column for theme heat')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: theme_heat narrative_llm ensured.")
+            except Exception as e:
+                logger.warning(f"theme_heat narrative_llm migration FAILED: {e}")
+
             # 修复 R3-2: paper_trading 的 ON CONFLICT (code, entry_date) 需要唯一约束。
             # v2（2026-09-29）：改为部分唯一索引（仅 status='OPEN' 行）。原全量唯一
             # 索引会让风控减仓/手动部分卖出的"拆行 CLOSED"INSERT 与原 OPEN 行撞键
@@ -2646,10 +2663,10 @@ def save_theme_heat_history(rows: List[Dict[str, Any]], engine=None) -> int:
                 INSERT INTO theme_heat_history
                     (bar_date, scope, theme, heat_score, rank, flow_3d, flow_today,
                      chg_today, limit_up_count, max_streak, hot_overlap, pct_above_ma20,
-                     members_count, members_json, narrative, evidence_json, tier, created_at)
+                     members_count, members_json, narrative, narrative_llm, evidence_json, tier, created_at)
                 VALUES ({date_expr}, :scope, :theme, :heat_score, :rank, :flow_3d, :flow_today,
                         :chg_today, :limit_up_count, :max_streak, :hot_overlap, :pct_above_ma20,
-                        :members_count, :members_json, :narrative, :evidence_json, :tier, :created_at)
+                        :members_count, :members_json, :narrative, :narrative_llm, :evidence_json, :tier, :created_at)
                 ON CONFLICT(bar_date, scope, theme) DO UPDATE SET
                     heat_score=EXCLUDED.heat_score, rank=EXCLUDED.rank,
                     flow_3d=EXCLUDED.flow_3d, flow_today=EXCLUDED.flow_today,
@@ -2658,6 +2675,7 @@ def save_theme_heat_history(rows: List[Dict[str, Any]], engine=None) -> int:
                     pct_above_ma20=EXCLUDED.pct_above_ma20,
                     members_count=EXCLUDED.members_count,
                     members_json=EXCLUDED.members_json, narrative=EXCLUDED.narrative,
+                    narrative_llm=EXCLUDED.narrative_llm,
                     evidence_json=EXCLUDED.evidence_json, tier=EXCLUDED.tier,
                     created_at=EXCLUDED.created_at
             """), [
@@ -2673,6 +2691,7 @@ def save_theme_heat_history(rows: List[Dict[str, Any]], engine=None) -> int:
                     "members_count": row.get("members_count"),
                     "members_json": _json.dumps(row.get("members") or [], ensure_ascii=False),
                     "narrative": row.get("narrative"),
+                    "narrative_llm": row.get("narrative_llm"),
                     "evidence_json": _json.dumps(row.get("evidence") or [], ensure_ascii=False),
                     "tier": row.get("tier"), "created_at": datetime.now(),
                 }

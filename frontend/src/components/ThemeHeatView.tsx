@@ -33,6 +33,7 @@ interface ThemeItem {
     pct_above_ma20?: number | null;
     members_count?: number | null;
     narrative?: string | null;
+    narrative_llm?: string | null;
     evidence?: string[] | null;
     tier?: string | null;
     members?: string[] | null;
@@ -51,6 +52,7 @@ interface MembersPayload {
     bar_date?: string | null;
     members?: string[] | null;
     narrative?: string | null;
+    narrative_llm?: string | null;
 }
 
 const SCOPE_OPTIONS: ReadonlyArray<{ value: ThemeScope; label: string }> = [
@@ -358,9 +360,14 @@ export default function ThemeHeatView({ onOpenStock }: { onOpenStock?: (stock: {
                             )}
 
                             <div className="rounded-xl border border-slate-200 bg-white p-4">
-                                <p className="metric-label">理由</p>
+                                <p className="metric-label">
+                                    理由
+                                    {selected.narrative_llm && (
+                                        <span className="ml-2 rounded bg-indigo-100 px-1.5 py-0.5 text-[9px] font-black text-indigo-600 align-middle">AI</span>
+                                    )}
+                                </p>
                                 <p className="mt-1.5 text-sm font-semibold leading-relaxed text-slate-700">
-                                    {selected.narrative || '--'}
+                                    {selected.narrative_llm || selected.narrative || '--'}
                                 </p>
                             </div>
 
