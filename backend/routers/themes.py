@@ -24,6 +24,8 @@ router = APIRouter(prefix="/api/themes", tags=["themes"])
 
 
 def _market_environment(engine) -> Dict[str, Any]:
+    from core.theme_heat import load_cached_market_env_summary
+
     try:
         gate = compute_market_state_gate(engine)
     except Exception:
@@ -50,6 +52,7 @@ def _market_environment(engine) -> Dict[str, Any]:
         "zt_broken_rate": zt.get("broken_rate"),
         "zt_max_streak": zt.get("max_streak"),
         "zt_bar_date": zt.get("bar_date"),
+        "summary_llm": load_cached_market_env_summary(engine),
         "summary": (
             f"市场状态闸门：10日动量 {gate.get('mom_10d_pct')}%（{'建议暂停新开仓' if gate.get('blocked') else '正常'}）；"
             f"涨停情绪：炸板率 {zt.get('broken_rate') if zt.get('broken_rate') is not None else '--'}%"

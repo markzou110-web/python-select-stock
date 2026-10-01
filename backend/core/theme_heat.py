@@ -443,3 +443,102 @@ def load_theme_board(engine=None, scope: str = "CONCEPT", bar_date: Optional[str
             "trend": _trend_tag(rank, prev_rank.get(str(row["theme"]))),
         })
     return {"bar_date": bar_date, "scope": scope, "themes": themes}
+
+def _market_env_facts(engine) -> Dict[str, Any]:
+    """聚合市场环境结构化事实（R3 动量/涨停情绪/NH-NL 宽度/代理5日/题材top3）。"""
+    from core.market_regime import (
+        compute_limit_up_sentiment,
+        compute_market_breadth_extremes,
+        compute_market_state_gate,
+    )
+
+    facts: Dict[str, Any] = {}
+    try:
+        facts.update(compute_market_state_gate(engine))
+    except Exception:
+        pass
+    try:
+        zt = compute_limit_up_sentiment(engine)
+        facts.update({k: zt.get(k) for k in ("sealed_count", "broken_count", "max_streak", "promotion_rate", "broken_rate")})
+    except Exception:
+        pass
+    try:
+        breadth = compute_market_breadth_extremes(engine)
+        facts.update({k: breadth.get(k) for k in ("nh_count", "nl_count", "pct_above_ma50")})
+    except Exception:
+        pass
+    try:
+        proxy = pd.read_sql(text(
+            "SELECT date, AVG(close / NULLIF(prev_close, 0) - 1) AS r FROM ("
+            " SELECT date, code, close, LAG(close) OVER (PARTITION BY code ORDER BY date) AS prev_close"
+            " FROM daily_k WHERE date >= :start) d"
+            " WHERE prev_close > 0 AND close / prev_close BETWEEN 0.75 AND 1.25 GROUP BY date ORDER BY date"
+        ), engine, params={"start": (datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d")})
+        if not proxy.empty:
+            level = (1 + proxy["r"].fillna(0)).cumprod()
+            facts["proxy_ret_5d_pct"] = round(float((level.iloc[-1] / level.iloc[-6] - 1) * 100), 2) if len(level) > 5 else None
+    except Exception:
+        pass
+    try:
+        board = load_theme_board(engine, scope="CONCEPT")
+        facts["top_themes"] = [
+            {"theme": t["theme"], "heat": t["heat"], "tier": t.get("tier"), "flow_3d": t.get("flow_3d")}
+            for t in (board.get("themes") or [])[:3]
+        ]
+    except Exception:
+        pass
+    return facts
+
+
+def generate_market_env_llm(engine) -> Optional[str]:
+    """LLM 生成市场环境叙述（easy-stock 式：阶段判断 + 具体数字 + 风险提示）。
+
+    结果缓存到 system_setting `market_env_summary_llm:{当日}`（每日一改，
+    供 /api/themes/heat 与每日 AI 复盘复用）。未配置 AI 或异常返回 None。"""
+    import json as _json
+
+    from core.db import save_setting
+
+    facts = _market_env_facts(engine)
+    # 任一关键事实（闸门/涨停情绪/宽度）存在即可生成；全空库回落 None
+    has_facts = any(facts.get(k) is not None for k in ("bar_date", "sealed_count", "nh_count", "broken_rate"))
+    if not has_facts:
+        return None
+    try:
+        from core.config import config
+
+        if not config.is_ai_analysis_configured():
+            return None
+        payload = {
+            "model": config.AI_MODEL,
+            "messages": [
+                {"role": "system", "content": (
+                    "你是 A 股市场状态研究助手。基于给定的结构化市场事实，输出一段不超过140字的"
+                    "中文市场环境叙述：先给阶段判断（主升/分歧/退潮/退潮后弱反抽/混沌，选最符合的），"
+                    "必须引用至少三个具体数字（10日动量、炸板率、涨停家数/最高连板、MA50上方占比、"
+                    "代理5日收益等），指出组合结构特征，最后一句风险提示。禁止买卖指令，"
+                    "禁止编造数据中不存在的事实。直接输出叙述正文。"
+                )},
+                {"role": "user", "content": _json.dumps(facts, ensure_ascii=False)},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 400,
+        }
+        text_out, _usage = _post_chat_text(payload)
+        if text_out:
+            save_setting(f"market_env_summary_llm:{datetime.now().strftime('%Y-%m-%d')}", text_out[:500])
+        return text_out[:500] if text_out else None
+    except Exception as exc:
+        logger.debug(f"market env LLM narrative unavailable: {exc}")
+        return None
+
+
+def load_cached_market_env_summary(engine, date: Optional[str] = None) -> Optional[str]:
+    """读当日缓存的 AI 市场环境叙述（system_setting）。"""
+    from core.db import get_setting
+
+    try:
+        key_date = date or datetime.now().strftime("%Y-%m-%d")
+        return get_setting(f"market_env_summary_llm:{key_date}", "") or None
+    except Exception:
+        return None

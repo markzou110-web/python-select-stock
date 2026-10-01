@@ -450,6 +450,24 @@ def send_daily_ai_review():
             title = f"收盘AI复核 {scan_date}｜无BUY"
         else:
             title = f"收盘AI复核 {scan_date}"
+        # 题材热度与市场环境 AI 叙述（只增行，fail-open）
+        try:
+            from core.theme_heat import load_theme_board, load_cached_market_env_summary
+
+            theme_engine = get_db_engine()
+            board = load_theme_board(theme_engine, scope="CONCEPT")
+            top_themes = (board.get("themes") or [])[:3]
+            if top_themes:
+                lines = ["题材热度TOP3：" + "；".join(
+                    f"{t['theme']} {t['heat']:.0f}分/{t.get('tier') or '观察'}/3日资金{t.get('flow_3d') if t.get('flow_3d') is not None else '--'}亿"
+                    for t in top_themes
+                )]
+                env_summary = load_cached_market_env_summary(theme_engine)
+                if env_summary:
+                    lines.append(f"市场环境AI叙述：{env_summary}")
+                report_body = report_body + "\n" + "\n".join(lines)
+        except Exception as exc:
+            logger.debug(f"theme heat digest skipped: {exc}")
         try:
             from core.data import get_market_regime
             market_desc = str(get_market_regime().get("desc") or "")
@@ -1820,6 +1838,12 @@ def update_market_state_gate():
             return {"status": "skipped", "reason": "no_data"}
         trading_date = datetime.now().strftime("%Y-%m-%d")
         save_setting(f"market_state_gate:{trading_date}", _json.dumps(gate, ensure_ascii=False))
+        try:
+            from core.theme_heat import generate_market_env_llm
+
+            generate_market_env_llm(engine)  # 盘后刷新 AI 市场环境叙述缓存
+        except Exception as exc:
+            logger.debug(f"market env LLM refresh skipped: {exc}")
         logger.info(f"Market state gate recorded: {gate}")
         return {"status": "ok", **gate}
     except Exception as e:
@@ -1843,6 +1867,15 @@ def update_theme_heat(scope: str = "CONCEPT"):
             except Exception as exc:
                 logger.warning(f"theme heat {scope_name} failed: {exc}")
                 results[scope_name] = {"saved": 0, "error": str(exc)[:120]}
+        # 市场环境 AI 叙述（缓存 system_setting，供 /api/themes/heat 与每日复盘复用）
+        try:
+            from core.theme_heat import generate_market_env_llm
+
+            summary = generate_market_env_llm(get_db_engine())
+            if summary:
+                results["market_env_llm"] = summary[:80] + "…"
+        except Exception as exc:
+            logger.debug(f"market env LLM skipped: {exc}")
         logger.info(f"Theme heat task done: {results}")
         return {"status": "ok", "results": results}
     except Exception as e:

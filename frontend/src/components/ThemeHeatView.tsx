@@ -17,6 +17,7 @@ interface MarketEnvironment {
     zt_max_streak?: number | null;
     zt_bar_date?: string | null;
     summary?: string | null;
+    summary_llm?: string | null;
 }
 
 interface ThemeItem {
@@ -215,7 +216,7 @@ export default function ThemeHeatView({ onOpenStock }: { onOpenStock?: (stock: {
                             {heat.market_environment.stage || '未知'}
                         </span>
                         <p className="min-w-0 text-sm font-semibold leading-relaxed text-slate-600">
-                            {heat.market_environment.summary || '暂无市场状态摘要'}
+                            {heat.market_environment.summary_llm || heat.market_environment.summary || '暂无市场状态摘要'}
                         </p>
                     </div>
                     <span className="shrink-0 text-xs font-bold text-slate-400">

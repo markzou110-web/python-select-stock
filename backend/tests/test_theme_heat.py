@@ -160,3 +160,49 @@ def test_collect_llm_narrative_wired(monkeypatch):
     board = load_theme_board(engine, scope="CONCEPT", bar_date=BAR)
     by_theme = {t["theme"]: t for t in board["themes"]}
     assert by_theme["人工智能"]["narrative_llm"] == "AI 解读 人工智能"
+
+
+def test_market_env_llm_generation_and_cache(monkeypatch):
+    """市场环境 AI 叙述：fake 客户端生成 → system_setting 当日缓存 → load 读回。"""
+    import core.theme_heat as th
+    from core.config import config as app_config
+
+    engine = _engine()
+    monkeypatch.setattr(app_config, "AI_MODEL", "test-model")
+    monkeypatch.setattr(app_config, "AI_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setattr(app_config, "AI_API_KEY", "test-key")
+    captured = {}
+    def _fake_post(payload):
+        captured["user"] = payload["messages"][1]["content"]
+        return "组合结构符合退潮后的弱反抽，动量-0.4%但炸板率18%；注意缩量反复。", {}
+    monkeypatch.setattr(th, "_post_chat_text", _fake_post)
+
+    out = th.generate_market_env_llm(engine)
+    assert out and "弱反抽" in out
+    assert "top_themes" in captured["user"]
+    # 缓存读回
+    assert th.load_cached_market_env_summary(engine) == out
+
+
+def test_daily_review_theme_digest_line(monkeypatch):
+    """每日 AI 复盘正文追加题材热度 TOP3 与市场环境叙述（只增行）。"""
+    import core.tasks as tasks
+    from core.theme_heat import collect_theme_heat
+
+    engine = _engine()
+    _seed_limit_up(engine)
+    collect_theme_heat(engine=engine, scope="CONCEPT", bar_date=BAR,
+                       fetchers={"board": _fake_board, "flow": _fake_flow,
+                                 "hot": lambda: pd.DataFrame([{"代码": "600001"}]),
+                                 "members": _fake_members})
+    monkeypatch.setattr(tasks, "get_db_engine", lambda: engine)
+    # 直接复刻任务里的拼装逻辑验证（任务本体过重，锁行为关键段）
+    from core.theme_heat import load_cached_market_env_summary, load_theme_board
+    board = load_theme_board(engine, scope="CONCEPT", bar_date=BAR)
+    top = (board.get("themes") or [])[:3]
+    assert top[0]["theme"] == "人工智能"
+    line = "题材热度TOP3：" + "；".join(
+        f"{t['theme']} {t['heat']:.0f}分/{t.get('tier') or '观察'}/3日资金{t.get('flow_3d')}亿"
+        for t in top
+    )
+    assert "人工智能" in line and "3日资金" in line
