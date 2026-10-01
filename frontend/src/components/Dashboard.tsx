@@ -25,6 +25,7 @@ import StockDetailPage from '@/components/StockDetailPage';
 import SectorRadarView from '@/components/SectorRadarView';
 import ResearchRadarView from '@/components/ResearchRadarView';
 import HotStocksView from '@/components/HotStocksView';
+import ThemeHeatView from '@/components/ThemeHeatView';
 import ExecutionInbox from '@/components/ExecutionInbox';
 import { Download, LayoutGrid, List, Search, Zap, Calendar, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -238,6 +239,15 @@ export default function Dashboard() {
                             ) : activeView === 'research-radar' ? (
                                 <ErrorBoundary fallbackTitle="资讯雷达加载异常">
                                     <ResearchRadarView
+                                        onOpenStock={(stock) => {
+                                            setSelectedStock(null);
+                                            setSearchDetailStock(stock);
+                                        }}
+                                    />
+                                </ErrorBoundary>
+                            ) : activeView === 'themes' ? (
+                                <ErrorBoundary fallbackTitle="题材热点加载异常">
+                                    <ThemeHeatView
                                         onOpenStock={(stock) => {
                                             setSelectedStock(null);
                                             setSearchDetailStock(stock);

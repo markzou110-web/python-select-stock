@@ -20,6 +20,7 @@ import {
     Newspaper,
     Inbox,
     Flame,
+    Sparkles,
     X
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -165,6 +166,12 @@ export default function Sidebar({
                         label="资讯雷达"
                         active={activeView === 'research-radar'}
                         onClick={() => navigate('research-radar')}
+                    />
+                    <NavItem
+                        icon={<Sparkles size={20} />}
+                        label="题材热点"
+                        active={activeView === 'themes'}
+                        onClick={() => navigate('themes')}
                     />
                     <NavItem
                         icon={<PieChart size={20} />}

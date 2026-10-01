@@ -25,6 +25,7 @@ const VIEW_META: Record<string, { title: string; description: string }> = {
     scanner: { title: '多因子共振', description: '全市场扫描与候选股决策' },
     'sector-radar': { title: '板块雷达', description: '识别主线方向与板块强度' },
     'research-radar': { title: '资讯雷达', description: '聚合题材信息与个股线索' },
+    themes: { title: '题材热点', description: '题材热度、资金与新闻证据' },
     paper: { title: '拟合实盘', description: '验证仓位、收益与风险约束' },
     watchlist: { title: '观察池', description: '跟踪候选股与触发条件' },
     review: { title: '交易复盘', description: '评估信号质量与执行结果' },
