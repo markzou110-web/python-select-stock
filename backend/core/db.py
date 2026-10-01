@@ -960,6 +960,42 @@ def init_db(engine=None):
             except Exception as e:
                 logger.warning(f"lhb_records migration skipped: {e}")
 
+            # 题材热度榜（借鉴 easy-stock 主题热点页）：规则化研究评分，不进交易资格
+            try:
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS theme_heat_history (
+                        id {id_type},
+                        bar_date DATE NOT NULL,
+                        scope VARCHAR(20) NOT NULL,
+                        theme VARCHAR(100) NOT NULL,
+                        heat_score FLOAT,
+                        rank INTEGER,
+                        flow_3d FLOAT,
+                        flow_today FLOAT,
+                        chg_today FLOAT,
+                        limit_up_count INTEGER,
+                        max_streak INTEGER,
+                        hot_overlap INTEGER,
+                        pct_above_ma20 FLOAT,
+                        members_count INTEGER,
+                        members_json TEXT,
+                        narrative TEXT,
+                        evidence_json TEXT,
+                        tier VARCHAR(60),
+                        created_at TIMESTAMP,
+                        UNIQUE(bar_date, scope, theme)
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_theme_heat_date ON theme_heat_history(bar_date DESC, scope);"))
+                conn.execute(text("""
+                    INSERT INTO schema_migrations(version, applied_at, description)
+                    VALUES ('2026-09-30-theme-heat-v1', CURRENT_TIMESTAMP, 'theme heat history table')
+                    ON CONFLICT(version) DO NOTHING
+                """))
+                logger.info("Migration: theme_heat_history ensured.")
+            except Exception as e:
+                logger.warning(f"theme_heat_history migration FAILED: {e}")
+
             # 修复 R3-2: paper_trading 的 ON CONFLICT (code, entry_date) 需要唯一约束。
             # v2（2026-09-29）：改为部分唯一索引（仅 status='OPEN' 行）。原全量唯一
             # 索引会让风控减仓/手动部分卖出的"拆行 CLOSED"INSERT 与原 OPEN 行撞键
@@ -2594,3 +2630,55 @@ def purge_expired_data(engine=None) -> Dict[str, Any]:
 
     logger.info(f"Weekly data maintenance done: {report['purged']}")
     return report
+
+
+def save_theme_heat_history(rows: List[Dict[str, Any]], engine=None) -> int:
+    """题材热度榜落库（theme_heat_history，UNIQUE(bar_date, scope, theme)）。"""
+    import json as _json
+
+    rows = [row for row in rows or [] if row.get("theme")]
+    if engine is None or not rows:
+        return 0
+    date_expr = ":bar_date" if engine.dialect.name == "sqlite" else "CAST(:bar_date AS DATE)"
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"""
+                INSERT INTO theme_heat_history
+                    (bar_date, scope, theme, heat_score, rank, flow_3d, flow_today,
+                     chg_today, limit_up_count, max_streak, hot_overlap, pct_above_ma20,
+                     members_count, members_json, narrative, evidence_json, tier, created_at)
+                VALUES ({date_expr}, :scope, :theme, :heat_score, :rank, :flow_3d, :flow_today,
+                        :chg_today, :limit_up_count, :max_streak, :hot_overlap, :pct_above_ma20,
+                        :members_count, :members_json, :narrative, :evidence_json, :tier, :created_at)
+                ON CONFLICT(bar_date, scope, theme) DO UPDATE SET
+                    heat_score=EXCLUDED.heat_score, rank=EXCLUDED.rank,
+                    flow_3d=EXCLUDED.flow_3d, flow_today=EXCLUDED.flow_today,
+                    chg_today=EXCLUDED.chg_today, limit_up_count=EXCLUDED.limit_up_count,
+                    max_streak=EXCLUDED.max_streak, hot_overlap=EXCLUDED.hot_overlap,
+                    pct_above_ma20=EXCLUDED.pct_above_ma20,
+                    members_count=EXCLUDED.members_count,
+                    members_json=EXCLUDED.members_json, narrative=EXCLUDED.narrative,
+                    evidence_json=EXCLUDED.evidence_json, tier=EXCLUDED.tier,
+                    created_at=EXCLUDED.created_at
+            """), [
+                {
+                    "bar_date": row.get("bar_date"), "scope": row.get("scope", "CONCEPT"),
+                    "theme": row["theme"], "heat_score": row.get("heat_score"),
+                    "rank": row.get("rank"),
+                    "flow_3d": row.get("flow_3d"), "flow_today": row.get("flow_today"),
+                    "chg_today": row.get("chg_today"),
+                    "limit_up_count": row.get("limit_up_count"),
+                    "max_streak": row.get("max_streak"), "hot_overlap": row.get("hot_overlap"),
+                    "pct_above_ma20": row.get("pct_above_ma20"),
+                    "members_count": row.get("members_count"),
+                    "members_json": _json.dumps(row.get("members") or [], ensure_ascii=False),
+                    "narrative": row.get("narrative"),
+                    "evidence_json": _json.dumps(row.get("evidence") or [], ensure_ascii=False),
+                    "tier": row.get("tier"), "created_at": datetime.now(),
+                }
+                for row in rows
+            ])
+        return len(rows)
+    except Exception as exc:
+        logger.warning(f"save_theme_heat_history failed (non-blocking): {exc}")
+        return 0

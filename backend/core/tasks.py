@@ -1825,3 +1825,26 @@ def update_market_state_gate():
     except Exception as e:
         logger.error(f"Error in update_market_state_gate task: {e}")
         return {"status": "error", "error": str(e)}
+
+
+@celery_app.task(name="tasks.update_theme_heat")
+def update_theme_heat(scope: str = "CONCEPT"):
+    """题材热度榜（借鉴 easy-stock 主题热点页）：午间/盘后各一次，CONCEPT+INDUSTRY。
+
+    热度为规则化研究评分（SHADOW），不进交易资格。接口失败逐项 fail-open。
+    """
+    try:
+        from core.theme_heat import collect_theme_heat
+
+        results = {}
+        for scope_name in ("CONCEPT", "INDUSTRY"):
+            try:
+                results[scope_name] = collect_theme_heat(scope=scope_name)
+            except Exception as exc:
+                logger.warning(f"theme heat {scope_name} failed: {exc}")
+                results[scope_name] = {"saved": 0, "error": str(exc)[:120]}
+        logger.info(f"Theme heat task done: {results}")
+        return {"status": "ok", "results": results}
+    except Exception as e:
+        logger.error(f"Error in update_theme_heat task: {e}")
+        return {"status": "error", "error": str(e)}

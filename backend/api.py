@@ -180,6 +180,7 @@ from routers.backtest import router as backtest_router
 from routers.money_flow import router as money_flow_router
 from routers.execution_intents import router as execution_intents_router
 from routers.ai_analysis import router as ai_analysis_router
+from routers.themes import router as themes_router
 
 app.include_router(market_router)
 app.include_router(sync_router)
@@ -194,6 +195,7 @@ app.include_router(watchlist_router)
 app.include_router(strategy_templates_router)
 app.include_router(system_router)
 app.include_router(backtest_router)
+app.include_router(themes_router)
 app.include_router(money_flow_router)
 app.include_router(execution_intents_router)
 app.include_router(ai_analysis_router)

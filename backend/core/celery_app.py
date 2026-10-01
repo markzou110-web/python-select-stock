@@ -295,6 +295,18 @@ celery_app.conf.update(
             'schedule': crontab(hour=19, minute=15, day_of_week='1-5'),
             'options': {'expires': 1800},
         },
+        # 题材热度榜（借鉴 easy-stock 主题热点页）：午间/盘后各一次（依赖 11:40/15:05 资金流先落库）
+        'theme-heat-1145': {
+            'task': 'tasks.update_theme_heat',
+            'schedule': crontab(hour=11, minute=45, day_of_week='1-5'),
+            'kwargs': {'scope': 'CONCEPT'},
+            'options': {'expires': 1200},
+        },
+        'theme-heat-1520': {
+            'task': 'tasks.update_theme_heat',
+            'schedule': crontab(hour=15, minute=20, day_of_week='1-5'),
+            'options': {'expires': 1800},
+        },
         # Full-market sync is owned by MarketSyncScheduler in the API process so
         # progress is observable and it cannot race an embedded Celery beat.
     },
