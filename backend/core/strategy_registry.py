@@ -202,8 +202,9 @@ def supported_backtest_strategies() -> set[str]:
 # （regime_attribution 脚手架）才能 promotion 为生产策略。注册表即台账。
 SHADOW_STRATEGY_REGISTRY: Dict[str, Dict[str, Any]] = {
     "tv_dual_strict_paired_window_5": {
-        "status": "validating",
-        "evidence": "事件级近似 test 段 935笔/+1.99%/PF1.48；真实引擎回测进行中",
+        "status": "rejected",
+        "evidence": "真实引擎全市场回测：3日窗 121,926笔/39.88%/+0.20% vs 5日窗 "
+                    "111,288笔/39.85%/+0.188% —— 无改善，事件级近似的乐观结论被证伪（2026-10-06）",
         "entered_at": "2026-10-06",
         "promotion_rule": "三段 walk-forward 一致 + SHADOW 实盘期 ≥3 个月",
     },
