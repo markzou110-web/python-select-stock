@@ -82,14 +82,18 @@ def _seed_daily_k(engine, dates):
 
 def test_collect_uses_trade_dates_from_daily_k_and_saves_rows():
     engine = _engine()
-    _seed_daily_k(engine, [date(2026, 9, 24), date(2026, 9, 25)])
+    # 交易日相对"今天"取：load 的 days 窗口也按真实 now 计算，硬编码日期会随
+    # 时间推移掉出窗口（本测试曾在 09-30 后第 8 天爆炸）
+    day2 = date.today() - timedelta(days=1)
+    day1 = date.today() - timedelta(days=2)
+    _seed_daily_k(engine, [day1, day2])
     payloads = {
-        "2026-09-25": {"stocks": [{"code": "600000", "name": "甲", "reason": "日涨幅偏离",
-                                   "net_buy_wan": 1200.0, "buy_wan": 3000.0,
-                                   "sell_wan": 1800.0, "change_pct": 10.0}]},
-        "2026-09-24": {"stocks": [{"code": "600001", "name": "乙", "reason": "换手率达20%",
-                                   "net_buy_wan": -500.0, "buy_wan": 800.0,
-                                   "sell_wan": 1300.0, "change_pct": -3.0}]},
+        day2.isoformat(): {"stocks": [{"code": "600000", "name": "甲", "reason": "日涨幅偏离",
+                                       "net_buy_wan": 1200.0, "buy_wan": 3000.0,
+                                       "sell_wan": 1800.0, "change_pct": 10.0}]},
+        day1.isoformat(): {"stocks": [{"code": "600001", "name": "乙", "reason": "换手率达20%",
+                                       "net_buy_wan": -500.0, "buy_wan": 800.0,
+                                       "sell_wan": 1300.0, "change_pct": -3.0}]},
     }
     result = collect_lhb_records(engine=engine, days=2, fetcher=lambda d: payloads[d])
     assert result == {"saved": 2, "days": 2, "errors": 0}
