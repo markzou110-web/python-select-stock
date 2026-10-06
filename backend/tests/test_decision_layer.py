@@ -709,3 +709,44 @@ def test_signal_tier_weighting_can_be_disabled(monkeypatch):
                      tv_execution_tier="A")]
     apply_decision_layer(stocks, _snapshot([8, 7, 6, 5, 4, 3, 2, 1]), {"status": "OFFENSIVE"})
     assert "signal_tier_adjust" not in stocks[0]
+
+
+def test_bull_bear_debate_roles_and_failopen(monkeypatch):
+    """P1：三段调用（bull/bear/judge），AI 未配置 fail-open。"""
+    from core import ai_debate as debate
+    from core.config import config as app_config
+
+    cand = {"名称": "测试", "代码": "600000", "现价": 10.0, "tv_execution_tier": "A"}
+    monkeypatch.setattr(app_config, "AI_MODEL", "")
+    assert debate.run_bull_bear_debate(cand) is None
+
+    monkeypatch.setattr(app_config, "AI_MODEL", "test-model")
+    monkeypatch.setattr(app_config, "AI_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setattr(app_config, "AI_API_KEY", "k")
+    seen_roles = []
+    def _fake_post(payload):
+        seen_roles.append(payload["messages"][0]["content"])
+        content = {"bull": "多头论证", "bear": "空头论证",
+                   "judge": "空头证据更硬，置信度中"}.get(
+            "多空辩论中的多头研究员" in seen_roles[-1] and "bull_x" or (
+                "空头研究员" in seen_roles[-1] and "bear" or "judge"), "")
+        # 简化：按角色提示词顺序返回
+        idx = len([r for r in seen_roles]) - 1
+        return ["多头论证", "空头论证", "空头证据更硬，置信度中"][min(idx, 2)], {}
+    import core.theme_heat as th
+    monkeypatch.setattr(th, "_post_chat_text", _fake_post)
+    out = debate.run_bull_bear_debate(cand, evidence_lines=["新闻A"])
+    assert out and "多头论证" in out["bull"] and "空头" in out["bear"] and "置信度" in out["verdict"]
+    assert len(seen_roles) == 3  # bull/bear/judge 三段
+
+
+def test_shadow_strategy_registry_promotion():
+    from core.strategy_registry import (
+        SHADOW_STRATEGY_REGISTRY, promote_shadow_strategy, register_shadow_strategy,
+    )
+    register_shadow_strategy("test_strategy_x", "验证中")
+    assert SHADOW_STRATEGY_REGISTRY["test_strategy_x"]["status"] == "shadow"
+    assert promote_shadow_strategy("test_strategy_x") is True
+    assert SHADOW_STRATEGY_REGISTRY["test_strategy_x"]["status"] == "promoted"
+    assert promote_shadow_strategy("不存在") is False
+    assert "tv_dual_strict_paired_window_5" in SHADOW_STRATEGY_REGISTRY

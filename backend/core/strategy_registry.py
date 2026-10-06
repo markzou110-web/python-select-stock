@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import datetime
 from typing import Any, Dict, List
 
 
@@ -195,3 +196,31 @@ def get_strategy(strategy_type: str) -> Dict[str, Any] | None:
 
 def supported_backtest_strategies() -> set[str]:
     return {key for key, value in _STRATEGIES.items() if value["supports_backtest"]}
+
+# ── Shadow 策略流水线（P2，借鉴 InStock 策略模板机制）────────────────────────
+# 候选策略先进 SHADOW 池（只研究不进证据门），过三段 walk-forward
+# （regime_attribution 脚手架）才能 promotion 为生产策略。注册表即台账。
+SHADOW_STRATEGY_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "tv_dual_strict_paired_window_5": {
+        "status": "validating",
+        "evidence": "事件级近似 test 段 935笔/+1.99%/PF1.48；真实引擎回测进行中",
+        "entered_at": "2026-10-06",
+        "promotion_rule": "三段 walk-forward 一致 + SHADOW 实盘期 ≥3 个月",
+    },
+}
+
+
+def register_shadow_strategy(name: str, evidence: str) -> None:
+    SHADOW_STRATEGY_REGISTRY[name] = {
+        "status": "shadow", "evidence": evidence,
+        "entered_at": datetime.now().strftime("%Y-%m-%d"),
+        "promotion_rule": "三段 walk-forward 一致 + SHADOW 实盘期 ≥3 个月",
+    }
+
+
+def promote_shadow_strategy(name: str) -> bool:
+    entry = SHADOW_STRATEGY_REGISTRY.get(name)
+    if entry and entry.get("status") in {"shadow", "validating"}:
+        entry["status"] = "promoted"
+        return True
+    return False

@@ -450,6 +450,24 @@ def send_daily_ai_review():
             title = f"收盘AI复核 {scan_date}｜无BUY"
         else:
             title = f"收盘AI复核 {scan_date}"
+        # 多空辩论（P1，借鉴 TradingAgents）：TOP3 候选 bull/bear/judge，只增行 fail-open
+        try:
+            from core.ai_debate import run_bull_bear_debate
+            import os as _os
+            if _os.getenv("AI_DEBATE_ENABLED", "true").lower() == "true":
+                for cand in (review.get("analyses") or [])[:3]:
+                    debate = run_bull_bear_debate(cand)
+                    if debate:
+                        cand["debate"] = debate
+                debates = [c for c in (review.get("analyses") or [])[:3] if c.get("debate")]
+                if debates:
+                    lines = ["多空辩论TOP3：" + " ｜ ".join(
+                        f"{c.get('名称') or c.get('code')}：{(c['debate'].get('verdict') or '')[:60]}"
+                        for c in debates
+                    )]
+                    report_body = report_body + "\n" + "\n".join(lines)
+        except Exception as exc:
+            logger.debug(f"bull-bear debate skipped: {exc}")
         # 题材热度与市场环境 AI 叙述（只增行，fail-open）
         try:
             from core.theme_heat import load_theme_board, load_cached_market_env_summary
