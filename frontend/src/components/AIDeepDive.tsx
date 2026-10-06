@@ -15,12 +15,55 @@ import {
     Bot
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import api from '@/lib/api';
+import api, { getApiErrorDetail } from '@/lib/api';
 import { useTradeStore } from '@/stores/tradeStore';
-import SplitKLineCharts, { ChipDistribution } from './SplitKLineCharts';
+import type { BacktestStats, ScanResult } from '@/stores/scanStore';
+import type { PriceActionDetails } from '@/lib/stockTypes';
+import SplitKLineCharts, { type ChartCandle, type ChipDistribution, type PriceActionLine } from './SplitKLineCharts';
+import ModalOverlay from './ui/ModalOverlay';
+
+type DeepDiveStock = Omit<Partial<ScanResult>, 'Score' | 'display_signal_score' | 'sector_alignment_score' | '回测统计'> & {
+    代码: string;
+    名称: string;
+    现价: number;
+    Score?: number | null;
+    display_signal_score?: number | null;
+    sector_alignment_score?: number | null;
+    回测统计?: (BacktestStats & { sample_warning?: string; adjusted_win_rate_99?: number; adjusted_win_rate?: number }) | null;
+    latest_scan_score?: number;
+    scan_date?: string;
+    latest_scan_date?: string | null;
+    latest_scan_strategy?: string | null;
+    money_flow_5d_yi?: number;
+    money_flow_bias?: string;
+    pa_volume_ratio?: number;
+    pa_volume_ratio_percentile?: number;
+    is_paper_trade?: boolean;
+    buy_price?: number;
+    take_profit_price?: number;
+    risk_stage?: string;
+    paper_remark?: string;
+    entry_date?: string;
+    entry_source?: string;
+    entry_signal_date?: string;
+    entry_reason_snapshot?: string;
+};
+
+type AIVerdict = {
+    action: string;
+    confidence?: number;
+    trend_view?: string;
+    guardrail_adjusted?: boolean;
+    summary: string;
+    positive_factors: string[];
+    risk_factors: string[];
+    catalysts: string[];
+    key_levels?: string;
+    data_limitations: string[];
+};
 
 interface AIDeepDiveProps {
-    stock: any;
+    stock: DeepDiveStock;
     onClose: () => void;
 }
 
@@ -59,13 +102,13 @@ function formatRate(value: number | null, digits = 1): string {
 
 export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
     const [loading, setLoading] = useState(true);
-    const [chartData, setChartData] = useState<any[]>([]);
-    const [stockInfo, setStockInfo] = useState<any>(null);
-    const [priceAction, setPriceAction] = useState<any>(null);
-    const [priceActionLines, setPriceActionLines] = useState<any[]>([]);
+    const [chartData, setChartData] = useState<Array<ChartCandle & { close: number }>>([]);
+    const [stockInfo, setStockInfo] = useState<DeepDiveStock | null>(null);
+    const [priceAction, setPriceAction] = useState<PriceActionDetails | null>(null);
+    const [priceActionLines, setPriceActionLines] = useState<PriceActionLine[]>([]);
     const [chipDistribution, setChipDistribution] = useState<ChipDistribution | null>(null);
     const [loadedCode, setLoadedCode] = useState<string | null>(null);
-    const [aiVerdict, setAiVerdict] = useState<any>(null);
+    const [aiVerdict, setAiVerdict] = useState<AIVerdict | null>(null);
     const [aiLoading, setAiLoading] = useState(false);
 
     // Simulated trading addition states
@@ -93,7 +136,13 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
             setChipDistribution(null);
             setAiVerdict(null);
             try {
-                const res = await api.get(`/api/stock/detail?code=${stock.代码}`);
+                const res = await api.get<{
+                    data: Array<ChartCandle & { close: number }>;
+                    stock_info?: Partial<DeepDiveStock>;
+                    price_action?: PriceActionDetails;
+                    price_action_lines?: PriceActionLine[];
+                    chip_distribution?: ChipDistribution;
+                }>(`/api/stock/detail?code=${stock.代码}`);
                 if (cancelled) return;
                 const data = res.data.data;
                 setChartData(data);
@@ -203,7 +252,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
     const runStockAIAnalysis = async () => {
         setAiLoading(true);
         try {
-            const res = await api.post('/api/ai/analyze-stock', {
+            const res = await api.post<{ status: string; analysis?: AIVerdict; message?: string }>('/api/ai/analyze-stock', {
                 code: stock.代码,
                 date: facts.latest_scan_date || stock.data_date || stock.scan_date || stock.date || stock.日期,
             });
@@ -260,9 +309,9 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
             } else {
                 showToast(res.data.detail || '加入失败，请重试', 'error');
             }
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error("Add to Paper Trade Error:", err);
-            const errorMsg = err.response?.data?.detail || '网络连接失败，请重试';
+            const errorMsg = getApiErrorDetail(err) || '网络连接失败，请重试';
             showToast(errorMsg, 'error');
         } finally {
             setIsAdding(false);
@@ -386,32 +435,32 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                             </div>
                             <span className={cn(
                                 "text-xs font-black px-2.5 py-1 rounded-xl shadow-sm border",
-                                (stockInfo.现价 - stockInfo.buy_price) >= 0 
+                                (stockInfo.现价 - Number(stockInfo.buy_price)) >= 0
                                     ? "bg-rose-50 border-rose-100 text-rose-600 shadow-rose-50/50" 
                                     : "bg-emerald-50 border-emerald-100 text-emerald-600 shadow-emerald-50/50"
                             )}>
-                                {(stockInfo.现价 - stockInfo.buy_price) >= 0 ? '+' : ''}
-                                {(((stockInfo.现价 - stockInfo.buy_price) / stockInfo.buy_price) * 100).toFixed(2)}%
+                                {(stockInfo.现价 - Number(stockInfo.buy_price)) >= 0 ? '+' : ''}
+                                {(((stockInfo.现价 - Number(stockInfo.buy_price)) / Number(stockInfo.buy_price)) * 100).toFixed(2)}%
                             </span>
                         </div>
 
                         <div className="grid grid-cols-3 gap-3">
                             <div className="p-3 bg-white/80 backdrop-blur-md rounded-2xl border border-slate-100 text-center shadow-sm">
                                 <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider mb-0.5">买入均价</p>
-                                <p className="text-sm font-extrabold text-slate-700 font-mono">¥{stockInfo.buy_price.toFixed(2)}</p>
+                                <p className="text-sm font-extrabold text-slate-700 font-mono">¥{formatNumber(toFiniteNumber(stockInfo.buy_price), 2)}</p>
                             </div>
                             <div className="p-3 bg-white/80 backdrop-blur-md rounded-2xl border border-slate-100 text-center shadow-sm relative group">
                                 <p className="text-[9px] font-black text-rose-500 tracking-wider mb-0.5">执行风控</p>
-                                <p className="text-sm font-extrabold text-rose-600 font-mono">¥{(stockInfo.active_stop_price || stockInfo.stop_price).toFixed(2)}</p>
+                                <p className="text-sm font-extrabold text-rose-600 font-mono">¥{formatNumber(toFiniteNumber(stockInfo.active_stop_price || stockInfo.stop_price), 2)}</p>
                                 <span className="text-[8px] font-bold text-rose-400/80 block mt-0.5">
-                                    {stockInfo.risk_stage || '分阶段'} · {(100 * (stockInfo.现价 - (stockInfo.active_stop_price || stockInfo.stop_price)) / stockInfo.现价).toFixed(1)}% 缓冲
+                                    {stockInfo.risk_stage || '分阶段'} · {(100 * (stockInfo.现价 - Number(stockInfo.active_stop_price || stockInfo.stop_price)) / stockInfo.现价).toFixed(1)}% 缓冲
                                 </span>
                             </div>
                             <div className="p-3 bg-white/80 backdrop-blur-md rounded-2xl border border-slate-100 text-center shadow-sm">
                                 <p className="text-[9px] font-black text-emerald-500 uppercase tracking-wider mb-0.5">目标止盈</p>
-                                <p className="text-sm font-extrabold text-emerald-600 font-mono">¥{stockInfo.take_profit_price.toFixed(2)}</p>
+                                <p className="text-sm font-extrabold text-emerald-600 font-mono">¥{formatNumber(toFiniteNumber(stockInfo.take_profit_price), 2)}</p>
                                 <span className="text-[8px] font-bold text-emerald-400/80 block mt-0.5">
-                                    距目标 {(100 * (stockInfo.take_profit_price - stockInfo.现价) / stockInfo.现价).toFixed(1)}%
+                                    距目标 {(100 * (Number(stockInfo.take_profit_price) - stockInfo.现价) / stockInfo.现价).toFixed(1)}%
                                 </span>
                             </div>
                         </div>
@@ -557,11 +606,11 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                                 priceAction={currentPriceAction}
                                 priceActionLines={hasCurrentDetail ? priceActionLines : []}
                                 chipDistribution={hasCurrentDetail ? chipDistribution : null}
-                                riskLevels={stockInfo}
+                                riskLevels={stockInfo || undefined}
                                 paperLines={stockInfo?.is_paper_trade ? [
-                                    { price: stockInfo.buy_price, label: '买入价', color: '#6366f1', date: stockInfo.entry_date },
-                                    { price: stockInfo.active_stop_price || stockInfo.stop_price, label: '实时持仓风控线', color: '#f43f5e' },
-                                    { price: stockInfo.take_profit_price, label: '止盈价', color: '#10b981' },
+                                    { price: Number(stockInfo.buy_price), label: '买入价', color: '#6366f1', date: stockInfo.entry_date },
+                                    { price: Number(stockInfo.active_stop_price || stockInfo.stop_price), label: '实时持仓风控线', color: '#f43f5e' },
+                                    { price: Number(stockInfo.take_profit_price), label: '止盈价', color: '#10b981' },
                                 ] : []}
                                 height={stockInfo?.is_paper_trade ? 220 : 190}
                                 compact
@@ -593,10 +642,15 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
 
             {/* Premium Remark Modal */}
             {showRemarkModal && (
-                <div className="absolute inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm" onClick={() => { setShowRemarkModal(false); setRemarkText(''); setAddTradeMode('SIMULATED'); }}>
-                    <div className="bg-white rounded-2xl shadow-2xl p-6 w-[360px] mx-4 space-y-4 animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+                <ModalOverlay
+                    open
+                    onClose={() => { setShowRemarkModal(false); setRemarkText(''); setAddTradeMode('SIMULATED'); }}
+                    labelledBy="ai-deepdive-remark-dialog-title"
+                    zIndexClass="absolute inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-sm"
+                >
+                    <div className="bg-white rounded-2xl shadow-2xl p-6 w-[360px] mx-4 space-y-4 animate-in fade-in zoom-in-95 duration-200">
                         <div className="flex items-center justify-between">
-                            <h3 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
+                            <h3 id="ai-deepdive-remark-dialog-title" className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
                                 <Plus size={16} className="text-indigo-500" /> 加入拟合仓
                             </h3>
                             <span className="text-[10px] text-slate-400 font-mono font-bold bg-slate-50 px-2 py-0.5 rounded border border-slate-100">
@@ -674,7 +728,7 @@ export default function AIDeepDive({ stock, onClose }: AIDeepDiveProps) {
                             </button>
                         </div>
                     </div>
-                </div>
+                </ModalOverlay>
             )}
 
             {/* Premium Sliding Toast Alert */}

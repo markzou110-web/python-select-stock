@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { CheckCircle2, Grid3x3, Loader2, Save, TrendingUp } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import api from '@/lib/api';
+import ModalOverlay from './ui/ModalOverlay';
 
 interface HeatmapProps {
     code: string;
@@ -99,11 +100,16 @@ export default function HeatmapOptimizer({ code, name, strategy, onClose }: Heat
     const maxVal = result ? Math.max(...result.values.flat()) : 0;
 
     return (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={onClose}>
-            <div className="bg-white rounded-2xl shadow-2xl p-8 w-[640px] max-h-[80vh] overflow-auto space-y-6 animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+        <ModalOverlay
+            open
+            onClose={onClose}
+            labelledBy="heatmap-optimizer-dialog-title"
+            zIndexClass="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+        >
+            <div className="bg-white rounded-2xl shadow-2xl p-8 w-[640px] max-h-[80vh] overflow-auto space-y-6 animate-in fade-in zoom-in-95 duration-200">
                 <div className="flex items-center justify-between">
                     <div>
-                        <h3 className="text-lg font-bold text-slate-800">参数寻优</h3>
+                        <h3 id="heatmap-optimizer-dialog-title" className="text-lg font-bold text-slate-800">参数寻优</h3>
                         <span className="text-xs text-slate-400 font-mono">{name} {code} · {strategy}</span>
                     </div>
                     <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-xl font-bold">&times;</button>
@@ -200,6 +206,6 @@ export default function HeatmapOptimizer({ code, name, strategy, onClose }: Heat
                     </div>
                 )}
             </div>
-        </div>
+        </ModalOverlay>
     );
 }

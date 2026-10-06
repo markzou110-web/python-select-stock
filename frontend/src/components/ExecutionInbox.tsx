@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { CheckCircle2, Clock3, Eye, Inbox, Loader2, RefreshCw, Send, XCircle } from 'lucide-react';
 import api from '@/lib/api';
 import { cn } from '@/lib/utils';
+import ModalOverlay from './ui/ModalOverlay';
 
 type IntentState = 'ISSUED' | 'SEEN' | 'ACCEPTED' | 'SKIPPED' | 'ORDERED' | 'PARTIAL' | 'FILLED' | 'CANCELLED' | 'EXPIRED';
 
@@ -179,24 +180,34 @@ export default function ExecutionInbox() {
             )}
 
             {transition && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4" onClick={() => setTransition(null)}>
-                    <div className="w-full max-w-md space-y-4 rounded-2xl bg-white p-6 shadow-2xl" onClick={event => event.stopPropagation()}>
-                        <h3 className="font-black text-slate-900">{stateLabel[transition.target]} · {transition.intent.name || transition.intent.code}</h3>
+                <ModalOverlay
+                    open
+                    onClose={() => setTransition(null)}
+                    labelledBy="execution-transition-dialog-title"
+                    zIndexClass="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
+                >
+                    <div className="w-full max-w-md space-y-4 rounded-2xl bg-white p-6 shadow-2xl">
+                        <h3 id="execution-transition-dialog-title" className="font-black text-slate-900">{stateLabel[transition.target]} · {transition.intent.name || transition.intent.code}</h3>
                         <label className="block text-xs font-bold text-slate-600">{transition.target === 'ORDERED' ? '委托股数' : '累计成交股数'}<input type="number" min="1" value={shares} onChange={event => setShares(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2" /></label>
                         {transition.target !== 'ORDERED' && <label className="block text-xs font-bold text-slate-600">累计成交均价<input type="number" min="0" step="0.01" value={price} onChange={event => setPrice(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2" /></label>}
                         <label className="block text-xs font-bold text-slate-600">备注（可选）<input value={note} onChange={event => setNote(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-200 px-3 py-2" /></label>
                         <div className="flex justify-end gap-2"><button onClick={() => setTransition(null)} className="rounded-lg px-4 py-2 text-xs font-bold text-slate-500">取消</button><button disabled={!shares || (transition.target !== 'ORDERED' && !price) || saving} onClick={() => submitTransition(transition.intent, transition.target, { shares: Number(shares), actual_price: price ? Number(price) : undefined, note })} className="flex items-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-xs font-bold text-white disabled:opacity-40">{saving ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}确认</button></div>
                     </div>
-                </div>
+                </ModalOverlay>
             )}
 
             {timeline && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4" onClick={() => setTimeline(null)}>
-                    <div className="max-h-[80vh] w-full max-w-xl overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl" onClick={event => event.stopPropagation()}>
-                        <div className="mb-5 flex items-center justify-between"><h3 className="font-black text-slate-900">执行时间线 · {timeline.intent.code}</h3><button onClick={() => setTimeline(null)}><XCircle className="text-slate-400" /></button></div>
+                <ModalOverlay
+                    open
+                    onClose={() => setTimeline(null)}
+                    labelledBy="execution-timeline-dialog-title"
+                    zIndexClass="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
+                >
+                    <div className="max-h-[80vh] w-full max-w-xl overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl">
+                        <div className="mb-5 flex items-center justify-between"><h3 id="execution-timeline-dialog-title" className="font-black text-slate-900">执行时间线 · {timeline.intent.code}</h3><button onClick={() => setTimeline(null)}><XCircle className="text-slate-400" /></button></div>
                         <div className="space-y-3">{timeline.events.map(event => <div key={event.id} className="flex gap-3 rounded-xl bg-slate-50 p-3"><Eye size={16} className="mt-0.5 shrink-0 text-blue-600" /><div><p className="text-xs font-black text-slate-700">{event.from_state ? `${stateLabel[event.from_state as IntentState] || event.from_state} → ` : ''}{stateLabel[event.to_state as IntentState] || event.to_state}</p><p className="text-[10px] text-slate-400">{new Date(event.event_at).toLocaleString()}{event.shares ? ` · ${event.shares}股` : ''}{event.actual_price ? ` · ¥${event.actual_price}` : ''}</p>{event.note && <p className="mt-1 text-[11px] text-slate-500">{event.note}</p>}</div></div>)}</div>
                     </div>
-                </div>
+                </ModalOverlay>
             )}
         </div>
     );

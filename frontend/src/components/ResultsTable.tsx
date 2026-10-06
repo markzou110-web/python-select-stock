@@ -29,6 +29,7 @@ import dynamic from 'next/dynamic';
 const StockChart = dynamic(() => import('./StockChart'), { ssr: false, loading: () => <div className="h-48 flex items-center justify-center text-slate-400 text-xs">Loading chart...</div> });
 import PositionSizer from './PositionSizer';
 import HeatmapOptimizer from './HeatmapOptimizer';
+import ModalOverlay from './ui/ModalOverlay';
 import { ScanResult } from '@/stores/scanStore';
 
 type AIReview = {
@@ -54,6 +55,22 @@ type AIPerformance = {
     };
     sample_warning?: string | null;
 };
+type ExecutionTimeline = {
+    code: string;
+    items: Array<{
+        scanned_at: string;
+        data_date: string;
+        strategy_type: string;
+        trade_bucket?: string;
+        price?: number;
+        confirmation_price?: number;
+        stop_price?: number;
+        target_price?: number;
+        plan_state?: { state?: string };
+        lifecycle?: string;
+        blockers?: string[];
+    }>;
+};
 export default function ResultsTable({
     results,
     onSelectStock,
@@ -78,7 +95,7 @@ export default function ResultsTable({
     const [aiLoading, setAILoading] = useState(false);
     const [aiPerformance, setAIPerformance] = useState<AIPerformance | null>(null);
     const [brooksFilter, setBrooksFilter] = useState<'ALL' | 'READY' | 'NO_AVOID' | 'LOW_RISK' | 'PULLBACK' | 'LOW_FAILURE' | 'H2_STRONG' | 'STRONG_TREND'>('ALL');
-    const [timeline, setTimeline] = useState<any>(null);
+    const [timeline, setTimeline] = useState<ExecutionTimeline | null>(null);
     const [timelineLoading, setTimelineLoading] = useState(false);
 
     const openTimeline = async (code: string) => {
@@ -1020,15 +1037,20 @@ export default function ResultsTable({
     return (
         <div className="glass-card overflow-hidden border-none shadow-2xl shadow-slate-200/50 animate-in fade-in slide-in-from-bottom-4 duration-500">
             {(timeline || timelineLoading) && (
-                <div className="fixed inset-0 z-50 bg-slate-950/40 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => !timelineLoading && setTimeline(null)}>
-                    <div className="w-full max-w-3xl max-h-[80vh] overflow-auto rounded-2xl bg-white p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+                <ModalOverlay
+                    open
+                    onClose={() => { if (!timelineLoading) setTimeline(null); }}
+                    labelledBy="results-timeline-dialog-title"
+                    zIndexClass="fixed inset-0 z-50 bg-slate-950/40 backdrop-blur-sm flex items-center justify-center p-4"
+                >
+                    <div className="w-full max-w-3xl max-h-[80vh] overflow-auto rounded-2xl bg-white p-5 shadow-2xl">
                         <div className="flex items-center justify-between mb-4">
-                            <div><h3 className="font-black text-slate-800">执行计划时间线</h3><p className="text-xs text-slate-400">{timeline?.code || '加载中'}</p></div>
+                            <div><h3 id="results-timeline-dialog-title" className="font-black text-slate-800">执行计划时间线</h3><p className="text-xs text-slate-400">{timeline?.code || '加载中'}</p></div>
                             <button onClick={() => setTimeline(null)} className="text-xs font-black text-slate-500">关闭</button>
                         </div>
                         {timelineLoading ? <div className="p-10 text-center text-slate-400">加载中...</div> : (
                             <div className="space-y-3">
-                                {(timeline?.items || []).map((item: any, index: number) => (
+                                {(timeline?.items || []).map((item, index) => (
                                     <div key={`${item.scanned_at}-${index}`} className="rounded-xl border border-slate-100 bg-slate-50 p-3">
                                         <div className="flex justify-between text-xs font-black text-slate-700"><span>{item.data_date} · {item.strategy_type}</span><span>{item.trade_bucket || '--'}</span></div>
                                         <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] text-slate-500">
@@ -1041,7 +1063,7 @@ export default function ResultsTable({
                             </div>
                         )}
                     </div>
-                </div>
+                </ModalOverlay>
             )}
             <div className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white">
                 <div className="flex items-center gap-3">
@@ -1202,10 +1224,15 @@ export default function ResultsTable({
             )}
 
             {remarkStock && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => { setRemarkStock(null); setRemarkText(''); setAddTradeMode('SIMULATED'); }}>
-                    <div className="bg-white rounded-2xl shadow-2xl p-6 w-[400px] space-y-4 animate-in fade-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+                <ModalOverlay
+                    open
+                    onClose={() => { setRemarkStock(null); setRemarkText(''); setAddTradeMode('SIMULATED'); }}
+                    labelledBy="results-remark-dialog-title"
+                    zIndexClass="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm"
+                >
+                    <div className="bg-white rounded-2xl shadow-2xl p-6 w-[400px] space-y-4 animate-in fade-in zoom-in-95 duration-200">
                         <div className="flex items-center justify-between">
-                            <h3 className="text-sm font-bold text-slate-800">加入交易记录</h3>
+                            <h3 id="results-remark-dialog-title" className="text-sm font-bold text-slate-800">加入交易记录</h3>
                             <span className="text-xs text-slate-400 font-mono">{remarkStock.名称} {remarkStock.代码}</span>
                         </div>
                         {/* Trade Mode Selector */}
@@ -1271,7 +1298,7 @@ export default function ResultsTable({
                             </button>
                         </div>
                     </div>
-                </div>
+                </ModalOverlay>
             )}
 
             {/* Toast notification */}
