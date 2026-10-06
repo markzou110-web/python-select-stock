@@ -671,3 +671,41 @@ def test_sector_fund_demote_disabled_rolls_back(monkeypatch):
     apply_decision_layer([stock], _snapshot([1, 2, 3, 1, 2, 1]), {"status": "OFFENSIVE"})
 
     assert stock["trade_bucket"] == "TRADE"
+
+
+def test_signal_tier_weighting_orders_confluence_higher(monkeypatch):
+    """signal-tier-weight-v1-shadow：同评分下 A 层（双确认）机会分 +4、B 层 -2、C 层不加权。
+
+    证据：regime_attribution 三段 walk-forward，同门槛下 A 对 B 期望优势约
+    +1pt/笔（docs/research/WINRATE_BASELINES_AND_GATES_2026-10-06.md）。"""
+    import core.risk_constants as rc
+
+    def _tiered_stock(tier):
+        return _stock(
+            strategy_type="tv_dual",
+            trade_eligible=True,
+            trade_bucket="TRADE",
+            tv_execution_tier=tier,
+        )
+
+    stocks = [_tiered_stock("A"), _tiered_stock("B"), _tiered_stock("C")]
+    apply_decision_layer(stocks, _snapshot([8, 7, 6, 5, 4, 3, 2, 1]), {"status": "OFFENSIVE"})
+    a_score = stocks[0]["trade_opportunity_score"]
+    b_score = stocks[1]["trade_opportunity_score"]
+    c_score = stocks[2]["trade_opportunity_score"]
+
+    assert a_score == round(min(100, b_score + rc.SIGNAL_TIER_B_PENALTY + rc.SIGNAL_TIER_A_BONUS), 1)
+    assert stocks[0]["signal_tier_adjust"] == rc.SIGNAL_TIER_A_BONUS
+    assert stocks[1]["signal_tier_adjust"] == -rc.SIGNAL_TIER_B_PENALTY
+    assert "signal_tier_adjust" not in stocks[2]  # C 层不加权
+    assert stocks[0]["signal_tier_policy_version"] == "signal-tier-weight-v1-shadow"
+
+
+def test_signal_tier_weighting_can_be_disabled(monkeypatch):
+    import core.risk_constants as rc
+
+    monkeypatch.setattr(rc, "SIGNAL_TIER_WEIGHT_ENABLED", False)
+    stocks = [_stock(strategy_type="tv_dual", trade_eligible=True, trade_bucket="TRADE",
+                     tv_execution_tier="A")]
+    apply_decision_layer(stocks, _snapshot([8, 7, 6, 5, 4, 3, 2, 1]), {"status": "OFFENSIVE"})
+    assert "signal_tier_adjust" not in stocks[0]

@@ -540,6 +540,24 @@ def apply_decision_layer(
         # v2：共振不再作为 TRADE 硬合取项，转为机会分加分。
         if TRADE_GATE_V2_ENABLED and stock.get("共振") == "🔥 核心热点":
             opportunity = round(_clamp(opportunity + TRADE_GATE_RESONANCE_BONUS), 1)
+        # ── 信号源分层加权（signal-tier-weight-v1-shadow）──
+        # A 层（MA+ZP 双确认）加分、B 层（MA-only）减分、C 层（ZP-only）不加权
+        # （强年份依赖）。只影响排序，不改资格；证据与转正条件见
+        # docs/research/WINRATE_BASELINES_AND_GATES_2026-10-06.md 与 validation_gate。
+        from core.risk_constants import (
+            SIGNAL_TIER_A_BONUS, SIGNAL_TIER_B_PENALTY,
+            SIGNAL_TIER_POLICY_VERSION, SIGNAL_TIER_WEIGHT_ENABLED,
+        )
+        if SIGNAL_TIER_WEIGHT_ENABLED:
+            tier = str(stock.get("tv_execution_tier") or "").upper()
+            if tier == "A":
+                opportunity = round(_clamp(opportunity + SIGNAL_TIER_A_BONUS), 1)
+                stock["signal_tier_adjust"] = SIGNAL_TIER_A_BONUS
+            elif tier == "B":
+                opportunity = round(_clamp(opportunity - SIGNAL_TIER_B_PENALTY), 1)
+                stock["signal_tier_adjust"] = -SIGNAL_TIER_B_PENALTY
+            if tier in {"A", "B"}:
+                stock["signal_tier_policy_version"] = SIGNAL_TIER_POLICY_VERSION
         # ── 市场环境 → 执行权限与仓位 ──
         # v2（trade-gate-v2）：市场状态从一票否决改为仓位调节——
         #   OFFENSIVE 正常 / DEFENSIVE 仓位×0.5 / CRITICAL 默认禁止新仓

@@ -27,6 +27,7 @@ PROMOTION_REGISTRY: Dict[str, str] = {
     # 拦截交易三段均为负（train -1.72/validation -2.34/test -2.44）；
     # 转正另需 SHADOW 实盘期 ≥3 个月方向一致 + 退潮型月份（ZT_EBB）覆盖评估
     "market_state_gate": "R3 十日动量闸门：历史三段已过；SHADOW 期逐日状态对照 ≥3 个月方向一致",
+    "signal_tier_weight": "双确认加权（机会分排序，v1-shadow）：SHADOW 期 ≥3 个月 A/B 层实现收益差方向一致",
 }
 
 

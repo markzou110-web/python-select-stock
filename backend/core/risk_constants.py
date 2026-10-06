@@ -57,6 +57,18 @@ SOP_A_GRADE_MIN_MATURE_SAMPLES = 30
 # trade_cautions（扣分+缩仓），市场环境从一票否决改为仓位调节。
 # 硬阻断仅保留：数据异常 / PA结构明确失效 / 风险>20% / 严重公告 /
 # 确认价不可成交 / 板块明确退潮（强度不足不算退潮）。
+# ── 信号源分层加权（signal-tier-weight-v1-shadow，2026-10-06）──
+# 依据：regime_attribution 事件分层（132,681 事件三段 walk-forward，
+# docs/research/WINRATE_BASELINES_AND_GATES_2026-10-06.md）——同门槛 PA≥60
+# 下 A 层（MA+ZP 双确认）对 B 层（MA-only）期望优势三段稳定约 +1pt/笔
+# （test 段 +0.75% vs -0.27%）。只影响 trade_opportunity_score 排序（±加分），
+# 不改任何资格硬门槛；C 层（ZP-only）强年份依赖不加权。
+# 转正：SHADOW 期 ≥3 个月 A/B 层实现收益差方向一致（validation_gate）。
+SIGNAL_TIER_WEIGHT_ENABLED = os.getenv("SIGNAL_TIER_WEIGHT_ENABLED", "true").lower() == "true"
+SIGNAL_TIER_A_BONUS = 4.0     # 双确认加分（机会分 0-100 内）
+SIGNAL_TIER_B_PENALTY = 2.0   # MA-only 减分
+SIGNAL_TIER_POLICY_VERSION = "signal-tier-weight-v1-shadow"
+
 TRADE_GATE_POLICY_VERSION = "trade-gate-v2"
 TRADE_GATE_V2_ENABLED = True  # 一行回滚：False 恢复 v1 全拦截行为
 
