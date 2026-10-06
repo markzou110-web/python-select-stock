@@ -504,51 +504,48 @@ def init_db(engine=None):
 
             # --- Migration: paper trading close audit metadata ---
             try:
-                conn.execute(text("""
-                    ALTER TABLE paper_trading
-                    ADD COLUMN IF NOT EXISTS close_source VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS closed_by VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP
-                """))
+                _ensure_columns(conn, engine, "paper_trading", {
+                    "close_source": "VARCHAR(50)",
+                    "closed_by": "VARCHAR(50)",
+                    "updated_at": "TIMESTAMP",
+                })
                 logger.info("Migration: paper trading close audit columns ensured.")
             except Exception as e:
                 logger.warning(f"paper trading close audit migration skipped: {e}")
 
             # --- Migration: price action P0 fields ---
             try:
-                conn.execute(text("""
-                    ALTER TABLE scan_history
-                    ADD COLUMN IF NOT EXISTS price_action_score FLOAT,
-                    ADD COLUMN IF NOT EXISTS price_action_regime VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS price_action_signal VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS price_action_pattern VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS price_action_entry_quality VARCHAR(50),
-                    ADD COLUMN IF NOT EXISTS price_action_summary TEXT,
-                    ADD COLUMN IF NOT EXISTS pa_entry_price FLOAT,
-                    ADD COLUMN IF NOT EXISTS pa_stop_price FLOAT,
-                    ADD COLUMN IF NOT EXISTS pa_target_price FLOAT,
-                    ADD COLUMN IF NOT EXISTS pa_risk_reward FLOAT,
-                    ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
-                    ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
-                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT,
-                    ADD COLUMN IF NOT EXISTS price_action_detail JSONB
-                """))
+                _ensure_columns(conn, engine, "scan_history", {
+                    "price_action_score": "FLOAT",
+                    "price_action_regime": "VARCHAR(50)",
+                    "price_action_signal": "VARCHAR(50)",
+                    "price_action_pattern": "VARCHAR(50)",
+                    "price_action_entry_quality": "VARCHAR(50)",
+                    "price_action_summary": "TEXT",
+                    "pa_entry_price": "FLOAT",
+                    "pa_stop_price": "FLOAT",
+                    "pa_target_price": "FLOAT",
+                    "pa_risk_reward": "FLOAT",
+                    "pa_trade_action": "VARCHAR(20)",
+                    "pa_trade_setup": "VARCHAR(80)",
+                    "pa_risk_pct": "FLOAT",
+                    "price_action_detail": "JSONB",
+                })
                 logger.info("Migration: price action columns ensured.")
             except Exception as e:
                 logger.warning(f"price action migration skipped (may already exist): {e}")
 
             # --- Migration: SOP grade snapshots for historical review ---
             try:
-                conn.execute(text("""
-                    ALTER TABLE scan_history
-                    ADD COLUMN IF NOT EXISTS sop_grade VARCHAR(10),
-                    ADD COLUMN IF NOT EXISTS sop_quality_score FLOAT,
-                    ADD COLUMN IF NOT EXISTS sop_subgrade VARCHAR(10),
-                    ADD COLUMN IF NOT EXISTS sop_vetoes JSONB,
-                    ADD COLUMN IF NOT EXISTS sop_checks JSONB,
-                    ADD COLUMN IF NOT EXISTS sop_bonuses JSONB,
-                    ADD COLUMN IF NOT EXISTS sop_risks JSONB
-                """))
+                _ensure_columns(conn, engine, "scan_history", {
+                    "sop_grade": "VARCHAR(10)",
+                    "sop_quality_score": "FLOAT",
+                    "sop_subgrade": "VARCHAR(10)",
+                    "sop_vetoes": "JSONB",
+                    "sop_checks": "JSONB",
+                    "sop_bonuses": "JSONB",
+                    "sop_risks": "JSONB",
+                })
                 if engine.dialect.name == "postgresql":
                     conn.execute(text("""
                         UPDATE scan_history
@@ -661,26 +658,24 @@ def init_db(engine=None):
 
             # --- Migration: Brooks trade-plan snapshots ---
             try:
-                conn.execute(text("""
-                    ALTER TABLE paper_trading
-                    ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
-                    ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
-                    ADD COLUMN IF NOT EXISTS pa_entry_condition TEXT,
-                    ADD COLUMN IF NOT EXISTS pa_invalidation TEXT,
-                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT
-                """))
-                conn.execute(text("""
-                    ALTER TABLE watchlist
-                    ADD COLUMN IF NOT EXISTS pa_trade_action VARCHAR(20),
-                    ADD COLUMN IF NOT EXISTS pa_trade_setup VARCHAR(80),
-                    ADD COLUMN IF NOT EXISTS pa_entry_condition TEXT,
-                    ADD COLUMN IF NOT EXISTS pa_invalidation TEXT,
-                    ADD COLUMN IF NOT EXISTS pa_risk_pct FLOAT,
-                    ADD COLUMN IF NOT EXISTS last_review_date DATE,
-                    ADD COLUMN IF NOT EXISTS watch_decision VARCHAR(30),
-                    ADD COLUMN IF NOT EXISTS watch_action TEXT,
-                    ADD COLUMN IF NOT EXISTS exit_reason TEXT
-                """))
+                _ensure_columns(conn, engine, "paper_trading", {
+                    "pa_trade_action": "VARCHAR(20)",
+                    "pa_trade_setup": "VARCHAR(80)",
+                    "pa_entry_condition": "TEXT",
+                    "pa_invalidation": "TEXT",
+                    "pa_risk_pct": "FLOAT",
+                })
+                _ensure_columns(conn, engine, "watchlist", {
+                    "pa_trade_action": "VARCHAR(20)",
+                    "pa_trade_setup": "VARCHAR(80)",
+                    "pa_entry_condition": "TEXT",
+                    "pa_invalidation": "TEXT",
+                    "pa_risk_pct": "FLOAT",
+                    "last_review_date": "DATE",
+                    "watch_decision": "VARCHAR(30)",
+                    "watch_action": "TEXT",
+                    "exit_reason": "TEXT",
+                })
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_history_pa_action ON scan_history(pa_trade_action);"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_watchlist_pa_action ON watchlist(pa_trade_action);"))
                 logger.info("Migration: Brooks trade-plan snapshot columns ensured.")
