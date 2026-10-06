@@ -26,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from typing import Any, Dict
+
 import pandas as pd
 
 from core.a_grade_kline_replay import (
@@ -100,6 +102,59 @@ RULES = {
 }
 
 
+
+
+def run_bucket_experiments(events_csv: str) -> Dict[str, Any]:
+    """负期望桶对照实验（提胜率路线第二步）。
+
+    用缓存事件验证"砍桶"规则在三段 walk-forward 是否一致拦截负期望：
+      X1 追高桶：排除 pa_score >= 80（高位扩展段，审查证据 -5.56%/5日）
+      X2 过热桶：排除 pct_5d > 10（A-EOD 回放唯一正期望门槛组成）
+      X3 X1+X2 组合
+    每条输出分段：拦截笔数、拦截笔平均收益（为负才是好规则）、
+    保留笔胜率/期望 vs 无桶基线。AMP20 桶事件里无该字段，留待扫描侧验证。
+    """
+    frame = pd.read_csv(events_csv)
+    filled = frame[frame["exec_filled"].fillna(False).astype(bool)].copy()
+    filled["exec_return_pct"] = pd.to_numeric(filled["exec_return_pct"], errors="coerce")
+    filled["exec_entry_date"] = pd.to_datetime(filled["exec_entry_date"], errors="coerce")
+    filled = filled.dropna(subset=["exec_entry_date", "exec_return_pct"])
+    filled["segment"] = filled["exec_entry_date"].map(lambda d: _segment_of(d))
+    for col in ("pa_score", "pct_5d"):
+        filled[col] = pd.to_numeric(filled.get(col), errors="coerce")
+
+    def _mask(predicate) -> pd.Series:
+        return filled.apply(predicate, axis=1).fillna(False).astype(bool)
+
+    experiments = {}
+    rules = {
+        "X1_pa_over_80": lambda r: pd.notna(r["pa_score"]) and r["pa_score"] >= 80,
+        "X2_pct_5d_over_10": lambda r: pd.notna(r["pct_5d"]) and r["pct_5d"] > 10,
+        "X3_combined": lambda r: (
+            (pd.notna(r["pa_score"]) and r["pa_score"] >= 80)
+            or (pd.notna(r["pct_5d"]) and r["pct_5d"] > 10)
+        ),
+    }
+    for name, predicate in rules.items():
+        mask = _mask(predicate)
+        per_segment = {}
+        for segment in ("train", "validation", "test"):
+            seg = filled[filled["segment"] == segment]
+            seg_mask = mask[seg.index]
+            per_segment[segment] = {
+                "baseline": _bucket_stats(seg),
+                "kept": _bucket_stats(seg[~seg_mask]),
+                "blocked": _bucket_stats(seg[seg_mask]),
+            }
+        experiments[name] = {"per_segment": per_segment}
+    return {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "events_csv": events_csv,
+        "filled": int(len(filled)),
+        "experiments": experiments,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start-date", default="2022-05-12")
@@ -110,7 +165,21 @@ def main() -> None:
                         help="filled 事件缓存（重放 ~70min，缓存后规则迭代免重跑）")
     parser.add_argument("--events-in", default="",
                         help="已有事件缓存路径；给定则跳过重放")
+    parser.add_argument("--buckets", action="store_true",
+                        help="只跑负期望桶对照实验（需 --events-in 缓存），不重放不落库")
     args = parser.parse_args()
+
+    if args.buckets:
+        if not args.events_in:
+            print("--buckets 需要 --events-in 指向事件缓存", flush=True)
+            sys.exit(1)
+        report = run_bucket_experiments(args.events_in)
+        payload = json.dumps(report, ensure_ascii=False, indent=2)
+        print(payload)
+        if args.out:
+            Path(args.out).write_text(payload, encoding="utf-8")
+            print(f"saved -> {args.out}", flush=True)
+        return
 
     engine = get_db_engine()
     market = _market_proxy(engine, args.start_date)

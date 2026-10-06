@@ -1,0 +1,725 @@
+{
+  "generated_at": "2026-10-06T13:38:23",
+  "start_date": "2022-05-12",
+  "events": 132681,
+  "filled": 52569,
+  "monthly": {
+    "2022-11": {
+      "filled": 877,
+      "win_rate": 28.96,
+      "avg_return": -1.581,
+      "median_return": -4.927,
+      "profit_factor": 0.679,
+      "market_month_return": 4.990630269414975,
+      "offensive_ratio": 86.36363636363636
+    },
+    "2022-12": {
+      "filled": 747,
+      "win_rate": 22.49,
+      "avg_return": -2.932,
+      "median_return": -6.547,
+      "profit_factor": 0.495,
+      "market_month_return": -4.627406657040978,
+      "offensive_ratio": 50.0
+    },
+    "2023-01": {
+      "filled": 1327,
+      "win_rate": 52.15,
+      "avg_return": 3.135,
+      "median_return": 0.656,
+      "profit_factor": 2.273,
+      "market_month_return": 5.669320418660173,
+      "offensive_ratio": 81.25
+    },
+    "2023-02": {
+      "filled": 1404,
+      "win_rate": 31.41,
+      "avg_return": -0.639,
+      "median_return": -3.883,
+      "profit_factor": 0.844,
+      "market_month_return": 1.6558086554536944,
+      "offensive_ratio": 100.0
+    },
+    "2023-03": {
+      "filled": 1530,
+      "win_rate": 35.29,
+      "avg_return": 0.676,
+      "median_return": -3.443,
+      "profit_factor": 1.175,
+      "market_month_return": -2.046475148220195,
+      "offensive_ratio": 34.78260869565217
+    },
+    "2023-04": {
+      "filled": 1444,
+      "win_rate": 29.78,
+      "avg_return": -1.205,
+      "median_return": -4.955,
+      "profit_factor": 0.753,
+      "market_month_return": -3.714987306194184,
+      "offensive_ratio": 47.368421052631575
+    },
+    "2023-05": {
+      "filled": 1518,
+      "win_rate": 26.81,
+      "avg_return": -2.242,
+      "median_return": -4.871,
+      "profit_factor": 0.575,
+      "market_month_return": -0.37402900049593457,
+      "offensive_ratio": 10.0
+    },
+    "2023-06": {
+      "filled": 1162,
+      "win_rate": 26.94,
+      "avg_return": -2.054,
+      "median_return": -5.168,
+      "profit_factor": 0.606,
+      "market_month_return": 1.5660005376065822,
+      "offensive_ratio": 40.0
+    },
+    "2023-07": {
+      "filled": 1176,
+      "win_rate": 24.32,
+      "avg_return": -2.226,
+      "median_return": -4.62,
+      "profit_factor": 0.539,
+      "market_month_return": 0.2783796832072527,
+      "offensive_ratio": 66.66666666666666
+    },
+    "2023-08": {
+      "filled": 747,
+      "win_rate": 15.13,
+      "avg_return": -3.774,
+      "median_return": -5.829,
+      "profit_factor": 0.334,
+      "market_month_return": -3.5621356197915177,
+      "offensive_ratio": 17.391304347826086
+    },
+    "2023-09": {
+      "filled": 805,
+      "win_rate": 24.1,
+      "avg_return": -2.083,
+      "median_return": -5.556,
+      "profit_factor": 0.602,
+      "market_month_return": -0.33547718381179426,
+      "offensive_ratio": 25.0
+    },
+    "2023-10": {
+      "filled": 763,
+      "win_rate": 40.89,
+      "avg_return": 0.373,
+      "median_return": -2.685,
+      "profit_factor": 1.092,
+      "market_month_return": -0.5031273283118476,
+      "offensive_ratio": 11.76470588235294
+    },
+    "2023-11": {
+      "filled": 1206,
+      "win_rate": 26.29,
+      "avg_return": -2.231,
+      "median_return": -5.104,
+      "profit_factor": 0.558,
+      "market_month_return": 3.3797209106221304,
+      "offensive_ratio": 100.0
+    },
+    "2023-12": {
+      "filled": 633,
+      "win_rate": 19.43,
+      "avg_return": -3.21,
+      "median_return": -6.375,
+      "profit_factor": 0.445,
+      "market_month_return": -2.492319325976733,
+      "offensive_ratio": 9.523809523809524
+    },
+    "2024-01": {
+      "filled": 674,
+      "win_rate": 16.02,
+      "avg_return": -4.61,
+      "median_return": -8.267,
+      "profit_factor": 0.305,
+      "market_month_return": -18.769003953509657,
+      "offensive_ratio": 0.0
+    },
+    "2024-02": {
+      "filled": 539,
+      "win_rate": 43.6,
+      "avg_return": 0.665,
+      "median_return": -2.433,
+      "profit_factor": 1.149,
+      "market_month_return": 7.839824797657391,
+      "offensive_ratio": 20.0
+    },
+    "2024-03": {
+      "filled": 296,
+      "win_rate": 37.16,
+      "avg_return": -0.467,
+      "median_return": -5.451,
+      "profit_factor": 0.905,
+      "market_month_return": 3.47623235022656,
+      "offensive_ratio": 90.47619047619048
+    },
+    "2024-04": {
+      "filled": 825,
+      "win_rate": 28.73,
+      "avg_return": -2.602,
+      "median_return": -6.34,
+      "profit_factor": 0.54,
+      "market_month_return": -3.4754480546378197,
+      "offensive_ratio": 25.0
+    },
+    "2024-05": {
+      "filled": 755,
+      "win_rate": 14.04,
+      "avg_return": -6.032,
+      "median_return": -9.341,
+      "profit_factor": 0.169,
+      "market_month_return": -3.5086047412789756,
+      "offensive_ratio": 65.0
+    },
+    "2024-06": {
+      "filled": 211,
+      "win_rate": 19.91,
+      "avg_return": -4.918,
+      "median_return": -8.322,
+      "profit_factor": 0.273,
+      "market_month_return": -7.01748360793526,
+      "offensive_ratio": 0.0
+    },
+    "2024-07": {
+      "filled": 428,
+      "win_rate": 21.73,
+      "avg_return": -2.534,
+      "median_return": -6.445,
+      "profit_factor": 0.551,
+      "market_month_return": -0.18309325406039578,
+      "offensive_ratio": 0.0
+    },
+    "2024-08": {
+      "filled": 374,
+      "win_rate": 15.78,
+      "avg_return": -3.6,
+      "median_return": -9.339,
+      "profit_factor": 0.475,
+      "market_month_return": -3.602567301754067,
+      "offensive_ratio": 22.727272727272727
+    },
+    "2024-09": {
+      "filled": 1274,
+      "win_rate": 79.67,
+      "avg_return": 13.449,
+      "median_return": 11.427,
+      "profit_factor": 13.387,
+      "market_month_return": 24.84961955329641,
+      "offensive_ratio": 26.31578947368421
+    },
+    "2024-10": {
+      "filled": 502,
+      "win_rate": 43.82,
+      "avg_return": 1.254,
+      "median_return": -5.34,
+      "profit_factor": 1.248,
+      "market_month_return": -1.2128022338256383,
+      "offensive_ratio": 100.0
+    },
+    "2024-11": {
+      "filled": 591,
+      "win_rate": 27.92,
+      "avg_return": -2.453,
+      "median_return": -9.339,
+      "profit_factor": 0.61,
+      "market_month_return": 8.018534346824847,
+      "offensive_ratio": 90.47619047619048
+    },
+    "2024-12": {
+      "filled": 1363,
+      "win_rate": 19.81,
+      "avg_return": -3.96,
+      "median_return": -9.338,
+      "profit_factor": 0.416,
+      "market_month_return": -6.1875403274604945,
+      "offensive_ratio": 54.54545454545454
+    },
+    "2025-01": {
+      "filled": 800,
+      "win_rate": 37.62,
+      "avg_return": 0.342,
+      "median_return": -4.231,
+      "profit_factor": 1.071,
+      "market_month_return": 0.27122748877432823,
+      "offensive_ratio": 5.555555555555555
+    },
+    "2025-02": {
+      "filled": 2507,
+      "win_rate": 42.0,
+      "avg_return": 1.373,
+      "median_return": -3.368,
+      "profit_factor": 1.329,
+      "market_month_return": 6.296281748425936,
+      "offensive_ratio": 94.44444444444444
+    },
+    "2025-03": {
+      "filled": 1742,
+      "win_rate": 24.51,
+      "avg_return": -2.62,
+      "median_return": -7.33,
+      "profit_factor": 0.564,
+      "market_month_return": -0.17387741291217118,
+      "offensive_ratio": 71.42857142857143
+    },
+    "2025-04": {
+      "filled": 1216,
+      "win_rate": 39.06,
+      "avg_return": 0.907,
+      "median_return": -4.457,
+      "profit_factor": 1.184,
+      "market_month_return": -3.374095586181558,
+      "offensive_ratio": 4.761904761904762
+    },
+    "2025-05": {
+      "filled": 1824,
+      "win_rate": 45.5,
+      "avg_return": 2.565,
+      "median_return": -1.928,
+      "profit_factor": 1.663,
+      "market_month_return": 1.9760595625533783,
+      "offensive_ratio": 100.0
+    },
+    "2025-06": {
+      "filled": 1490,
+      "win_rate": 40.47,
+      "avg_return": 1.187,
+      "median_return": -3.82,
+      "profit_factor": 1.276,
+      "market_month_return": 4.829316754678636,
+      "offensive_ratio": 80.0
+    },
+    "2025-07": {
+      "filled": 2062,
+      "win_rate": 47.87,
+      "avg_return": 2.812,
+      "median_return": -0.951,
+      "profit_factor": 1.808,
+      "market_month_return": 4.597154345899446,
+      "offensive_ratio": 100.0
+    },
+    "2025-08": {
+      "filled": 2060,
+      "win_rate": 36.17,
+      "avg_return": 0.281,
+      "median_return": -4.558,
+      "profit_factor": 1.062,
+      "market_month_return": 8.010619797517403,
+      "offensive_ratio": 100.0
+    },
+    "2025-09": {
+      "filled": 1376,
+      "win_rate": 30.81,
+      "avg_return": -1.037,
+      "median_return": -5.863,
+      "profit_factor": 0.803,
+      "market_month_return": 0.08667322484203765,
+      "offensive_ratio": 81.81818181818183
+    },
+    "2025-10": {
+      "filled": 1519,
+      "win_rate": 37.79,
+      "avg_return": 0.652,
+      "median_return": -3.271,
+      "profit_factor": 1.16,
+      "market_month_return": 0.7923480962982232,
+      "offensive_ratio": 58.82352941176471
+    },
+    "2025-11": {
+      "filled": 1913,
+      "win_rate": 23.73,
+      "avg_return": -2.082,
+      "median_return": -5.915,
+      "profit_factor": 0.616,
+      "market_month_return": -1.0517168183329484,
+      "offensive_ratio": 60.0
+    },
+    "2025-12": {
+      "filled": 1689,
+      "win_rate": 47.54,
+      "avg_return": 2.891,
+      "median_return": -1.536,
+      "profit_factor": 1.791,
+      "market_month_return": 0.9463125695616581,
+      "offensive_ratio": 30.434782608695656
+    },
+    "2026-01": {
+      "filled": 2274,
+      "win_rate": 41.2,
+      "avg_return": 1.226,
+      "median_return": -3.739,
+      "profit_factor": 1.28,
+      "market_month_return": 6.0686794736722005,
+      "offensive_ratio": 100.0
+    },
+    "2026-02": {
+      "filled": 657,
+      "win_rate": 32.57,
+      "avg_return": -0.731,
+      "median_return": -5.827,
+      "profit_factor": 0.858,
+      "market_month_return": 6.5960928122942075,
+      "offensive_ratio": 92.85714285714286
+    },
+    "2026-03": {
+      "filled": 1449,
+      "win_rate": 24.84,
+      "avg_return": -2.4,
+      "median_return": -6.899,
+      "profit_factor": 0.588,
+      "market_month_return": -7.719620635428514,
+      "offensive_ratio": 13.636363636363635
+    },
+    "2026-04": {
+      "filled": 1630,
+      "win_rate": 44.6,
+      "avg_return": 2.366,
+      "median_return": -2.425,
+      "profit_factor": 1.569,
+      "market_month_return": 4.566143714594273,
+      "offensive_ratio": 66.66666666666666
+    },
+    "2026-05": {
+      "filled": 1275,
+      "win_rate": 28.94,
+      "avg_return": -1.976,
+      "median_return": -8.299,
+      "profit_factor": 0.673,
+      "market_month_return": -4.918460505218503,
+      "offensive_ratio": 72.22222222222221
+    },
+    "2026-06": {
+      "filled": 743,
+      "win_rate": 29.48,
+      "avg_return": -2.05,
+      "median_return": -9.342,
+      "profit_factor": 0.67,
+      "market_month_return": -5.98381948002703,
+      "offensive_ratio": 0.0
+    },
+    "2026-07": {
+      "filled": 501,
+      "win_rate": 19.96,
+      "avg_return": -4.534,
+      "median_return": -9.344,
+      "profit_factor": 0.331,
+      "market_month_return": -9.765172104618426,
+      "offensive_ratio": 0.0
+    },
+    "2026-08": {
+      "filled": 436,
+      "win_rate": 28.67,
+      "avg_return": -2.691,
+      "median_return": -8.564,
+      "profit_factor": 0.526,
+      "market_month_return": 8.331104739778183,
+      "offensive_ratio": 76.19047619047619
+    },
+    "2026-09": {
+      "filled": 235,
+      "win_rate": 7.66,
+      "avg_return": -7.237,
+      "median_return": -9.354,
+      "profit_factor": 0.12,
+      "market_month_return": -2.456825027297249,
+      "offensive_ratio": 57.14285714285714
+    }
+  },
+  "rules": {
+    "R1_non_offensive": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 13477,
+            "win_rate": 33.15,
+            "avg_return": -0.516,
+            "median_return": -4.638,
+            "profit_factor": 0.891
+          },
+          "blocked": {
+            "filled": 9694,
+            "win_rate": 28.71,
+            "avg_return": -1.397,
+            "median_return": -5.074,
+            "profit_factor": 0.727
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 15316,
+            "win_rate": 38.52,
+            "avg_return": 0.811,
+            "median_return": -4.019,
+            "profit_factor": 1.185
+          },
+          "blocked": {
+            "filled": 4882,
+            "win_rate": 36.38,
+            "avg_return": 0.229,
+            "median_return": -4.653,
+            "profit_factor": 1.048
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 5964,
+            "win_rate": 36.54,
+            "avg_return": 0.056,
+            "median_return": -5.173,
+            "profit_factor": 1.011
+          },
+          "blocked": {
+            "filled": 3236,
+            "win_rate": 27.5,
+            "avg_return": -2.113,
+            "median_return": -7.999,
+            "profit_factor": 0.646
+          }
+        }
+      }
+    },
+    "R2_drawdown_5pct": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 19896,
+            "win_rate": 31.59,
+            "avg_return": -0.713,
+            "median_return": -4.623,
+            "profit_factor": 0.851
+          },
+          "blocked": {
+            "filled": 3275,
+            "win_rate": 29.44,
+            "avg_return": -1.929,
+            "median_return": -6.534,
+            "profit_factor": 0.66
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 18762,
+            "win_rate": 38.4,
+            "avg_return": 0.778,
+            "median_return": -4.067,
+            "profit_factor": 1.176
+          },
+          "blocked": {
+            "filled": 1436,
+            "win_rate": 32.8,
+            "avg_return": -0.736,
+            "median_return": -5.564,
+            "profit_factor": 0.861
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 7374,
+            "win_rate": 34.28,
+            "avg_return": -0.447,
+            "median_return": -5.727,
+            "profit_factor": 0.913
+          },
+          "blocked": {
+            "filled": 1826,
+            "win_rate": 29.63,
+            "avg_return": -1.753,
+            "median_return": -8.792,
+            "profit_factor": 0.703
+          }
+        }
+      }
+    },
+    "R3_mom_neg_3pct": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 19859,
+            "win_rate": 31.62,
+            "avg_return": -0.746,
+            "median_return": -4.716,
+            "profit_factor": 0.846
+          },
+          "blocked": {
+            "filled": 3312,
+            "win_rate": 29.32,
+            "avg_return": -1.718,
+            "median_return": -5.574,
+            "profit_factor": 0.676
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 18852,
+            "win_rate": 38.86,
+            "avg_return": 0.886,
+            "median_return": -3.942,
+            "profit_factor": 1.202
+          },
+          "blocked": {
+            "filled": 1346,
+            "win_rate": 26.08,
+            "avg_return": -2.342,
+            "median_return": -7.136,
+            "profit_factor": 0.611
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 7740,
+            "win_rate": 34.63,
+            "avg_return": -0.38,
+            "median_return": -5.709,
+            "profit_factor": 0.926
+          },
+          "blocked": {
+            "filled": 1460,
+            "win_rate": 26.64,
+            "avg_return": -2.437,
+            "median_return": -9.075,
+            "profit_factor": 0.602
+          }
+        }
+      }
+    },
+    "R4_combined": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 12911,
+            "win_rate": 32.65,
+            "avg_return": -0.585,
+            "median_return": -4.636,
+            "profit_factor": 0.876
+          },
+          "blocked": {
+            "filled": 10260,
+            "win_rate": 29.58,
+            "avg_return": -1.262,
+            "median_return": -5.074,
+            "profit_factor": 0.754
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 15316,
+            "win_rate": 38.52,
+            "avg_return": 0.811,
+            "median_return": -4.019,
+            "profit_factor": 1.185
+          },
+          "blocked": {
+            "filled": 4882,
+            "win_rate": 36.38,
+            "avg_return": 0.229,
+            "median_return": -4.653,
+            "profit_factor": 1.048
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 5964,
+            "win_rate": 36.54,
+            "avg_return": 0.056,
+            "median_return": -5.173,
+            "profit_factor": 1.011
+          },
+          "blocked": {
+            "filled": 3236,
+            "win_rate": 27.5,
+            "avg_return": -2.113,
+            "median_return": -7.999,
+            "profit_factor": 0.646
+          }
+        }
+      }
+    }
+  }
+}

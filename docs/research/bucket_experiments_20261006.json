@@ -1,0 +1,226 @@
+{
+  "generated_at": "2026-10-06T13:39:21",
+  "events_csv": "/tmp/regime_events.csv",
+  "filled": 52569,
+  "experiments": {
+    "X1_pa_over_80": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 22093,
+            "win_rate": 31.21,
+            "avg_return": -0.896,
+            "median_return": -4.822,
+            "profit_factor": 0.817
+          },
+          "blocked": {
+            "filled": 1078,
+            "win_rate": 32.84,
+            "avg_return": -0.652,
+            "median_return": -4.416,
+            "profit_factor": 0.862
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 19074,
+            "win_rate": 37.91,
+            "avg_return": 0.679,
+            "median_return": -4.157,
+            "profit_factor": 1.152
+          },
+          "blocked": {
+            "filled": 1124,
+            "win_rate": 39.59,
+            "avg_return": 0.527,
+            "median_return": -4.233,
+            "profit_factor": 1.113
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 8650,
+            "win_rate": 33.13,
+            "avg_return": -0.735,
+            "median_return": -6.117,
+            "profit_factor": 0.861
+          },
+          "blocked": {
+            "filled": 550,
+            "win_rate": 36.91,
+            "avg_return": -0.256,
+            "median_return": -6.086,
+            "profit_factor": 0.952
+          }
+        }
+      }
+    },
+    "X2_pct_5d_over_10": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 14142,
+            "win_rate": 30.46,
+            "avg_return": -0.743,
+            "median_return": -4.079,
+            "profit_factor": 0.831
+          },
+          "blocked": {
+            "filled": 9029,
+            "win_rate": 32.58,
+            "avg_return": -1.106,
+            "median_return": -7.538,
+            "profit_factor": 0.805
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 11259,
+            "win_rate": 38.48,
+            "avg_return": 1.203,
+            "median_return": -3.32,
+            "profit_factor": 1.309
+          },
+          "blocked": {
+            "filled": 8939,
+            "win_rate": 37.41,
+            "avg_return": -0.001,
+            "median_return": -6.423,
+            "profit_factor": 1.0
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 4471,
+            "win_rate": 31.56,
+            "avg_return": -0.732,
+            "median_return": -5.091,
+            "profit_factor": 0.852
+          },
+          "blocked": {
+            "filled": 4729,
+            "win_rate": 35.06,
+            "avg_return": -0.682,
+            "median_return": -8.43,
+            "profit_factor": 0.879
+          }
+        }
+      }
+    },
+    "X3_combined": {
+      "per_segment": {
+        "train": {
+          "baseline": {
+            "filled": 23171,
+            "win_rate": 31.29,
+            "avg_return": -0.885,
+            "median_return": -4.805,
+            "profit_factor": 0.819
+          },
+          "kept": {
+            "filled": 13696,
+            "win_rate": 30.4,
+            "avg_return": -0.766,
+            "median_return": -4.114,
+            "profit_factor": 0.827
+          },
+          "blocked": {
+            "filled": 9475,
+            "win_rate": 32.57,
+            "avg_return": -1.056,
+            "median_return": -7.084,
+            "profit_factor": 0.811
+          }
+        },
+        "validation": {
+          "baseline": {
+            "filled": 20198,
+            "win_rate": 38.0,
+            "avg_return": 0.671,
+            "median_return": -4.17,
+            "profit_factor": 1.149
+          },
+          "kept": {
+            "filled": 10874,
+            "win_rate": 38.42,
+            "avg_return": 1.204,
+            "median_return": -3.334,
+            "profit_factor": 1.309
+          },
+          "blocked": {
+            "filled": 9324,
+            "win_rate": 37.52,
+            "avg_return": 0.048,
+            "median_return": -6.097,
+            "profit_factor": 1.009
+          }
+        },
+        "test": {
+          "baseline": {
+            "filled": 9200,
+            "win_rate": 33.36,
+            "avg_return": -0.707,
+            "median_return": -6.113,
+            "profit_factor": 0.866
+          },
+          "kept": {
+            "filled": 4333,
+            "win_rate": 31.41,
+            "avg_return": -0.766,
+            "median_return": -5.13,
+            "profit_factor": 0.846
+          },
+          "blocked": {
+            "filled": 4867,
+            "win_rate": 35.09,
+            "avg_return": -0.654,
+            "median_return": -8.076,
+            "profit_factor": 0.883
+          }
+        }
+      }
+    }
+  }
+}
