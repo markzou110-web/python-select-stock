@@ -1,32 +1,33 @@
 "use client";
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
     X,
     Calculator,
     ShieldAlert,
     TrendingDown,
-    Target,
     ArrowRight
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import type { ScanResult } from '@/stores/scanStore';
 
 interface PositionSizerProps {
-    stock: any;
+    stock: Pick<ScanResult, '代码' | '名称' | '现价'>;
     onClose: () => void;
 }
 
 export default function PositionSizer({ stock, onClose }: PositionSizerProps) {
     const [totalCapital, setTotalCapital] = useState(500000); // 默认 50万
     const [riskPercent, setRiskPercent] = useState(2); // 默认 2%
-    const [stopLossPrice, setStopLossPrice] = useState(0);
+    const [previousStock, setPreviousStock] = useState(stock);
+    const [stopLossPrice, setStopLossPrice] = useState(() => Number((stock.现价 * 0.95).toFixed(2)));
 
     // 自动计算止损价：默认设为当前价的 -5%
-    useEffect(() => {
-        if (stock?.现价) {
+    if (stock !== previousStock) {
+        setPreviousStock(stock);
+        if (stock.现价) {
             setStopLossPrice(Number((stock.现价 * 0.95).toFixed(2)));
         }
-    }, [stock]);
+    }
 
     const riskAmount = totalCapital * (riskPercent / 100);
     const lossPerShare = stock.现价 - stopLossPrice;

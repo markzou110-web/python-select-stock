@@ -21,7 +21,19 @@ export interface Trade {
 interface TradeStore {
     trades: Trade[];
     loading: boolean;
-    stats: Record<string, any>;
+    stats: {
+        total_trades: number;
+        wins: number;
+        losses: number;
+        flat: number;
+        win_rate: number;
+        avg_pl_pct: number;
+        total_pl_pct: number;
+        avg_hold_days: number;
+        best_trade: { name: string; pl_pct: number } | null;
+        worst_trade: { name: string; pl_pct: number } | null;
+        sector_distribution: Array<{ name: string; value: number; count: number }>;
+    };
     tab: 'open' | 'closed';
     closingId: number | null;
     closePrice: string;

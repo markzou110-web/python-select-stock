@@ -1,6 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import api from '@/lib/api';
-import SplitKLineCharts from './SplitKLineCharts';
+import SplitKLineCharts, { type SplitKLineChartsProps, type PriceActionData, type ChipDistribution } from './SplitKLineCharts';
+
+interface StockChartData {
+    candlestick?: SplitKLineChartsProps['candles'];
+    rf_filter?: SplitKLineChartsProps['rfFilter'];
+    trailing_stops?: SplitKLineChartsProps['trailingStops'];
+    markers?: SplitKLineChartsProps['markers'];
+    strategy_sets?: SplitKLineChartsProps['strategySignalSets'];
+    price_action?: PriceActionData | null;
+    price_action_lines?: SplitKLineChartsProps['priceActionLines'];
+    chip_distribution?: ChipDistribution | null;
+    chart_context?: SplitKLineChartsProps['riskLevels'];
+    timeframe_complete?: boolean;
+}
 
 interface StockChartProps {
     code: string;
@@ -11,8 +24,8 @@ interface StockChartProps {
 const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [chartData, setChartData] = useState<any | null>(null);
-    const [priceAction, setPriceAction] = useState<any>(null);
+    const [chartData, setChartData] = useState<StockChartData | null>(null);
+    const [priceAction, setPriceAction] = useState<PriceActionData | null>(null);
     const [timeframe, setTimeframe] = useState<'day' | 'week'>('day');
 
     useEffect(() => {
@@ -20,12 +33,12 @@ const StockChart: React.FC<StockChartProps> = ({ code, name, strategyType }) => 
             try {
                 setLoading(true);
                 setError(null);
-                const response = await api.get(`/api/kline/${code}?strategy_type=${strategyType || 'squeeze'}&timeframe=${timeframe}`);
+                const response = await api.get<StockChartData>(`/api/kline/${code}?strategy_type=${strategyType || 'squeeze'}&timeframe=${timeframe}`);
                 const data = response.data;
                 setChartData(data);
                 setPriceAction(data.price_action || null);
-            } catch (err: any) {
-                setError(err.message || 'Error loading chart data');
+            } catch (err: unknown) {
+                setError(err instanceof Error ? err.message : 'Error loading chart data');
             } finally {
                 setLoading(false);
             }

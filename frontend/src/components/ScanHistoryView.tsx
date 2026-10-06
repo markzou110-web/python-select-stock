@@ -2,6 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { Calendar, ChevronRight, TrendingUp, TrendingDown, RefreshCw, BarChart2 } from 'lucide-react';
 import { clampScore, cn } from '@/lib/utils';
 import api from '@/lib/api';
+import type { ScanResult } from '@/stores/scanStore';
+
+type HistoryResult = ScanResult & { 最新价?: number; '表现%'?: number };
 
 interface ScanHistoryViewProps {
     availableDates: string[];
@@ -9,7 +12,7 @@ interface ScanHistoryViewProps {
 
 export default function ScanHistoryView({ availableDates }: ScanHistoryViewProps) {
     const [selectedDate, setSelectedDate] = useState<string>(availableDates[0] || '');
-    const [historyData, setHistoryData] = useState<any[]>([]);
+    const [historyData, setHistoryData] = useState<HistoryResult[]>([]);
     const [isLoading, setIsLoading] = useState(false);
 
     useEffect(() => {

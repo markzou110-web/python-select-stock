@@ -8,11 +8,17 @@ import {
     LineSeries,
     createSeriesMarkers,
     IChartApi,
+    type LogicalRange,
+    type MouseEventParams,
+    type SeriesMarker,
+    type LineWidth,
 } from 'lightweight-charts';
 import { AlertTriangle, CheckCircle2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { collapseChartMarkers, selectTvStrictSignals, selectWaveDisplaySignals } from '@/lib/signalDisplay';
 import { buildRiskPriceLines, getEffectiveStopLabel, getEffectiveStopPrice } from '@/lib/tradingLevels';
+import type { RiskLevelSource } from '@/lib/tradingLevels';
+import type { DatedSignal } from '@/lib/signalDisplay';
 import { buildDowPhaseMarkers, buildProjectionScenarioMarkers, futureWhitespaceCandles, hintLevelStyle, projectionPriceLines, type ChartHint, type DowPhasePoint, type TradeProjection } from '@/lib/dowPhase';
 
 export interface ChipDistributionBar {
@@ -36,22 +42,74 @@ export interface ChipDistribution {
     bars?: ChipDistributionBar[];
 }
 
-interface SplitKLineChartsProps {
-    candles: any[];
+export interface ChartCandle {
+    time?: string;
+    open?: unknown;
+    high?: unknown;
+    low?: unknown;
+    close?: unknown;
+    [key: string]: unknown;
+}
+
+interface NormalizedCandle extends ChartCandle {
+    time: string;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+}
+
+export type ChartSignalMarker = SeriesMarker<string> & { source?: string; label?: string; sameDay?: boolean; [key: string]: unknown };
+export interface PriceActionLine {
+    points?: { time?: string; value?: unknown }[];
+    color?: string;
+    kind?: string;
+    style?: string;
+    label?: string;
+}
+
+export type PriceActionData = Partial<Record<
+    'pa_entry_price' | 'pa_close_guard_price' | 'pa_stop_price' | 'pa_hard_stop_price' | 'pa_target_price' |
+    'pa_pullback_structure' | 'pa_breakout_quality' | 'pa_failure_risk' | 'pa_h2_quality' | 'pa_h2_state' |
+    'pa_follow_through_state' | 'pa_structure_state_label' | 'pa_structure_state_action' | 'pa_mtr_state' |
+    'pa_sr_confluence_grade' | 'pa_mtf_state' | 'pa_failed_breakout_type' | 'pa_micro_channel' |
+    'pa_trend_damage' | 'pa_always_in_strength' | 'pa_weekly_context' | 'pa_volume_pattern' |
+    'pa_gap_type' | 'pa_opening_behavior' | 'pa_volume_pullback_status' | 'pa_volume_pullback_label' |
+    'pa_volume_pullback_confirmation_label', string | number | null
+>> & {
+    price_action_score?: number;
+    price_action_summary?: string;
+    price_action_regime?: string;
+    price_action_entry_quality?: string;
+    pa_mtf_intraday?: { label?: string };
+};
+
+interface ChartRiskLevels extends RiskLevelSource {
+    entry_date?: string;
+    bark_recommendation_date?: string;
+    latest_scan_date?: string | null;
+    entry_signal_date?: string;
+    sector_phase?: string;
+    sector_momentum_score?: number;
+    risk_notes?: string[];
+}
+
+export interface SplitKLineChartsProps {
+    candles: ChartCandle[];
     emaLines?: { key: string; label: string; color: string; width?: number }[];
-    rfFilter?: any[];
-    trailingStops?: any[];
-    markers?: any[];
-    buySignals?: any[];
-    sellSignals?: any[];
-    strategySignalSets?: Record<string, any>;
-    priceAction?: any;
-    priceActionLines?: any[];
+    rfFilter?: ChartCandle[];
+    trailingStops?: ChartCandle[];
+    markers?: ChartSignalMarker[];
+    buySignals?: DatedSignal[];
+    sellSignals?: DatedSignal[];
+    strategySignalSets?: Record<string, { buy_signals?: DatedSignal[]; sell_signals?: DatedSignal[]; buy_count?: number; sell_count?: number }>;
+    priceAction?: PriceActionData | null;
+    priceActionLines?: PriceActionLine[];
     trendPhases?: DowPhasePoint[];
     chartHints?: ChartHint[];
     tradeProjection?: TradeProjection | null;
     paperLines?: { price: number; label: string; color: string; date?: string }[];
-    riskLevels?: any;
+    riskLevels?: ChartRiskLevels;
     chipDistribution?: ChipDistribution | null;
     timeframe?: 'day' | 'week';
     timeframeComplete?: boolean;
@@ -60,13 +118,13 @@ interface SplitKLineChartsProps {
     compact?: boolean;
 }
 
-function validNumber(value: any) {
+function validNumber(value: unknown) {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
 }
 
-function normalizeCandles(candles: any[]) {
-    const map = new Map<string, any>();
+function normalizeCandles(candles: ChartCandle[]) {
+    const map = new Map<string, NormalizedCandle>();
     candles.forEach((item) => {
         if (!item?.time) return;
         const open = validNumber(item.open);
@@ -79,7 +137,7 @@ function normalizeCandles(candles: any[]) {
     return Array.from(map.values()).sort((a, b) => a.time.localeCompare(b.time));
 }
 
-function normalizeLine(data: any[] | undefined, valueKey = 'value') {
+function normalizeLine(data: ChartCandle[] | undefined, valueKey = 'value') {
     const map = new Map<string, number>();
     (data || []).forEach((item) => {
         if (!item?.time) return;
@@ -125,8 +183,8 @@ function dependencyFingerprint(value: unknown): string {
     }
 }
 
-function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: string) {
-    const markers: any[] = [];
+function buildSignalMarkers(buySignals?: DatedSignal[], sellSignals?: DatedSignal[], source?: string) {
+    const markers: ChartSignalMarker[] = [];
     const displayBuys = source === 'squeeze'
         ? selectWaveDisplaySignals(buySignals, sellSignals)
         : (buySignals || []).map((signal) => ({ signal, role: 'entry' as const }));
@@ -166,7 +224,7 @@ function buildSignalMarkers(buySignals?: any[], sellSignals?: any[], source?: st
     return markers.sort((a, b) => a.time.localeCompare(b.time));
 }
 
-function getSignalMarkerTone(marker: any) {
+function getSignalMarkerTone(marker: ChartSignalMarker) {
     const text = String(marker?.text || '');
     if (marker?.source === 'timeframe_confluence') return { badge: 'D+W', label: '日周买点共振', color: '#7c3aed' };
     if (marker?.source === 'trader_vic_2b') return { badge: '2B', label: '形态观察', color: '#0f766e' };
@@ -189,7 +247,7 @@ function getSignalMarkerTone(marker: any) {
     return { badge: '•', label: text || '信号', color: marker?.color || '#64748b' };
 }
 
-function buildStrategySummary(candles: any[], trailingStops?: any[], buySignals?: any[], sellSignals?: any[]) {
+function buildStrategySummary(candles: NormalizedCandle[], trailingStops?: ChartCandle[], buySignals?: DatedSignal[], sellSignals?: DatedSignal[]) {
     if (candles.length === 0) {
         return {
             title: 'K线数据不足',
@@ -206,8 +264,8 @@ function buildStrategySummary(candles: any[], trailingStops?: any[], buySignals?
     const stopGap = trailing ? ((close - trailing) / close) * 100 : null;
     const aboveEma20 = ema20 != null && close >= ema20;
     const aboveEma60 = ema60 != null && close >= ema60;
-    const recentBuys = (buySignals || []).filter((s) => s?.time && s.time >= candles[Math.max(0, candles.length - 20)]?.time).length;
-    const recentSells = (sellSignals || []).filter((s) => s?.time && s.time >= candles[Math.max(0, candles.length - 20)]?.time).length;
+    const recentBuys = (buySignals || []).filter((s) => s?.time && String(s.time) >= candles[Math.max(0, candles.length - 20)]?.time).length;
+    const recentSells = (sellSignals || []).filter((s) => s?.time && String(s.time) >= candles[Math.max(0, candles.length - 20)]?.time).length;
 
     if (stopGap != null && stopGap < 2) {
         return {
@@ -240,7 +298,7 @@ function buildStrategySummary(candles: any[], trailingStops?: any[], buySignals?
     };
 }
 
-function buildPriceActionSummary(priceAction: any, priceActionLines?: any[]) {
+function buildPriceActionSummary(priceAction: PriceActionData | null | undefined, priceActionLines?: PriceActionLine[]) {
     const score = validNumber(priceAction?.price_action_score);
     const summary = priceAction?.price_action_summary;
     const regime = priceAction?.price_action_regime;
@@ -295,11 +353,11 @@ function formatCellValue(value: number | string | null | undefined) {
     return formatPrice(value);
 }
 
-function normalizeDate(value: any) {
+function normalizeDate(value: unknown) {
     return value ? String(value).slice(0, 10) : '';
 }
 
-function formatDateLabel(value: any) {
+function formatDateLabel(value: unknown) {
     const date = normalizeDate(value);
     return date ? date.slice(5) : '';
 }
@@ -408,8 +466,8 @@ export default function SplitKLineCharts({
     const strategyTooltipRef = useRef<HTMLDivElement>(null);
     const priceActionTooltipRef = useRef<HTMLDivElement>(null);
     const chipOverlayRef = useRef<HTMLDivElement>(null);
-    const strategyVisibleRangeRef = useRef<any>(null);
-    const priceActionVisibleRangeRef = useRef<any>(null);
+    const strategyVisibleRangeRef = useRef<LogicalRange | null>(null);
+    const priceActionVisibleRangeRef = useRef<LogicalRange | null>(null);
     const chartsLifecycleRef = useRef<{ fingerprint: string; destroy: () => void } | null>(null);
     const [showChips, setShowChips] = useState(true);
 
@@ -442,10 +500,10 @@ export default function SplitKLineCharts({
     const recentTvDates = sortedCandles.slice(-3).map((candle) => candle.time);
     const currentTvStrictSignal = latestTvStrictSignal
         && recentTvDates.some((date) => date === latestTvStrictSignal.time)
-        && recentTvDates.some((date) => (strategySignalSets?.squeeze?.buy_signals || []).some((signal: { time?: string }) => signal.time === date))
-        && recentTvDates.some((date) => (strategySignalSets?.tv_zp?.buy_signals || []).some((signal: { time?: string }) => signal.time === date))
-        && !(strategySignalSets?.tv_zp?.sell_signals || []).some((signal: { time?: string }) => (
-            signal.time && signal.time > latestTvStrictSignal.time
+        && recentTvDates.some((date) => (strategySignalSets?.squeeze?.buy_signals || []).some((signal) => signal.time === date))
+        && recentTvDates.some((date) => (strategySignalSets?.tv_zp?.buy_signals || []).some((signal) => signal.time === date))
+        && !(strategySignalSets?.tv_zp?.sell_signals || []).some((signal) => (
+            signal.time && String(signal.time) > latestTvStrictSignal.time
         ))
         ? latestTvStrictSignal
         : null;
@@ -463,15 +521,19 @@ export default function SplitKLineCharts({
                 ...(set?.sell_signals || []).map((signal: { time?: unknown }) => `${signal?.time}-aboveBar`),
             ]),
         );
-        const all = [
+        const all: ChartSignalMarker[] = [
             ...(markers || []).filter((marker) => (
                 marker?.source === 'mtr_pullback_rebreak'
                 || !overlaySignalKeys.has(`${marker?.time}-${marker?.position}`)
             )),
-            ...buildDowPhaseMarkers(trendPhases),
-            ...buildProjectionScenarioMarkers(tradeProjection, String(sortedCandles[sortedCandles.length - 1]?.time || '')),
+            ...buildDowPhaseMarkers(trendPhases).map((marker): ChartSignalMarker => ({
+                ...marker,
+                position: marker.position === 'belowBar' ? 'belowBar' : 'aboveBar',
+                shape: 'square',
+            })),
+            ...buildProjectionScenarioMarkers(tradeProjection, String(sortedCandles[sortedCandles.length - 1]?.time || '')).map((marker) => ({ ...marker })),
             ...overlayMarkers,
-            ...tvStrictSignals.map((signal) => ({
+            ...tvStrictSignals.map((signal): ChartSignalMarker => ({
                 time: signal.time,
                 position: 'aboveBar',
                 color: signal.sameDay ? '#7c3aed' : '#d97706',
@@ -706,7 +768,7 @@ export default function SplitKLineCharts({
         emaLines.forEach((line) => {
             const series = strategyChart.addSeries(LineSeries, {
                 color: line.color,
-                lineWidth: (line.width || 1) as any,
+                lineWidth: (line.width === 2 || line.width === 3 || line.width === 4 ? line.width : 1) satisfies LineWidth,
                 title: line.label,
                 lastValueVisible: true,
                 priceLineVisible: false,
@@ -774,7 +836,7 @@ export default function SplitKLineCharts({
         }
 
         const candleByTime = new Map(sortedCandles.map((c, index) => [String(c.time), { candle: c, index }]));
-        const renderHoverTooltip = (tooltip: HTMLDivElement | null, param: any, chart: IChartApi) => {
+        const renderHoverTooltip = (tooltip: HTMLDivElement | null, param: MouseEventParams, chart: IChartApi) => {
             if (!tooltip) return;
             if (!param?.time || !param?.point) {
                 tooltip.style.display = 'none';
@@ -809,7 +871,7 @@ export default function SplitKLineCharts({
             // 同一条结构线两端点可能落在同一天（如突破日即当天），须按时间去重，
             // 否则 lightweight-charts 的 setData 严格升序断言会直接崩溃。
             const pointMap = new Map<string, number>();
-            (line.points || []).forEach((point: any) => {
+            (line.points || []).forEach((point) => {
                 if (!point?.time) return;
                 const value = validNumber(point.value);
                 if (value == null) return;
@@ -839,7 +901,7 @@ export default function SplitKLineCharts({
             const overlay = strategyOverlayRef.current;
             if (!overlay) return;
             overlay.innerHTML = '';
-            const barkX = barkDate ? strategyChart.timeScale().timeToCoordinate(barkDate as any) : null;
+            const barkX = barkDate ? strategyChart.timeScale().timeToCoordinate(barkDate) : null;
             if (barkX != null) {
                 const line = document.createElement('div');
                 line.className = 'absolute top-0 bottom-0 z-10 border-l border-dashed border-sky-500/70';
@@ -856,7 +918,7 @@ export default function SplitKLineCharts({
             signalMarkers.forEach((marker) => {
                 const candle = candleByTime.get(String(marker.time));
                 if (!candle) return;
-                const x = strategyChart.timeScale().timeToCoordinate(String(marker.time) as any);
+                const x = strategyChart.timeScale().timeToCoordinate(marker.time);
                 const anchorPrice = marker.position === 'aboveBar' ? candle.high : candle.low;
                 const y = strategyCandles.priceToCoordinate(anchorPrice);
                 if (x == null || y == null) return;
@@ -902,7 +964,7 @@ export default function SplitKLineCharts({
             priceActionMarkers.forEach((marker) => {
                 const candle = candleByTime.get(String(marker.time));
                 if (!candle) return;
-                const x = paChart.timeScale().timeToCoordinate(String(marker.time) as any);
+                const x = paChart.timeScale().timeToCoordinate(marker.time);
                 const anchorPrice = marker.position === 'aboveBar' ? candle.high : candle.low;
                 const y = paCandles.priceToCoordinate(anchorPrice);
                 if (x == null || y == null) return;
@@ -953,11 +1015,11 @@ export default function SplitKLineCharts({
         renderPriceActionLabels();
         renderChipProfile();
 
-        const handleStrategyRangeChange = (range: any) => {
+        const handleStrategyRangeChange = (range: LogicalRange | null) => {
             if (range) strategyVisibleRangeRef.current = range;
             renderTradeLabels();
         };
-        const handlePriceActionRangeChange = (range: any) => {
+        const handlePriceActionRangeChange = (range: LogicalRange | null) => {
             if (range) priceActionVisibleRangeRef.current = range;
             renderPriceActionLabels();
             renderChipProfile();
@@ -965,8 +1027,8 @@ export default function SplitKLineCharts({
         strategyChart.timeScale().subscribeVisibleLogicalRangeChange(handleStrategyRangeChange);
         paChart.timeScale().subscribeVisibleLogicalRangeChange(handlePriceActionRangeChange);
 
-        const handleStrategyCrosshairMove = (param: any) => renderHoverTooltip(strategyTooltipRef.current, param, strategyChart);
-        const handlePriceActionCrosshairMove = (param: any) => renderHoverTooltip(priceActionTooltipRef.current, param, paChart);
+        const handleStrategyCrosshairMove = (param: MouseEventParams) => renderHoverTooltip(strategyTooltipRef.current, param, strategyChart);
+        const handlePriceActionCrosshairMove = (param: MouseEventParams) => renderHoverTooltip(priceActionTooltipRef.current, param, paChart);
         strategyChart.subscribeCrosshairMove(handleStrategyCrosshairMove);
         paChart.subscribeCrosshairMove(handlePriceActionCrosshairMove);
 
@@ -991,7 +1053,7 @@ export default function SplitKLineCharts({
                 paChart.remove();
             },
         };
-    }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, riskPriceLines, barkDate, height, compact, chipDistribution, chipProfile, showChips]);
+    }, [sortedCandles, emaLines, rfFilter, trailingStops, signalMarkers, priceActionMarkers, priceActionLines, riskPriceLines, barkDate, buyDate, tradeProjection, height, compact, chipDistribution, chipProfile, showChips]);
 
     // 组件卸载时销毁图表（主 effect 不再返回 cleanup：依赖变化触发的清理已改由
     // 函数体内的 chartsLifecycleRef.destroy() 接管，以便指纹守卫能跳过整轮销毁重建；
@@ -1022,8 +1084,8 @@ export default function SplitKLineCharts({
                         <span className={currentTvStrictSignal.sameDay ? 'text-violet-700' : 'text-amber-700'}>
                             TV严格双信号：{currentTvStrictSignal.sameDay ? '同日强共振·观察' : '3日窗口双命中·待确认'}
                         </span>
-                        {Number(priceAction?.pa_entry_price) > 0 && <span>价格行为触发参考 {Number(priceAction.pa_entry_price).toFixed(2)}</span>}
-                        {Number(priceAction?.pa_stop_price) > 0 && <span>结构失效参考 {Number(priceAction.pa_stop_price).toFixed(2)}</span>}
+                        {Number(priceAction?.pa_entry_price) > 0 && <span>价格行为触发参考 {Number(priceAction?.pa_entry_price).toFixed(2)}</span>}
+                        {Number(priceAction?.pa_stop_price) > 0 && <span>结构失效参考 {Number(priceAction?.pa_stop_price).toFixed(2)}</span>}
                         <span>仅供研究观察，仍须按现有风控确认；不自动买入</span>
                     </div>
                 )}

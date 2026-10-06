@@ -19,7 +19,7 @@ from core.ws_manager import manager as ws_manager
 from core.db import (
     _json_safe, get_db_engine, save_scan_results,
     get_scan_history_by_date, get_scan_dates, get_available_dates,
-    load_from_db
+    load_from_db, validate_stock_code
 )
 from core.data import (
     get_cached_data, get_market_snapshot, get_index_hist, get_sector_map, get_stale_cache
@@ -155,29 +155,32 @@ def run_market_scan_task(
     primary_results: List[Dict[str, Any]] = []
     for current_strategy in selected_strategies:
         current_metadata: Dict[str, Any] = {}
-        current_results = perform_market_scan(
-            threshold=threshold,
-            vol_multiplier=vol_multiplier,
-            rsi_min=rsi_min,
-            use_macd_filter=use_macd_filter,
-            use_bb_sqz=use_bb_sqz,
-            sqz_lookback=sqz_lookback,
-            use_weekly=use_weekly,
-            market_range=market_range,
-            turnover_min=turnover_min,
-            mkt_cap_min=mkt_cap_min,
-            use_rs_filter=use_rs_filter,
-            local_only=local_only,
-            data_date=data_date,
-            strategy_type=current_strategy,
-            pine_min_signals=pine_min_signals,
-            min_data_days=min_data_days,
-            weekly_ma_period=weekly_ma_period,
-            stop_loss_pct=stop_loss_pct,
-            require_live_snapshot=require_live_snapshot,
-            scan_context=current_metadata,
-            publish_to_sentinel=current_strategy == PRIMARY_TV_STRATEGY and not combined_all,
-        )
+        try:
+            current_results = perform_market_scan(
+                threshold=threshold,
+                vol_multiplier=vol_multiplier,
+                rsi_min=rsi_min,
+                use_macd_filter=use_macd_filter,
+                use_bb_sqz=use_bb_sqz,
+                sqz_lookback=sqz_lookback,
+                use_weekly=use_weekly,
+                market_range=market_range,
+                turnover_min=turnover_min,
+                mkt_cap_min=mkt_cap_min,
+                use_rs_filter=use_rs_filter,
+                local_only=local_only,
+                data_date=data_date,
+                strategy_type=current_strategy,
+                pine_min_signals=pine_min_signals,
+                min_data_days=min_data_days,
+                weekly_ma_period=weekly_ma_period,
+                stop_loss_pct=stop_loss_pct,
+                require_live_snapshot=require_live_snapshot,
+                scan_context=current_metadata,
+                publish_to_sentinel=current_strategy == PRIMARY_TV_STRATEGY and not combined_all,
+            )
+        except HTTPException as exc:
+            raise RuntimeError(f"{exc.status_code}: {exc.detail}") from exc
         all_results.extend(current_results or [])
         if current_strategy == PRIMARY_TV_STRATEGY:
             primary_results = current_results or []

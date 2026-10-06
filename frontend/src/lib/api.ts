@@ -1,4 +1,10 @@
-import axios, { InternalAxiosRequestConfig } from 'axios';
+import axios from 'axios';
+
+export function getApiErrorDetail(error: unknown): string | undefined {
+    if (!axios.isAxiosError<{ detail?: unknown }>(error)) return undefined;
+    const detail = error.response?.data?.detail;
+    return typeof detail === 'string' ? detail : undefined;
+}
 
 // Extend Axios config to include our custom metadata
 declare module 'axios' {

@@ -12,7 +12,6 @@ import {
     AlertCircle,
     Loader2,
     RefreshCw,
-    CalendarDays,
     Trophy,
     Skull,
     LogOut,
@@ -29,9 +28,7 @@ import {
     CartesianGrid,
     Tooltip as ReTooltip,
     ResponsiveContainer,
-    Cell,
-    AreaChart,
-    Area
+    Cell
 } from 'recharts';
 import { useScanStore } from '@/stores/scanStore';
 import PortfolioDashboard from './PortfolioDashboard';
@@ -122,7 +119,7 @@ export default function PaperTradingView() {
     const [tab, setTab] = useState<'open' | 'closed' | 'analytics'>('open');
     const [closingId, setClosingId] = useState<number | null>(null);
     const [closePrice, setClosePrice] = useState('');
-    const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+    const [, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [detailStock, setDetailStock] = useState<{ code: string; name: string } | null>(null);
     const [tradeMode, setTradeMode] = useState<'ALL' | 'SIMULATED' | 'REAL'>('REAL');
     const [statsByMode, setStatsByMode] = useState<{ SIMULATED: ModeStats; REAL: ModeStats }>({
@@ -210,9 +207,8 @@ export default function PaperTradingView() {
         }
     };
 
-    const modeFilter = (t: Trade) => tradeMode === 'ALL' || t.trade_mode === tradeMode;
-    const openTrades = useMemo(() => trades.filter(t => t.status === 'OPEN' && modeFilter(t)), [trades, tradeMode]);
-    const closedTrades = useMemo(() => trades.filter(t => t.status === 'CLOSED' && modeFilter(t)), [trades, tradeMode]);
+    const openTrades = useMemo(() => trades.filter(t => t.status === 'OPEN' && (tradeMode === 'ALL' || t.trade_mode === tradeMode)), [trades, tradeMode]);
+    const closedTrades = useMemo(() => trades.filter(t => t.status === 'CLOSED' && (tradeMode === 'ALL' || t.trade_mode === tradeMode)), [trades, tradeMode]);
     const displayTrades = tab === 'open' ? openTrades : (tab === 'closed' ? closedTrades : []);
 
     // Counts for the mode bar

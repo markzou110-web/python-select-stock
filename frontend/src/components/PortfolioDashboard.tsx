@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { 
-    LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, 
+    AreaChart, Area, XAxis, YAxis, CartesianGrid,
     Tooltip, ResponsiveContainer, BarChart, Bar, PieChart, Pie, Cell, Legend 
 } from 'recharts';
-import { TrendingUp, TrendingDown, Shield, Target, PieChart as PieIcon, BarChart2 } from 'lucide-react';
+import { TrendingUp, Shield, Target, PieChart as PieIcon, BarChart2 } from 'lucide-react';
 import api from '@/lib/api';
 
 interface RiskMetrics {

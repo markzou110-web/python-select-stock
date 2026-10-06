@@ -367,6 +367,7 @@ const SCAN_STRATEGY_LABELS: Record<ScanParams['strategy_type'], string> = {
 };
 
 let resultRequestGeneration = 0;
+let historyRequestGeneration = 0;
 
 function selectedStrategies(params: ScanParams): ScanStrategyType[] {
     return params.strategy_types?.length ? params.strategy_types : [params.strategy_type];
@@ -625,16 +626,22 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 
                 // Poll for status
                 return new Promise<void>((resolve) => {
+                    let polling = false;
+                    let stopped = false;
                     const pollInterval = setInterval(async () => {
+                        if (stopped || polling) return;
                         if (requestGeneration !== resultRequestGeneration) {
+                            stopped = true;
                             clearInterval(pollInterval);
                             if (ws) { try { ws.close(); } catch {} }
                             resolve();
                             return;
                         }
+                        polling = true;
                         try {
                             const statusRes = await api.get(`/api/scan/status/${taskId}`);
                             if (requestGeneration !== resultRequestGeneration) {
+                                stopped = true;
                                 clearInterval(pollInterval);
                                 if (ws) { try { ws.close(); } catch {} }
                                 resolve();
@@ -644,6 +651,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                             const state = statusRes.data.status;
                             
                             if (state === 'SUCCESS') {
+                                stopped = true;
                                 clearInterval(pollInterval);
                                 // Allow progress animation to complete
                                 setTimeout(() => {
@@ -673,10 +681,12 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                                     if (ws) { try { ws.close(); } catch {} }
                                     resolve();
                                 }, 1000);
-                            } else if (state === 'FAILURE') {
+                            } else if (state === 'FAILURE' || state === 'REVOKED') {
+                                stopped = true;
                                 clearInterval(pollInterval);
                                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-                                alert(`扫描失败 (耗时: ${elapsed}秒)\n\n${statusRes.data.message}`);
+                                const statusLabel = state === 'REVOKED' ? '扫描已取消' : '扫描失败';
+                                alert(`${statusLabel} (耗时: ${elapsed}秒)\n\n${statusRes.data.message}`);
                                 set({ isScanning: false, scanProgress: null });
                                 if (ws) { try { ws.close(); } catch {} }
                                 resolve();
@@ -684,6 +694,7 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                             // PENDING or STARTED: just wait
                         } catch (err) {
                             if (requestGeneration !== resultRequestGeneration) {
+                                stopped = true;
                                 clearInterval(pollInterval);
                                 if (ws) { try { ws.close(); } catch {} }
                                 resolve();
@@ -702,12 +713,15 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                             });
                             console.warn("Scan status polling failed; will retry", err);
                             if (consecutivePollFailures >= 10) {
+                                stopped = true;
                                 clearInterval(pollInterval);
                                 alert("扫描状态连接中断，请确认后端服务正常后重新扫描。");
                                 set({ isScanning: false, scanProgress: null });
                                 if (ws) { try { ws.close(); } catch {} }
                                 resolve();
                             }
+                        } finally {
+                            polling = false;
                         }
                     }, 1000);
                 });
@@ -801,13 +815,15 @@ export const useScanStore = create<ScanStore>((set, get) => ({
     },
 
     fetchHistory: async () => {
-        const requestGeneration = ++resultRequestGeneration;
+        const historyGeneration = ++historyRequestGeneration;
+        const requestGeneration = resultRequestGeneration;
         const strategyTypes = selectedStrategies(get().params);
         const matchMode = get().params.match_mode;
         const strategyKey = strategyTypes.join(',');
         const strategyType = strategyTypes[0];
         try {
             const dateRes = await api.get('/api/scan/dates');
+            if (historyGeneration !== historyRequestGeneration) return;
             const dates = dateRes.data;
             set({ historyDates: dates });
 
@@ -825,7 +841,8 @@ export const useScanStore = create<ScanStore>((set, get) => ({
                 set({ selectedDate: latestDate });
                 const res = await api.get(`/api/scan/history?date=${latestDate}`);
                 if (
-                    requestGeneration === resultRequestGeneration
+                    historyGeneration === historyRequestGeneration
+                    && requestGeneration === resultRequestGeneration
                     && get().selectedDate === latestDate
                     && selectedStrategies(get().params).join(',') === strategyKey
                     && get().params.match_mode === matchMode

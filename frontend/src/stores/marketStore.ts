@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import api, { marketApi } from '@/lib/api';
+import type { ScanParams } from '@/stores/scanStore';
 
 export interface IndexData {
     price: number;
@@ -35,7 +36,7 @@ export interface MarketRegimeData {
 
 interface MarketStore {
     indices: Record<string, IndexData>;
-    sectors: any[];
+    sectors: Array<{ name: string; pct: number; lead: string }>;
     syncProgress: SyncProgress | null;
     marketRegime: MarketRegimeData | null;
     loading: boolean;
@@ -46,7 +47,10 @@ interface MarketStore {
     fetchMarketData: () => Promise<void>;
     fetchSyncStatus: () => Promise<void>;
     fetchMarketPulse: () => Promise<void>;
-    fetchMarketRegime: (strategyType?: string) => Promise<any>;
+    fetchMarketRegime: (strategyType?: string) => Promise<{
+        regime: { label: string; description: string };
+        recommended_params: Partial<ScanParams> & { description?: string };
+    } | null>;
     startSync: () => Promise<void>;
     startSyncFundamentals: () => Promise<void>;
     stopSync: () => Promise<void>;

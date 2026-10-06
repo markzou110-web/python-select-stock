@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, AlertTriangle, BarChart3, Bot, CalendarDays, Copy, Download, Globe2, Loader2, RefreshCw, Target, TrendingUp } from 'lucide-react';
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import api from '@/lib/api';
@@ -370,10 +370,43 @@ type NextDayFollowupPayload = {
     };
 };
 
+type PerformanceRow = Record<string, string | number | null | undefined> & {
+    signals?: number;
+    win_rate?: number;
+    avg_return?: number;
+};
+
+type RecommendationEvent = {
+    code: string;
+    name?: string;
+    event_date?: string;
+    trade_bucket?: string;
+    strategy_type?: string;
+    ret_5d?: number | null;
+};
+
+type ScanPerformancePayload = Partial<Record<
+    'horizons' | 'by_strategy' | 'by_pa_action' | 'by_price_action' | 'by_pa_h2_quality' |
+    'by_pa_volume_pattern' | 'by_pa_trend_phase' | 'by_pa_weekly_context' | 'by_trade_bucket' |
+    'by_market_regime' | 'by_market_sentiment' | 'by_opportunity_bucket' | 'by_sector_phase' |
+    'by_sector_role' | 'by_sector_alignment' | 'by_sector_mainline' | 'by_trade_state' |
+    'by_next_open_gap' | 'by_pa_trap_risk' | 'brooks_backtests' | 'by_industry' | 'recent_dates',
+    PerformanceRow[]
+>> & {
+    summary?: { signals?: number; win_rate_5d?: number; avg_return_5d?: number; best_bucket?: string; worst_bucket?: string };
+    execution_summary?: { trade_signals?: number; trade_win_rate_1d?: number; trade_avg_return_1d?: number; filter_alpha_1d?: number };
+    portfolio_sim?: { trades?: number; win_rate?: number; avg_return?: number; total_compound_return?: number };
+    data_quality?: { excluded_adjustment_gap_returns?: number; rule?: string };
+    timeframe_shadow?: {
+        tagged_candidates?: number;
+        arms?: Array<{ name: string; candidates?: number; mature_5d?: number; win_rate_5d_pct?: number | null; avg_proxy_return_5d_pct?: number | null }>;
+        contract?: { limitations?: string };
+    };
+    recommendation_events?: RecommendationEvent[];
+};
+
 export default function ReviewCenter() {
-    // scan-performance 响应含 30+ 个宽松结构的分组数组（by_* / horizons / timeframe_shadow 等），
-    // 全部直接喂给 any 形参的 ChartCard/TableCard，完整建模收益低，故保留 any。
-    const [data, setData] = useState<any>(null);
+    const [data, setData] = useState<ScanPerformancePayload | null>(null);
     const [profitability, setProfitability] = useState<ProfitabilityPayload | null>(null);
     const [sectorWatchPerformance, setSectorWatchPerformance] = useState<SectorWatchPerformance | null>(null);
     const [recommendationLoop, setRecommendationLoop] = useState<RecommendationOutcomeLoop | null>(null);
@@ -394,53 +427,53 @@ export default function ReviewCenter() {
     // 代数守卫：快速切换 days 时丢弃过期响应，防止旧数据覆盖新数据
     const fetchGeneration = useRef(0);
 
-    const fetchData = async () => {
+    const fetchData = useCallback(async () => {
         const generation = ++fetchGeneration.current;
         setLoading(true);
         try {
             const results = await Promise.allSettled([
-                api.get(`/api/review/scan-performance?days=${days}`),
-                api.get(`/api/review/profitability-dashboard?days=${days}`),
-                api.get(`/api/review/sector-watch-performance?days=${days}`),
-                api.get(`/api/review/recommendation-outcome-loop?days=${days}`),
-                api.get('/api/review/daily-strategy-report'),
-                api.get(`/api/review/strategy-calibration-report?days=${days}&executable=true`),
-                api.get('/api/review/research-context'),
-                api.get(`/api/review/execution-policy-replay?days=${days}`),
-                api.get(`/api/system/signal-performance?days=${days}`),
-                api.get('/api/review/lhb-records?days=3'),
+                api.get<ScanPerformancePayload>(`/api/review/scan-performance?days=${days}`),
+                api.get<ProfitabilityPayload>(`/api/review/profitability-dashboard?days=${days}`),
+                api.get<SectorWatchPerformance>(`/api/review/sector-watch-performance?days=${days}`),
+                api.get<RecommendationOutcomeLoop>(`/api/review/recommendation-outcome-loop?days=${days}`),
+                api.get<DailyStrategyReport>('/api/review/daily-strategy-report'),
+                api.get<CalibrationPayload>(`/api/review/strategy-calibration-report?days=${days}&executable=true`),
+                api.get<ResearchContext>('/api/review/research-context'),
+                api.get<ExecutionReplayPayload>(`/api/review/execution-policy-replay?days=${days}`),
+                api.get<SignalPerformancePayload>(`/api/system/signal-performance?days=${days}`),
+                api.get<LhbPayload>('/api/review/lhb-records?days=3'),
             ]);
             if (fetchGeneration.current !== generation) return;
             const failedCount = results.filter(
                 item => item.status === 'rejected' || (item.status === 'fulfilled' && item.value.data == null),
             ).length;
-            const value = (index: number) => results[index].status === 'fulfilled' ? (results[index] as PromiseFulfilledResult<any>).value.data : null;
-            if (value(0)) setData(value(0));
-            if (value(1)) setProfitability(value(1));
-            if (value(2)) setSectorWatchPerformance(value(2));
-            if (value(3)) setRecommendationLoop(value(3));
-            if (value(4)) setDailyReport(value(4));
-            if (value(5)) setCalibration(value(5));
-            if (value(6)) setResearchContext(value(6));
-            if (value(7)) setExecutionReplay(value(7));
-            if (value(8)) setSignalPerformance(value(8));
-            if (value(9)) setLhb(value(9));
+            const value = <T,>(result: PromiseSettledResult<{ data: T }>): T | null => result.status === 'fulfilled' ? result.value.data : null;
+            setData(previous => value(results[0]) || previous);
+            setProfitability(previous => value(results[1]) || previous);
+            setSectorWatchPerformance(previous => value(results[2]) || previous);
+            setRecommendationLoop(previous => value(results[3]) || previous);
+            setDailyReport(previous => value(results[4]) || previous);
+            setCalibration(previous => value(results[5]) || previous);
+            setResearchContext(previous => value(results[6]) || previous);
+            setExecutionReplay(previous => value(results[7]) || previous);
+            setSignalPerformance(previous => value(results[8]) || previous);
+            setLhb(previous => value(results[9]) || previous);
             setLoadError(failedCount > 0 ? `复盘数据 ${failedCount} 项加载失败，以下数字可能不完整` : null);
         } finally {
             if (fetchGeneration.current === generation) setLoading(false);
         }
-    };
+    }, [days]);
 
-    useEffect(() => { fetchData(); }, [days]);
+    useEffect(() => { fetchData(); }, [fetchData]);
 
     useEffect(() => {
         const loadDates = async () => {
             const res = await api.get('/api/scan/dates');
             const dates = Array.isArray(res.data) ? res.data : [];
             setHistoryDates(dates);
-            if (!followupDate && dates.length > 0) {
+            if (dates.length > 0) {
                 const today = new Date().toISOString().slice(0, 10);
-                setFollowupDate(dates[0] === today && dates.length > 1 ? dates[1] : dates[0]);
+                setFollowupDate(previous => previous || (dates[0] === today && dates.length > 1 ? dates[1] : dates[0]));
             }
         };
         loadDates().catch(() => setHistoryDates([]));
@@ -513,7 +546,7 @@ export default function ReviewCenter() {
 
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <Stat label="有效信号" value={`${summary.signals || 0}`} sub="有未来价格可验证" icon={<Target size={20} />} />
-                <Stat label="5日胜率" value={`${summary.win_rate_5d || 0}%`} sub={`均收 ${summary.avg_return_5d >= 0 ? '+' : ''}${summary.avg_return_5d || 0}%`} icon={<TrendingUp size={20} />} hot={(summary.win_rate_5d || 0) >= 50} />
+                <Stat label="5日胜率" value={`${summary.win_rate_5d || 0}%`} sub={`均收 ${Number(summary.avg_return_5d) >= 0 ? '+' : ''}${summary.avg_return_5d || 0}%`} icon={<TrendingUp size={20} />} hot={(summary.win_rate_5d || 0) >= 50} />
                 <Stat label="优势板块" value={summary.best_bucket || "暂无"} sub="按5日胜率排序" icon={<BarChart3 size={20} />} />
                 <Stat label="薄弱板块" value={summary.worst_bucket || "暂无"} sub="建议降低权重" icon={<Activity size={20} />} />
             </div>
@@ -539,7 +572,7 @@ export default function ReviewCenter() {
                     <p className="text-sm text-slate-500 mt-4">暂无带新标签的成熟扫描样本；后续扫描会开始积累。</p>
                 ) : (
                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3 mt-4">
-                        {(data.timeframe_shadow.arms || []).map((arm: any) => (
+                        {(data?.timeframe_shadow?.arms || []).map((arm) => (
                             <div key={arm.name} className="rounded-xl border border-slate-100 bg-white p-3">
                                 <div className="text-xs font-black text-slate-700">{arm.name}</div>
                                 <div className="text-xs text-slate-500 mt-2">候选 {arm.candidates} · 已满5日 {arm.mature_5d}</div>
@@ -714,7 +747,7 @@ function LhbRecordsCard({ data }: { data: LhbPayload | null }) {
     );
 }
 
-function RecommendationEventCard({ rows }: { rows: any[] }) {
+function RecommendationEventCard({ rows }: { rows: RecommendationEvent[] }) {
     return (
         <div className="glass-card p-6">
             <h3 className="font-black text-slate-800 mb-4">推荐事件追踪</h3>
@@ -1770,7 +1803,7 @@ function Stat({ label, value, sub, icon, hot = false }: { label: string; value: 
     );
 }
 
-function ChartCard({ title, data, xKey, barKey, suffix = "%" }: { title: string; data: any[]; xKey: string; barKey: string; suffix?: string }) {
+function ChartCard({ title, data, xKey, barKey, suffix = "%" }: { title: string; data: PerformanceRow[]; xKey: string; barKey: string; suffix?: string }) {
     return (
         <div className="glass-card p-6 h-[340px]">
             <h3 className="font-black text-slate-800 mb-4">{title}</h3>
@@ -1780,7 +1813,7 @@ function ChartCard({ title, data, xKey, barKey, suffix = "%" }: { title: string;
                         <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(148,163,184,0.18)" />
                         <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: '#64748b', fontWeight: 700 }} />
                         <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} />
-                        <Tooltip formatter={(v: any) => [`${v}${suffix}`, title]} />
+                        <Tooltip formatter={(v) => [`${v}${suffix}`, title]} />
                         <Bar dataKey={barKey} fill="#6366f1" radius={[8, 8, 0, 0]} />
                     </BarChart>
                 </ResponsiveContainer>
@@ -1789,7 +1822,7 @@ function ChartCard({ title, data, xKey, barKey, suffix = "%" }: { title: string;
     );
 }
 
-function TableCard({ title, rows, nameKey }: { title: string; rows: any[]; nameKey: string }) {
+function TableCard({ title, rows, nameKey }: { title: string; rows: PerformanceRow[]; nameKey: string }) {
     return (
         <div className="glass-card p-6">
             <h3 className="font-black text-slate-800 mb-4">{title}</h3>
@@ -1802,7 +1835,7 @@ function TableCard({ title, rows, nameKey }: { title: string; rows: any[]; nameK
                         </div>
                         <div className="text-right">
                             <p className="text-sm font-black text-indigo-600">{row.win_rate}%</p>
-                            <p className={cn("text-[10px] font-bold", row.avg_return >= 0 ? "text-rose-500" : "text-emerald-500")}>{row.avg_return >= 0 ? '+' : ''}{row.avg_return}%</p>
+                            <p className={cn("text-[10px] font-bold", Number(row.avg_return) >= 0 ? "text-rose-500" : "text-emerald-500")}>{Number(row.avg_return) >= 0 ? '+' : ''}{row.avg_return}%</p>
                         </div>
                     </div>
                 ))}

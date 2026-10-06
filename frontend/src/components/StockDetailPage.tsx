@@ -7,7 +7,6 @@ import {
     TrendingDown,
     ShieldCheck,
     AlertTriangle,
-    Activity,
     Target,
     BarChart3,
     Zap,
@@ -16,10 +15,8 @@ import {
     Layers,
     DollarSign,
     ShieldAlert,
-    Gauge,
     Clock,
     Tag,
-    PieChart as PieIcon,
     CheckCircle2,
     XCircle,
     MinusCircle,
@@ -33,9 +30,10 @@ import {
     Save
 } from 'lucide-react';
 import { clampScore, cn } from '@/lib/utils';
-import api from '@/lib/api';
+import api, { getApiErrorDetail } from '@/lib/api';
 import { getEffectiveStopPrice, getQuoteSourceLabel } from '@/lib/tradingLevels';
-import SplitKLineCharts, { ChipDistribution } from './SplitKLineCharts';
+import SplitKLineCharts, { type ChartCandle, type ChartSignalMarker, type ChipDistribution, type PriceActionLine } from './SplitKLineCharts';
+import type { PriceActionDetails } from '@/lib/stockTypes';
 
 interface StockDetailPageProps {
     code: string;
@@ -46,7 +44,7 @@ interface StockDetailPageProps {
 // ── 后端 /api/stock/full-analysis 隐式契约的最小显式类型（字段名取自本文件实际访问点）──
 
 // 日K线柱（lightweight-charts 数据源）
-interface KLineCandle {
+interface KLineCandle extends ChartCandle {
     time: string; // 后端字段
     open: number; // 后端字段
     high: number; // 后端字段
@@ -153,17 +151,10 @@ interface FullAnalysisData {
         reasoning: string[];
         action_label: string;
     };
-    price_action?: any;
-    price_action_markers?: any[];
-    timeframe_confluence_markers?: Array<{
-        time: string;
-        position: string;
-        color: string;
-        shape: string;
-        text: string;
-        source: string;
-    }>;
-    price_action_lines?: any[];
+    price_action?: PriceActionDetails;
+    price_action_markers?: ChartSignalMarker[];
+    timeframe_confluence_markers?: ChartSignalMarker[];
+    price_action_lines?: PriceActionLine[];
     trend_phases?: Array<{ time: string; phase: string; action?: string }>;
     chart_hints?: Array<{ level: string; text: string }>;
     trade_projection?: {
@@ -348,10 +339,10 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 console.warn("Daily/weekly confluence fetch failed (non-critical):", confluenceErr);
             }
             setData(analysis);
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error("Full analysis fetch error:", err);
             if (showLoading) {
-                setError(err.response?.data?.detail || '数据加载失败');
+                setError(getApiErrorDetail(err) || '数据加载失败');
             }
         } finally {
             setLoading(false);
@@ -503,7 +494,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const addToPaperTrade = async (force = false) => {
         setAddingAction('paper');
         try {
-            const plan = data.price_action?.pa_trade_plan || {};
+            const plan: Partial<NonNullable<PriceActionDetails['pa_trade_plan']>> = data.price_action?.pa_trade_plan || {};
             const res = await api.post('/api/paper/add', {
                 code: info.代码,
                 name: info.名称,
@@ -538,9 +529,9 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                     : `${info.名称} 已加入模拟盘`,
             );
             await fetchData(false);
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error("Add to paper trade error:", err);
-            showToast(err.response?.data?.detail || '加入模拟盘失败', 'error');
+            showToast(getApiErrorDetail(err) || '加入模拟盘失败', 'error');
         } finally {
             setAddingAction(null);
         }
@@ -549,7 +540,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
     const addToWatchlist = async () => {
         setAddingAction('watchlist');
         try {
-            const plan = data.price_action?.pa_trade_plan || {};
+            const plan: Partial<NonNullable<PriceActionDetails['pa_trade_plan']>> = data.price_action?.pa_trade_plan || {};
             await api.post('/api/watchlist/add', {
                 code: info.代码,
                 name: info.名称,
@@ -568,9 +559,9 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                 pa_risk_pct: plan.risk_pct || data.price_action?.pa_risk_pct,
             });
             showToast(`${info.名称} 已加入观察池`);
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error("Add to watchlist error:", err);
-            showToast(err.response?.data?.detail || '加入观察池失败', 'error');
+            showToast(getApiErrorDetail(err) || '加入观察池失败', 'error');
         } finally {
             setAddingAction(null);
         }
@@ -831,7 +822,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                                     </span>
                                 )}
                                 {data.price_action.pa_weekly_pattern_signals?.map((signal: string) => (
-                                    <span key={signal} className="px-2 py-0.5 bg-amber-50 text-amber-700 rounded-full border border-amber-100" title={`已完成周线截至 ${data.price_action.pa_weekly_position_as_of}；观察标签，非买入信号`}>
+                                    <span key={signal} className="px-2 py-0.5 bg-amber-50 text-amber-700 rounded-full border border-amber-100" title={`已完成周线截至 ${data.price_action?.pa_weekly_position_as_of}；观察标签，非买入信号`}>
                                         周线观察：{signal}
                                     </span>
                                 ))}
@@ -1173,7 +1164,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                         <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">📝 持仓纪律 / 备注</span>
                     </div>
                     <p className="text-sm font-semibold text-slate-600 italic leading-relaxed pl-6">
-                        "{info.paper_remark}"
+                        &quot;{info.paper_remark}&quot;
                     </p>
                 </div>
             )}

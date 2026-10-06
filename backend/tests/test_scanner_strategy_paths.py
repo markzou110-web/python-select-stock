@@ -3,6 +3,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -656,12 +657,11 @@ def test_perform_market_scan_proceeds_when_preflight_not_blocking(monkeypatch):
 
     # 预检不阻断：函数会继续执行并最终因无数据/无候选抛 HTTPException(503) 或返回 []。
     # 关键断言：build_scan_preflight 被调用且 blocking=False 时未在预检处早返回。
-    try:
-        result = scanner.perform_market_scan(strategy_type="tv_dual_strict", local_only=True)
-        assert result == []
-    except Exception:
-        # 因 mock engine 无法真实查询，下游可能抛 503——这也证明已越过预检阶段
-        pass
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as error:
+        scanner.perform_market_scan(strategy_type="tv_dual_strict", local_only=True)
+    assert error.value.status_code == 503
 
     assert preflight_called["n"] == 1  # 预检确实被调用且未被熔断跳过
 

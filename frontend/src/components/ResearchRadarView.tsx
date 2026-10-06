@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, ExternalLink, FileText, Loader2, Newspaper, RefreshCw, Sparkles } from 'lucide-react';
-import api from '@/lib/api';
+import api, { getApiErrorDetail } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 type Evidence = {
@@ -44,8 +44,8 @@ export default function ResearchRadarView({ onOpenStock }: { onOpenStock: (stock
                 params: { limit: 12, force_refresh: forceRefresh },
             });
             setData(res.data);
-        } catch (err: any) {
-            setError(err.response?.data?.detail || '资讯雷达加载失败');
+        } catch (err: unknown) {
+            setError(getApiErrorDetail(err) || '资讯雷达加载失败');
         } finally {
             setLoading(false);
         }

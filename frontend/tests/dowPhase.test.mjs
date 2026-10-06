@@ -4,7 +4,6 @@ import test from 'node:test';
 import {
     buildDowPhaseMarkers,
     dowPhaseCategory,
-    dowPhaseColor,
     DOW_PHASE_LEGEND,
 } from '../src/lib/dowPhase.ts';
 

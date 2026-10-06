@@ -329,14 +329,23 @@ def audit_task_finished(task_id=None, task=None, state=None, retval=None, **kwar
     from .audit_log import record_task_run
     summary = _task_result_summary(retval)
     audit_status = str(state or "SUCCESS")
-    if audit_status == "SUCCESS" and isinstance(retval, dict) and retval.get("errors"):
-        audit_status = "SUCCESS_WITH_ERRORS"
+    error_message = None
+    if audit_status == "SUCCESS" and isinstance(retval, dict):
+        if retval.get("status") == "error":
+            audit_status = "FAILURE"
+            error_message = str(
+                retval.get("error") or retval.get("detail") or retval.get("reason")
+                or "unknown task failure"
+            )
+        elif retval.get("errors"):
+            audit_status = "SUCCESS_WITH_ERRORS"
     record_task_run(
         str(task_id or ""),
         getattr(task, "name", None),
         audit_status,
         finished_at=datetime.now(),
         result_summary=summary,
+        error_message=error_message,
     )
 
 
@@ -359,7 +368,7 @@ def _task_result_summary(retval) -> str:
         return summary
 
     keep_keys = (
-        "status", "reason", "slot", "sync", "scan_count", "scan_push",
+        "status", "error", "detail", "reason", "slot", "sync", "scan_count", "scan_push",
         "operation_alerts", "watch_alerts", "watch_status_push",
         "formal_scan_completed", "formal_scan_count", "formal_scan_push", "pruned", "next_day_push",
         "next_day_reviewed", "next_day_confirmed", "next_day_confirmation_bark",

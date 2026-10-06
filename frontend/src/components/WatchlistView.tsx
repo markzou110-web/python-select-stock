@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Archive, BellRing, LineChart, Loader2, PlusCircle, RefreshCw, Star, Trash2, TrendingDown, TrendingUp } from 'lucide-react';
-import api from '@/lib/api';
+import api, { getApiErrorDetail } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface WatchlistViewProps {
@@ -10,6 +10,39 @@ interface WatchlistViewProps {
 }
 
 type WatchlistSortMode = 'priority' | 'gain';
+type WatchlistItem = {
+    id: number;
+    code: string;
+    name: string;
+    industry?: string;
+    status: string;
+    watch_price: number;
+    current_price: number;
+    pl_pct: number;
+    target_price?: number;
+    stop_price?: number;
+    target_hit?: boolean;
+    stop_hit?: boolean;
+    strategy_type?: string;
+    reason?: string;
+    invalidation?: string;
+    latest_date?: string;
+    signal_sources?: string[] | string;
+    pa_trade_action?: string;
+    pa_trade_setup?: string;
+    pa_entry_condition?: string;
+    pa_invalidation?: string;
+    pa_risk_pct?: number;
+    theme_priority_boost?: number;
+    theme_tracking_state?: string;
+    theme_tracking_label?: string;
+    theme_tracking_action?: string;
+    theme_priority_note?: string;
+    watch_decision?: string;
+    watch_action?: string;
+    computed_action?: string;
+    watch_priority_score?: number;
+};
 
 const WATCHLIST_VIEW_PREF_KEY = 'alpha_vision_watchlist_view_v1';
 const THEME_STATE_OPTIONS = [
@@ -41,8 +74,8 @@ function readWatchlistViewPrefs(): { themeStateFilter: string; sortMode: Watchli
 }
 
 export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
-    const [items, setItems] = useState<any[]>([]);
-    const [stats, setStats] = useState<any>({});
+    const [items, setItems] = useState<WatchlistItem[]>([]);
+    const [stats, setStats] = useState<{ total?: number; triggered?: number; avg_pl_pct?: number }>({});
     const [loading, setLoading] = useState(true);
     const [checking, setChecking] = useState(false);
     const [notice, setNotice] = useState<string>('');
@@ -54,7 +87,7 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
     const setThemeStateFilter = (themeStateFilter: string) => setViewPrefs(prev => ({ ...prev, themeStateFilter }));
     const setSortMode = (sortMode: WatchlistSortMode) => setViewPrefs(prev => ({ ...prev, sortMode }));
 
-    const fetchItems = async () => {
+    const fetchItems = useCallback(async () => {
         setLoading(true);
         try {
             const res = await api.get(`/api/watchlist/list?status=${status}`);
@@ -63,9 +96,9 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
         } finally {
             setLoading(false);
         }
-    };
+    }, [status]);
 
-    useEffect(() => { fetchItems(); }, [status]);
+    useEffect(() => { fetchItems(); }, [fetchItems]);
     useEffect(() => {
         try {
             window.localStorage.setItem(WATCHLIST_VIEW_PREF_KEY, JSON.stringify(viewPrefs));
@@ -85,7 +118,7 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
         fetchItems();
     };
 
-    const transferToPaper = async (item: any, force = false) => {
+    const transferToPaper = async (item: WatchlistItem, force = false) => {
         setTransferringId(item.id);
         setNotice('');
         try {
@@ -128,9 +161,9 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
                     : `${item.name} 已转入拟合实盘，观察记录已归档`,
             );
             await fetchItems();
-        } catch (err: any) {
+        } catch (err: unknown) {
             console.error("Transfer watchlist to paper error:", err);
-            setNotice(err.response?.data?.detail || '转入拟合实盘失败');
+            setNotice(getApiErrorDetail(err) || '转入拟合实盘失败');
         } finally {
             setTransferringId(null);
         }
@@ -216,7 +249,7 @@ export default function WatchlistView({ onOpenStock }: WatchlistViewProps) {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <Summary label="观察标的" value={stats.total || 0} />
                 <Summary label="触发条件" value={stats.triggered || 0} hot />
-                <Summary label="平均表现" value={`${stats.avg_pl_pct >= 0 ? '+' : ''}${stats.avg_pl_pct || 0}%`} hot={(stats.avg_pl_pct || 0) >= 0} />
+                <Summary label="平均表现" value={`${Number(stats.avg_pl_pct) >= 0 ? '+' : ''}${stats.avg_pl_pct || 0}%`} hot={(stats.avg_pl_pct || 0) >= 0} />
             </div>
 
             <div className="flex flex-col gap-3 rounded-md border border-slate-100 bg-white/80 px-4 py-3 md:flex-row md:items-center md:justify-between">

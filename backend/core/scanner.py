@@ -3468,17 +3468,20 @@ def _scan_load_data(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) 
     """阶段 3/6：预拉取基准指数、批量装载候选历史 K 线、注入实时快照行、
     流动性/次新股过滤与向量化指标计算，产出 hist_map。
 
-    返回 True 表示过滤后无候选（审计已落库），调用方应立即返回空结果。
+    返回 True 表示无候选，调用方仍需完成空结果的持久化与结束通知。
     """
     data_date = ctx.data_date
     strategy_type = ctx.strategy_type
     snapshot_df = ctx.snapshot_df
+    candidates = ctx.candidates
     audit_payload = ctx.audit_payload
-    resolved_data_date = ctx.resolved_data_date
-    scan_started_at = ctx.scan_started_at
+
+    ctx.start_time = start_time = time.time()
+    ctx.engine = engine = get_db_engine()
+    if candidates.empty:
+        return True
 
     results = []
-    ctx.engine = engine = get_db_engine()
 
     # 核心优化：预拉取指数历史并过滤，避免在线程内重复查询和过滤
     bench_df = get_index_hist("000001")
@@ -3495,7 +3498,6 @@ def _scan_load_data(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) 
 
     # 核心优化：批量拉取所有候选标的的历史数据，并进行向量化指标计算
     logger.info(f"Pre-loading historical data for {len(candidates)} candidates in batch...")
-    ctx.start_time = start_time = time.time()
     end_date_hist = datetime.now().strftime("%Y-%m-%d") if not data_date else data_date
     # 图表和扫描共用同一 TV 预热窗口；Alternate Signal 对历史起点敏感。
     start_date_hist = (
@@ -3587,13 +3589,6 @@ def _scan_load_data(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) 
         ]))
         if candidates.empty:
             logger.info("No candidates remain after five-day liquidity and new-stock filters.")
-            audit_payload.update({
-                "scan_date": resolved_data_date,
-                "finished_at": datetime.now(),
-                "duration_sec": round((datetime.now() - scan_started_at).total_seconds(), 2),
-                "result_count": 0,
-            })
-            save_scan_audit_log(audit_payload, engine)
             return True
 
         logger.info(f"Master dataframe loaded: {len(master_df)} rows. Calculating indicators...")
@@ -3620,6 +3615,8 @@ def _scan_load_data(ctx: _MarketScanContext, mark_phase: Callable[[str], None]) 
         # 按代码切分，供并发扫描使用
         ctx.hist_map = hist_map = {code: group for code, group in master_df.groupby('code')}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Batch processing failed: {e}")
         import traceback
@@ -3633,6 +3630,7 @@ def _scan_evaluate_candidates(ctx: _MarketScanContext, mark_phase: Callable[[str
     """阶段 4/6：装载基本面/资金流映射、线程池并发执行单股策略扫描、RPS 截面闸门、
     Top 100 截断、板块上下文构建与板块观察/历史复活/动量加速候选注入。"""
     engine = ctx.engine
+    start_time = ctx.start_time
     candidates = ctx.candidates
     hist_map = ctx.hist_map
     bench_slice = ctx.bench_slice
@@ -4475,10 +4473,6 @@ def _scan_decide_and_persist(ctx: _MarketScanContext, mark_phase: Callable[[str]
         ),
     )
 
-    # Only the designated execution strategy may update Bark/Sentinel memory.
-    if publish_to_sentinel:
-        from core.sentinel import sentinel, _select_intraday_push_stocks
-        sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else []
     mark_phase("result_ranking")
 
     # --- 持久化保存 ---
@@ -4496,12 +4490,18 @@ def _scan_decide_and_persist(ctx: _MarketScanContext, mark_phase: Callable[[str]
             res['result_group'] = 'SHADOW_RESEARCH'
         else:
             res['result_group'] = 'FORMAL'
-    save_scan_results(
+    saved = save_scan_results(
         results,
         engine,
         data_date=scan_data_date,
         replace_strategy_types=[strategy_type],
     )
+    if not saved:
+        raise HTTPException(status_code=500, detail="扫描结果保存失败，请检查数据库连接后重试。")
+    # Only persisted results from the execution strategy may update Sentinel memory.
+    if publish_to_sentinel:
+        from core.sentinel import sentinel, _select_intraday_push_stocks
+        sentinel.last_top_5 = _select_intraday_push_stocks(results) if results else []
     phase_timings["result_persistence"] = round(time.perf_counter() - persist_started_at, 3)
     audit_payload["params_snapshot"]["performance_phases_sec"] = phase_timings
     audit_payload.update({
@@ -4626,6 +4626,7 @@ def perform_market_scan(
             return []
         _scan_filter_candidates(ctx, mark_phase)
         if _scan_load_data(ctx, mark_phase):
+            _scan_decide_and_persist(ctx, mark_phase)
             return []
         _scan_evaluate_candidates(ctx, mark_phase)
         _scan_enrich_candidates(ctx, mark_phase)
