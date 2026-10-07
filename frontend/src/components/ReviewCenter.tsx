@@ -815,7 +815,7 @@ function ResearchContextCard({ data }: { data: ResearchContext | null }) {
                     <div className="mb-2 text-[10px] font-black uppercase tracking-widest text-slate-400">策略健康</div>
                     <div className="space-y-2">
                         {healthRows.slice(0, 6).map(([strategy, row]) => (
-                            <div key={strategy} className="flex items-center justify-between border-b border-slate-100 pb-2 text-xs last:border-b-0">
+                            <div key={strategy} className="flex items-center justify-between border-b border-slate-50 pb-2 text-xs last:border-b-0">
                                 <span className="font-black text-slate-700">{strategy}</span>
                                 <span className={cn("font-black", row.status === 'ACTIVE' ? 'text-rose-600' : row.status === 'PAUSED' ? 'text-emerald-700' : 'text-amber-700')}>{row.status || 'UNKNOWN'} · {row.signals || 0}</span>
                             </div>
@@ -1269,7 +1269,7 @@ function PriceActionCalibration({ data }: { data?: CalibrationPayload['price_act
                     <table className="w-full min-w-[820px] text-left text-[10px]">
                         <thead className="text-slate-400"><tr><th className="p-2">形态</th><th className="p-2">市场状态</th><th className="p-2">成熟/信号</th><th className="p-2">信号后5日均值</th><th className="p-2">可执行净收益均值</th><th className="p-2">最新30%可执行留出</th><th className="p-2">成交/未成交</th><th className="p-2">样本状态</th></tr></thead>
                         <tbody>{rows.slice(0, 24).map((row, idx) => (
-                            <tr key={`${row.setup}-${row.market_regime}-${idx}`} className="border-t border-slate-100 text-slate-600">
+                            <tr key={`${row.setup}-${row.market_regime}-${idx}`} className="border-t border-slate-50 text-slate-600">
                                 <td className="p-2 font-bold">{row.setup || '未知'}</td><td className="p-2">{row.market_regime || '未知'}</td>
                                 <td className="p-2">{row.mature_5d || 0}/{row.signals || 0}</td>
                                 <td className="p-2">{formatSignedPct(row.signal_close_5d?.avg_return)}</td>
@@ -1612,7 +1612,7 @@ function formatLayerMetric(metric?: LayerMetric) {
     const color = value >= 0 ? 'text-rose-600' : 'text-emerald-600';
     return (
         <div>
-            <div className={cn("font-black", color)}>{signals ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '--'}</div>
+            <div className={cn("font-mono font-black tabular-nums", color)}>{signals ? `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` : '--'}</div>
             <div className="text-[10px] font-bold text-slate-400">{signals ? `${winRate}%胜` : '无样本'}</div>
         </div>
     );
@@ -1729,12 +1729,12 @@ function NextDayFollowupCard({
                                         {item.trade_bucket || 'UNKNOWN'}
                                     </span>
                                 </td>
-                                <td className="py-3 pr-3 font-bold text-slate-600">{formatPrice(item.signal_price)}</td>
-                                <td className="py-3 pr-3 font-bold text-slate-600">{formatPrice(item.entry_line)}</td>
-                                <td className={cn("py-3 pr-3 font-black", (item.max_gain_pct || 0) >= 5 ? "text-rose-600" : "text-slate-600")}>
+                                <td className="py-3 pr-3 font-mono font-bold tabular-nums text-slate-600">{formatPrice(item.signal_price)}</td>
+                                <td className="py-3 pr-3 font-mono font-bold tabular-nums text-slate-600">{formatPrice(item.entry_line)}</td>
+                                <td className={cn("py-3 pr-3 font-mono font-black tabular-nums", (item.max_gain_pct || 0) >= 5 ? "text-rose-600" : "text-slate-600")}>
                                     {formatSignedPct(item.max_gain_pct)}
                                 </td>
-                                <td className={cn("py-3 pr-3 font-black", (item.latest_gain_pct || 0) >= 0 ? "text-rose-500" : "text-emerald-600")}>
+                                <td className={cn("py-3 pr-3 font-mono font-black tabular-nums", (item.latest_gain_pct || 0) >= 0 ? "text-rose-500" : "text-emerald-600")}>
                                     {formatSignedPct(item.latest_gain_pct)}
                                 </td>
                                 <td className="py-3 pr-3 font-bold text-slate-500">{item.setup || '--'}</td>
@@ -1756,7 +1756,7 @@ function MiniStat({ label, value, hot = false }: { label: string; value: string;
     return (
         <div className="rounded-md border border-slate-100 bg-slate-50/70 px-3 py-2">
             <div className="text-[10px] font-black text-slate-400">{label}</div>
-            <div className={cn("mt-1 text-lg font-black", hot ? "text-rose-600" : "text-slate-800")}>{value}</div>
+            <div className={cn("mt-1 font-mono text-lg font-black tabular-nums", hot ? "text-rose-600" : "text-slate-800")}>{value}</div>
         </div>
     );
 }
@@ -1796,7 +1796,7 @@ function Stat({ label, value, sub, icon, hot = false }: { label: string; value: 
             <div className={cn("w-12 h-12 rounded-2xl flex items-center justify-center", hot ? "bg-rose-50 text-rose-600" : "bg-indigo-50 text-indigo-600")}>{icon}</div>
             <div className="min-w-0">
                 <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{label}</p>
-                <h3 className="text-xl font-black text-slate-900 mt-1 truncate">{value}</h3>
+                <h3 className="text-xl font-black tabular-nums text-slate-900 mt-1 truncate">{value}</h3>
                 <p className="text-xs text-slate-400 font-bold mt-1 truncate">{sub}</p>
             </div>
         </div>

@@ -642,7 +642,7 @@ export default function PaperTradingView() {
                                         );
                                     }) : (
                                         <tr>
-                                            <td colSpan={7} className="px-6 py-20 text-center text-slate-400 italic">
+                                            <td colSpan={7} className="px-6 py-20 text-center text-slate-400 font-bold">
                                                 {tab === 'open' ? '暂无持仓中的记录' : '暂无交易记录'}
                                             </td>
                                         </tr>

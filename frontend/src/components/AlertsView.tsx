@@ -173,7 +173,7 @@ export default function AlertsView() {
                                                     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">浮动盈亏</p>
                                                     <p className={cn(
                                                         "font-extrabold text-lg",
-                                                        alert.pl_pct < 0 ? "text-rose-500" : "text-emerald-500"
+                                                        alert.pl_pct < 0 ? "text-emerald-500" : "text-rose-500"
                                                     )}>
                                                         {alert.pl_pct}%
                                                     </p>

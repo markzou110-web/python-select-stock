@@ -64,7 +64,7 @@ export default function ScanHistoryView({ availableDates }: ScanHistoryViewProps
                                 </button>
                             ))}
                             {availableDates.length === 0 && (
-                                <p className="text-center text-slate-400 text-sm mt-10">暂无扫描记录</p>
+                                <p className="text-center text-slate-400 text-sm font-bold mt-10">暂无扫描记录</p>
                             )}
                         </div>
                     </div>

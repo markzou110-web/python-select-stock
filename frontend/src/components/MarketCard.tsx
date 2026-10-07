@@ -30,7 +30,7 @@ export default function MarketCard({ name, price, pct, loading = false }: Market
                 <span className="metric-label">{name}</span>
                 <div className={cn(
                     "flex size-8 items-center justify-center rounded-lg transition-colors",
-                    isUp ? "bg-rose-50 text-rose-700 group-hover:bg-rose-100" : "bg-teal-50 text-teal-700 group-hover:bg-teal-100"
+                    isUp ? "bg-rose-50 text-rose-700 group-hover:bg-rose-100" : "bg-emerald-50 text-emerald-700 group-hover:bg-emerald-100"
                 )} aria-hidden="true">
                     {isUp ? <ArrowUpRight size={16} /> : <ArrowDownRight size={16} />}
                 </div>
@@ -42,7 +42,7 @@ export default function MarketCard({ name, price, pct, loading = false }: Market
                 </div>
                 <div className={cn(
                     "flex items-center gap-2 text-sm font-semibold tabular-nums",
-                    isUp ? "text-rose-700" : "text-teal-700"
+                    isUp ? "text-rose-700" : "text-emerald-700"
                 )}>
                     {isUp ? '+' : ''}{pct.toFixed(2)}%
                     <span className="text-xs font-normal text-slate-500">今日涨跌幅</span>

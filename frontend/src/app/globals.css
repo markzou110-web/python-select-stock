@@ -95,7 +95,7 @@ button:not(:disabled) {
 
   .nav-item.active {
     color: white;
-    background: oklch(1 0 0 / 0.1);
+    background: oklch(1 0 0 / 0.14);
     box-shadow: inset 3px 0 0 oklch(0.72 0.14 70);
   }
 

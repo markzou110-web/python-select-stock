@@ -146,7 +146,7 @@ const MarketSentiment: React.FC = () => {
                         </div>
                         <div className="bg-slate-50 rounded-lg p-2 text-center border border-slate-100">
                             <div className="metric-label mb-1">跌停</div>
-                            <div className="text-lg font-black font-mono text-teal-600">{data.limit_down_count}</div>
+                            <div className="text-lg font-black font-mono text-emerald-600">{data.limit_down_count}</div>
                         </div>
                         <div className="bg-slate-50 rounded-lg p-2 text-center border border-slate-100">
                             <div className="metric-label mb-1">连板</div>

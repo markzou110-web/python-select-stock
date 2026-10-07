@@ -1071,7 +1071,7 @@ export default function StockDetailPage({ code, name, onBack }: StockDetailPageP
                             ))}
                         </div>
                     ) : (
-                        <p className="text-xs text-slate-400 italic py-4">暂无概念板块数据</p>
+                        <p className="text-xs text-slate-400 font-bold py-4">暂无概念板块数据</p>
                     )}
                 </div>
 

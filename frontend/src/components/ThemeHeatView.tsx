@@ -63,8 +63,8 @@ const SCOPE_OPTIONS: ReadonlyArray<{ value: ThemeScope; label: string }> = [
 
 const TREND_META: Record<string, { label: string; className: string }> = {
     new: { label: '新', className: 'bg-blue-50 text-blue-700 border-blue-100' },
-    up: { label: '升', className: 'bg-emerald-50 text-emerald-700 border-emerald-100' },
-    down: { label: '降', className: 'bg-rose-50 text-rose-700 border-rose-100' },
+    up: { label: '升', className: 'bg-rose-50 text-rose-700 border-rose-100' },
+    down: { label: '降', className: 'bg-emerald-50 text-emerald-700 border-emerald-100' },
     flat: { label: '平', className: 'bg-slate-100 text-slate-500 border-slate-200' },
 };
 
@@ -430,7 +430,7 @@ export default function ThemeHeatView({ onOpenStock }: { onOpenStock?: (stock: {
                     ) : (
                         <div className="flex min-h-[320px] flex-col items-center justify-center text-center">
                             <Flame size={28} className="text-slate-300" aria-hidden="true" />
-                            <p className="mt-3 text-sm font-semibold text-slate-500">
+                            <p className="mt-3 text-sm font-semibold text-slate-600">
                                 {loading ? '正在加载题材热度…' : themes.length === 0 ? '暂无题材数据' : '在左侧选择一个题材查看详情'}
                             </p>
                         </div>

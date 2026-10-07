@@ -302,7 +302,7 @@ export default function BacktestLab() {
                                             </td>
                                             <td className="px-3 py-2 font-mono">{trade.exit_date}</td>
                                             <td className="px-3 py-2 font-mono">{trade.entry_price} → {trade.exit_price}</td>
-                                            <td className={cn("px-3 py-2 font-black", trade.return_pct >= 0 ? "text-emerald-600" : "text-rose-600")}>{trade.return_pct}%</td>
+                                            <td className={cn("px-3 py-2 font-black", trade.return_pct >= 0 ? "text-rose-600" : "text-emerald-600")}>{trade.return_pct}%</td>
                                             <td className="px-3 py-2">{trade.hold_days}</td>
                                             <td className="px-3 py-2 text-slate-500">{trade.exit_reason} · {trade.signal_reason}</td>
                                         </tr>

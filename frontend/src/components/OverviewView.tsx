@@ -95,8 +95,8 @@ function OverviewCard({ icon, label, value, sub, color }: { icon: React.ReactNod
             <div className={cn("flex size-11 shrink-0 items-center justify-center rounded-xl", color)} aria-hidden="true">{icon}</div>
             <div className="min-w-0">
                 <p className="text-xs font-semibold text-slate-500">{label}</p>
-                <p className="mt-0.5 truncate text-xl font-bold tabular-nums text-slate-950">{value}</p>
-                <p className="mt-0.5 truncate text-xs text-slate-500" title={sub}>{sub}</p>
+                <p className="mt-0.5 truncate font-mono text-xl font-bold tabular-nums text-slate-950">{value}</p>
+                <p className="mt-0.5 truncate text-[11px] text-slate-400" title={sub}>{sub}</p>
             </div>
         </article>
     );
