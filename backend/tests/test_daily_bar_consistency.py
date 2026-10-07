@@ -18,6 +18,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import core.data as data
 from core.data import (
     apply_snapshot_bar_to_frame,
     get_snapshot_daily_bar,
@@ -43,11 +44,16 @@ def test_snapshot_bar_parses_quote_date_and_ohlc():
     }
 
 
-def test_snapshot_bar_missing_or_invalid_fails_open():
+def test_snapshot_bar_missing_or_invalid_fails_open(monkeypatch):
     frame = _snapshot_frame(None)
     assert get_snapshot_daily_bar("000999", frame) is None          # 无此代码
     assert get_snapshot_daily_bar("300852", pd.DataFrame()) is None  # 空快照
-    assert get_snapshot_daily_bar("300852", None) is not None        # 无快照→内部刷新
+    # 无快照→内部刷新：封闭化注入罐头快照（CI 无网络/无本地 PG，不能走真实刷新）
+    canned = _snapshot_frame([{"code": "300852", "price": 10.0, "open": 9.8,
+                               "high": 10.2, "low": 9.7, "close": 10.1, "vol": 12000.0}])
+    monkeypatch.setattr(data, "get_market_snapshot", lambda: canned)
+    bar = get_snapshot_daily_bar("300852", None)
+    assert bar is not None and bar["close"] == 10.0  # close 取快照 price
 
 
 def test_snapshot_bar_bad_price_fails_open():

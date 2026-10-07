@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from core import data
+import core.data as data
 from core.data import CACHE
 import core.direct_sources as ds
 
@@ -138,9 +139,11 @@ def test_market_snapshot_falls_back_to_stale_cache(monkeypatch):
 
     # 预置一份 stale 缓存（时间戳设为 2 分钟前，绕过 60s TTL，确保走全失败→stale 分支）
     stale_df = pd.DataFrame({"code": ["000001"], "name": ["X"], "price": [9.0]})
+    fixed_date = "2026-10-06"
+    monkeypatch.setattr(data, "_expected_snapshot_date", lambda: fixed_date)
     stale_df.attrs = {
         "fetched_at": data.datetime.now() - data.timedelta(minutes=2),
-        "data_date": data._expected_snapshot_date(),
+        "data_date": fixed_date,
         "source": "腾讯",
     }
     with data._cache_lock:
