@@ -408,9 +408,9 @@ export default function ThemeHeatView({ onOpenStock }: { onOpenStock?: (stock: {
                                 )}
                                 {membersTheme === selected.theme && members && members.length > 0 ? (
                                     <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-6">
-                                        {members.map((code) => (
+                                        {members.map((code, idx) => (
                                             <button
-                                                key={code}
+                                                key={`${code}-${idx}`}
                                                 type="button"
                                                 onClick={() => onOpenStock?.({ code, name: code })}
                                                 className="min-h-9 truncate rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 font-mono text-xs font-bold tabular-nums text-slate-700 transition-colors hover:border-rose-300 hover:bg-rose-50 hover:text-rose-700"

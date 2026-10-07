@@ -130,7 +130,9 @@ def _fetch_members(theme: str, fetcher=None, industry: bool = False) -> List[str
     code_col = _column(frame, "代码") or _column(frame, "品种代码")
     if not code_col:
         return []
-    return [str(v).zfill(6) for v in frame[code_col].tolist()][:MEMBER_CAP]
+    codes = [str(v).zfill(6) for v in frame[code_col].tolist()]
+    # 东财成分接口可能返回重复行（如 A+H 两地上市同一码），按序去重
+    return list(dict.fromkeys(codes))[:MEMBER_CAP]
 
 
 def _limit_up_stats(engine, members: List[str], bar_date: str) -> Dict[str, float]:
