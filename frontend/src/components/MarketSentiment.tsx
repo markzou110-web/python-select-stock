@@ -124,7 +124,7 @@ const MarketSentiment: React.FC = () => {
                 <div className="flex flex-col md:flex-row items-center gap-3 lg:w-[42%]">
                     <div className="flex flex-col items-center">
                         <div className={`relative w-16 h-16 rounded-lg flex items-center justify-center border border-slate-200 ${bgPulse}`}>
-                            <div className={`text-2xl font-black font-mono ${scoreColor}`}>
+                            <div className={`text-2xl font-black font-mono tracking-tight ${scoreColor}`}>
                                 {data.sentiment_score}
                             </div>
                         </div>

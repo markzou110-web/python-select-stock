@@ -22,11 +22,11 @@ export default function SectorGrid({ sectors }: { sectors: Sector[] }) {
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
                 {sectors.length > 0 ? sectors.map((sector, i) => (
-                    <article key={`${sector.name}-${i}`} className="glass-card group flex min-h-24 flex-col justify-between overflow-hidden p-4 transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-lg">
+                    <article key={`${sector.name}-${i}`} className="glass-card group flex min-h-24 flex-col justify-between overflow-hidden p-4 transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-[inset_0_1px_0_oklch(1_0_0/0.55),0_2px_4px_oklch(0.2_0.02_255/0.04),0_18px_40px_oklch(0.2_0.03_255/0.09)]">
                         <div>
                             <p className="metric-label mb-1.5">{sector.name}</p>
                             <div className="flex items-baseline gap-2">
-                                <span className="font-mono text-xl font-bold tabular-nums text-rose-700">+{sector.pct.toFixed(2)}%</span>
+                                <span className="font-mono text-xl font-bold tracking-tight tabular-nums text-rose-700">+{sector.pct.toFixed(2)}%</span>
                             </div>
                         </div>
 

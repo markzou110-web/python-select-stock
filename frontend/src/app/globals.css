@@ -74,11 +74,49 @@ button:not(:disabled) {
 
 @layer components {
   .glass-card {
-    background: var(--card);
+    position: relative;
+    /* 浅色玻璃：半透明底（略降不透明度，让 app-canvas 冷色微光透出） */
+    background-color: oklch(0.995 0.004 90 / 0.82);
     color: var(--card-foreground);
     border: 1px solid oklch(0.92 0.012 255);
     border-radius: var(--radius-md);
-    box-shadow: var(--shadow-surface);
+    /* 多层柔和阴影 + 顶部 1px 内高光，模拟玻璃厚度 */
+    box-shadow:
+      0 1px 2px oklch(0.2 0.02 255 / 0.04),
+      0 6px 16px oklch(0.2 0.03 255 / 0.04),
+      0 16px 40px oklch(0.2 0.03 255 / 0.06),
+      inset 0 1px 0 oklch(1 0 0 / 0.55);
+  }
+
+  /* 极细渐变描边：白 → 一丝 cyan → 透明（冷色科技感，1px 环） */
+  .glass-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(165deg, oklch(1 0 0 / 0.5), oklch(0.85 0.13 207 / 0.15) 45%, oklch(1 0 0 / 0.02) 72%, transparent);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  /* 虚线空态卡与无边框卡保留原始描边意图，不叠加渐变环 */
+  .glass-card.border-dashed::before,
+  .glass-card.border-none::before {
+    display: none;
+  }
+
+  /* 首屏 hero 网格纹理：1px 冷色细线（约 5% 透明度），向下渐隐 */
+  .overview-grid {
+    background-image:
+      linear-gradient(oklch(0.45 0.08 257 / 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(0.45 0.08 257 / 0.05) 1px, transparent 1px);
+    background-size: 28px 28px;
+    -webkit-mask-image: radial-gradient(120% 90% at 50% 0%, black 25%, transparent 78%);
+    mask-image: radial-gradient(120% 90% at 50% 0%, black 25%, transparent 78%);
   }
   
   .premium-gradient {
@@ -89,7 +127,7 @@ button:not(:disabled) {
     @apply flex w-full items-center gap-3 px-3 py-2.5 text-left;
     min-height: 44px;
     border-radius: var(--radius-sm);
-    transition-property: color, background-color, box-shadow;
+    transition-property: color, background-color, box-shadow, transform;
     transition-duration: 150ms;
   }
 

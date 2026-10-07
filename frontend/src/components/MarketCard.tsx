@@ -25,7 +25,7 @@ export default function MarketCard({ name, price, pct, loading = false }: Market
     }
 
     return (
-        <article className="glass-card group p-4 transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-lg">
+        <article className="glass-card group p-4 transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-[inset_0_1px_0_oklch(1_0_0/0.55),0_2px_4px_oklch(0.2_0.02_255/0.04),0_18px_40px_oklch(0.2_0.03_255/0.09)]">
             <div className="mb-3 flex items-start justify-between">
                 <span className="metric-label">{name}</span>
                 <div className={cn(

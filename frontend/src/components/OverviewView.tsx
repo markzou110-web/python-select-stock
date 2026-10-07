@@ -23,7 +23,9 @@ export default function OverviewView({ onNavigate }: OverviewViewProps) {
     const topResult = results?.[0];
 
     return (
-        <div className="space-y-6">
+        <div className="relative space-y-6">
+            {/* 首屏 hero 网格纹理：纯装饰，不拦截交互 */}
+            <span aria-hidden="true" className="overview-grid pointer-events-none absolute inset-x-0 top-0 h-72" />
             <section className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between" aria-labelledby="overview-heading">
                 <div>
                     <p className="text-xs font-semibold tracking-wide text-blue-700">今日决策驾驶舱</p>
@@ -91,11 +93,12 @@ export default function OverviewView({ onNavigate }: OverviewViewProps) {
 
 function OverviewCard({ icon, label, value, sub, color }: { icon: React.ReactNode; label: string; value: string; sub: string; color: string }) {
     return (
-        <article className="glass-card flex items-center gap-4 p-4 sm:p-5">
+        <article className="glass-card relative flex items-center gap-4 p-4 transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-[inset_0_1px_0_oklch(1_0_0/0.55),0_2px_4px_oklch(0.2_0.02_255/0.04),0_18px_40px_oklch(0.2_0.03_255/0.1)] sm:p-5">
+            <span aria-hidden="true" className="absolute inset-x-0 top-0 h-[3px] rounded-t-[inherit] bg-gradient-to-r from-indigo-600 to-cyan-400" />
             <div className={cn("flex size-11 shrink-0 items-center justify-center rounded-xl", color)} aria-hidden="true">{icon}</div>
             <div className="min-w-0">
                 <p className="text-xs font-semibold text-slate-500">{label}</p>
-                <p className="mt-0.5 truncate font-mono text-xl font-bold tabular-nums text-slate-950">{value}</p>
+                <p className="mt-0.5 truncate font-mono text-2xl font-bold tracking-tight tabular-nums text-slate-950">{value}</p>
                 <p className="mt-0.5 truncate text-[11px] text-slate-400" title={sub}>{sub}</p>
             </div>
         </article>
@@ -104,8 +107,8 @@ function OverviewCard({ icon, label, value, sub, color }: { icon: React.ReactNod
 
 function QuickAction({ icon, title, body, onClick }: { icon: React.ReactNode; title: string; body: string; onClick: () => void }) {
     return (
-        <button type="button" onClick={onClick} className="glass-card group p-5 text-start transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-lg active:scale-[0.96]">
-            <div className="mb-4 flex size-11 items-center justify-center rounded-xl bg-blue-50 text-blue-700 transition-colors group-hover:bg-blue-100" aria-hidden="true">{icon}</div>
+        <button type="button" onClick={onClick} className="glass-card group p-5 text-start transition-[transform,box-shadow] hover:-translate-y-0.5 hover:shadow-[inset_0_1px_0_oklch(1_0_0/0.55),0_18px_40px_oklch(0.2_0.03_255/0.09),0_0_12px_rgba(34,211,238,0.08)] hover:ring-1 hover:ring-cyan-400/30 active:scale-[0.99]">
+            <div className="mb-4 flex size-11 items-center justify-center rounded-xl bg-gradient-to-br from-blue-50 to-cyan-50 text-blue-700 transition-colors group-hover:from-blue-100 group-hover:to-cyan-100" aria-hidden="true">{icon}</div>
             <h3 className="font-semibold text-slate-900">{title}</h3>
             <p className="mt-2 text-sm leading-relaxed text-slate-500">{body}</p>
         </button>

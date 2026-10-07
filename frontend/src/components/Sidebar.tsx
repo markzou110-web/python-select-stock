@@ -118,7 +118,7 @@ export default function Sidebar({
                         <Cpu size={18} aria-hidden="true" />
                     </div>
                     <div className="min-w-0">
-                        <p className="text-sm font-bold leading-tight text-white">Alpha Vision</p>
+                        <p className="text-sm font-bold leading-tight tracking-[0.04em] text-white">Alpha Vision</p>
                         <p className="mt-0.5 text-[11px] font-medium text-slate-400">A 股决策终端</p>
                     </div>
                 </div>
@@ -135,7 +135,7 @@ export default function Sidebar({
 
             {/* Scrollable Navigation */}
             <div className="flex-1 overflow-y-auto px-3 py-4">
-                <p className="px-2 pb-2 text-[11px] font-semibold tracking-wide text-slate-500">工作台</p>
+                <p className="px-2 pb-2 text-[11px] font-semibold tracking-[0.16em] text-slate-500">工作台</p>
                 <nav className="space-y-1" aria-label="工作区">
                     <NavItem
                         icon={<LayoutDashboard size={20} />}
@@ -222,7 +222,7 @@ export default function Sidebar({
             {/* Fixed Bottom Section */}
             <div className="flex-shrink-0 border-t border-white/10 bg-[var(--sidebar-raised)] p-3">
                 <div className="mb-3">
-                    <h2 className="mb-2 px-1 text-[11px] font-semibold tracking-wide text-slate-400">数据管理</h2>
+                    <h2 className="mb-2 px-1 text-[11px] font-semibold tracking-[0.16em] text-slate-500">数据管理</h2>
 
                     <div className="grid gap-2">
                         <button
@@ -310,7 +310,7 @@ function NavItem({ icon, label, active = false, badge = 0, onClick }: { icon: Re
             onClick={onClick}
             aria-current={active ? 'page' : undefined}
             className={cn(
-                "nav-item justify-between text-slate-400 hover:bg-white/[0.07] hover:text-white",
+                "nav-item justify-between text-slate-400 hover:translate-x-0.5 hover:bg-white/[0.07] hover:text-white",
                 active && "active text-white hover:bg-white/10"
             )}
         >

@@ -911,7 +911,7 @@ function RecommendationOutcomeLoopCard({ data }: { data: RecommendationOutcomeLo
                 <div className="overflow-x-auto">
                     <table className="w-full text-left">
                         <thead>
-                            <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                            <tr className="bg-slate-50/50 text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
                                 <th className="py-2 pr-3">来源</th>
                                 <th className="py-2 pr-3">样本</th>
                                 <th className="py-2 pr-3">1日</th>
@@ -1119,7 +1119,7 @@ function ProfitabilityLayerCard({ data }: { data: ProfitabilityPayload | null })
             <div className="overflow-x-auto">
                 <table className="w-full text-left">
                     <thead>
-                        <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                        <tr className="bg-slate-50/50 text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
                             <th className="py-2 pr-3">分层</th>
                             <th className="py-2 pr-3">样本</th>
                             <th className="py-2 pr-3">1日</th>
@@ -1267,7 +1267,7 @@ function PriceActionCalibration({ data }: { data?: CalibrationPayload['price_act
             {rows.length ? (
                 <div className="mt-3 overflow-x-auto">
                     <table className="w-full min-w-[820px] text-left text-[10px]">
-                        <thead className="text-slate-400"><tr><th className="p-2">形态</th><th className="p-2">市场状态</th><th className="p-2">成熟/信号</th><th className="p-2">信号后5日均值</th><th className="p-2">可执行净收益均值</th><th className="p-2">最新30%可执行留出</th><th className="p-2">成交/未成交</th><th className="p-2">样本状态</th></tr></thead>
+                        <thead className="text-slate-400"><tr className="bg-slate-50/50"><th className="p-2">形态</th><th className="p-2">市场状态</th><th className="p-2">成熟/信号</th><th className="p-2">信号后5日均值</th><th className="p-2">可执行净收益均值</th><th className="p-2">最新30%可执行留出</th><th className="p-2">成交/未成交</th><th className="p-2">样本状态</th></tr></thead>
                         <tbody>{rows.slice(0, 24).map((row, idx) => (
                             <tr key={`${row.setup}-${row.market_regime}-${idx}`} className="border-t border-slate-50 text-slate-600">
                                 <td className="p-2 font-bold">{row.setup || '未知'}</td><td className="p-2">{row.market_regime || '未知'}</td>
@@ -1558,7 +1558,7 @@ function SectorWatchPerformanceCard({ data }: { data: SectorWatchPerformance | n
             <div className="overflow-x-auto">
                 <table className="w-full text-left">
                     <thead>
-                        <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                        <tr className="bg-slate-50/50 text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
                             <th className="py-2 pr-3">状态</th>
                             <th className="py-2 pr-3">样本</th>
                             <th className="py-2 pr-3">5日</th>
@@ -1700,7 +1700,7 @@ function NextDayFollowupCard({
             <div className="overflow-x-auto">
                 <table className="w-full text-left">
                     <thead>
-                        <tr className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
+                        <tr className="bg-slate-50/50 text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
                             <th className="py-2 pr-3">股票</th>
                             <th className="py-2 pr-3">状态</th>
                             <th className="py-2 pr-3">执行</th>

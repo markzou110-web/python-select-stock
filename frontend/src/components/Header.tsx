@@ -148,7 +148,7 @@ export default function Header({
     };
 
     return (
-        <header className="sticky top-0 z-30 border-b border-slate-200/90 bg-[color:oklch(0.99_0.004_90/0.94)] px-3 py-3 backdrop-blur-xl sm:px-5">
+        <header className="sticky top-0 z-30 bg-[color:oklch(0.99_0.004_90/0.94)] px-3 py-3 backdrop-blur-xl after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:h-px after:bg-gradient-to-r after:from-transparent after:via-slate-200/50 after:to-transparent sm:px-5">
             <div className="mx-auto flex w-full max-w-[1920px] flex-wrap items-center gap-3">
                 <div className="flex min-w-0 flex-1 items-center gap-3">
                     <button
@@ -161,7 +161,7 @@ export default function Header({
                         <Menu size={20} aria-hidden="true" />
                     </button>
                     <div className="min-w-0">
-                        <h1 className="truncate text-lg font-bold tracking-tight text-slate-950 sm:text-xl">
+                        <h1 className="truncate text-lg font-bold tracking-[0.01em] text-slate-950 sm:text-xl">
                             {viewMeta.title}
                         </h1>
                         <p className="hidden truncate text-xs text-slate-500 sm:block">{viewMeta.description}</p>

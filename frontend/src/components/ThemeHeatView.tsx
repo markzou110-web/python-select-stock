@@ -428,9 +428,9 @@ export default function ThemeHeatView({ onOpenStock }: { onOpenStock?: (stock: {
                             </div>
                         </div>
                     ) : (
-                        <div className="flex min-h-[320px] flex-col items-center justify-center text-center">
+                        <div className="flex min-h-[320px] flex-col items-center justify-center gap-2 text-center">
                             <Flame size={28} className="text-slate-300" aria-hidden="true" />
-                            <p className="mt-3 text-sm font-semibold text-slate-600">
+                            <p className="text-sm font-semibold text-slate-600">
                                 {loading ? '正在加载题材热度…' : themes.length === 0 ? '暂无题材数据' : '在左侧选择一个题材查看详情'}
                             </p>
                         </div>
